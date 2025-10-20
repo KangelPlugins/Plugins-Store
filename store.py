@@ -1,3 +1,0 @@
-plugins_list = {
-    "steam_plugin": "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/Plugins/steam_plugin.py"
-}
