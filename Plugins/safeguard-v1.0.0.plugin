@@ -1,0 +1,261 @@
+__id__ = "safesend"
+__name__ = "SafeSend"
+__description__ = "Плагин для параноиков защищает от *случайной* отправки личной инфы. Перед отправкой предупреждает о рисках. Есть белый список чатов."
+__author__ = "@nokirby"
+__version__ = "0.1.0"
+__icon__ = "tomocracy/3"
+__min_version__ = "11.12.0"
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from hook_utils import find_class
+from client_utils import send_message, run_on_queue, get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from android_utils import run_on_ui_thread
+import re, os, tempfile
+
+
+DEFAULTS = {
+    "enabled": True,
+    "scan_email": True,
+    "scan_phone": True,
+    "scan_card": True,
+    "scan_iban": True,
+    "scan_geo": True,
+    "scan_addr": False,
+    "scan_links": True,
+    "resolve_shorteners": False,
+    "mask_keep": 4,
+    "strip_exif": True,
+    "whitelist_peers": "",
+}
+
+RE_EMAIL   = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+RE_PHONE   = re.compile(r"(?:\+?\d[\s\-\(\)]?){6,}\d")
+RE_CC      = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+RE_IBAN    = re.compile(r"\b[A-Z]{2}[0-9A-Z]{13,34}\b")
+RE_COORDS  = re.compile(r"\b([\-+]?\d{1,2}\.\d{3,}),\s*([\-+]?\d{1,3}\.\d{3,})\b")
+RE_ADDR    = re.compile(r"\b(ул\.|улица|проспект|пр-т|пр-т\.|дом|д\.)\s*[^\n,]{2,}", re.I)
+RE_URL     = re.compile(r"https?://[^\s)>\]]+")
+SHORTENERS = {"t.co","bit.ly","tinyurl.com","goo.gl","ow.ly","buff.ly","t.ly","is.gd","s.id"}
+
+def _has_puny(host: str) -> bool:
+    return "xn--" in host.lower()
+
+def _luhn_ok(number: str) -> bool:
+    digits = [int(d) for d in re.sub(r"\D","", number)]
+    if len(digits) < 12:
+        return False
+    s = 0
+    alt = False
+    for d in reversed(digits):
+        if alt:
+            dbl = d * 2
+            s += dbl - 9 if dbl > 9 else dbl
+        else:
+            s += d
+        alt = not alt
+    return s % 10 == 0
+
+def _mask_digits(s: str, keep: int = 4) -> str:
+    idxs = [i for i, ch in enumerate(s) if ch.isdigit()]
+    cutoff = max(0, len(idxs) - keep)
+    out = list(s)
+    for j, pos in enumerate(idxs):
+        if j < cutoff:
+            out[pos] = "•"
+    return "".join(out)
+
+def _scan_text(text: str, cfg: dict):
+    findings = []
+    redacted = text
+    if cfg.get("scan_email"):
+        for m in RE_EMAIL.findall(text):
+            findings.append(("email", m))
+            redacted = redacted.replace(m, "***@***")
+    if cfg.get("scan_phone"):
+        for m in RE_PHONE.findall(text):
+            if len(re.sub(r"\D","", m)) >= 10:
+                findings.append(("phone", m))
+                redacted = redacted.replace(m, _mask_digits(m, cfg.get("mask_keep", 4)))
+    if cfg.get("scan_card"):
+        for m in RE_CC.findall(text):
+            if _luhn_ok(m):
+                findings.append(("card", m))
+                redacted = redacted.replace(m, _mask_digits(m, cfg.get("mask_keep", 4)))
+    if cfg.get("scan_iban"):
+        for m in RE_IBAN.findall(text):
+            findings.append(("iban", m))
+            redacted = redacted.replace(m, m[:4] + " " + "•"*8 + " ...")
+    if cfg.get("scan_geo"):
+        for m in RE_COORDS.findall(text):
+            val = ",".join(m)
+            findings.append(("geo", val))
+            redacted = redacted.replace(val, "⟨coords hidden⟩")
+    if cfg.get("scan_addr"):
+        for m in RE_ADDR.findall(text):
+            findings.append(("addr", m))
+            redacted = redacted.replace(m, "⟨addr hidden⟩")
+    if cfg.get("scan_links"):
+        for url in RE_URL.findall(text):
+            try:
+                host = re.sub(r"^https?://","", url).split("/")[0]
+                if host in SHORTENERS or _has_puny(host):
+                    findings.append(("link", url))
+            except Exception:
+                pass
+    return findings, redacted
+
+class _PhotoPrepareHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+    def before_hooked_method(self, param):
+        try:
+            if not self.p.get_setting("strip_exif", True):
+                return
+            path = None
+            for a in param.args:
+                try:
+                    if a is None:
+                        continue
+                    if a.getClass().getName() == "java.lang.String":
+                        s = str(a)
+                        if s.lower().endswith((".jpg", ".jpeg", ".png")) and os.path.exists(s):
+                            path = s
+                            break
+                except Exception:
+                    continue
+            if not path:
+                return
+            from android.graphics import BitmapFactory, Bitmap
+            from java.io import FileOutputStream
+            bmp = BitmapFactory.decodeFile(path)
+            if bmp is None:
+                return
+            tmp = os.path.join(tempfile.gettempdir(), f"safesend_{abs(hash(path))}" + (".png" if path.lower().endswith(".png") else ".jpg"))
+            fos = FileOutputStream(tmp)
+            try:
+                if tmp.lower().endswith(".png"):
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                else:
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 92, fos)
+            finally:
+                try:
+                    fos.close()
+                except Exception:
+                    pass
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
+            for i, a in enumerate(param.args):
+                try:
+                    if a is not None and a.getClass().getName() == "java.lang.String" and str(a) == path:
+                        param.args[i] = tmp
+                except Exception:
+                    pass
+        except Exception as e:
+            self.p.log(f"SafeSend EXIF error: {e}")
+
+class SafeSendGuard(BasePlugin):
+    def on_plugin_load(self):
+        for k, v in DEFAULTS.items():
+            if self.get_setting(k, None) is None:
+                self.set_setting(k, v)
+        self.add_on_send_message_hook()
+        try:
+            smh = find_class("org.telegram.messenger.SendMessagesHelper")
+            methods = smh.getDeclaredMethods()
+            hooked = 0
+            ph = _PhotoPrepareHook(self)
+            for m in methods:
+                try:
+                    if m.getName() == "prepareSendingPhoto":
+                        m.setAccessible(True)
+                        self.hook_method(m, ph)
+                        hooked += 1
+                except Exception:
+                    continue
+            self.log(f"SafeSend: hooked photo methods = {hooked}")
+        except Exception as e:
+            self.log(f"SafeSend: photo hook failed: {e}")
+    def _peer_whitelisted(self, peer) -> bool:
+        wl = self.get_setting("whitelist_peers", "")
+        if not wl:
+            return False
+        pid = str(peer)
+        for t in [t.strip() for t in wl.split(",") if t.strip()]:
+            if t in pid:
+                return True
+        return False
+    def on_send_message_hook(self, account, params):
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+        if msg.startswith(".safesend"):
+            parts = msg.strip().split()
+            if len(parts) >= 2 and parts[1] in ("on", "off"):
+                self.set_setting("enabled", parts[1] == "on")
+                BulletinHelper.show_info(f"SafeSend: {parts[1]}")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            BulletinHelper.show_info("Использование: .safesend on|off")
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if not self.get_setting("enabled", True):
+            return HookResult()
+        if self._peer_whitelisted(getattr(params, "peer", None)):
+            return HookResult()
+        cfg = {k: self.get_setting(k, v) for k, v in DEFAULTS.items()}
+        findings, redacted = _scan_text(msg, cfg)
+        if not findings:
+            return HookResult()
+        kinds = {}
+        for k, _ in findings:
+            kinds[k] = kinds.get(k, 0) + 1
+        summary = "Найдены риски: " + ", ".join(f"{k}×{n}" for k, n in kinds.items())
+        peer = getattr(params, "peer", None)
+        def show_dialog():
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                BulletinHelper.show_error("SafeSend: нет активного экрана для диалога")
+                return
+            b = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            b.set_title("SafeSend Guard")
+            b.set_message(summary)
+            def _send_as_is(_b, _which):
+                send_message({"peer": peer, "message": msg})
+            def _send_redacted(_b, _which):
+                send_message({"peer": peer, "message": redacted})
+            b.set_positive_button("Отправить как есть", _send_as_is)
+            b.set_negative_button("Редактировать и отправить", _send_redacted)
+            b.set_neutral_button("Отмена", lambda _b, _w: _b.dismiss())
+            b.set_cancelable(True)
+            b.show()
+        try:
+            run_on_ui_thread(show_dialog)
+        except Exception:
+            BulletinHelper.show_error(summary)
+        return HookResult(strategy=HookStrategy.CANCEL)
+    def create_settings(self):
+        from ui.settings import Header, Switch, Input, Divider, Text
+        return [
+            Header(text="SafeSend"),
+            Switch(key="enabled", text="Включить SafeSend", default=DEFAULTS["enabled"]),
+            Divider(),
+            Switch(key="scan_email", text="Проверять e-mail", default=DEFAULTS["scan_email"]),
+            Switch(key="scan_phone", text="Проверять телефоны", default=DEFAULTS["scan_phone"]),
+            Switch(key="scan_card", text="Проверять карты (Luhn)", default=DEFAULTS["scan_card"]),
+            Switch(key="scan_iban", text="Проверять IBAN", default=DEFAULTS["scan_iban"]),
+            Switch(key="scan_geo", text="Проверять координаты", default=DEFAULTS["scan_geo"]),
+            Switch(key="scan_addr", text="Проверять адреса (нестабильно)", default=DEFAULTS["scan_addr"]),
+            Divider(),
+            Switch(key="scan_links", text="Проверять ссылки (punycode/shorteners)", default=DEFAULTS["scan_links"]),
+            Input(key="mask_keep", text="Сколько цифр оставлять (по умолчанию 4)", default=str(DEFAULTS["mask_keep"])),
+            Input(key="whitelist_peers", text="Белый список чатов (через запятую)", subtext="@friend, -1001234567", default=DEFAULTS["whitelist_peers"]),
+            Divider(),
+        ]
+    def on_plugin_unload(self):
+        try:
+            self.remove_hook("on_send_message")
+        except Exception:
+            pass
