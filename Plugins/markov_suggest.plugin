@@ -1,0 +1,527 @@
+__id__ = "markov_suggest"
+__name__ = "Markov Chain Suggest"
+__description__ = "Подсказки из цепи Маркова: 3 слова, обновление по слову"
+__version__ = "1.0.0"
+__author__ = "MandreAI"
+__icon__ = "msg_keyboard_solar"
+__min_version__ = "11.12.1"
+
+import re
+import json
+import threading
+import random
+from typing import Any, Dict, List, Tuple
+
+from base_plugin import BasePlugin, HookResult, MethodHook
+from base_plugin import HookStrategy
+from hook_utils import find_class, jarray
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+from ui.settings import Header, Text, Divider
+from mandre_lib import Mandre
+
+from java.util import ArrayList, Arrays
+
+
+class _MarkovModel:
+    def __init__(self, max_states: int = 200_000):
+        self.max_states = max_states
+        self.lock = threading.Lock()
+        self.trigram: Dict[Tuple[str, str], Dict[str, int]] = {}
+        self.unigram: Dict[str, int] = {}
+        self.total_tokens = 0
+        # Preseed with common words to ensure suggestions even before training
+        for w in ("и","но","как","это","все","я","ты","мы","он","она","они","есть","будет","может"):
+            self.unigram[w] = self.unigram.get(w, 0) + 1
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = text or ""
+        text = re.sub(r"[\r\n]+", " ", text)
+        tokens = re.findall(r"[\w]+|[.!?]", text.lower())
+        return tokens
+
+    def train(self, text: str, group_size: int = 1):
+        # Treat a "thought" as N lines grouped together (default 1 = per-line)
+        raw_lines = [ln.strip() for ln in (text or "").splitlines()]
+        lines = [ln for ln in raw_lines if ln]
+        if not lines:
+            return
+        group_size = 1 if not isinstance(group_size, int) else max(1, min(6, group_size))
+        # Chunk lines into groups of group_size
+        groups = []
+        for i in range(0, len(lines), group_size):
+            grp = " ".join(lines[i:i + group_size])
+            if grp:
+                groups.append(grp)
+        if not groups:
+            return
+        with self.lock:
+            remaining = 2_000_000
+            for grp in groups:
+                if remaining <= 0:
+                    break
+                tokens = self._tokenize(grp)
+                if not tokens:
+                    continue
+                if len(tokens) > remaining:
+                    tokens = tokens[:remaining]
+                self.total_tokens += len(tokens)
+                remaining -= len(tokens)
+                for t in tokens:
+                    self.unigram[t] = self.unigram.get(t, 0) + 1
+                for i in range(2, len(tokens)):
+                    w1, w2, w3 = tokens[i - 2], tokens[i - 1], tokens[i]
+                    key = (w1, w2)
+                    bucket = self.trigram.get(key)
+                    if bucket is None:
+                        if len(self.trigram) >= self.max_states:
+                            try:
+                                to_drop = max(1, len(self.trigram) // 100)
+                                totals = [(sum(d.values()), k) for k, d in self.trigram.items()]
+                                totals.sort(key=lambda x: x[0])
+                                for _, k in totals[:to_drop]:
+                                    self.trigram.pop(k, None)
+                            except Exception:
+                                pass
+                        bucket = {}
+                        self.trigram[key] = bucket
+                    bucket[w3] = bucket.get(w3, 0) + 1
+
+    def _top_next(self, w1: str, w2: str, k: int = 5) -> List[str]:
+        bucket = self.trigram.get((w1, w2), {})
+        if not bucket:
+            return [w for w, _ in sorted(self.unigram.items(), key=lambda x: -x[1])[:k]]
+        return [w for w, _ in sorted(bucket.items(), key=lambda x: -x[1])[:k]]
+
+    def _weighted_choice(self, counts: Dict[str, int]) -> str:
+        total = sum(counts.values())
+        if total <= 0:
+            return ""
+        r = random.randint(1, total)
+        s = 0
+        for w, c in counts.items():
+            s += c
+            if r <= s:
+                return w
+        return ""
+
+    def _weighted_next(self, w1: str, w2: str) -> str:
+        bucket = self.trigram.get((w1, w2))
+        if bucket:
+            return self._weighted_choice(bucket)
+        if self.unigram:
+            return self._weighted_choice(self.unigram)
+        return ""
+
+    def suggest_three(self, prefix_text: str, k: int = 6) -> List[str]:
+        tokens = self._tokenize(prefix_text)
+        suggestions: List[str] = []
+        attempts = max(10, k * 6)
+        if len(tokens) >= 2:
+            w1, w2 = tokens[-2], tokens[-1]
+        else:
+            w1, w2 = ("", tokens[-1]) if len(tokens) == 1 else ("", "")
+
+        while len(suggestions) < k and attempts > 0:
+            attempts -= 1
+            if len(tokens) == 0:
+                n1 = self._weighted_choice(self.unigram) if self.unigram else ""
+                n2 = self._weighted_next(n1, n1) if n1 else ""
+                n3 = self._weighted_next(n2, n2) if n2 else ""
+            else:
+                n1 = self._weighted_next(w1, w2)
+                n2 = self._weighted_next(w2, n1) if n1 else ""
+                n3 = self._weighted_next(n1, n2) if n2 else ""
+            phrase = " ".join([t for t in (n1, n2, n3) if t]).strip()
+            if phrase and phrase not in suggestions:
+                suggestions.append(phrase)
+        if not suggestions:
+            # Fallback to deterministic if sampling failed
+            if len(tokens) == 0:
+                starters = [w for w, _ in sorted(self.unigram.items(), key=lambda x: -x[1])[:max(3, k)]]
+                return [" ".join(starters[:3])] if starters else []
+            base = self._top_next(w1, w2, k=max(3, k))
+            for i in range(0, min(k, len(base))):
+                n1 = base[i]
+                n2s = self._top_next(w2, n1, k=3)
+                n3s = self._top_next(n1, n2s[0], k=2) if n2s else []
+                phrase = " ".join([n1, n2s[0] if n2s else "", n3s[0] if n3s else ""]).strip()
+                if phrase:
+                    suggestions.append(phrase)
+        return suggestions[:k]
+
+
+class _MarkovSuggestHook(MethodHook):
+    def __init__(self, plugin_instance: "MarkovSuggestPlugin"):
+        self.plugin = plugin_instance
+        self._last_word_count = -1
+        self._last_token = ""
+        self._last_suggestions = []
+        self._suggestions_count = 5
+
+    def _inject_suggestions(self, param, text: str):
+        try:
+            this = param.thisObject
+            MentionsAdapterClass = this.getClass()
+            # Use hashtags list to avoid command auto-send on click
+            field_hashtags = MentionsAdapterClass.getDeclaredField("searchResultHashtags")
+            field_commands = MentionsAdapterClass.getDeclaredField("searchResultCommands")
+            field_help = MentionsAdapterClass.getDeclaredField("searchResultCommandsHelp")
+            field_delegate = MentionsAdapterClass.getDeclaredField("delegate")
+            # Prepare start/length so selection inserts at caret
+            field_start = MentionsAdapterClass.getDeclaredField("resultStartPosition")
+            field_len = MentionsAdapterClass.getDeclaredField("resultLength")
+            for f in [field_hashtags, field_commands, field_help, field_delegate, field_start, field_len]:
+                f.setAccessible(True)
+
+            # Build fresh list: show up to N suggestions
+            # Prefer exactly 3 suggestions for clarity
+            suggestions = self.plugin.model.suggest_three(text, k=3)
+            if not suggestions:
+                return
+            # Always refresh suggestions to keep panel consistent
+            self._last_suggestions = suggestions
+            string_class = find_class("java.lang.String").getClass()
+            new_hashtags = ArrayList(Arrays.asList(jarray(string_class)(suggestions)))
+
+            def _ui_update():
+                try:
+                    # Clear command lists to avoid command-send behavior
+                    field_commands.set(this, None)
+                    field_help.set(this, None)
+                    # Set hashtags list to show plain text items
+                    field_hashtags.set(this, new_hashtags)
+                    # Always append at end: set start to end-of-text, length to 0
+                    try:
+                        t = str(param.args[0].toString()) if (param.args and len(param.args) > 0 and param.args[0] is not None) else ""
+                        end_pos = len(t)
+                    except Exception:
+                        end_pos = 0
+                    field_start.setInt(this, end_pos)
+                    field_len.setInt(this, 0)
+                    this.notifyDataSetChanged()
+                    delegate = field_delegate.get(this)
+                    if delegate:
+                        delegate.needChangePanelVisibility(True)
+                except Exception as e:
+                    self.plugin.log(f"[markov_suggest] ui update error: {e}")
+
+            run_on_ui_thread(_ui_update)
+        except Exception as e:
+            self.plugin.log(f"[markov_suggest] inject error: {e}")
+
+    def before_hooked_method(self, param):
+        try:
+            if not param.args or len(param.args) == 0:
+                return
+            text = str(param.args[0].toString()) if param.args[0] is not None else ""
+            # Respect global enable flag
+            if not self.plugin._is_enabled():
+                return
+            tokens = re.findall(r"\b\w+\b", text)
+            word_count = len(tokens)
+            last_tok = tokens[-1] if tokens else ""
+            # Only update on word boundary (space/punct at end)
+            if not re.search(r"[\s.!?,;:]$", text):
+                return
+            if word_count == self._last_word_count and last_tok == self._last_token:
+                return
+            self._last_word_count = word_count
+            self._last_token = last_tok
+            self._inject_suggestions(param, text)
+        except Exception as e:
+            self.plugin.log(f"[markov_suggest] hook error: {e}")
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.plugin._is_enabled():
+                return
+            if not param.args or len(param.args) == 0:
+                return
+            text = str(param.args[0].toString()) if param.args[0] is not None else ""
+            # Also update after method if at word boundary to stabilize panel
+            if re.search(r"[\s.!?,;:]$", text):
+                self._inject_suggestions(param, text)
+        except Exception as e:
+            self.plugin.log(f"[markov_suggest] after hook error: {e}")
+
+
+class MarkovSuggestPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.model = _MarkovModel(max_states=200_000)
+        self._hook_ref = None
+        self._result_hook = None
+        self._picker_request_code = 10234
+        self._enabled_default = True
+
+    def on_plugin_load(self) -> None:
+        try:
+            mentions_adapter_class = find_class("org.telegram.ui.Adapters.MentionsAdapter").getClass()
+            target_method = mentions_adapter_class.getDeclaredMethod(
+                "searchUsernameOrHashtag",
+                find_class("java.lang.CharSequence"), find_class("java.lang.Integer").TYPE,
+                find_class("java.util.ArrayList"), find_class("java.lang.Boolean").TYPE,
+                find_class("java.lang.Boolean").TYPE
+            )
+            target_method.setAccessible(True)
+            self._hook_ref = self.hook_method(target_method, _MarkovSuggestHook(self))
+            # Register send-message hook for .onss/.offss commands
+            try:
+                self.add_on_send_message_hook()
+            except Exception:
+                pass
+            self.log("MarkovSuggest: hooked MentionsAdapter.searchUsernameOrHashtag")
+        except Exception as e:
+            self.log(f"MarkovSuggest: failed to hook MentionsAdapter: {e}")
+
+    def on_plugin_unload(self) -> None:
+        try:
+            if self._hook_ref:
+                self.unhook_method(self._hook_ref)
+                self._hook_ref = None
+            if self._result_hook:
+                self.unhook_method(self._result_hook)
+                self._result_hook = None
+        except Exception:
+            pass
+
+    def _is_enabled(self) -> bool:
+        try:
+            val = self.get_setting("markov_enabled", None)
+            if val is None:
+                return self._enabled_default
+            if isinstance(val, str):
+                return val.lower() in ("1","true","yes","on")
+            return bool(val)
+        except Exception:
+            return self._enabled_default
+
+    def _list_txt_uris(self) -> List[str]:
+        try:
+            raw = self.get_setting("markov_txt_uris", "[]")
+            arr = json.loads(raw) if raw else []
+            return [str(u) for u in arr]
+        except Exception:
+            return []
+
+    def _save_txt_uris(self, uris: List[str]):
+        try:
+            self.set_setting("markov_txt_uris", json.dumps(list(uris)))
+        except Exception:
+            pass
+
+    def _open_txt_picker(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            Intent = find_class("android.content.Intent")
+            intent = Intent(Intent.ACTION_GET_CONTENT)
+            intent.setType("text/plain")
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+
+            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+            IntegerType = find_class("java.lang.Integer").TYPE
+            on_activity_result = LaunchActivity.getClass().getDeclaredMethod("onActivityResult", IntegerType, IntegerType, Intent)
+            on_activity_result.setAccessible(True)
+
+            request_code = self._picker_request_code
+
+            class _ResultHook(MethodHook):
+                def __init__(self, outer, req_code):
+                    self.outer = outer
+                    self.req_code = req_code
+                def before_hooked_method(self, param):
+                    try:
+                        if not param.args or len(param.args) < 3:
+                            return
+                        if param.args[0] != self.req_code:
+                            return
+                        if param.args[1] == find_class("android.app.Activity").RESULT_OK and param.args[2] is not None:
+                            uri = param.args[2].getData()
+                            if uri:
+                                s = str(uri.toString())
+                                uris = self.outer._list_txt_uris()
+                                if s not in uris:
+                                    uris.append(s)
+                                    self.outer._save_txt_uris(uris)
+                                def _post():
+                                    self.outer._notify("Файл добавлен")
+                                    try:
+                                        Mandre.apply_and_refresh_settings(self.outer)
+                                    except Exception:
+                                        pass
+                                run_on_ui_thread(_post)
+                        self.outer.unhook_method(self.outer._result_hook)
+                        self.outer._result_hook = None
+                    except Exception as e:
+                        self.outer.log(f"MarkovSuggest: picker result error: {e}")
+
+            self._result_hook = self.hook_method(on_activity_result, _ResultHook(self, request_code))
+            fragment.getParentActivity().startActivityForResult(intent, request_code)
+        except Exception as e:
+            self.log(f"MarkovSuggest: picker error: {e}")
+
+    def _notify(self, msg: str):
+        try:
+            from ui.bulletin import BulletinHelper
+            run_on_ui_thread(lambda: BulletinHelper.show_info(msg))
+        except Exception:
+            self.log(msg)
+
+    def _read_uri_text(self, uri_str: str, size_limit_mb: int = 10) -> str:
+        try:
+            ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
+            context = ApplicationLoader.applicationContext
+            resolver = context.getContentResolver()
+            Uri = find_class("android.net.Uri")
+            uri = Uri.parse(uri_str)
+            ins = resolver.openInputStream(uri)
+            if not ins:
+                return ""
+            limit = size_limit_mb * 1024 * 1024
+            bufsize = 8192
+            chunks = []
+            total = 0
+            barray = bytearray(bufsize)
+            read = ins.read(barray)
+            while read != -1 and total < limit:
+                total += read
+                chunks.append(bytes(barray[:read]))
+                read = ins.read(barray)
+            try:
+                ins.close()
+            except Exception:
+                pass
+            data = b"".join(chunks)
+            try:
+                return data.decode("utf-8", errors="ignore")
+            except Exception:
+                return data.decode("latin-1", errors="ignore")
+        except Exception as e:
+            self.log(f"MarkovSuggest: read uri error: {e}")
+            return ""
+
+    def _delete_all(self):
+        try:
+            self._save_txt_uris([])
+            # Reset model to free memory
+            self.model = _MarkovModel(max_states=200_000)
+            self._notify("Удалено все и сброшена модель")
+            try:
+                Mandre.apply_and_refresh_settings(self)
+            except Exception:
+                pass
+        except Exception as e:
+            self.log(f"MarkovSuggest: delete all error: {e}")
+
+    def append_suggestion_at_cursor(self, phrase: str):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return False
+            enter_view = fragment.getChatActivityEnterView()
+            if not enter_view:
+                return False
+            edit = enter_view.getEditText()
+            if not edit:
+                return False
+            text = edit.getText()
+            s = str(text)
+            cursor = enter_view.getCursorPosition()
+            # Insert at cursor with smart spacing
+            prefix_space = (len(s) > 0 and cursor > 0 and not s[cursor-1].isspace())
+            to_insert = (" " if prefix_space else "") + phrase
+            edit.setText(text.insert(cursor, to_insert))
+            return True
+        except Exception as e:
+            self.log(f"MarkovSuggest: append_suggestion_at_cursor error: {e}")
+            return False
+
+    def _train_from_uris(self):
+        try:
+            uris = self._list_txt_uris()
+            if not uris:
+                self._notify("Нет файлов для обучения")
+                return
+            group_size = self._get_thought_lines_count()
+            for u in uris:
+                text = self._read_uri_text(u, size_limit_mb=10)
+                if text:
+                    self.model.train(text, group_size=group_size)
+            self._notify("Обучение завершено")
+        except Exception as e:
+            self.log(f"MarkovSuggest: train error: {e}")
+
+    def _train_single_uri(self, uri_str: str):
+        try:
+            text = self._read_uri_text(uri_str, size_limit_mb=10)
+            if text:
+                self.model.train(text, group_size=self._get_thought_lines_count())
+                self._notify("Моментальное обучение выполнено")
+        except Exception as e:
+            self.log(f"MarkovSuggest: instant train error: {e}")
+
+    def create_settings(self) -> List[Any]:
+        uris = self._list_txt_uris()
+        items = [
+            Header(text="Цепь Маркова: подсказки"),
+            Text(text=f"Файлы .txt: {len(uris)}", icon="msg_filehq_solar"),
+            Divider(),
+            Text(text="Выбрать .txt", icon="msg_upload_solar", accent=True, on_click=lambda _ : self._open_txt_picker()),
+            Text(text="Строк на мысль: 4", icon="msg_info_solar", create_sub_fragment=lambda: self._create_thought_lines_selector()),
+            Text(text="Удалить все", icon="msg_delete", red=True, on_click=lambda _ : self._delete_all()),
+            Text(text="Обучить", icon="msg_check_solar", accent=True, on_click=lambda _ : threading.Thread(target=self._train_from_uris, daemon=True).start()),
+            Divider(),
+            Text(text="Лимит памяти ~200MB (ограничение состояний)", icon="msg_info_solar"),
+        ]
+        return items
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            msg = getattr(params, 'message', None)
+            if isinstance(msg, str):
+                text = msg.strip().lower()
+                if text == ".onss":
+                    self.set_setting("markov_enabled", True)
+                    self._enabled_default = True
+                    self._notify("Подсказки включены")
+                    try:
+                        Mandre.apply_and_refresh_settings(self)
+                    except Exception:
+                        pass
+                    return HookResult(strategy=HookStrategy.CANCEL)
+                if text == ".offss":
+                    self.set_setting("markov_enabled", False)
+                    self._enabled_default = False
+                    self._notify("Подсказки выключены")
+                    try:
+                        Mandre.apply_and_refresh_settings(self)
+                    except Exception:
+                        pass
+                    return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception:
+            pass
+        return HookResult()
+
+    def _get_thought_lines_count(self) -> int:
+        try:
+            val = int(self.get_setting("thought_lines", 4))
+            return max(1, min(6, val))
+        except Exception:
+            return 4
+
+    def _create_thought_lines_selector(self):
+        # Simple selector: toggles between 4 and 6 lines per thought
+        def set_lines(val: int):
+            try:
+                self.set_setting("thought_lines", val)
+                Mandre.apply_and_refresh_settings(self)
+            except Exception:
+                pass
+        return [
+            Header(text="Строк на мысль"),
+            Text(text="4", accent=True, icon="msg_check_solar", on_click=lambda _ : set_lines(4)),
+            Text(text="6", accent=True, icon="msg_check_solar", on_click=lambda _ : set_lines(6)),
+        ]
