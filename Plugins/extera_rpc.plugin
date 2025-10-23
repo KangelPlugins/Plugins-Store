@@ -1,0 +1,301 @@
+__id__ = "extera_rpc"
+__name__ = "Custom Now Playing"
+__description__ = "Allows you to set custom 'Now Playing'"
+__author__ = "@PESSDES_Plugins"
+__min_version__ = "11.14.1"
+__icon__ = "VoiceToText7/8"
+__version__ = "1.1"
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin
+import requests
+import hashlib
+from com.exteragram.messenger.nowplaying import NowPlayingController as NPC
+from com.exteragram.messenger.api.dto import NowPlayingInfoDTO, NowPlayingDTO
+from com.exteragram.messenger.api.model import NowPlayingServiceType
+from java.util.function import Consumer
+from java.lang.reflect import Modifier
+from java import dynamic_proxy
+from typing import Callable, Optional, Any, List, Dict
+from hook_utils import get_private_field, set_private_field
+from ui.settings import Text, Header, Divider, Switch, Selector, Input
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from client_utils import get_last_fragment, run_on_queue
+import time
+
+LAST_FM_API_KEY = '490596b5715841b57a2b8daa44d372c7'
+LAST_FM_API_SECRET = 'f7eb70b66862272fc4db2c6acf11e0d6'
+RANDOM_HASH = '8782edb31157a9daff2f9d4d6dad51d7b674d298a37170579eb2ec56e1498c03'
+
+def show_alert(title: Optional[str], msg: str):
+    def i():
+        alert_dialog = AlertDialogBuilder(get_last_fragment().getContext())
+        if title:
+            alert_dialog.set_title(title)
+        alert_dialog.set_message(msg)
+        alert_dialog.set_positive_button('OK')
+        alert_dialog.show()
+    
+    run_on_ui_thread(i)
+
+class PrivateBridge:
+    """класс нужен для того чтобы без лишней ебли обращаться к приватным полям, сука, илья, зачем делать все поля приватными?"""
+    def __init__(self, original, excluded_fields: List[str] = []):
+        self._original = original
+        self.excluded_fields = excluded_fields
+        self.create_fields()
+    
+    def create_fields(self):
+        if not self._original: return
+        
+        fields = self._original.getClass().getDeclaredFields()
+        for field in fields:
+            field_name = field.getName()
+            
+            if not Modifier.isPrivate(field.getModifiers()) or field_name in self.excluded_fields:
+                continue
+
+            getter = property(
+                fget=lambda self, name=field_name: get_private_field(self._original, name),
+                fset=lambda self, value, name=field_name: set_private_field(self._original, name, value)
+            )
+            setattr(self.__class__, field_name, getter)
+    
+    def __eq__(self, value):
+        if isinstance(value, type(self._original)):
+            return self._original.equals(value)
+        return super().__eq__(value)
+
+class NowPlaying(PrivateBridge):
+    def __init__(self, original: NowPlayingDTO):
+        super().__init__(original)
+      
+class NowPlayingInfo(PrivateBridge):
+    class ServiceType(PrivateBridge):
+        def __init__(self, original: NowPlayingServiceType):
+            super().__init__(original)
+        
+    @property
+    def serviceType(self) -> ServiceType:
+        if not self._original: return None
+        
+        return self.ServiceType(get_private_field(self._original, "serviceType"))
+           
+    def __init__(self, original: NowPlayingInfoDTO):
+        super().__init__(original, ["serviceType"])
+
+class NowPlayingController:
+    @staticmethod
+    def get_now_playing_info(on_get: Callable[[Optional[NowPlayingInfo]], None]) -> None:
+        NPC.getNowPlayingInfo(ConsumerFactory(lambda value: on_get(NowPlayingInfo(value) if value else None)))
+        
+class Plugin(BasePlugin):
+    service_type = None
+    working = False
+    worker_token = 0
+    
+    def reload_settings(self):
+        self.set_setting(RANDOM_HASH, str(time.time()))
+    
+    def on_get_playing_info(self, value: NowPlayingInfo, after_that: Optional[Callable[[Optional[NowPlayingInfo]], None]] = None):
+        self.now_playing_info = value
+        self.service_type = value.serviceType if value else None
+        if after_that:
+            after_that(value)
+    
+    def update_playing_info(self, after_that: Optional[Callable[[Optional[NowPlayingInfo]], None]] = None):
+        NowPlayingController.get_now_playing_info(lambda value: self.on_get_playing_info(value, after_that))
+    
+    def on_plugin_load(self):
+        self.update_playing_info(lambda _: (self.reload_settings(), self.start_worker()))
+    
+    def on_plugin_unload(self):
+        self.stop_worker()
+        self.update_playing_info(after_that=lambda _: self.reload_settings())
+    
+    def create_settings(self):
+        self.update_playing_info()
+        settings = []
+        
+        if self.service_type == None:
+            settings.append(Divider('Не удалось получить информацию о скоробблинге, возможно вы используете аккаунт без стрелочки, если это не так, то перезагрузите плагин'))
+            return settings
+        elif self.service_type == NowPlayingServiceType.NONE:
+            settings.append(Divider('Скробблинг отключен, включите его в профиле. Если вы уверены что он включен, то перезапустите плагин'))
+            return settings
+        elif self.service_type != NowPlayingServiceType.LAST_FM:
+            settings.append(Divider('Поддерживается только скробблинг Last.FM, после смены скоробблинга перезапустите плагин'))
+            return settings
+
+        settings.append(Header('Настройки RPC')) 
+        settings.append(Text('Изменить пароль от Last.FM', accent=True, create_sub_fragment=lambda: [
+            Input(key='password', text='Пароль', subtext='Пароль от Last.FM', on_change=self.login_last_fm)
+            ]))
+        if self.get_setting('session_key', ''):
+            settings.append(Divider())
+            settings.append(Input('title', 'Заголовок', on_change=lambda value: self.start_worker()))
+            settings.append(Input('artist', 'Исполнитель (подзаголовок)', on_change=lambda value: self.start_worker()))
+            settings.append(Input('album', 'Альбом (2 подзаголовок)', on_change=lambda value: self.start_worker()))
+            settings.append(Input('update', 'Обновлять каждые .. секунд', default='600', on_change=lambda value: (self.check_int(value, 'update', 600), self.start_worker())))
+        return settings
+    
+    def check_int(self, value: str, key: str, default: Optional[int] = None, min: Optional[int] = 30, max: Optional[int] = 18000):
+        new_value: Any = value
+        try:
+            new_value = int(value)
+            if new_value < min or new_value > max:
+                new_value = default
+                
+            if new_value < min:
+                BulletinHelper.show_info(f'Минимальное значение - {min}')
+            elif new_value > max:
+                BulletinHelper.show_info(f'Максимальное значение - {max}')
+        except:
+            new_value = default or ''
+            
+        if new_value is not value:
+            self.set_setting(key, str(new_value))
+    
+    def login_last_fm(self, *_):
+        if not self.now_playing_info:
+            show_alert('Ошибка', 'Информация о прослушивании еще не загружена. Пожалуйста, подождите и попробуйте снова.')
+            return
+
+        username = self.now_playing_info.username
+        password = self.get_setting('password')
+        if not username or not password:
+            return
+        key = LastFmUtils.get_mobile_session(username, password)
+        self.set_setting('session_key', key or '')
+        if not key:
+            show_alert('Не удалось войти', 'Сервис не вернул API ключ, проверьте данные')
+        else:
+            BulletinHelper.show_success('Успешно!')
+            self.start_worker()
+    
+    def start_worker(self):
+        self.worker_token += 1
+        local_token = self.worker_token
+
+        sk = self.get_setting('session_key')
+        artist = self.get_setting('artist')
+        title = self.get_setting('title')
+        try:
+            update = int(self.get_setting('update', '600'))
+        except (ValueError, TypeError):
+            update = 600
+            
+        album = self.get_setting('album')
+        if not album:
+            album = None
+        if any(not x for x in [sk, artist, title]):
+            return
+        
+        self.working = True
+        run_on_queue(lambda: self.worker(artist, title, sk, update, album, None, local_token))
+    
+    def stop_worker(self):
+        self.working = False
+        self.worker_token += 1
+    
+    def worker(self, artist: str, title: str, sk: str, update: int, album: Optional[str], mbid: Optional[str], token: int):
+        if not self.working or self.worker_token != token:
+            return
+        if self.now_playing_info.serviceType == NowPlayingServiceType.LAST_FM:
+            LastFmUtils.updateNowPlaying(artist, title, sk, album, mbid, update)
+            
+        run_on_queue(lambda: self.worker(artist, title, sk, update, album, mbid, token), delay=(update - 15) * 1000)
+    
+class ConsumerFactory(dynamic_proxy(Consumer)):
+    def __init__(self, fn: Callable):
+        super().__init__()
+        self.fn = fn
+    
+    def accept(self, arg):
+        self.fn(arg)
+
+class LastFmUtils:
+    @staticmethod
+    def sign(params: dict) -> str:
+        filtered = {k: v for k, v in params.items() if k not in ["format", "api_sig"]}
+        sorted_items = sorted(filtered.items())
+        sig_str = "".join(f"{k}{v}" for k, v in sorted_items)
+        sig_str += LAST_FM_API_SECRET
+        md5hash = hashlib.md5(sig_str.encode("utf-8")).hexdigest()
+        return md5hash
+
+    @classmethod
+    def updateNowPlaying(cls, artist: str, track: str, session_key: str, album: Optional[str] = None, mbid: Optional[str] = None, duration: int = 360, timestamp: int = int(time.time())) -> Optional[int]:
+        try:
+            params = {
+                "method": "track.updateNowPlaying",
+                "api_key": LAST_FM_API_KEY,
+                "artist": artist,
+                "track": track,
+                "timestamp": timestamp,
+                "sk": session_key,
+                'duration': duration,
+                "format": "json",
+            }
+            if album:
+                params['album'] = album
+
+            if mbid:
+                params['mbid'] = mbid  
+            params["api_sig"] = cls.sign(params)
+
+            resp = requests.post("https://ws.audioscrobbler.com/2.0/", data=params)
+            log(f"updateNowPlaying response: {resp.text}")
+            resp.raise_for_status()
+            json_data: Dict = resp.json()
+            return json_data.get('error', None)
+        except Exception as e:
+            log(f"Error in updateNowPlaying: {e}")
+            return None
+
+    @staticmethod
+    def get_album_mbid(artist, album) -> Optional[str]:
+        try:
+            url = "https://ws.audioscrobbler.com/2.0/"
+            params = {
+                "method": "album.getInfo",
+                "artist": artist,
+                "album": album,
+                "api_key": LAST_FM_API_KEY,
+                "format": "json"
+            }
+            resp = requests.get(url, params=params)
+            log('albumIdResponce:' + str(resp.text))
+            json = resp.json()
+            return json.get("album", {}).get("mbid")
+        except Exception as e:
+            log(f"Error in get_album_mbid: {e}")
+            return None
+            
+    @classmethod
+    def get_mobile_session(cls, username: str, password: str) -> Optional[str]:
+        try:
+            params = {
+                'api_key': LAST_FM_API_KEY,
+                'method': 'auth.getMobileSession',
+                'username': username,
+                'password': password,
+                'format': 'json',
+            }
+
+            params["api_sig"] = cls.sign(params)
+            
+            resp = requests.post('https://ws.audioscrobbler.com/2.0/', data=params)
+            log(f"get_mobile_session response: {resp.text}")
+            resp.raise_for_status()
+            data = resp.json()
+            session = data.get('session')
+            if session:
+                return session.get('key')
+            if 'error' in data:
+                log(f"Last.fm login error: {data.get('message')}")
+            return None
+        except  Exception as e:
+            log(f"Error in get_mobile_session: {e}")
+            return None
