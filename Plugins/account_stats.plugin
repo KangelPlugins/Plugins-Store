@@ -1,0 +1,417 @@
+# -*- coding: @gemeguardian -*-
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import run_on_queue, send_message, get_last_fragment, send_request, RequestCallback
+from android_utils import run_on_ui_thread
+from markdown_utils import parse_markdown
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Divider
+from java.util import ArrayList
+from org.telegram.tgnet import TLRPC, TLObject
+
+__id__ = "account_stats"
+__name__ = "Статистика аккаунта"
+__description__ = "Показывает статистику по всем чатам аккаунта. Команда: .stats"
+__version__ = "1.2"
+__author__ = "@gemeguardian"
+__icon__ = "sGemeGuardian/0"
+__min_version__ = "11.12.0"
+
+class AccountStatsPlugin(BasePlugin):
+    """
+    Плагин для exteraGram для точного и оптимизированного подсчета статистики по всем чатам.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.stats_counters = {}
+        self.processed_dialog_ids = set()
+        self.archived_count = 0
+        self.original_params = None
+        self.deleted_users = 0
+        self.deleted_bots = 0
+        self.total_dialogs = 0
+        self.pg_error_occurred = False
+        self.blocked_processed = False
+        self.dialogs_fetched_count = 0
+        self.only_blocked = False
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    def create_settings(self):
+        """Создаёт динамические настройки для отключения отображения пунктов статистики."""
+        settings = [
+            Header("Настройки отображения"),
+            Switch(key="show_header", text="Показывать заголовок", default=True, on_change=lambda v: self._on_setting_change("show_header", v)),
+            Switch(key="show_total", text="Всего чатов", default=True, on_change=lambda v: self._on_setting_change("show_total", v)),
+            Switch(key="show_personal", text="Личные чаты", default=True, on_change=lambda v: self._on_setting_change("show_personal", v)),
+            Switch(key="show_groups", text="Группы", default=True, on_change=lambda v: self._on_setting_change("show_groups", v)),
+            Switch(key="show_channels", text="Каналы", default=True, on_change=lambda v: self._on_setting_change("show_channels", v)),
+            Switch(key="show_deleted", text="Удаленные аккаунты", default=True, on_change=lambda v: self._on_setting_change("show_deleted", v)),
+            Switch(key="show_archived", text="Архивированные диалоги", default=True, on_change=lambda v: self._on_setting_change("show_archived", v)),
+            Switch(key="show_blocked", text="Заблокированные", default=True, on_change=lambda v: self._on_setting_change("show_blocked", v)),
+            Switch(key="show_subcategories", text="Показывать подкатегории (люди/боты)", default=True, on_change=lambda v: self._on_setting_change("show_subcategories", v)),
+            Divider("Сделано @gemeguardian")
+        ]
+        return settings
+
+    def _on_setting_change(self, key: str, value: bool):
+        """Обработчик изменения настроек."""
+        self.set_setting(key, value)
+
+    def _check_settings_valid(self):
+        """Проверяет, выбран ли хотя бы один пункт статистики (исключая заголовок)."""
+        content_keys = ["show_total", "show_personal", "show_groups", "show_channels", "show_deleted", "show_archived", "show_blocked"]
+        enabled_count = sum(1 for key in content_keys if self.get_setting(key, True))
+        return enabled_count >= 1
+
+    def _is_only_blocked_requested(self):
+        """Проверяет, запрошена ли только статистика заблокированных (оптимизация)."""
+        content_keys = ["show_total", "show_personal", "show_groups", "show_channels", "show_deleted", "show_archived", "show_blocked"]
+        enabled_content = [key for key in content_keys if self.get_setting(key, True)]
+        return len(enabled_content) == 1 and enabled_content[0] == "show_blocked"
+
+    def on_send_message_hook(self, account: int, params: any) -> HookResult:
+        if hasattr(params, 'message') and isinstance(params.message, str):
+            if params.message.strip().lower() == ".stats":
+                fragment = get_last_fragment()
+                if fragment:
+                    if not self._check_settings_valid():
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Пожалуйста, выберите что собирать в настройках плагина", fragment))
+                        return HookResult(strategy=HookStrategy.CANCEL)
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("Загрузка статистики...", fragment))
+                    
+                    # Оптимизация: если только заблокированные, то сразу их запрашиваем
+                    self.only_blocked = self._is_only_blocked_requested()
+                    self.original_params = params  # Устанавливаем params в любом случае
+                    if self.only_blocked:
+                        # Инициализация счётчиков для случая only_blocked
+                        self.stats_counters = {'u': 0, 'b': 0, 'c': 0, 'ch': 0}
+                        self.deleted_users = 0
+                        self.deleted_bots = 0
+                        self.archived_count = 0
+                        self.total_dialogs = 0
+                        self.pg_error_occurred = False
+                        self.blocked_processed = False
+                        run_on_queue(lambda: self._fetch_blocked())
+                    else:
+                        run_on_queue(lambda: self._start_stats_calculation(params))
+                else:
+                    return HookResult(strategy=HookStrategy.CANCEL)
+                return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
+
+    def _start_stats_calculation(self, params: any):
+        """Инициализирует переменные и запускает получение диалогов."""
+        if self.pg_error_occurred:
+            return  # Не запускать, если уже была ошибка
+        self.stats_counters = {'u': 0, 'b': 0, 'c': 0, 'ch': 0}
+        self.processed_dialog_ids = set()
+        self.archived_count = 0
+        self.deleted_users = 0
+        self.deleted_bots = 0
+        self.total_dialogs = 0
+        self.dialogs_fetched_count = 0
+        self.pg_error_occurred = False
+        self.blocked_processed = False
+        self.original_params = params
+        
+        self._fetch_dialog_batch(0, 0, TLRPC.TL_inputPeerEmpty())
+
+    def _fetch_dialog_batch(self, offset_date: int, offset_id: int, offset_peer: TLRPC.InputPeer):
+        """Создает и отправляет один запрос на получение порции диалогов."""
+        if self.pg_error_occurred:
+            return
+        try:
+            req = TLRPC.TL_messages_getDialogs()
+            req.flags = 0; req.offset_date = offset_date; req.offset_id = offset_id
+            req.offset_peer = offset_peer; req.limit = 100; req.hash = 0
+            
+            callback = RequestCallback(self._on_dialogs_received)
+            send_request(req, callback)
+            self.dialogs_fetched_count += 1
+        except Exception as e:
+            self.pg_error_occurred = True
+            self._handle_error("Ошибка загрузки диалогов.")
+
+    def _on_dialogs_received(self, response: TLObject, error: TLRPC.TL_error):
+        """Обрабатывает ответ от сервера со списком диалогов."""
+        if self.pg_error_occurred:
+            return
+        if error:
+            self.pg_error_occurred = True
+            self._handle_error(f"API Ошибка: {error.text}")
+            return
+
+        try:
+            local_user_map = {}; local_chat_map = {}; messages_map = {}
+
+            if hasattr(response, 'users'):
+                for i in range(response.users.size()):
+                    user = response.users.get(i)
+                    local_user_map[user.id] = user
+            if hasattr(response, 'chats'):
+                for i in range(response.chats.size()):
+                    chat = response.chats.get(i)
+                    local_chat_map[chat.id] = chat
+            if hasattr(response, 'messages'):
+                for i in range(response.messages.size()):
+                    msg = response.messages.get(i)
+                    messages_map[msg.id] = msg
+
+            dialogs = response.dialogs
+            if not dialogs or dialogs.isEmpty():
+                self._finalize_dialogs_and_fetch_blocked()
+                return
+
+            dialogs_added_this_batch = 0
+            for i in range(dialogs.size()):
+                dialog = dialogs.get(i)
+                dialog_id = dialog.peer.user_id or dialog.peer.chat_id or dialog.peer.channel_id
+                
+                if dialog_id in self.processed_dialog_ids:
+                    continue
+                self.processed_dialog_ids.add(dialog_id)
+                self.total_dialogs += 1  # Подсчет общего количества
+                dialogs_added_this_batch += 1
+
+                # Подсчет архивных диалогов
+                if hasattr(dialog, 'folder_id') and dialog.folder_id == 1:
+                    self.archived_count += 1
+
+                if isinstance(dialog.peer, TLRPC.TL_peerUser):
+                    user = local_user_map.get(dialog.peer.user_id)
+                    if user:
+                        if user.deleted:
+                            if hasattr(user, 'bot') and user.bot:
+                                self.deleted_bots += 1
+                            else:
+                                self.deleted_users += 1
+                        else:
+                            if hasattr(user, 'bot') and user.bot:
+                                self.stats_counters['b'] += 1
+                            else:
+                                self.stats_counters['u'] += 1
+                elif isinstance(dialog.peer, (TLRPC.TL_peerChat, TLRPC.TL_peerChannel)):
+                    chat_id = dialog.peer.chat_id or dialog.peer.channel_id
+                    chat = local_chat_map.get(chat_id)
+                    if chat:
+                        if isinstance(chat, TLRPC.TL_channel) and (hasattr(chat, 'megagroup') and chat.megagroup or hasattr(chat, 'gigagroup') and chat.gigagroup):
+                            self.stats_counters['c'] += 1
+                        elif isinstance(chat, TLRPC.TL_channel):
+                             self.stats_counters['ch'] += 1
+                        else:
+                            self.stats_counters['c'] += 1
+
+            is_slice = False
+            try:
+                is_slice = isinstance(response, TLRPC.TL_messages_dialogsSlice)
+            except:
+                # Фоллбэк через атрибуты
+                is_slice = hasattr(response, 'count') and hasattr(response, 'users') and hasattr(response, 'chats')
+
+            if is_slice:
+                last_dialog = dialogs.get(dialogs.size() - 1)
+                last_peer = last_dialog.peer
+                top_message_id = last_dialog.top_message
+                last_message = messages_map.get(top_message_id)
+
+                if not last_message:
+                    self._finalize_dialogs_and_fetch_blocked()
+                    return
+
+                next_offset_date = last_message.date
+                next_offset_id = last_message.id
+                
+                next_offset_peer = TLRPC.TL_inputPeerEmpty()
+                if isinstance(last_peer, TLRPC.TL_peerUser):
+                    entity = local_user_map.get(last_peer.user_id)
+                    if entity and hasattr(entity, 'access_hash'):
+                        next_offset_peer = TLRPC.TL_inputPeerUser()
+                        next_offset_peer.user_id = entity.id
+                        next_offset_peer.access_hash = entity.access_hash
+                    else:
+                        self._finalize_dialogs_and_fetch_blocked()
+                        return
+                elif isinstance(last_peer, TLRPC.TL_peerChannel):
+                    entity = local_chat_map.get(last_peer.channel_id)
+                    if entity and hasattr(entity, 'access_hash'):
+                        next_offset_peer = TLRPC.TL_inputPeerChannel()
+                        next_offset_peer.channel_id = entity.id
+                        next_offset_peer.access_hash = entity.access_hash
+                    else:
+                        self._finalize_dialogs_and_fetch_blocked()
+                        return
+                elif isinstance(last_peer, TLRPC.TL_peerChat):
+                    next_offset_peer = TLRPC.TL_inputPeerChat()
+                    next_offset_peer.chat_id = last_peer.chat_id
+                else:
+                    self._finalize_dialogs_and_fetch_blocked()
+                    return
+
+                if next_offset_peer != TLRPC.TL_inputPeerEmpty():
+                    self._fetch_dialog_batch(next_offset_date, next_offset_id, next_offset_peer)
+                else:
+                    self._finalize_dialogs_and_fetch_blocked()
+            else:
+                self._finalize_dialogs_and_fetch_blocked()
+        except Exception as e:
+            self.pg_error_occurred = True
+            self._handle_error("Ошибка обработки данных диалогов.")
+
+    def _finalize_dialogs_and_fetch_blocked(self):
+        """Завершает обработку диалогов и запускает запрос заблокированных."""
+        if self.pg_error_occurred:
+            return
+        self._fetch_blocked()
+
+    def _fetch_blocked(self):
+        """Запрашивает список заблокированных."""
+        if self.pg_error_occurred:
+            return
+        try:
+            req = TLRPC.TL_contacts_getBlocked()
+            req.offset = 0
+            req.limit = 200  # Достаточно для большинства пользователей
+            callback = RequestCallback(self._on_blocked_received)
+            send_request(req, callback)
+        except Exception as e:
+            self.blocked_processed = True  # Помечаем как обработанное с ошибкой
+            self.pg_error_occurred = True
+            self._generate_stats_text(0, 0)  # Генерируем без blocked
+
+    def _on_blocked_received(self, response: TLObject, error: TLRPC.TL_error):
+        """Обрабатывает ответ со списком заблокированных и формирует итоговое сообщение."""
+        if self.blocked_processed or self.pg_error_occurred:
+            return
+        self.blocked_processed = True
+        if error:
+            blocked_users = 0
+            blocked_bots = 0
+        else:
+            blocked_users = 0
+            blocked_bots = 0
+            try:
+                # Улучшенная проверка: по атрибутам, а не CONSTRUCTOR_ID
+                # Для TL_contacts_blocked или TL_contacts_blockedSlice
+                if hasattr(response, 'users') and response.users:
+                    for i in range(response.users.size()):
+                        user = response.users.get(i)
+                        if hasattr(user, 'bot') and user.bot:
+                            blocked_bots += 1
+                        else:
+                            blocked_users += 1
+                if hasattr(response, 'chats') and response.chats:
+                    for i in range(response.chats.size()):
+                        chat = response.chats.get(i)
+                        # Чаты/каналы редки, но считаем как ботов
+                        blocked_bots += 1
+            except Exception as e:
+                blocked_users = 0
+                blocked_bots = 0
+
+        self._generate_stats_text(blocked_users, blocked_bots)
+
+    def _generate_stats_text(self, blocked_users: int, blocked_bots: int):
+        """Генерирует текст статистики динамически на основе настроек."""
+        if self.pg_error_occurred:
+            return
+        blocked_total = blocked_users + blocked_bots
+        show_subcats = self.get_setting("show_subcategories", True)
+
+        # Инициализация счётчиков с безопасным доступом (get с дефолтом 0)
+        u = self.stats_counters.get('u', 0)
+        b = self.stats_counters.get('b', 0)
+        c = self.stats_counters.get('c', 0)
+        ch = self.stats_counters.get('ch', 0)
+        deleted_total = getattr(self, 'deleted_users', 0) + getattr(self, 'deleted_bots', 0)
+        archived = getattr(self, 'archived_count', 0)
+        total = getattr(self, 'total_dialogs', 0)
+        personal_live = u + b
+
+        # Если только заблокированные, сбрасываем другие счётчики
+        if self.only_blocked:
+            u = b = c = ch = deleted_total = archived = total = personal_live = 0
+
+        lines = []
+        if self.get_setting("show_header", True):
+            lines.append("[📊](5431577498364158238) *Статистика аккаунта*\n\n")
+
+        if self.get_setting("show_total", True) and not self.only_blocked:
+            lines.append(f"[🔢](5884510167986343350) *Всего чатов:* `{total}`\n\n")
+
+        if self.get_setting("show_personal", True) and not self.only_blocked:
+            if show_subcats:
+                personal_line = f"[👥](5258513401784573443) *Личные чаты:* `{personal_live}`\n"
+                personal_line += f"• [👤](5258011929993026890) *Люди:* `{u}`\n• [🤖](5258093637450866522) *Боты:* `{b}`"
+            else:
+                personal_line = f"[👥](5258513401784573443) *Личные чаты:* `{personal_live}`"
+            lines.append(personal_line)
+            lines.append("\n")
+
+        # Группы и каналы на отдельных строках
+        if self.get_setting("show_groups", True) and not self.only_blocked:
+            lines.append(f"[👥](5258513401784573443) *Группы:* `{c}`")
+            lines.append("\n")
+        if self.get_setting("show_channels", True) and not self.only_blocked:
+            lines.append(f"[➡️](5260450573768990626) *Каналы:* `{ch}`")
+            lines.append("\n\n")
+
+        lower_lines = []
+        if self.get_setting("show_deleted", True) and not self.only_blocked:
+            # Для удаленных всегда только общая цифра, без подкатегорий
+            lower_lines.append(f"[🗑️](5258430848218176413) *Удаленные аккаунты:* `{deleted_total}`")
+        if self.get_setting("show_archived", True) and not self.only_blocked:
+            lower_lines.append(f"[📂](5258389041006518073) *Архивированные диалоги:* `{archived}`")
+        if self.get_setting("show_blocked", True):
+            if show_subcats:
+                blocked_line = f"[❌](5260342697075416641) *Заблокированные:* `{blocked_total}`\n"
+                blocked_line += f"• [👤](5258011929993026890) *Люди:* `{blocked_users}`\n• [🤖](5258093637450866522) *Боты:* `{blocked_bots}`"
+                lower_lines.append(blocked_line)
+            else:
+                lower_lines.append(f"[❌](5260342697075416641) *Заблокированные:* `{blocked_total}`")
+        
+        if lower_lines:
+            lines.append("\n".join(lower_lines))
+
+        result_text = "".join(lines).strip()
+        if not result_text.endswith("\n"):
+            result_text += "\n"
+
+        self._send_result(self.original_params, result_text)
+
+    def _handle_error(self, error_msg: str):
+        """Обработчик ошибок с отправкой уведомления."""
+        self.pg_error_occurred = True
+        fragment = get_last_fragment()
+        if fragment:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(error_msg, fragment))
+        # Попытка отправить базовую статистику, даже при ошибке
+        if self.total_dialogs > 0 and self._check_settings_valid() and not self.only_blocked:
+            if self.get_setting("show_header", True):
+                basic_text = "[📊](5431577498364158238) *Статистика (частично)*\n\n"
+            else:
+                basic_text = ""
+            if self.get_setting("show_total", True):
+                basic_text += f"[🔢](5884510167986343350) Всего чатов: `{self.total_dialogs}`\n\n"
+            if self.get_setting("show_archived", True):
+                basic_text += f"[📂](5258389041006518073) Архив: `{self.archived_count}`"
+            if basic_text.strip():
+                self._send_result(self.original_params, basic_text)
+    
+    def _send_result(self, original_params: any, text: str):
+        """Универсальная функция для отправки ответа."""
+        try:
+            parsed = parse_markdown(text)
+            send_params = { "peer": original_params.peer, "message": parsed.text, "entities": [entity.to_tlrpc_object() for entity in parsed.entities] }
+            if hasattr(original_params, 'replyToMsg') and original_params.replyToMsg:
+                send_params["replyToMsg"] = original_params.replyToMsg
+            run_on_ui_thread(lambda: send_message(send_params))
+        except Exception as e:
+            import re
+            plain_text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text.replace("*", "").replace("`", ""))
+            send_params = {"peer": original_params.peer, "message": plain_text}
+            if hasattr(original_params, 'replyToMsg') and original_params.replyToMsg:
+                send_params["replyToMsg"] = original_params.replyToMsg
+            run_on_ui_thread(lambda: send_message(send_params))

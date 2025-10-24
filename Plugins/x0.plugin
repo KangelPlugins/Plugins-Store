@@ -1,0 +1,237 @@
+import os
+import time
+import requests
+import traceback
+import threading
+from typing import Any, Optional
+from java.util import Locale
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from android_utils import run_on_ui_thread, log
+from client_utils import send_message, get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Divider, Input
+from markdown_utils import parse_markdown
+
+from org.telegram.messenger import FileLoader, MessageObject, UserConfig
+from org.telegram.tgnet import TLRPC
+
+
+# Apache license 2.0 copyright @shareui
+# Нарушение будет снесено через dmca@telegram.org
+# Плагин предназначен для публикаций в @shrdevv и @exteraPluginsSup
+
+__id__ = "shareui_x0"
+__name__ = "Simple photo link"
+__description__ = "Загружает медиафайл (фото, видео, гиф, документ) на хостинг x0.at и отправляет полученную ссылку в чат. Для использования, ответьте на сообщение с медиафайлом командой .x0"
+__author__ = "@shrdevv"
+__version__ = "1.0.1"
+__min_version__ = "11.12.0"
+__icon__ = "plugin232/12"
+
+class Locales:
+    default = {
+        "command_description": "Uploads media files (photo, video, gif, document) to x0.at hosting and sends the received link to the chat. To use, reply to a message with a media file with the command .x0",
+        "processing_upload": "Uploading to x0.at...",
+        "processing_in_progress": "Another file is already being uploaded.",
+        "reply_to_media": "Reply to a message with a media file.",
+        "no_supported_media": "The message does not contain a supported media file.",
+        "file_download_failed": "Failed to download file for upload.",
+        "upload_error_general": "Upload error: {status_code} {response_text}",
+        "upload_error_connection": "Upload error: Failed to connect to x0.at. Check your internet connection.",
+        "upload_error_timeout": "Upload error: Request to x0.at timed out. Please try again.",
+        "unknown_error": "An unknown error occurred: {error}",
+        "your_link": "Your link:",
+        "settings_header": "x0.at Uploader Settings",
+        "mono_format_switch": "Use mono (code) format for link",
+        "mono_format_subtext": "If enabled, the link will be sent in a code block for easy copying."
+    }
+    ru = {
+        "command_description": "Загружает медиафайл (фото, видео, гиф, документ) на хостинг x0.at и отправляет полученную ссылку в чат. Для использования, ответьте на сообщение с медиафайлом командой .x0",
+        "processing_upload": "Загрузка на x0.at...",
+        "processing_in_progress": "Уже идет загрузка другого файла.",
+        "reply_to_media": "Ответьте на сообщение с медиафайлом.",
+        "no_supported_media": "В сообщении нет поддерживаемого медиафайла.",
+        "file_download_failed": "Не удалось загрузить файл для отправки.",
+        "upload_error_general": "Ошибка загрузки: {status_code} {response_text}",
+        "upload_error_connection": "Ошибка загрузки: Не удалось подключиться к x0.at. Проверьте ваше интернет-соединение.",
+        "upload_error_timeout": "Ошибка загрузки: Запрос к x0.at превысил время ожидания. Попробуйте еще раз.",
+        "unknown_error": "Произошла неизвестная ошибка: {error}",
+        "your_link": "Ваша ссылка:",
+        "settings_header": "Настройки загрузчика x0.at",
+        "mono_format_switch": "Использовать моно-формат (код) для ссылки",
+        "mono_format_subtext": "Если включено, ссылка будет отправлена в виде блока кода для удобного копирования."
+    }
+
+# Возвращает строку локализованного текста по ключу, учитывая текущий язык системы
+def localise(key: str, **kwargs) -> str:
+    lang = Locale.getDefault().getLanguage()
+    locale_dict = Locales.ru if lang.startswith('ru') else Locales.default
+    return locale_dict.get(key, key).format(**kwargs)
+
+class X0UploaderPlugin(BasePlugin):
+    # Конструктор плагина, инициализирует состояние и выбранный аккаунт
+    def __init__(self):
+        super().__init__()
+        self._is_processing = False
+        self.pg_current_account = UserConfig.selectedAccount
+
+    # Регистрирует хуки при загрузке плагина
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    # Создает список элементов настроек плагина
+    def create_settings(self):
+        return [
+            Header(text=localise("settings_header")),
+            Switch(
+                key="mono_format_enabled",
+                text=localise("mono_format_switch"),
+                default=True,
+                subtext=localise("mono_format_subtext"),
+                icon="msg_code"
+            ),
+            Divider(text=localise("command_description"))
+        ]
+
+    # Хук отправки сообщения: проверяет команду .x0 и запускает процесс загрузки
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, 'message') or not isinstance(params.message, str):
+            return HookResult()
+        
+        if params.message.strip().lower() != ".x0":
+            return HookResult()
+
+        if self._is_processing:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(localise("processing_in_progress")))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if not hasattr(params, "replyToMsg") or not params.replyToMsg:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(localise("reply_to_media")))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        message_obj = params.replyToMsg
+        if not self._has_media(message_obj):
+            run_on_ui_thread(lambda: BulletinHelper.show_error(localise("no_supported_media")))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        run_on_ui_thread(lambda: BulletinHelper.show_info(localise("processing_upload")))
+        
+        thread = threading.Thread(target=self._process_upload, args=(message_obj, params.peer), daemon=True)
+        thread.start()
+
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    # Проверяет, содержит ли сообщение поддерживаемый медиафайл
+    def _has_media(self, message_obj: MessageObject) -> bool:
+        return (message_obj.isPhoto() or message_obj.isVideo() or 
+                message_obj.isGif() or message_obj.isDocument() or 
+                message_obj.isVoice() or message_obj.isRoundVideo())
+
+    # Загружает медиафайл на сервер x0.at и отправляет ссылку в чат
+    def _process_upload(self, message_obj: MessageObject, peer_id: int):
+        self._is_processing = True
+        try:
+            file_path = self._get_media_path_blocking(message_obj)
+
+            if not file_path:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(localise("file_download_failed")))
+                return
+
+            log(f"[{__id__}] Uploading file: {file_path}")
+
+            with open(file_path, 'rb') as f:
+                response = requests.post('https://x0.at', files={'file': f}, timeout=30)
+
+            if response.status_code == 200:
+                link = response.text.strip()
+                
+                mono_enabled = self.get_setting("mono_format_enabled", True)
+                
+                if mono_enabled:
+                    message_markdown = f"{localise('your_link')} `{link}`"
+                    parsed_message = parse_markdown(message_markdown)
+                    send_message({
+                        "peer": peer_id,
+                        "message": parsed_message.text,
+                        "entities": [e.to_tlrpc_object() for e in parsed_message.entities],
+                        "replyToMsg": message_obj,
+                    })
+                else:
+                    send_message({
+                        "peer": peer_id,
+                        "message": f"{localise('your_link')} {link}",
+                        "replyToMsg": message_obj,
+                    })
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"{localise('your_link')} {link}"))
+
+            else:
+                error_text = localise("upload_error_general", status_code=response.status_code, response_text=response.text)
+                run_on_ui_thread(lambda: BulletinHelper.show_error(error_text))
+
+        except requests.exceptions.ConnectionError:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(localise("upload_error_connection")))
+        except requests.exceptions.Timeout:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(localise("upload_error_timeout")))
+        except requests.exceptions.RequestException as e:
+            error_text = localise("unknown_error", error=str(e))
+            log(f"[{__id__}] Request error during upload process: {e}\n{traceback.format_exc()}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(error_text))
+        except Exception as e:
+            error_text = localise("unknown_error", error=str(e))
+            log(f"[{__id__}] General error during upload process: {e}\n{traceback.format_exc()}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(error_text))
+        finally:
+            self._is_processing = False
+
+    # Синхронно получает путь к медиафайлу: из кэша или после скачивания
+    def _get_media_path_blocking(self, message_obj: MessageObject) -> Optional[str]:
+        try:
+            file_loader = FileLoader.getInstance(self.pg_current_account)
+            
+            path_obj = file_loader.getPathToMessage(message_obj.messageOwner)
+            if path_obj:
+                path_str = path_obj.getAbsolutePath()
+                if os.path.exists(path_str) and os.path.getsize(path_str) > 0:
+                    log(f"[{__id__}] File found in cache: {path_str}")
+                    return path_str
+            
+            log(f"[{__id__}] File not in cache, starting download...")
+            pg_media_attach = self._get_media_attach(message_obj)
+            if not pg_media_attach:
+                log(f"[{__id__}] Could not get media attach object.")
+                return None
+
+            file_loader.loadFile(pg_media_attach, message_obj, "mp4", FileLoader.PRIORITY_HIGH, 1)
+
+            final_path_obj = file_loader.getPathToAttach(pg_media_attach, True)
+            if not final_path_obj:
+                log(f"[{__id__}] Could not determine final path.")
+                return None
+            final_path_str = final_path_obj.getAbsolutePath()
+
+            timeout_seconds = 60
+            for _ in range(timeout_seconds):
+                if os.path.exists(final_path_str) and os.path.getsize(final_path_str) > 0:
+                    log(f"[{__id__}] File downloaded successfully: {final_path_str}")
+                    return final_path_str
+                time.sleep(1)
+
+            log(f"[{__id__}] File download timed out.")
+            return None
+
+        except Exception as e:
+            log(f"[{__id__}] Error in _get_media_path_blocking: {e}\n{traceback.format_exc()}")
+            return None
+
+    # Возвращает объект вложения для загрузки медиафайла (фото, документ, видео, GIF)
+    def _get_media_attach(self, message_obj: MessageObject):
+        if message_obj.isPhoto():
+            photo = message_obj.messageOwner.media.photo
+            if photo and photo.sizes:
+                return max(photo.sizes, key=lambda s: s.size if hasattr(s, 'size') else (s.w * s.h))
+        elif message_obj.isDocument():
+            return message_obj.getDocument()
+        elif message_obj.isVideo() or message_obj.isGif() or message_obj.isRoundVideo():
+            return message_obj.getDocument()
+        return None
