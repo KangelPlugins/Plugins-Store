@@ -1,0 +1,1069 @@
+"""
+Стена (Wall Feed) — агрегатор постов из всех каналов пользователя.
+Требования:
+- Отдельный чат в списке чатов (как архив), всегда сверху.
+- НИ ОДИН вызов к API: читаем из локальной БД (messages_v2) как в chikiexport.plugin (DB mode).
+- Сортировка по дате: сверху самые старые, снизу — самые свежие.
+- Механика «непрочитанное»: запоминаем позицию, показываем разделитель и считаем количество.
+- Отображение: название канала, аватарка, просмотры, реакции, кнопка комментов.
+- Поддержка всех типов постов (текст, медиа, текст+медиа и т.д.) через ChatMessageCell.
+
+Используется MandreLib для хранения состояния и утилит.
+Ватермарка: содержание файла WATERMARK.md доступно в настройках.
+"""
+
+__id__ = "wall_feed"
+__name__ = "Стена"
+__description__ = "Агрегатор постов каналов: отдельный чат сверху, оффлайн из БД, с непрочитанным."
+__author__ = "MandreAI"
+__version__ = "1.0.0"
+__icon__ = "msg_pinnedlist_solar"
+__min_version__ = "11.12.1"
+
+import time
+import threading
+from typing import List, Dict, Any, Optional, Tuple
+
+from base_plugin import BasePlugin, HookResult
+from android_utils import log, run_on_ui_thread, OnClickListener
+from hook_utils import find_class, get_private_field, set_private_field
+from client_utils import get_last_fragment, get_messages_storage, get_messages_controller
+
+try:
+    from mandre_lib import Mandre
+except Exception:
+    Mandre = None
+
+from android.view import View, ViewGroup, Gravity
+from android.widget import FrameLayout, LinearLayout, TextView, ScrollView
+from android.graphics import Color
+from android.graphics.drawable import GradientDrawable
+from android.util import TypedValue
+
+from org.telegram.messenger import (
+    UserConfig, MessagesController, LocaleController, AndroidUtilities, ImageLocation, MessageObject, ChatObject, NotificationCenter
+)
+from org.telegram.ui import ChatActivity
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui.Cells import ChatMessageCell, DialogCell
+from org.telegram.ui.Components import BackupImageView, AvatarDrawable
+from java import jclass
+from java.util import ArrayList as JArrayList
+
+
+SETTINGS_KEY_SHOW_HEADER = "show_header_in_chats"
+SETTINGS_KEY_BAN_LIST = "ban_list_csv"
+STORAGE_KEY_LAST_READ_DATE = "last_read_date"
+STORAGE_KEY_LAST_SYNC = "last_sync_time"
+STORAGE_KEY_LAST_WRITE_DATE = "last_write_date"
+STORAGE_KEY_LAST_SYNTH_ID = "last_synth_id"
+PERSIST_FILE_IGNORE = "ignore.json"
+PERSIST_FILE_IDMAP = "idmap.json"
+
+
+class WallFeedPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.header_view_ref = None
+        self.overlay_container = None
+        self.messages_cache: List[Tuple[int, TLRPC.Message, int]] = []  # (dialog_id, message, date)
+        self.unread_count = 0
+        self.unread_divider_index = -1
+        self.hook_create_view_ref = None
+        self.hook_on_resume_ref = None
+        # Synthetic chat id (positive chat id); dialog id is -WALL_CHAT_ID
+        self.WALL_CHAT_ID = 777777777
+        self.WALL_DIALOG_ID = -self.WALL_CHAT_ID
+        # Sync control
+        self._stop_sync = False
+        self._sync_thread = None
+
+    def get_settings_items(self):
+        from ui.settings import Header, Switch, Text, Divider, Input
+        items = [
+            Header(text="Стена (Wall Feed)"),
+            Switch(
+                key=SETTINGS_KEY_SHOW_HEADER,
+                text="Показывать ‘Стена’ вверху списка чатов",
+                default=False,
+                on_change=lambda v: self._reapply_dialogs_hook()
+            ),
+            Divider(text="Ватермарка"),
+            Text(
+                text=self._read_watermark_text(),
+                icon="msg_info_solar",
+                on_click=lambda _: None
+            )
+        ]
+        return items
+
+    def _read_watermark_text(self) -> str:
+        try:
+            import os
+            wm_path_candidates = [
+                os.path.join(os.path.dirname(__file__), "..", "WATERMARK.md"),
+                os.path.join(os.path.dirname(__file__), "..", "..", "WATERMARK.md"),
+            ]
+            for p in wm_path_candidates:
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        text = f.read()
+                        return text[:400] + ("..." if len(text) > 400 else "")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return "WATERMARK.md не найден"
+
+    def on_plugin_load(self):
+        try:
+            if Mandre:
+                Mandre.use_persistent_storage(self)
+        except Exception:
+            log(f"[{self.id}] MandreLib persistent storage unavailable")
+
+        # Load ignore/id map state
+        try:
+            if Mandre:
+                self._ignore_keys = Mandre.Data.read_persistent_json(self.id, PERSIST_FILE_IGNORE, {}) or {}
+                self._id_map = Mandre.Data.read_persistent_json(self.id, PERSIST_FILE_IDMAP, {}) or {}
+                val = Mandre.Data.read_persistent(self.id, STORAGE_KEY_LAST_SYNTH_ID)
+                if isinstance(val, int):
+                    self._last_synth_id = val
+                elif isinstance(val, str) and val.isdigit():
+                    self._last_synth_id = int(val)
+        except Exception:
+            pass
+
+        self._apply_dialogs_hook()
+        self._apply_chat_activity_hooks()
+
+        # Register synthetic chat in MessagesController so it can be displayed and searchable by name
+        try:
+            mc = get_messages_controller()
+            # Register as channel to avoid appearing in users-only folders and mislabeling
+            channel = TLRPC.TL_channel()
+            channel.id = self.WALL_CHAT_ID
+            channel.title = "Стена"
+            channel.megagroup = False
+            channel.broadcast = True
+            channel.creator = False
+            channel.left = False
+            channel.verified = False
+            channel.scam = False
+            channel.restricted = False
+            mc.putChat(channel, True)
+        except Exception as e:
+            log(f"[{self.id}] putChat error: {e}")
+
+        try:
+            threading.Thread(target=self._sync_messages_background, daemon=True).start()
+        except Exception as e:
+            log(f"[{self.id}] Background sync thread error: {e}")
+
+        log(f"[{self.id}] Стена загружена")
+
+    def on_plugin_unload(self):
+        self._remove_dialogs_hook()
+        self._remove_overlay()
+        try:
+            self._stop_sync = True
+        except Exception:
+            pass
+        log(f"[{self.id}] Стена выгружена")
+
+    def _apply_dialogs_hook(self):
+        try:
+            DialogsActivityCls = find_class("org.telegram.ui.DialogsActivity")
+            # Hook getDialogsArray to inject synthetic dialog (wrap primitives via java.lang)
+            getDialogsArray = DialogsActivityCls.getClass().getDeclaredMethod(
+                "getDialogsArray",
+                jclass('java.lang.Integer').TYPE,
+                jclass('java.lang.Integer').TYPE,
+                jclass('java.lang.Integer').TYPE,
+                jclass('java.lang.Boolean').TYPE
+            )
+            getDialogsArray.setAccessible(True)
+            self.hook_method(getDialogsArray, _GetDialogsArrayHook(self))
+
+            log(f"[{self.id}] hooked DialogsActivity.getDialogsArray")
+        except Exception as e:
+            log(f"[{self.id}] dialogs hook error: {e}")
+
+        # Hook MessagesController.getDialogs to ensure our dialog exists in arrays used across app (including some searches)
+        # Do not hook MC.getDialogs globally to avoid polluting archives/folders
+
+        # Hook ChatActivity to open Wall feed when the synthetic chat is opened
+        # Do not hook ChatActivity; we want default chat UI
+
+    def _remove_dialogs_hook(self):
+        try:
+            if self.hook_create_view_ref:
+                self.unhook_method(self.hook_create_view_ref)
+                self.hook_create_view_ref = None
+            if self.hook_on_resume_ref:
+                self.unhook_method(self.hook_on_resume_ref)
+                self.hook_on_resume_ref = None
+        except Exception:
+            pass
+
+    def _reapply_dialogs_hook(self):
+        self._remove_dialogs_hook()
+        self._apply_dialogs_hook()
+
+    def _ensure_header_in_dialogs(self, fragment):
+        try:
+            if not self.get_setting(SETTINGS_KEY_SHOW_HEADER, True):
+                self._remove_header()
+                return
+
+            content_view = get_private_field(fragment, "fragmentView") or get_private_field(fragment, "contentView")
+            list_view = get_private_field(fragment, "listView")
+            if content_view is None or list_view is None:
+                return
+
+            if self.header_view_ref and self.header_view_ref.getParent() is not None:
+                return
+
+            # Используем DialogCell для аутентичного вида как чат
+            cell = DialogCell(None, content_view.getContext(), True, False, UserConfig.selectedAccount, None)
+            custom = DialogCell.CustomDialog()
+            custom.name = "Стена"
+            custom.message = "• 0 непроч."
+            try:
+                # Установим аватар-заглушку
+                # DialogCell сам рисует аватар на основе объекта, для CustomDialog можно оставить дефолт
+                pass
+            except Exception:
+                pass
+            cell.setDialog(custom)
+
+            def on_click(_):
+                try:
+                    self.open_wall_feed()
+                except Exception as e:
+                    log(f"[{self.id}] open_wall_feed error: {e}")
+
+            cell.setOnClickListener(OnClickListener(on_click))
+
+            # Вставляем корректно в зависимости от контейнера
+            try:
+                header_height = AndroidUtilities.dp(72)
+                parent_view = list_view.getParent()
+                if parent_view is not None:
+                    # Если список находится в LinearLayout — добавим перед ним как обычную строку
+                    from android.widget import LinearLayout as _LL
+                    from android.widget import FrameLayout as _FL
+                    if isinstance(parent_view, _LL):
+                        # Найдём позицию list_view
+                        insert_index = 0
+                        try:
+                            count = parent_view.getChildCount()
+                            for i in range(count):
+                                if parent_view.getChildAt(i) is list_view:
+                                    insert_index = i
+                                    break
+                        except Exception:
+                            insert_index = 0
+                        parent_view.addView(cell, insert_index, _LL.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, header_height))
+                    elif isinstance(parent_view, _FL):
+                        # Для FrameLayout добавим оверлей сверху и сдвинем список паддингом
+                        lp = _FL.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, header_height)
+                        lp.gravity = Gravity.TOP
+                        parent_view.addView(cell, lp)
+                        try:
+                            list_view.setPadding(
+                                list_view.getPaddingLeft(),
+                                list_view.getPaddingTop() + header_height,
+                                list_view.getPaddingRight(),
+                                list_view.getPaddingBottom()
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        # Фолбэк — добавим в content_view сверху
+                        try:
+                            from android.widget import LinearLayout as _LL2
+                            if isinstance(content_view, _LL2):
+                                content_view.addView(cell, 0, _LL2.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, header_height))
+                            else:
+                                lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, header_height)
+                                lp.gravity = Gravity.TOP
+                                content_view.addView(cell, lp)
+                                list_view.setPadding(list_view.getPaddingLeft(), list_view.getPaddingTop() + header_height, list_view.getPaddingRight(), list_view.getPaddingBottom())
+                        except Exception:
+                            pass
+                else:
+                    # Нет родителя — добавим в content_view как оверлей
+                    lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, header_height)
+                    lp.gravity = Gravity.TOP
+                    content_view.addView(cell, lp)
+                    try:
+                        list_view.setPadding(list_view.getPaddingLeft(), list_view.getPaddingTop() + header_height, list_view.getPaddingRight(), list_view.getPaddingBottom())
+                    except Exception:
+                        pass
+            except Exception as e:
+                log(f"[{self.id}] header insert error: {e}")
+
+            self.header_view_ref = cell
+            self._update_unread_counter(None)
+
+        except Exception as e:
+            log(f"[{self.id}] ensure_header error: {e}")
+
+    def _remove_header(self):
+        try:
+            if self.header_view_ref and self.header_view_ref.getParent() is not None:
+                parent = self.header_view_ref.getParent()
+                parent.removeView(self.header_view_ref)
+            self.header_view_ref = None
+        except Exception:
+            pass
+
+    def _sync_messages_background(self):
+        try:
+            # Initial sync: from yesterday to now
+            now = int(time.time())
+            start_ts = now - 24 * 60 * 60
+            # Show loading dialog on first load
+            self._show_progress_dialog("Загрузка постов…")
+            self._sync_in_progress = True
+            self._perform_sync_range(start_ts, now)
+            self._sync_in_progress = False
+            self._dismiss_progress_dialog()
+
+            # Periodic sync every 1 minute until plugin unload
+            def loop_sync():
+                while not self._stop_sync:
+                    try:
+                        if getattr(self, '_sync_in_progress', False):
+                            time.sleep(1)
+                            continue
+                        self._sync_in_progress = True
+                        last_sync = self._get_last_sync_time()
+                        now2 = int(time.time())
+                        # sync new posts since last sync
+                        self._perform_sync_range(last_sync or (now2 - 2 * 24 * 60 * 60), now2)
+                    except Exception as e:
+                        log(f"[{self.id}] periodic sync error: {e}")
+                    # sleep 1 minute
+                    for _ in range(1):
+                        if self._stop_sync:
+                            break
+                        time.sleep(60)
+                    self._sync_in_progress = False
+            self._sync_thread = threading.Thread(target=loop_sync, daemon=True)
+            self._sync_thread.start()
+        except Exception as e:
+            log(f"[{self.id}] sync error: {e}")
+
+    def _perform_sync_range(self, start_ts: int, end_ts: int):
+        dialogs = self._get_channel_dialog_ids()
+        log(f"[{self.id}] sync: scanning channels, found {len(dialogs)}")
+        msgs = self._load_channels_messages_from_db(dialogs, per_dialog_limit=500, start_ts=start_ts, end_ts=end_ts)
+        log(f"[{self.id}] sync: loaded {len(msgs)} posts from DB")
+        # Sort ascending by date so freshest are at bottom
+        msgs.sort(key=lambda t: t[2])
+        self.messages_cache = msgs
+
+        # Write to wall chat storage so ChatActivity shows them
+        try:
+            self._write_messages_to_wall(msgs)
+        except Exception as e:
+            log(f"[{self.id}] write-to-wall error: {e}")
+
+        last_read = self._get_last_read_date()
+        self.unread_count = sum(1 for _, _, d in msgs if d > last_read)
+        self.unread_divider_index = -1
+        if last_read > 0:
+            for i, (_, _, d) in enumerate(msgs):
+                if d > last_read:
+                    self.unread_divider_index = i
+                    break
+        self._set_last_sync_time(int(time.time()))
+        # Update dialog unread count in MessagesController
+        try:
+            mc = get_messages_controller()
+            d = mc.dialogs_dict.get(self.WALL_DIALOG_ID)
+            if d is None:
+                d = TLRPC.TL_dialog()
+                d.id = self.WALL_DIALOG_ID
+            d.unread_count = int(self.unread_count)
+            mc.dialogs_dict.put(self.WALL_DIALOG_ID, d)
+        except Exception:
+            pass
+
+    def _write_messages_to_wall(self, msgs: List[Tuple[int, TLRPC.Message, int]]):
+        try:
+            if not msgs:
+                return
+            last_written = 0
+            try:
+                if Mandre:
+                    val = Mandre.Data.read_persistent(self.id, STORAGE_KEY_LAST_WRITE_DATE)
+                    if isinstance(val, int):
+                        last_written = val
+                    elif isinstance(val, str) and val.isdigit():
+                        last_written = int(val)
+            except Exception:
+                pass
+            arr = JArrayList()
+            for did, tl_msg, _ in msgs:
+                try:
+                    # Skip already written by ignore and date cutoff
+                    orig_peer0 = getattr(tl_msg, 'peer_id', None)
+                    orig_ch_id0 = None
+                    if orig_peer0 and hasattr(orig_peer0, 'channel_id') and orig_peer0.channel_id:
+                        orig_ch_id0 = int(orig_peer0.channel_id)
+                    key = f"{orig_ch_id0 or did}:{tl_msg.id}"
+                    if getattr(self, '_ignore_keys', {}).get(key):
+                        continue
+                    if last_written and tl_msg.date <= last_written:
+                        continue
+                    # Redirect message to wall chat
+                    old_peer = getattr(tl_msg, 'peer_id', None)
+                    tl_msg.dialog_id = self.WALL_DIALOG_ID
+                    peer = TLRPC.TL_peerChannel()
+                    peer.channel_id = self.WALL_CHAT_ID
+                    tl_msg.peer_id = peer
+                    tl_msg.out = True
+                    # Add forward header with original channel info
+                    ch_id = None
+                    if old_peer and hasattr(old_peer, 'channel_id') and old_peer.channel_id:
+                        ch_id = int(old_peer.channel_id)
+                    if ch_id:
+                        try:
+                            fwd = TLRPC.TL_messageFwdHeader()
+                            fwd.channel_id = ch_id
+                            fwd.date = tl_msg.date
+                            chat = get_messages_controller().getChat(ch_id)
+                            if chat and hasattr(chat, 'title'):
+                                fwd.from_name = chat.title
+                            # also set from_id for avatar resolution
+                            try:
+                                fpeer = TLRPC.TL_peerChannel()
+                                fpeer.channel_id = ch_id
+                                fwd.from_id = fpeer
+                            except Exception:
+                                pass
+                            tl_msg.fwd_from = fwd
+                        except Exception:
+                            pass
+                    # assign synthetic id and remember mapping + ignore
+                    synth_id = getattr(self, '_last_synth_id', 0) + 1
+                    self._last_synth_id = synth_id
+                    try:
+                        tl_msg.id = int(synth_id)
+                    except Exception:
+                        pass
+                    if key:
+                        self._id_map[key] = int(synth_id)
+                        self._ignore_keys[key] = True
+                except Exception:
+                    pass
+                arr.add(tl_msg)
+            storage = get_messages_storage()
+            # Use MessagesController-style variant to ensure dialog creation and proper indexing
+            # putMessages(messages, dialogId, load_type, max_id, createDialog, mode, threadMessageId)
+            to_write = arr.size()
+            try:
+                messagesRes = jclass('org.telegram.tgnet.TLRPC$TL_messages_messages')()
+                messagesRes.messages = arr
+                messagesRes.users = JArrayList()
+                messagesRes.chats = JArrayList()
+                storage.putMessages(messagesRes, self.WALL_DIALOG_ID, -1, 0, True, ChatActivity.MODE_SAVED, 0)
+            except Exception:
+                # Fallback to simple put
+                storage.putMessages(arr, False, True, False, 0, False, 0, 0)
+            log(f"[{self.id}] wrote {to_write} messages to wall storage")
+            # Persist last write max date
+            try:
+                max_date = 0
+                for _, tl_msg2, _ in msgs:
+                    if tl_msg2.date > max_date:
+                        max_date = tl_msg2.date
+                if max_date and Mandre:
+                    Mandre.Data.write_persistent(self.id, STORAGE_KEY_LAST_WRITE_DATE, int(max_date))
+            except Exception:
+                pass
+            # persist ignore/id maps and last synth id
+            try:
+                if Mandre:
+                    Mandre.Data.write_persistent_json(self.id, PERSIST_FILE_IGNORE, getattr(self, '_ignore_keys', {}))
+                    Mandre.Data.write_persistent_json(self.id, PERSIST_FILE_IDMAP, getattr(self, '_id_map', {}))
+                    Mandre.Data.write_persistent(self.id, STORAGE_KEY_LAST_SYNTH_ID, int(getattr(self, '_last_synth_id', 0)))
+            except Exception:
+                pass
+            # Notify UI to refresh dialogs
+            try:
+                NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.dialogsNeedReload)
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"[{self.id}] _write_messages_to_wall error: {e}")
+
+    # --- Hook ChatActivity to set saved mode for wall and update last_read on exit ---
+    def _apply_chat_activity_hooks(self):
+        try:
+            CA = find_class("org.telegram.ui.ChatActivity")
+            ctx = find_class("android.content.Context")
+            createView = CA.getClass().getDeclaredMethod("createView", ctx.getClass())
+            createView.setAccessible(True)
+            self.hook_method(createView, _ChatActivityCreateHook(self))
+
+            onPause = CA.getClass().getDeclaredMethod("onPause")
+            onPause.setAccessible(True)
+            self.hook_method(onPause, _ChatActivityPauseHook(self))
+        except Exception as e:
+            log(f"[{self.id}] chat hooks error: {e}")
+
+    def _get_channel_dialog_ids(self) -> List[int]:
+        res = []
+        try:
+            mc = get_messages_controller()
+            dialogs = mc.getDialogs(0)
+            acc = UserConfig.selectedAccount
+            ban = set(self._get_ban_list())
+            # Convert to Python list to avoid index issues
+            if hasattr(dialogs, 'toArray'):
+                arr = list(dialogs.toArray())
+            else:
+                # Fallback: try iterating with get(i) safely
+                arr = []
+                try:
+                    size = dialogs.size()
+                    for i in range(size):
+                        try:
+                            arr.append(dialogs.get(i))
+                        except Exception:
+                            break
+                except Exception:
+                    arr = []
+            for d in arr:
+                try:
+                    if isinstance(d, TLRPC.TL_dialog):
+                        did = d.id
+                        # Exclude wall itself and include only broadcast channels (exclude megagroups)
+                        if did == self.WALL_DIALOG_ID:
+                            continue
+                        if ChatObject.isChannelAndNotMegaGroup(-did, acc):
+                            ch_id = -int(did)
+                            if ch_id in ban:
+                                continue
+                            res.append(did)
+                except Exception:
+                    continue
+        except Exception as e:
+            log(f"[{self.id}] get channel dialogs error: {e}")
+        return res
+
+    def _load_channels_messages_from_db(self, dialog_ids: List[int], per_dialog_limit: int = 300, start_ts: Optional[int] = None, end_ts: Optional[int] = None) -> List[Tuple[int, TLRPC.Message, int]]:
+        agg: List[Tuple[int, TLRPC.Message, int]] = []
+        try:
+            storage = get_messages_storage()
+            database = get_private_field(storage, "database")
+            if not database:
+                return []
+            for did in dialog_ids:
+                try:
+                    # Primary query (as in chikiexport): by uid (dialog id)
+                    q = f"SELECT data, mid, date, uid FROM messages_v2 WHERE uid = {did} ORDER BY date DESC LIMIT {per_dialog_limit}"
+                    cursor = database.queryFinalized(q)
+                    loaded_for_did = 0
+                    while cursor.next():
+                        data = cursor.byteBufferValue(0)
+                        if data:
+                            msg = TLRPC.Message.TLdeserialize(data, data.readInt32(False), False)
+                            if msg:
+                                msg.id = cursor.intValue(1)
+                                msg.date = cursor.intValue(2)
+                                msg.dialog_id = cursor.longValue(3)
+                                # Ensure message belongs to a channel (exclude user/group)
+                                peer = getattr(msg, 'peer_id', None)
+                                if not (peer and hasattr(peer, 'channel_id') and peer.channel_id):
+                                    data.reuse()
+                                    continue
+                                # Apply time window filter in Python to avoid missing data due to DB schema differences
+                                if start_ts and end_ts:
+                                    if msg.date < start_ts or msg.date > end_ts:
+                                        data.reuse()
+                                        continue
+                                agg.append((did, msg, msg.date))
+                                loaded_for_did += 1
+                            data.reuse()
+                    # Fallback: some builds store uid with opposite sign; try positive channel id if nothing loaded
+                    if loaded_for_did == 0:
+                        try:
+                            fallback_uid = -did
+                            q2 = f"SELECT data, mid, date, uid FROM messages_v2 WHERE uid = {fallback_uid} ORDER BY date DESC LIMIT {per_dialog_limit}"
+                            cursor2 = database.queryFinalized(q2)
+                            while cursor2.next():
+                                data2 = cursor2.byteBufferValue(0)
+                                if data2:
+                                    msg2 = TLRPC.Message.TLdeserialize(data2, data2.readInt32(False), False)
+                                    if msg2:
+                                        peer2 = getattr(msg2, 'peer_id', None)
+                                        if not (peer2 and hasattr(peer2, 'channel_id') and peer2.channel_id):
+                                            data2.reuse()
+                                            continue
+                                        if start_ts and end_ts and (msg2.date < start_ts or msg2.date > end_ts):
+                                            data2.reuse()
+                                            continue
+                                        msg2.id = cursor2.intValue(1)
+                                        msg2.date = cursor2.intValue(2)
+                                        msg2.dialog_id = cursor2.longValue(3)
+                                        agg.append((did, msg2, msg2.date))
+                                data2.reuse()
+                            if len(agg) == 0:
+                                log(f"[{self.id}] no rows for uid={did} or fallback_uid={fallback_uid}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log(f"[{self.id}] DB read error for {did}: {e}")
+        except Exception as e:
+            log(f"[{self.id}] DB access error: {e}")
+        return agg
+
+    def open_wall_feed(self):
+        # No overlay; normal ChatActivity handles opening this synthetic chat
+        pass
+
+    def _remove_overlay(self):
+        try:
+            # Помечаем как прочитанное до последнего загруженного сообщения
+            try:
+                if self.messages_cache:
+                    last_date = self.messages_cache[-1][2]
+                    if last_date and last_date > 0:
+                        self._set_last_read_date(last_date)
+            except Exception:
+                pass
+            if self.overlay_container and self.overlay_container.getParent() is not None:
+                parent = self.overlay_container.getParent()
+                parent.removeView(self.overlay_container)
+            self.overlay_container = None
+        except Exception:
+            pass
+
+    def _build_unread_divider(self, ctx) -> View:
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER)
+        row.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8))
+        tv = TextView(ctx)
+        tv.setText("Непрочитанные сообщения")
+        tv.setTextColor(Color.LTGRAY)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
+        row.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        return row
+
+    def _build_feed_item(self, ctx, account: int, dialog_id: int, msg: TLRPC.Message) -> View:
+        container = LinearLayout(ctx)
+        container.setOrientation(LinearLayout.VERTICAL)
+        container.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
+
+        header = LinearLayout(ctx)
+        header.setOrientation(LinearLayout.HORIZONTAL)
+        header.setGravity(Gravity.CENTER_VERTICAL)
+
+        avatar = BackupImageView(ctx)
+        ava_draw = AvatarDrawable()
+        name = "Канал"
+        try:
+            mc = get_messages_controller()
+            peer = getattr(msg, 'peer_id', None)
+            if peer and hasattr(peer, 'channel_id') and peer.channel_id:
+                cid = peer.channel_id
+                chat = mc.getChat(cid)
+                if chat and hasattr(chat, 'title'):
+                    name = chat.title
+                ava_draw.setInfo(chat)
+            else:
+                ava_draw.setInfo(0, name, None)
+        except Exception:
+            ava_draw.setInfo(0, name, None)
+        avatar.setImageDrawable(ava_draw)
+        header.addView(avatar, LinearLayout.LayoutParams(AndroidUtilities.dp(36), AndroidUtilities.dp(36)))
+
+        title = TextView(ctx)
+        title.setText(name)
+        title.setTextColor(Color.WHITE)
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
+        p = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        p.leftMargin = AndroidUtilities.dp(8)
+        header.addView(title, p)
+
+        container.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        try:
+            cell = ChatMessageCell(ctx, account)
+            mo = MessageObject(account, msg, False, False)
+            cell.setMessageObject(mo, None, False, False, False)
+            container.addView(cell, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        except Exception as e:
+            fallback = TextView(ctx)
+            try:
+                text = getattr(msg, 'message', '') or "(медиа)"
+            except Exception:
+                text = "(сообщение)"
+            fallback.setText(text)
+            fallback.setTextColor(Color.WHITE)
+            fallback.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14)
+            fallback.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(6), AndroidUtilities.dp(8), AndroidUtilities.dp(6))
+            container.addView(fallback, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        return container
+
+    def _update_unread_counter(self, tv: TextView):
+        try:
+            count = self.unread_count
+            # Обновим подзаголовок диалога
+            if isinstance(self.header_view_ref, DialogCell):
+                custom = DialogCell.CustomDialog()
+                custom.name = "Стена"
+                custom.message = f"• {count} непроч."
+                self.header_view_ref.setDialog(custom)
+            elif tv is not None:
+                tv.setText(f"• {count} непроч.")
+        except Exception:
+            pass
+
+    def _get_last_read_date(self) -> int:
+        try:
+            if Mandre:
+                val = Mandre.Data.read_persistent(self.id, STORAGE_KEY_LAST_READ_DATE)
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str) and val.isdigit():
+                    return int(val)
+        except Exception:
+            pass
+        return 0
+
+    def _set_last_read_date(self, ts: int):
+        try:
+            if Mandre:
+                Mandre.Data.write_persistent(self.id, STORAGE_KEY_LAST_READ_DATE, int(ts))
+        except Exception:
+            pass
+
+    def _get_last_sync_time(self) -> int:
+        try:
+            if Mandre:
+                val = Mandre.Data.read_persistent(self.id, STORAGE_KEY_LAST_SYNC)
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str) and val.isdigit():
+                    return int(val)
+        except Exception:
+            pass
+        return 0
+
+    def _set_last_sync_time(self, ts: int):
+        try:
+            if Mandre:
+                Mandre.Data.write_persistent(self.id, STORAGE_KEY_LAST_SYNC, int(ts))
+        except Exception:
+            pass
+
+    # --- Ban list helpers ---
+    def _get_ban_list_csv(self) -> str:
+        try:
+            if Mandre:
+                v = self.get_setting(SETTINGS_KEY_BAN_LIST, "") or ""
+                return str(v)
+        except Exception:
+            pass
+        return ""
+
+    def _set_ban_list_csv(self, csv: str):
+        try:
+            self.set_setting(SETTINGS_KEY_BAN_LIST, csv or "")
+        except Exception:
+            pass
+
+    def _get_ban_list(self) -> List[int]:
+        try:
+            csv = self._get_ban_list_csv()
+            ids = []
+            for part in str(csv).replace(";", ",").split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                try:
+                    ids.append(int(p))
+                except Exception:
+                    continue
+            return ids
+        except Exception:
+            return []
+
+    # --- Progress dialog helpers ---
+    def _show_progress_dialog(self, message: str):
+        try:
+            from ui.alert import AlertDialogBuilder
+            last_fragment = get_last_fragment()
+            if not last_fragment:
+                return
+            def show():
+                try:
+                    builder = AlertDialogBuilder(last_fragment.getParentActivity(), AlertDialogBuilder.ALERT_TYPE_LOADING)
+                    builder.set_title(message)
+                    builder.set_cancelable(False)
+                    self.progress_dialog = builder
+                    self.progress_dialog.show()
+                except Exception:
+                    pass
+            run_on_ui_thread(show)
+        except Exception:
+            pass
+
+    def _dismiss_progress_dialog(self):
+        try:
+            def dism():
+                try:
+                    if self.progress_dialog:
+                        self.progress_dialog.dismiss()
+                        self.progress_dialog = None
+                except Exception:
+                    pass
+            run_on_ui_thread(dism)
+        except Exception:
+            pass
+
+    # --- Synthetic ID generator ---
+    def _next_synth_id(self) -> int:
+        try:
+            self._last_synth_id = int(self._last_synth_id) + 1
+            return self._last_synth_id
+        except Exception:
+            self._last_synth_id = 1
+            return 1
+
+
+class _DialogsCreateViewHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        frag = param.thisObject
+        try:
+            self.plugin._ensure_header_in_dialogs(frag)
+        except Exception as e:
+            log(f"[wall_feed] after createView error: {e}")
+
+
+class _DialogsOnResumeHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        frag = param.thisObject
+        try:
+            threading.Thread(target=self.plugin._sync_messages_background, daemon=True).start()
+            self.plugin._ensure_header_in_dialogs(frag)
+        except Exception as e:
+            log(f"[wall_feed] after onResume error: {e}")
+
+
+class _GetDialogsArrayHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            res = param.getResult()
+            if res is None:
+                return
+            # res is java.util.ArrayList
+            # Inject synthetic dialog at position 0 if not present
+            try:
+                # Only inject for main folder (folderId == 0)
+                folderId = param.args[2]
+                if folderId != 0:
+                    return
+                size = res.size()
+                exists = False
+                for i in range(size):
+                    d = res.get(i)
+                    if hasattr(d, 'id') and d.id == self.plugin.WALL_DIALOG_ID:
+                        exists = True
+                        break
+                if not exists:
+                    d = TLRPC.TL_dialog()
+                    d.id = self.plugin.WALL_DIALOG_ID
+                    d.peer = TLRPC.TL_peerChannel()
+                    d.peer.channel_id = self.plugin.WALL_CHAT_ID
+                    d.pinned = False
+                    res.add(0, d)
+                    param.setResult(res)
+            except Exception as e:
+                log(f"[{self.plugin.id}] inject dialog error: {e}")
+        except Exception as e:
+            log(f"[{self.plugin.id}] getDialogsArray hook error: {e}")
+
+
+class _DialogsOnBindHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            adapter = param.thisObject  # org.telegram.ui.Adapters.DialogsAdapter
+            holder = param.args[0]
+            pos = param.args[1]
+            itemView = holder.itemView
+            # Only modify our synthetic dialog item
+            try:
+                getItem = adapter.getClass().getDeclaredMethod("getItem", jclass('java.lang.Integer').TYPE)
+                getItem.setAccessible(True)
+                item = getItem.invoke(adapter, jclass('java.lang.Integer').valueOf(pos))
+            except Exception:
+                item = None
+
+            try:
+                if item is not None and isinstance(item, TLRPC.Dialog) and getattr(item, 'id', 0) == self.plugin.WALL_DIALOG_ID:
+                    if isinstance(itemView, DialogCell):
+                        # Build custom dialog with proper avatar and title
+                        custom = DialogCell.CustomDialog()
+                        custom.name = "Стена"
+                        custom.message = f"• {self.plugin.unread_count} непроч."
+                        itemView.setDialog(custom)
+                        try:
+                            # Ensure MessagesController has chat with proper title
+                            mc = get_messages_controller()
+                            chat = mc.getChat(self.plugin.WALL_CHAT_ID)
+                            if chat is None:
+                                chat = TLRPC.TL_chat()
+                                chat.id = self.plugin.WALL_CHAT_ID
+                                chat.title = "Стена"
+                                mc.putChat(chat, True)
+                        except Exception:
+                            pass
+
+                        def on_click(_):
+                            try:
+                                self.plugin.open_wall_feed()
+                            except Exception as e:
+                                log(f"[{self.plugin.id}] open_wall_feed error: {e}")
+                        itemView.setOnClickListener(OnClickListener(on_click))
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"[{self.plugin.id}] onBind hook error: {e}")
+
+
+class _GetDialogsHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            res = param.getResult()
+            if res is None:
+                return
+            try:
+                # Ensure dialogs list contains our dialog
+                size = res.size()
+                exists = False
+                for i in range(size):
+                    d = res.get(i)
+                    if hasattr(d, 'id') and d.id == self.plugin.WALL_DIALOG_ID:
+                        exists = True
+                        break
+                if not exists:
+                    d = TLRPC.TL_dialog()
+                    d.id = self.plugin.WALL_DIALOG_ID
+                    d.peer = TLRPC.TL_peerChat()
+                    d.peer.chat_id = self.plugin.WALL_CHAT_ID
+                    d.pinned = True
+                    res.add(0, d)
+                    param.setResult(res)
+            except Exception as e:
+                log(f"[{self.plugin.id}] ensure MC.getDialogs wall: {e}")
+        except Exception as e:
+            log(f"[{self.plugin.id}] MC.getDialogs hook error: {e}")
+
+
+class _ChatActivityCreateHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            chat_act = param.thisObject
+            did = 0
+            try:
+                did = get_private_field(chat_act, "dialog_id")
+            except Exception:
+                pass
+            if did == self.plugin.WALL_DIALOG_ID:
+                # Set saved-mode UI flags so avatars/titles render like saved forward view
+                try:
+                    set_private_field(chat_act, "mode", ChatActivity.MODE_SAVED)
+                except Exception:
+                    pass
+                # Scroll to first unread based on last_read_date
+                try:
+                    last_read = self.plugin._get_last_read_date()
+                    target_id = 0
+                    for did2, msg, date in self.plugin.messages_cache:
+                        if date > last_read:
+                            orig_peer = getattr(msg, 'peer_id', None)
+                            ch_id = None
+                            if orig_peer and hasattr(orig_peer, 'channel_id') and orig_peer.channel_id:
+                                ch_id = int(orig_peer.channel_id)
+                            key = f"{ch_id or did2}:{msg.id}"
+                            sid = self.plugin._id_map.get(key)
+                            if sid:
+                                target_id = int(sid)
+                            break
+                    if target_id:
+                        try:
+                            scrollToMessageId = chat_act.getClass().getDeclaredMethod(
+                                "scrollToMessageId",
+                                jclass('java.lang.Integer').TYPE,
+                                jclass('java.lang.Integer').TYPE,
+                                jclass('java.lang.Boolean').TYPE,
+                                jclass('java.lang.Integer').TYPE,
+                                jclass('java.lang.Boolean').TYPE,
+                                jclass('java.lang.Integer').TYPE
+                            )
+                            scrollToMessageId.setAccessible(True)
+                            scrollToMessageId.invoke(chat_act,
+                                jclass('java.lang.Integer').valueOf(target_id),
+                                jclass('java.lang.Integer').valueOf(0),
+                                jclass('java.lang.Boolean').valueOf(True),
+                                jclass('java.lang.Integer').valueOf(0),
+                                jclass('java.lang.Boolean').valueOf(True),
+                                jclass('java.lang.Integer').valueOf(0)
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[{self.plugin.id}] ChatActivity createView hook error: {e}")
+
+class _ChatActivityPauseHook:
+    def __init__(self, plugin: WallFeedPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            chat_act = param.thisObject
+            did = 0
+            try:
+                did = get_private_field(chat_act, "dialog_id")
+            except Exception:
+                pass
+            if did == self.plugin.WALL_DIALOG_ID:
+                # On leaving wall, mark last_read_date to max written date
+                try:
+                    storage_last = Mandre.Data.read_persistent(self.plugin.id, STORAGE_KEY_LAST_WRITE_DATE)
+                    if isinstance(storage_last, int) and storage_last:
+                        self.plugin._set_last_read_date(storage_last)
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[{self.plugin.id}] ChatActivity onPause hook error: {e}")
