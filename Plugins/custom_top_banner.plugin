@@ -1,0 +1,412 @@
+__id__ = "custom_top_banner"
+__name__ = "CustomBanner"
+__author__ = "@RnPlugins with @PluginIDE"
+__version__ = "1.0.4r"
+__description__ = """Настраиваемый баннер сверху (обязательно зайти в настройки!)"""
+
+__icon__ = "sPluginIDE/32"
+__min_version__ = "11.12.0"
+
+import os
+import traceback
+import threading
+from typing import List, Any, Optional, Dict
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from client_utils import get_last_fragment, run_on_queue
+from android_utils import run_on_ui_thread, log
+from ui.settings import Header, Text, Divider, Switch, Selector
+from ui.bulletin import BulletinHelper
+
+from android.app import Activity
+from android.content import Intent
+from android.net import Uri
+from java.io import File, FileOutputStream
+from org.telegram.messenger import ApplicationLoader, ImageReceiver, ImageLocation, Utilities
+from java import jarray, jint, jbyte, dynamic_proxy
+from java.lang import Integer, Runnable
+from android.os import Handler, Looper
+
+from android.graphics import Bitmap, BitmapFactory, Canvas, Color, Paint, Matrix
+from android.graphics.drawable import Drawable, GradientDrawable, LayerDrawable, ColorDrawable, BitmapDrawable, TransitionDrawable
+from org.telegram.ui.ActionBar import Theme, BaseFragment
+from org.telegram.ui.Components import AvatarDrawable
+from android.view import Gravity, ViewGroup
+
+class CustomBannerPlugin(BasePlugin):
+    FILE_PICKER_REQUEST_CODE = 102
+    BLACKLISTED_FRAGMENTS = {
+        "org.telegram.ui.ProfileActivity", "com.exteragram.messenger.preferences.MainPreferencesActivity",
+        "org.telegram.ui.PremiumPreviewFragment", "org.telegram.ui.Stars.StarsIntroActivity",
+        "com.radolyn.ayugram.ui.preferences.AyuMainPreferencesActivity"
+    }
+
+    class ActivityResultHook(MethodHook):
+        def __init__(self, plugin): self.plugin = plugin
+        def before_hooked_method(self, param):
+            req_code, res_code, data = param.args
+            if req_code == self.plugin.FILE_PICKER_REQUEST_CODE:
+                param.setResult(None); self.plugin._handle_file_picker_result(res_code, data)
+
+    class FragmentResumeHook(MethodHook):
+        def __init__(self, plugin): self.plugin = plugin
+        def after_hooked_method(self, param):
+            fragment = param.thisObject
+            if not isinstance(fragment, BaseFragment): return
+
+            fragment_class_name = fragment.getClass().getName()
+            
+            if self.plugin.main_handler:
+                self.plugin.main_handler.removeCallbacksAndMessages(None)
+
+            if fragment_class_name in self.plugin.BLACKLISTED_FRAGMENTS:
+                if hasattr(fragment, 'getActionBar') and (action_bar := fragment.getActionBar()):
+                    action_bar.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+                return
+
+            self.plugin._request_banner_update(fragment)
+
+    def __init__(self):
+        super().__init__()
+        self.activity_hook = self.fragment_resume_hook = None
+        self._plugin_dir_path = ""
+        self.bitmap_cache: Dict[str, Bitmap] = {}
+        self.fragments_to_ignore = set()
+        self.cache_lock = threading.Lock()
+        self.main_handler: Optional[Handler] = None
+        self.loading_hq_dialog_id = 0
+        self.chat_activity_avatar_container_field = None
+        self.BackupImageViewClass = None
+        self.is_processing_file = False
+
+    def _get_avatar_drawable_from_view(self, fragment) -> Optional[Drawable]:
+        try:
+            if not self.chat_activity_avatar_container_field:
+                field = fragment.getClass().getDeclaredField("avatarContainer")
+                field.setAccessible(True); self.chat_activity_avatar_container_field = field
+            avatar_container_view = self.chat_activity_avatar_container_field.get(fragment)
+            if avatar_container_view and isinstance(avatar_container_view, ViewGroup):
+                if not self.BackupImageViewClass: self.BackupImageViewClass = find_class("org.telegram.ui.Components.BackupImageView")
+                if not self.BackupImageViewClass: return None
+                for i in range(avatar_container_view.getChildCount()):
+                    child = avatar_container_view.getChildAt(i)
+                    if isinstance(child, self.BackupImageViewClass):
+                        drawable = child.getImageReceiver().getDrawable()
+                        if drawable and not isinstance(drawable, AvatarDrawable): return drawable
+        except Exception: pass
+        return None
+
+    def _drawable_to_bitmap(self, drawable: Drawable) -> Optional[Bitmap]:
+        try:
+            if isinstance(drawable, BitmapDrawable) and (bitmap := drawable.getBitmap()) and bitmap and not bitmap.isRecycled():
+                return bitmap.copy(bitmap.getConfig(), True)
+            width, height = drawable.getIntrinsicWidth(), drawable.getIntrinsicHeight()
+            if width <= 0 or height <= 0: return None
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            canvas = Canvas(bitmap)
+            drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight())
+            drawable.draw(canvas)
+            return bitmap
+        except Exception: return None
+
+    def _get_gravity_from_setting(self) -> int:
+        style_index = self.get_setting("banner_crop_style", 1)
+        if style_index == 0: return Gravity.TOP
+        if style_index == 2: return Gravity.BOTTOM
+        return Gravity.CENTER
+
+    def _apply_drawable_to_actionbar(self, fragment, final_drawable):
+        if not fragment or fragment.getClass().getName() in self.BLACKLISTED_FRAGMENTS: return
+        if fragment.isFinishing() or not fragment.getParentActivity(): return
+        action_bar = fragment.getActionBar()
+        if not action_bar: return
+        
+        current_background = action_bar.getBackground()
+        old_image_layer = None
+        if isinstance(current_background, LayerDrawable) and current_background.getNumberOfLayers() > 0:
+            potential_old_layer = current_background.getDrawable(0)
+            if isinstance(potential_old_layer, TransitionDrawable): old_image_layer = potential_old_layer.getDrawable(1)
+            elif isinstance(potential_old_layer, (BitmapDrawable, ColorDrawable)): old_image_layer = potential_old_layer
+        if not old_image_layer: old_image_layer = ColorDrawable(Theme.getColor(Theme.key_actionBarDefault))
+
+        if isinstance(old_image_layer, BitmapDrawable) and (bmp := old_image_layer.getBitmap()) and (bmp is None or bmp.isRecycled()):
+            old_image_layer = ColorDrawable(Theme.getColor(Theme.key_actionBarDefault))
+
+        transition = TransitionDrawable(jarray(Drawable)([old_image_layer, final_drawable.getDrawable(0)]))
+        full_transition_drawable = LayerDrawable(jarray(Drawable)([transition, final_drawable.getDrawable(1), final_drawable.getDrawable(2)]))
+        action_bar.setBackgroundDrawable(full_transition_drawable)
+        transition.startTransition(250)
+
+    def _process_bitmap_to_banner(self, fragment, source_bitmap: Bitmap, cache_key: str, should_blur: bool):
+        if not fragment or fragment.getClass().getName() in self.BLACKLISTED_FRAGMENTS: return
+        if not source_bitmap or source_bitmap.isRecycled() or fragment.isFinishing() or not fragment.getParentActivity(): return
+        action_bar = fragment.getActionBar()
+        if not action_bar: return
+        
+        if should_blur:
+            try: Utilities.stackBlurBitmap(source_bitmap, 25)
+            except Exception: pass
+            
+        target_w, target_h = action_bar.getWidth(), action_bar.getHeight()
+        gravity = self._get_gravity_from_setting()
+        final_bitmap: Optional[Bitmap] = None
+        try:
+            bw, bh = source_bitmap.getWidth(), source_bitmap.getHeight()
+            scale = max(float(target_w) / bw, float(target_h) / bh)
+            dx, dy = (target_w - bw * scale) / 2.0, (target_h - bh * scale) / 2.0
+            if gravity == Gravity.TOP: dy = 0
+            elif gravity == Gravity.BOTTOM: dy = target_h - bh * scale
+            matrix = Matrix(); matrix.setScale(scale, scale); matrix.postTranslate(round(dx), round(dy))
+            final_bitmap = Bitmap.createBitmap(target_w, target_h, Bitmap.Config.ARGB_8888)
+            canvas = Canvas(final_bitmap)
+            paint = Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG)
+            canvas.drawBitmap(source_bitmap, matrix, paint)
+        finally:
+            if source_bitmap and not source_bitmap.isRecycled(): source_bitmap.recycle()
+        if not final_bitmap: return
+
+        with self.cache_lock: self.bitmap_cache[cache_key] = final_bitmap
+        
+        parent_activity = fragment.getParentActivity()
+        if not parent_activity: return
+        
+        image_drawable = BitmapDrawable(parent_activity.getResources(), final_bitmap)
+        default_color, scrim_color = Theme.getColor(Theme.key_actionBarDefault), 0x4D000000
+        gradient = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, jarray(jint)([Color.TRANSPARENT, default_color]))
+        scrim = ColorDrawable(scrim_color)
+        final_drawable = LayerDrawable(jarray(Drawable)([image_drawable, scrim, gradient]))
+        run_on_ui_thread(lambda: self._apply_drawable_to_actionbar(fragment, final_drawable))
+
+    def _update_banner_for_fragment(self, fragment):
+        try:
+            if not fragment or fragment != get_last_fragment() or not hasattr(fragment, 'getActionBar'): return
+            action_bar = fragment.getActionBar()
+            if not action_bar: return
+
+            fragment_class_name = fragment.getClass().getName()
+            if fragment_class_name in self.BLACKLISTED_FRAGMENTS: return
+            
+            if action_bar.getWidth() <= 0:
+                run_on_ui_thread(lambda: self._update_banner_for_fragment(fragment), 150)
+                return
+                
+            if fragment_class_name in self.fragments_to_ignore:
+                action_bar.setBackgroundDrawable(ColorDrawable(Theme.getColor(Theme.key_actionBarDefault)))
+                return
+
+            effective_fragment = fragment
+            if "DialogsActivity" in fragment_class_name:
+                if hasattr(fragment, 'getChatActivity') and (hosted_chat := fragment.getChatActivity()): effective_fragment = hosted_chat
+                elif hasattr(fragment, 'getTopicsFragment') and (topics_fragment := fragment.getTopicsFragment()): effective_fragment = topics_fragment
+
+            if action_bar.isActionModeShowed() or not action_bar.getOccupyStatusBar():
+                action_bar.setBackgroundDrawable(ColorDrawable(Theme.getColor(Theme.key_actionBarDefault))); return
+
+            is_chat = "ChatActivity" in effective_fragment.getClass().getName() or "TopicsFragment" in effective_fragment.getClass().getName()
+            is_main = "DialogsActivity" in effective_fragment.getClass().getName() or "MainActivity" in effective_fragment.getClass().getName()
+            if not (is_chat or is_main or self.get_setting("display_everywhere", False)):
+                self.fragments_to_ignore.add(fragment_class_name)
+                action_bar.setBackgroundDrawable(ColorDrawable(Theme.getColor(Theme.key_actionBarDefault)))
+                return
+
+            source_drawable, source_path = None, None
+            dialog_id = effective_fragment.getDialogId() if hasattr(effective_fragment, 'getDialogId') else 0
+
+            if self.get_setting("use_chat_avatars", False) and is_chat:
+                source_drawable = self._get_avatar_drawable_from_view(effective_fragment)
+            if not source_drawable:
+                self.loading_hq_dialog_id = 0; source_path = self.get_setting("banner_internal_path", "")
+                if not source_path or not File(source_path).exists():
+                    action_bar.setBackgroundDrawable(ColorDrawable(Theme.getColor(Theme.key_actionBarDefault))); return
+
+            should_blur = bool(source_drawable and self.get_setting("blur_avatars", False))
+            cache_key_part = str(dialog_id) if source_drawable else source_path
+            gravity, blur_part = self._get_gravity_from_setting(), "_blur" if should_blur else ""
+            cache_key = f"{cache_key_part}_{action_bar.getWidth()}x{action_bar.getHeight()}_{gravity}{blur_part}"
+
+            with self.cache_lock: cached_bitmap = self.bitmap_cache.get(cache_key)
+            if cached_bitmap and not cached_bitmap.isRecycled():
+                if (parent_activity := fragment.getParentActivity()):
+                    image_drawable = BitmapDrawable(parent_activity.getResources(), cached_bitmap)
+                    default_color = Theme.getColor(Theme.key_actionBarDefault)
+                    gradient = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, jarray(jint)([Color.TRANSPARENT, default_color]))
+                    scrim = ColorDrawable(0x4D000000)
+                    self._apply_drawable_to_actionbar(fragment, LayerDrawable(jarray(Drawable)([image_drawable, scrim, gradient])))
+                return
+
+            run_on_queue(lambda: self._process_cached_or_new_bitmap(fragment, source_drawable, source_path, cache_key, should_blur))
+
+            if source_drawable and self.get_setting("load_hq_avatars", True) and not should_blur and dialog_id != 0 and self.loading_hq_dialog_id != dialog_id:
+                self._load_high_quality_avatar(effective_fragment, dialog_id)
+        except Exception as e: log(f"[{self.id}] Error in _update_banner: {e}\n{traceback.format_exc()}")
+
+    def _process_cached_or_new_bitmap(self, fragment, drawable, path, cache_key, should_blur):
+        if fragment.isFinishing(): return
+        bitmap_to_process = None
+        if drawable: bitmap_to_process = self._drawable_to_bitmap(drawable)
+        elif path:
+            try: bitmap_to_process = BitmapFactory.decodeFile(path, None)
+            except Exception: pass
+        if bitmap_to_process: self._process_bitmap_to_banner(fragment, bitmap_to_process, cache_key, should_blur)
+
+    def _load_high_quality_avatar(self, fragment, dialog_id):
+        self.loading_hq_dialog_id = dialog_id
+        user = fragment.getCurrentUser() if hasattr(fragment, 'getCurrentUser') else None
+        chat = fragment.getCurrentChat() if hasattr(fragment, 'getCurrentChat') else None
+        image_loc = None
+        if user and user.photo: image_loc = ImageLocation.getForUser(user, ImageLocation.TYPE_BIG)
+        elif chat and chat.photo: image_loc = ImageLocation.getForChat(chat, ImageLocation.TYPE_BIG)
+        if not image_loc: self.loading_hq_dialog_id = 0; return
+        
+        class HighQualityAvatarDelegate(dynamic_proxy(ImageReceiver.ImageReceiverDelegate)):
+            def __init__(self, plugin, frag, dlg_id):
+                super().__init__()
+                self.plugin, self.fragment, self.dialog_id = plugin, frag, dlg_id
+            
+            def _process(self, drawable: Drawable):
+                if not drawable or self.fragment.isFinishing(): return
+                action_bar = self.fragment.getActionBar()
+                if not action_bar or action_bar.getWidth() <= 0: return
+                cache_key = f"{self.dialog_id}_{action_bar.getWidth()}x{action_bar.getHeight()}_{self.plugin._get_gravity_from_setting()}"
+                source_bitmap = self.plugin._drawable_to_bitmap(drawable)
+                if source_bitmap: self.plugin._process_bitmap_to_banner(self.fragment, source_bitmap, cache_key, False)
+                if self.plugin.loading_hq_dialog_id == self.dialog_id: self.plugin.loading_hq_dialog_id = 0
+            
+            def didSetImage(self, receiver, set_val, thumb, memCache):
+                if set_val and (drawable := receiver.getDrawable()):
+                    self._process(drawable)
+            
+            def didSetImageBitmap(self, tag, key, drawable):
+                if drawable:
+                    self._process(drawable)
+
+        receiver = ImageReceiver(fragment.getFragmentView()); receiver.setDelegate(HighQualityAvatarDelegate(self, fragment, dialog_id))
+        receiver.setImage(image_loc, "200_200", None, "png", 0, 1)
+
+    def on_plugin_load(self):
+        self.main_handler = Handler(Looper.getMainLooper())
+        try:
+            base_dir = ApplicationLoader.getFilesDirFixed(); plugin_folder = File(base_dir, self.id)
+            if not plugin_folder.exists(): plugin_folder.mkdirs()
+            self._plugin_dir_path = plugin_folder.getAbsolutePath()
+        except Exception as e: log(f"[{self.id}] Error initializing directory: {e}")
+        try:
+            BaseFragmentClass = find_class("org.telegram.ui.ActionBar.BaseFragment")
+            if BaseFragmentClass:
+                resume_method = BaseFragmentClass.getClass().getDeclaredMethod("onResume")
+                self.fragment_resume_hook = self.hook_method(resume_method, self.FragmentResumeHook(self))
+        except Exception as e: log(f"[{self.id}] Failed to set up hooks: {e}\n{traceback.format_exc()}")
+
+    def on_plugin_unload(self):
+        if self.fragment_resume_hook: self.unhook_method(self.fragment_resume_hook)
+        if self.main_handler: self.main_handler.removeCallbacksAndMessages(None)
+        try:
+            if (fragment := get_last_fragment()) and hasattr(fragment, 'getActionBar') and (action_bar := fragment.getActionBar()):
+                drawable_to_set = ColorDrawable(Color.TRANSPARENT) if fragment.getClass().getName() in self.BLACKLISTED_FRAGMENTS else ColorDrawable(Theme.getColor(Theme.key_actionBarDefault))
+                run_on_ui_thread(lambda: action_bar.setBackgroundDrawable(drawable_to_set))
+        except Exception: pass
+        with self.cache_lock: self.bitmap_cache.clear()
+
+    def create_settings(self) -> List[Any]:
+        file_path = self.get_setting("banner_internal_path", "")
+        file_info = os.path.basename(file_path) if file_path and os.path.exists(file_path) else "Изображение не выбрано"
+        return [
+            Header(text="Основные настройки"),
+            Switch(key="display_everywhere", text="Отображать везде", default=False, subtext="Показывать баннер на всех экранах, кроме чёрного списка.", icon="msg_chats", on_change=self._on_settings_change),
+            Header(text="Источник баннера"),
+            Switch(key="use_chat_avatars", text="Аватарки в чатах", default=False, subtext="Использовать аватарки чатов/каналов в качестве фона.", icon="msg_channel", on_change=self._on_settings_change),
+            Switch(key="blur_avatars", text="Размытие аватарок", default=False, subtext="Фон у аватарок будет размытым. Не требует загрузки HQ.", icon="msg_effects", on_change=self._on_settings_change),
+            Switch(key="load_hq_avatars", text="Загружать HQ аватарки", default=True, subtext="Подгружать аватарки в высоком качестве (больше трафика).", icon="msg_data"),
+            Text(text="Выбрать свой баннер", icon="msg_gallery", on_click=self._launch_file_picker),
+            Divider("Этот баннер будет использоваться по умолчанию."),
+            Text(text="Удалить свой баннер", icon="msg_delete", red=True, on_click=self._delete_image),
+            Header(text="Внешний вид"),
+            Selector(key="banner_crop_style", text="Обрезать изображение", default=1, items=["Сверху", "По центру", "Снизу"], icon="msg_crop", on_change=self._on_settings_change),
+            Divider(), Text(text="Информация о файле:", icon="msg_info"), Divider(file_info),
+        ]
+
+    def _on_settings_change(self, _=None):
+        self.fragments_to_ignore.clear()
+        with self.cache_lock: self.bitmap_cache.clear()
+        self._request_banner_update()
+
+    def _request_banner_update(self, fragment: Optional[BaseFragment] = None, _=None):
+        target_fragment = fragment if fragment else get_last_fragment()
+        if not target_fragment or not self.main_handler: return
+        class UpdateRunnable(dynamic_proxy(Runnable)):
+            def __init__(self, plugin_ref, fragment_ref): super().__init__(); self.plugin, self.fragment = plugin_ref, fragment_ref
+            def run(self):
+                if self.fragment: self.plugin._update_banner_for_fragment(self.fragment)
+        self.main_handler.postDelayed(UpdateRunnable(self, target_fragment), 200)
+
+    def _launch_file_picker(self, view=None):
+        if self.is_processing_file:
+            BulletinHelper.show_error("Пожалуйста, подождите завершения предыдущей операции."); return
+        self.is_processing_file = True
+        try:
+            fragment = get_last_fragment()
+            if not (fragment and (activity := fragment.getParentActivity())):
+                raise RuntimeError("Не удалось получить текущий экран.")
+            if self.activity_hook: self.unhook_method(self.activity_hook)
+            method = activity.getClass().getDeclaredMethod("onActivityResult", Integer.TYPE, Integer.TYPE, find_class("android.content.Intent"))
+            self.activity_hook = self.hook_method(method, self.ActivityResultHook(self))
+            intent = Intent(Intent.ACTION_GET_CONTENT).setType("image/*")
+            activity.startActivityForResult(Intent.createChooser(intent, "Выберите изображение"), self.FILE_PICKER_REQUEST_CODE)
+        except Exception as e:
+            if self.activity_hook: self.unhook_method(self.activity_hook); self.activity_hook = None
+            BulletinHelper.show_error(f"Не удалось запустить выбор файла: {e}"); self.is_processing_file = False
+
+    def _handle_file_picker_result(self, res_code, data):
+        if self.activity_hook: self.unhook_method(self.activity_hook); self.activity_hook = None
+        if res_code == Activity.RESULT_OK and data and data.getData(): run_on_queue(lambda: self._handle_file_uri(data.getData()))
+        else: self.is_processing_file = False
+
+    def _handle_file_uri(self, uri: Uri):
+        istream = None
+        ostream = None
+        try:
+            istream = ApplicationLoader.applicationContext.getContentResolver().openInputStream(uri)
+            if not istream:
+                raise IOError("Не удалось открыть поток для выбранного файла (InputStream is null).")
+            
+            destination_path = os.path.join(self._plugin_dir_path, "banner_image.png")
+            ostream = FileOutputStream(destination_path)
+            
+            buffer = jarray(jbyte)(8192)
+            bytes_read = istream.read(buffer)
+            while bytes_read != -1:
+                ostream.write(buffer, 0, bytes_read)
+                bytes_read = istream.read(buffer)
+            
+            ostream.flush()
+            run_on_ui_thread(lambda: self._update_settings_on_success(destination_path))
+            
+        except Exception as e:
+            log(f"[{self.id}] Ошибка в _handle_file_uri: {e}\n{traceback.format_exc()}")
+            run_on_ui_thread(lambda: self._on_file_process_fail("Ошибка обработки файла."))
+        finally:
+            try:
+                if istream: istream.close()
+                if ostream: ostream.close()
+            except Exception as close_e:
+                log(f"[{self.id}] Ошибка при закрытии потоков: {close_e}")
+            self.is_processing_file = False
+
+
+    def _on_file_process_fail(self, message: str):
+        BulletinHelper.show_error(message)
+
+    def _update_settings_on_success(self, file_path: str):
+        self.set_setting("banner_internal_path", file_path, reload_settings=True)
+        BulletinHelper.show_success("Изображение успешно установлено")
+        self._on_settings_change()
+
+    def _delete_image(self, view=None):
+        file_path = self.get_setting("banner_internal_path", "")
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except OSError: pass
+        self.set_setting("banner_internal_path", "", reload_settings=True)
+        BulletinHelper.show_success("Изображение удалено, баннер сброшен")
+        self._on_settings_change()
