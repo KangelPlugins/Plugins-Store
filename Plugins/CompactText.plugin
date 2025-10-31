@@ -1,0 +1,828 @@
+import time
+import os
+import threading
+import zipfile
+import json
+from datetime import datetime
+from typing import Any, Dict, List
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_account_instance, get_last_fragment, run_on_queue
+from android_utils import log, run_on_ui_thread, OnClickListener
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Switch, Selector, Divider, Input, Text
+from ui.bulletin import BulletinHelper
+from org.telegram.messenger import ApplicationLoader, SendMessagesHelper, AndroidUtilities
+from org.telegram.ui.Components import EditTextBoldCursor
+from org.telegram.ui.ActionBar import Theme
+from android.text import InputType
+from android.util import TypedValue
+from android.widget import LinearLayout, TextView
+from java.io import File
+
+__id__ = "compact_text"
+__name__ = "Compact Text"
+__description__ = "Пакует длинные сообщения в файл (порог и тип файла в натройках)"
+__author__ = "@incLu_01 and @buligaEplugins"
+__version__ = "1.0.0-beta"
+__icon__ = "BuligaPlugins/0"
+__min_version__ = "11.9.0"
+
+DEFAULT_THRESHOLD = 5000
+COLLECT_DELAY = 0.05
+TEMP_DIR_NAME = "CompactText"
+
+
+class CompactText(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.message_parts: Dict[int, List[str]] = {}
+        self.collect_timers: Dict[int, threading.Timer] = {}
+        self.params_cache: Dict[int, Any] = {}
+        # lock to protect presets save/load operations (thread-safety)
+        self._presets_lock = threading.Lock()
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook(priority=100)
+        log(f"[CompactText] v{__version__} loaded")
+
+    def create_settings(self):
+        """
+        Возвращает динамический набор пунктов настроек.
+        Берёт заготовки прямо из настроек при каждом вызове — поэтому
+        при корректной перезагрузке страницы настроек изменения будут видны мгновенно.
+        """
+        items = [
+            Header(text="⚙️ Настройки Compact Text"),
+            Switch(key="show_dialog", text="Диалог переименования", default=True, subtext="Показывать окно для редактирования имени файла перед отправкой"),
+            Divider(),
+            Header(text="📊 Порог длины сообщения"),
+            Input(key="threshold", text="Порог символов (500-50000)", default=str(DEFAULT_THRESHOLD), subtext="Сообщения длиннее этого значения будут упакованы в файл"),
+            Divider(),
+            Header(text="📄 Формат файла"),
+            Selector(key="file_format", text="Тип файла", default=0, items=["TXT", "DOCX", "Custom"]),
+        ]
+        fmt = self._get_int_setting("file_format", 0)
+        if fmt == 2:
+            items.append(Input(key="custom_ext", text="Своё расширение (без точки)", default="txt"))
+        # Заготовки расширений
+        items.append(Divider())
+        items.append(Header(text="📝 Заготовки расширений"))
+
+        presets = self._get_presets()
+        log(f"[CompactText] create_settings: Loaded {len(presets)} presets")
+
+        if len(presets) == 0:
+            items.append(Text(
+                text="Пусто (Нажмите ниже, чтобы добавить первую заготовку)"
+            ))
+        else:
+            for i, (pname, pext) in enumerate(presets):
+                log(f"[CompactText] Adding preset {i}: {pname} (.{pext})")
+                # создаём handler, который удалит заготовку и сразу обновит интерфейс настроек
+                def make_onclick(index):
+                    def handler(v):
+                        self._confirm_delete_preset(index)
+                    return handler
+                items.append(Text(
+                    text=f"{pname} (.{pext}) - Нажмите, чтобы удалить",
+                    icon="msg_delete",
+                    on_click=make_onclick(i)
+                ))
+
+        if len(presets) < 20:
+            items.append(Text(
+                text="Добавить заготовку",
+                icon="msg_add",
+                accent=True,
+                on_click=lambda v: self._show_add_preset_dialog()
+            ))
+        else:
+            items.append(Text(
+                text="Достигнут лимит (20). Удалите лишние"
+            ))
+        # Прочие настройки
+        items.extend([
+            Divider(),
+            Header(text="📏 Отображение размера"),
+            Selector(key="size_unit", text="Единица измерения", default=0, items=["Килобайты (КБ)", "Мегабайты (МБ)"]),
+            Divider(),
+            Header(text="🕐 Формат времени в имени файла"),
+            Switch(key="include_sec", text="Включить секунды", default=True, subtext="[ЧЧ.ММ.СС] вместо [ЧЧ.ММ]")
+        ])
+        if self._get_bool_setting("include_sec", True):
+            items.append(Switch(key="include_ms", text="Включить миллисекунды", default=False, subtext="[ЧЧ.ММ.СС.МС]"))
+        return items
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+        message = params.message
+        peer_id = params.peer
+        if peer_id in self.message_parts:
+            self.message_parts[peer_id].append(message)
+            self.params_cache[peer_id] = params
+            self._restart_timer(peer_id)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        threshold = self._get_threshold()
+        if len(message) >= threshold:
+            self.message_parts[peer_id] = [message]
+            self.params_cache[peer_id] = params
+            self._restart_timer(peer_id)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
+
+    def _restart_timer(self, peer_id: int):
+        if peer_id in self.collect_timers:
+            try:
+                self.collect_timers[peer_id].cancel()
+            except Exception:
+                pass
+        t = threading.Timer(COLLECT_DELAY, self._send_collected_parts, args=(peer_id,))
+        self.collect_timers[peer_id] = t
+        t.start()
+
+    def _send_collected_parts(self, peer_id: int):
+        if peer_id not in self.message_parts:
+            return
+        parts = self.message_parts.get(peer_id)
+        params = self.params_cache.get(peer_id)
+        if not params or not parts:
+            self._cleanup_peer(peer_id)
+            return
+        full_text = "".join(parts)
+        self._cleanup_peer(peer_id)
+        run_on_queue(lambda: self._prepare_and_send_file(full_text, params, peer_id))
+
+    def _cleanup_peer(self, peer_id: int):
+        self.message_parts.pop(peer_id, None)
+        self.params_cache.pop(peer_id, None)
+        if peer_id in self.collect_timers:
+            try:
+                self.collect_timers[peer_id].cancel()
+            except Exception:
+                pass
+            try:
+                del self.collect_timers[peer_id]
+            except Exception:
+                pass
+
+    def _prepare_and_send_file(self, text: str, params: Any, peer_id: int):
+        try:
+            default_filename = self._generate_filename(peer_id)
+            show_dlg = self._get_bool_setting("show_dialog", True)
+            log(f"[CompactText] show_dialog={show_dlg}, filename={default_filename}")
+            if show_dlg:
+                run_on_ui_thread(lambda: self._show_filename_dialog(text, params, default_filename))
+            else:
+                self._create_and_send_file(text, params, default_filename)
+        except Exception as e:
+            log(f"[CompactText] prepare error: {e}")
+            import traceback
+            log(traceback.format_exc())
+
+    def _generate_filename(self, peer_id: int) -> str:
+        now = datetime.now()
+        if peer_id < 0:
+            cid = str(abs(peer_id))
+            if cid.startswith("100"):
+                cid = cid[3:]
+        else:
+            cid = str(peer_id)
+        date_str = now.strftime("%d.%m.%Y")
+        include_sec = self._get_bool_setting("include_sec", True)
+        include_ms = self._get_bool_setting("include_ms", False) if include_sec else False
+        if include_ms and include_sec:
+            ms = int(now.microsecond / 1000)
+            time_str = now.strftime("%H.%M.%S") + f".{ms:03d}"
+        elif include_sec:
+            time_str = now.strftime("%H.%M.%S")
+        else:
+            time_str = now.strftime("%H.%M")
+        fmt = self._get_int_setting("file_format", 0)
+        if fmt == 0:
+            ext = "txt"
+        elif fmt == 1:
+            ext = "docx"
+        else:
+            ext = str(self.get_setting("custom_ext", "txt")).strip().lstrip(".") or "txt"
+        return f"{cid}_{date_str}_{time_str}.{ext}"
+
+    def _show_filename_dialog(self, text: str, params: Any, default_filename: str):
+        try:
+            log("[CompactText] showing dialog...")
+            frag = get_last_fragment()
+            if not frag:
+                log("[CompactText] no fragment, sending without dialog")
+                run_on_queue(lambda: self._create_and_send_file(text, params, default_filename))
+                return
+            act = frag.getParentActivity()
+            if not act:
+                log("[CompactText] no activity, sending without dialog")
+                run_on_queue(lambda: self._create_and_send_file(text, params, default_filename))
+                return
+            log("[CompactText] building dialog UI...")
+            size_str = self._format_file_size(len(text))
+            if "." in default_filename:
+                base = default_filename.rsplit(".", 1)[0]
+                ext = "." + default_filename.rsplit(".", 1)[1]
+            else:
+                base = default_filename
+                ext = ""
+            # Текущее выбранное расширение в диалоге (с точкой)
+            selected_ext = [ext]
+            container = LinearLayout(act)
+            container.setOrientation(LinearLayout.VERTICAL)
+            container.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(10), AndroidUtilities.dp(24), AndroidUtilities.dp(10))
+            inp = EditTextBoldCursor(act)
+            inp.setHint("Имя файла (без расширения)")
+            inp.setText(base)
+            inp.setInputType(InputType.TYPE_CLASS_TEXT)
+            inp.setMaxLines(1)
+            inp.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            inp.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(12))
+            inp.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            inp.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            inp.setBackgroundColor(Theme.getColor(Theme.key_dialogInputField))
+            ext_tv = TextView(act)
+            ext_tv.setText(f"Расширение: {selected_ext[0]}")
+            ext_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            ext_tv.setTextColor(Theme.getColor(Theme.key_dialogTextGray2))
+            ext_tv.setPadding(0, AndroidUtilities.dp(8), 0, 0)
+            clear_tv = TextView(act)
+            clear_tv.setText("Очистить поле")
+            clear_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            clear_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlue2))
+            clear_tv.setPadding(0, AndroidUtilities.dp(8), 0, 0)
+            def _on_clear(v):
+                try:
+                    inp.setText("")
+                except Exception:
+                    pass
+            clear_tv.setOnClickListener(OnClickListener(_on_clear))
+
+            change_ext_tv = TextView(act)
+            change_ext_tv.setText("Изменить расширение")
+            change_ext_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            change_ext_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlue2))
+            change_ext_tv.setPadding(0, AndroidUtilities.dp(8), 0, 0)
+            def _on_change_ext(v):
+                try:
+                    self._show_extension_dialog(act, ext_tv, selected_ext)
+                except Exception as e:
+                    log(f"[CompactText] ext dialog error: {e}")
+            change_ext_tv.setOnClickListener(OnClickListener(_on_change_ext))
+
+            send_msgs_tv = TextView(act)
+            send_msgs_tv.setText("Отправить сообщениями")
+            send_msgs_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            send_msgs_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlue2))
+            send_msgs_tv.setPadding(0, AndroidUtilities.dp(8), 0, 0)
+            def _on_send_msgs(v):
+                try:
+                    bld.dismiss()
+                    self._send_as_messages(text, params)
+                except Exception as e:
+                    log(f"[CompactText] send msgs error: {e}")
+            send_msgs_tv.setOnClickListener(OnClickListener(_on_send_msgs))
+
+            container.addView(inp)
+            container.addView(ext_tv)
+            container.addView(clear_tv)
+            container.addView(change_ext_tv)
+            container.addView(send_msgs_tv)
+            bld = AlertDialogBuilder(act)
+            bld.set_title("Имя файла")
+            bld.set_message(f"Размер: {len(text)} символов ({size_str})")
+            bld.set_view(container)
+            def on_ok(b, w):
+                name = str(inp.getText()).strip() or base
+                cur_ext = selected_ext[0] if selected_ext[0] else ext
+                full = name + cur_ext
+                b.dismiss()
+                run_on_queue(lambda: self._create_and_send_file(text, params, full))
+            def on_cancel(b, w):
+                b.dismiss()
+            bld.set_positive_button("Отправить", on_ok)
+            bld.set_negative_button("Отмена", on_cancel)
+            bld.show()
+            log("[CompactText] dialog shown")
+        except Exception as e:
+            log(f"[CompactText] dialog error: {e}")
+            import traceback
+            log(traceback.format_exc())
+            run_on_queue(lambda: self._create_and_send_file(text, params, default_filename))
+
+    def _show_extension_dialog(self, act, ext_tv, selected_ext_ref):
+        try:
+            ext_builder = AlertDialogBuilder(act)
+            ext_builder.set_title("Выбор расширения")
+
+            options = ["TXT", "DOCX"]
+            presets = self._get_presets()
+            for preset in presets:
+                options.append(preset[0])
+            options.append("Custom (своё)")
+
+            def on_item_click(b, which):
+                b.dismiss()
+                if which == 0:
+                    ext_tv.setText("Расширение: .txt")
+                    self._show_apply_choice_dialog(act, ".txt", False, "", selected_ext_ref)
+                elif which == 1:
+                    ext_tv.setText("Расширение: .docx")
+                    self._show_apply_choice_dialog(act, ".docx", False, "", selected_ext_ref)
+                elif which == len(options) - 1:
+                    self._show_custom_extension_dialog(act, ext_tv, selected_ext_ref)
+                else:
+                    preset = presets[which - 2]
+                    ext_tv.setText(f"Расширение: .{preset[1]}")
+                    self._show_apply_choice_dialog(act, f".{preset[1]}", True, preset[1], selected_ext_ref)
+
+            ext_builder.set_items(options, on_item_click)
+            ext_builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            ext_builder.show()
+        except Exception as e:
+            log(f"[CompactText] ext dialog error: {e}")
+            import traceback
+            log(traceback.format_exc())
+
+    def _show_custom_extension_dialog(self, act, ext_tv, selected_ext_ref):
+        try:
+            custom_builder = AlertDialogBuilder(act)
+            custom_builder.set_title("Своё расширение")
+            custom_builder.set_message("Введите расширение без точки (например: md, json, log)")
+
+            custom_input = EditTextBoldCursor(act)
+            custom_input.setHint("Расширение")
+            custom_input.setInputType(InputType.TYPE_CLASS_TEXT)
+            custom_input.setMaxLines(1)
+            custom_input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            custom_input.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(12))
+            custom_input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            custom_input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            custom_input.setBackgroundColor(Theme.getColor(Theme.key_dialogInputField))
+            custom_builder.set_view(custom_input)
+
+            def on_ok(b, w):
+                custom_ext = str(custom_input.getText()).strip().lstrip(".")
+                if custom_ext:
+                    b.dismiss()
+                    ext_tv.setText(f"Расширение: .{custom_ext}")
+                    self._show_apply_choice_dialog(act, f".{custom_ext}", True, custom_ext, selected_ext_ref)
+
+            custom_builder.set_positive_button("OK", on_ok)
+            custom_builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            custom_builder.show()
+        except Exception as e:
+            log(f"[CompactText] custom ext error: {e}")
+
+    def _show_apply_choice_dialog(self, act, new_ext: str, is_custom: bool = False, custom_value: str = "", selected_ext_ref=None):
+        try:
+            choice_builder = AlertDialogBuilder(act)
+            choice_builder.set_title("Применить изменение")
+            choice_builder.set_message("Как применить выбранное расширение?\n\n(Настройки всегда можно изменить в разделе плагина)")
+
+            def on_temp(b, w):
+                b.dismiss()
+                try:
+                    if selected_ext_ref is not None:
+                        selected_ext_ref[0] = new_ext
+                    log(f"[CompactText] Extension changed temporarily to {new_ext}")
+                except Exception:
+                    pass
+
+            def on_permanent(b, w):
+                try:
+                    if is_custom:
+                        self.set_setting("file_format", 2)
+                        self.set_setting("custom_ext", custom_value)
+                        log(f"[CompactText] Saved custom extension: {custom_value}")
+                    else:
+                        if new_ext == ".txt":
+                            self.set_setting("file_format", 0)
+                        elif new_ext == ".docx":
+                            self.set_setting("file_format", 1)
+                        log(f"[CompactText] Saved format permanently: {new_ext}")
+                    if selected_ext_ref is not None:
+                        selected_ext_ref[0] = new_ext
+                    b.dismiss()
+                    # сразу обновляем UI настроек, чтобы пользователь увидел изменение
+                    self._reload_settings()
+                except Exception as e:
+                    log(f"[CompactText] save settings error: {e}")
+
+            choice_builder.set_positive_button("Изменить навсегда", on_permanent)
+            choice_builder.set_negative_button("Только в этот раз", on_temp)
+            choice_builder.show()
+        except Exception as e:
+            log(f"[CompactText] apply choice error: {e}")
+
+    def _format_file_size(self, size_bytes: int) -> str:
+        unit = self._get_int_setting("size_unit", 0)
+        if unit == 0:
+            return f"{size_bytes/1024:.2f} КБ"
+        mb = size_bytes/(1024*1024)
+        return f"{mb:.3f} МБ" if mb < 1 else f"{mb:.2f} МБ"
+
+    def _create_and_send_file(self, text: str, params: Any, filename: str):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            plugin_dir = File(ctx.getExternalCacheDir(), TEMP_DIR_NAME)
+            if not plugin_dir.exists():
+                plugin_dir.mkdirs()
+            path = File(plugin_dir, filename).getAbsolutePath()
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
+            mime = "text/plain"
+            if ext == "docx":
+                ok = self._create_docx(text, path)
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                if not ok:
+                    # fallback: write as plain text if docx creation failed
+                    self._write_bytes(path, text.encode("utf-8"))
+                    mime = "text/plain"
+            else:
+                self._write_bytes(path, text.encode("utf-8"))
+                mime = "text/plain"
+            account = get_account_instance()
+            dialog_id = params.peer
+            reply_to_msg = getattr(params, "replyToMsg", None)
+            reply_to_top_msg = getattr(params, "replyToTopMsg", None)
+
+            def send_doc():
+                try:
+                    SendMessagesHelper.prepareSendingDocument(account, path, path, None, None, mime, dialog_id, reply_to_msg, reply_to_top_msg, None, None, None, True, 0, None, None, 0, False)
+                    log(f"[CompactText] sent: {filename}")
+                    time.sleep(0.1)
+                    self._clear_input_field_safe()
+                except Exception as e:
+                    log(f"[CompactText] send error: {e}")
+
+            run_on_ui_thread(send_doc)
+        except Exception as e:
+            log(f"[CompactText] create/send error: {e}")
+
+    def _write_bytes(self, path: str, data: bytes):
+        # Пишем файл в бинарном режиме
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def _create_docx(self, text: str, path: str) -> bool:
+        try:
+            buf = []
+            # Собираем document.xml с сохранением пробелов
+            for para in text.splitlines() or [text]:
+                esc = (para.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+                buf.append(f"<w:p><w:r><w:t xml:space=\"preserve\">{esc}</w:t></w:r></w:p>")
+            document_xml = "".join([
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+                "<w:body>",
+                "".join(buf),
+                "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"/></w:sectPr>",
+                "</w:body></w:document>"
+            ])
+            content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+ <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+            rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"""
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                z.writestr("[Content_Types].xml", content_types)
+                z.writestr("_rels/.rels", rels)
+                z.writestr("word/document.xml", document_xml)
+            return True
+        except Exception as e:
+            log(f"[CompactText] docx error: {e}")
+            return False
+
+    def _get_bool_setting(self, key: str, default: bool) -> bool:
+        try:
+            v = self.get_setting(key, default)
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            if isinstance(v, str):
+                s = v.strip().lower()
+                if s in ("1", "true", "on", "yes", "y"):
+                    return True
+                if s in ("0", "false", "off", "no", "n"):
+                    return False
+                return default
+            return default
+        except Exception:
+            return default
+
+    def _get_threshold(self) -> int:
+        try:
+            val = self.get_setting("threshold", DEFAULT_THRESHOLD)
+            if isinstance(val, int):
+                threshold = val
+            else:
+                threshold = int(str(val).strip())
+            if threshold < 500:
+                threshold = 500
+            elif threshold > 50000:
+                threshold = 50000
+            return threshold
+        except Exception:
+            return DEFAULT_THRESHOLD
+
+    def _get_presets(self) -> List[tuple]:
+        # Читаем заготовки из настроек. Поддерживаем как список словарей, так и JSON-строку.
+        try:
+            raw = self.get_setting("presets_json", [])
+            arr = []
+            if isinstance(raw, str):
+                try:
+                    arr = json.loads(raw)
+                except Exception:
+                    arr = []
+            elif isinstance(raw, (list, tuple)):
+                arr = list(raw)
+            out = []
+            for it in arr:
+                if isinstance(it, dict):
+                    name = str(it.get("name", "")).strip()
+                    ext = str(it.get("ext", "")).strip().lstrip(".")
+                elif isinstance(it, (list, tuple)) and len(it) >= 2:
+                    name = str(it[0]).strip()
+                    ext = str(it[1]).strip().lstrip(".")
+                else:
+                    continue
+                if name and ext:
+                    out.append((name, ext))
+            log(f"[CompactText] _get_presets returning {len(out)} items")
+            return out[:20]
+        except Exception as e:
+            log(f"[CompactText] _get_presets error: {e}")
+            return []
+
+    def _save_presets(self, presets: List[tuple]):
+        try:
+            with self._presets_lock:
+                data = [{"name": n, "ext": e} for n, e in presets[:20]]
+                # Сохраняем как структурированный список, чтобы get_setting возвращал List, а не строку
+                self.set_setting("presets_json", data)
+                log(f"[CompactText] Saved {len(presets)} presets")
+            # непосредственное обновление UI настроек — теперь изменения применяются сразу
+            self._reload_settings()
+        except Exception as e:
+            log(f"[CompactText] _save_presets error: {e}")
+
+    def _make_delete_preset_handler(self, idx: int):
+        def handler(v):
+            self._confirm_delete_preset(idx)
+        return handler
+
+    def _reload_settings(self):
+        """Перезагружает настройки плагина для отображения изменений.
+        Пытаемся найти любой фрагмент настроек и вызвать у него reloadSettings().
+        Этот метод безопасно вызывает UI-операции в главном потоке.
+        """
+        try:
+            def reload():
+                try:
+                    frag = get_last_fragment()
+                    tried = set()
+                    # 1) Попытка на последнем фрагменте
+                    if frag and hasattr(frag, "reloadSettings"):
+                        try:
+                            frag.reloadSettings()
+                            log("[CompactText] Settings reloaded via last fragment")
+                        except Exception:
+                            log("[CompactText] reloadSettings call on last fragment failed")
+                    # 2) Попытка через активность фрагмента
+                    try:
+                        if frag:
+                            activity = frag.getParentActivity()
+                            if activity:
+                                # try getCurrentFragment (custom Telegram UI)
+                                try:
+                                    if hasattr(activity, "getCurrentFragment"):
+                                        current_frag = activity.getCurrentFragment()
+                                        if current_frag and hasattr(current_frag, "reloadSettings"):
+                                            current_frag.reloadSettings()
+                                            log("[CompactText] Settings reloaded via activity.getCurrentFragment")
+                                except Exception:
+                                    pass
+                                # try support fragment manager
+                                try:
+                                    if hasattr(activity, "getSupportFragmentManager"):
+                                        fm = activity.getSupportFragmentManager()
+                                        if fm and hasattr(fm, "getFragments"):
+                                            fragments = fm.getFragments()
+                                            if fragments:
+                                                for f in fragments:
+                                                    if f and f not in tried:
+                                                        tried.add(f)
+                                                        try:
+                                                            if hasattr(f, "reloadSettings"):
+                                                                f.reloadSettings()
+                                                                log("[CompactText] Settings reloaded via support fragment manager")
+                                                        except Exception:
+                                                            pass
+                                except Exception:
+                                    pass
+                                # try framework fragment manager
+                                try:
+                                    if hasattr(activity, "getFragmentManager"):
+                                        fm2 = activity.getFragmentManager()
+                                        if fm2 and hasattr(fm2, "getFragments"):
+                                            fragments2 = fm2.getFragments()
+                                            if fragments2:
+                                                for f in fragments2:
+                                                    if f and f not in tried:
+                                                        tried.add(f)
+                                                        try:
+                                                            if hasattr(f, "reloadSettings"):
+                                                                f.reloadSettings()
+                                                                log("[CompactText] Settings reloaded via framework fragment manager")
+                                                        except Exception:
+                                                            pass
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    # 3) В качестве крайней меры: пробуем вызвать глобальную перерисовку UI (если доступно)
+                    try:
+                        app_ctx = ApplicationLoader.applicationContext
+                        if app_ctx and hasattr(app_ctx, "getSystemService"):
+                            # Попробуем invalidateOptionsMenu на видимой активности (если есть)
+                            # Это мягкая попытка триггернуть обновление UI
+                            try:
+                                if frag and hasattr(frag, "getParentActivity"):
+                                    act = frag.getParentActivity()
+                                    if act and hasattr(act, "invalidateOptionsMenu"):
+                                        act.invalidateOptionsMenu()
+                                        log("[CompactText] activity.invalidateOptionsMenu called")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log(f"[CompactText] reload settings error (inner): {e}")
+            run_on_ui_thread(reload)
+        except Exception as e:
+            log(f"[CompactText] reload settings error: {e}")
+
+    def _show_add_preset_dialog(self):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity():
+                return
+            act = frag.getParentActivity()
+            presets = self._get_presets()
+            if len(presets) >= 20:
+                BulletinHelper.show_error("Достигнут лимит заготовок (20)")
+                return
+            ll = LinearLayout(act)
+            ll.setOrientation(LinearLayout.VERTICAL)
+            ll.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(10), AndroidUtilities.dp(24), AndroidUtilities.dp(10))
+            name_inp = EditTextBoldCursor(act)
+            name_inp.setHint("Название заготовки")
+            name_inp.setMaxLines(1)
+            name_inp.setInputType(InputType.TYPE_CLASS_TEXT)
+            name_inp.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            name_inp.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(12))
+            ext_inp = EditTextBoldCursor(act)
+            ext_inp.setHint("Расширение (без точки)")
+            ext_inp.setMaxLines(1)
+            ext_inp.setInputType(InputType.TYPE_CLASS_TEXT)
+            ext_inp.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            ext_inp.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(12))
+            ll.addView(name_inp)
+            ll.addView(ext_inp)
+            b = AlertDialogBuilder(act)
+            b.set_title("Новая заготовка")
+            b.set_view(ll)
+
+            def on_ok(dlg, w):
+                name = str(name_inp.getText()).strip()
+                ext = str(ext_inp.getText()).strip().lstrip(".")
+                if not name or not ext:
+                    BulletinHelper.show_error("Укажите название и расширение")
+                    return
+                presets2 = self._get_presets()
+                presets2.append((name, ext))
+                log(f"[CompactText] Adding preset: {name} (.{ext})")
+                self._save_presets(presets2)
+                dlg.dismiss()
+                BulletinHelper.show_success("Заготовка добавлена")
+
+            b.set_positive_button("Добавить", on_ok)
+            b.set_negative_button("Отмена", lambda d, w: d.dismiss())
+            b.show()
+        except Exception as e:
+            log(f"[CompactText] add preset error: {e}")
+
+    def _confirm_delete_preset(self, idx: int):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity():
+                return
+            act = frag.getParentActivity()
+            presets = self._get_presets()
+            if idx < 0 or idx >= len(presets):
+                return
+            name, ext = presets[idx]
+            b = AlertDialogBuilder(act)
+            b.set_title("Удалить заготовку")
+            b.set_message(f"Удалить '{name} (.{ext})'?")
+
+            def on_yes(dlg, w):
+                presets2 = self._get_presets()
+                if idx < len(presets2):
+                    removed = presets2.pop(idx)
+                    log(f"[CompactText] Removing preset at {idx}: {removed}")
+                    self._save_presets(presets2)
+                    dlg.dismiss()
+                    BulletinHelper.show_success("Удалено")
+
+            b.set_positive_button("Удалить", on_yes)
+            b.set_negative_button("Отмена", lambda d, w: d.dismiss())
+            b.show()
+        except Exception as e:
+            log(f"[CompactText] delete preset error: {e}")
+
+    def _send_as_messages(self, text: str, params: Any):
+        try:
+            threshold = self._get_threshold()
+            chunks = []
+            current = ""
+            for line in text.splitlines() or [text]:
+                # добавляем строку в текущий кусок если поместится
+                if len(current) + len(line) + (1 if current else 0) <= threshold:
+                    current = (current + ("\n" if current else "") + line)
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = line
+            if current:
+                chunks.append(current)
+
+            if not chunks:
+                chunks = [text]
+
+            log(f"[CompactText] Sending {len(chunks)} messages")
+            from client_utils import send_message
+            dialog_id = params.peer
+            reply_to_msg = getattr(params, "replyToMsg", None)
+            reply_to_top_msg = getattr(params, "replyToTopMsg", None)
+
+            def send_chunk(msg_text):
+                send_message({
+                    "message": msg_text,
+                    "peer": dialog_id,
+                    "replyToMsg": reply_to_msg,
+                    "replyToTopMsg": reply_to_top_msg,
+                })
+
+            for i, chunk in enumerate(chunks):
+                run_on_ui_thread(lambda txt=chunk: send_chunk(txt))
+                if i < len(chunks) - 1:
+                    time.sleep(0.05)
+
+            run_on_ui_thread(self._clear_input_field_safe)
+        except Exception as e:
+            log(f"[CompactText] send as messages error: {e}")
+            import traceback
+            log(traceback.format_exc())
+
+    def _clear_input_field_safe(self):
+        try:
+            frag = get_last_fragment()
+            if not frag:
+                return
+            enter_getter = getattr(frag, 'getChatActivityEnterView', None)
+            if enter_getter is None:
+                return
+            enter = enter_getter()
+            if enter is not None:
+                enter.setFieldText("")
+        except Exception as e:
+            log(f"[CompactText] clear input error: {e}")
+
+    def _get_int_setting(self, key: str, default: int) -> int:
+        try:
+            v = self.get_setting(key, default)
+            if isinstance(v, int):
+                return v
+            s = str(v).strip()
+            try:
+                return int(s)
+            except Exception:
+                s_low = s.lower()
+                if key == "file_format":
+                    if s_low in ("txt", "text"): return 0
+                    if s_low in ("docx", "word"): return 1
+                    if s_low in ("custom", "other"): return 2
+                return default
+        except Exception:
+            return default

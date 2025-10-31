@@ -1,0 +1,848 @@
+__id__ = "send_file_text"
+__name__ = "FileText"
+__author__ = "@RnPlugins with @PluginIDE"
+__version__ = "1.0.1"
+__description__ = """Добавляет в контекстное меню отправки сообщения (удержи кнопку отправки) пункт **«Отправить файлом»** — введённый текст будет отправлен как **.txt** файл.
+
+Adds a **“Send as file”** option to the message send context menu (hold the send button). The entered text will be sent as a **.txt** file."""
+
+__icon__ = "sPluginIDE/8"
+__min_version__ = "11.12.1"
+
+# Сгенерировано в PluginIDE - @PluginIDE
+
+from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, run_on_queue
+from android_utils import run_on_ui_thread, log as logcat
+from ui.settings import Header, Input, Divider, Text, Switch, Selector
+
+from java.io import File, FileOutputStream
+from java import jlong, dynamic_proxy
+from java.lang import Runnable
+from java.util import Locale, ArrayList
+
+from hook_utils import get_private_field
+from com.exteragram.messenger.plugins import PluginsController
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+
+# UI / Telegram classes
+from org.telegram.ui import ChatActivity, MessageSendPreview
+from org.telegram.ui.Components import ItemOptions
+from org.telegram.messenger import (
+    ApplicationLoader, AndroidUtilities, SendMessagesHelper, AccountInstance, R, MessageObject
+)
+from android.net import Uri  # оставлено про запас
+from android.view import View
+
+
+def _log(msg: str):
+    logcat(f"[send_file_text] {msg}")
+
+
+class RunnableFactory(dynamic_proxy(Runnable)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception as e:
+            _log(f"Runnable error: {e}")
+
+
+class TelegramUtils:
+    @staticmethod
+    def get_fixed_icon_id() -> int:
+        return R.drawable.msg_sendfile
+
+
+class _SetItemOptionsHook(MethodHook):
+    """
+    Добавляем пункт в меню долгого нажатия на кнопку отправки.
+    Фильтруем дубли: на каждый экземпляр ItemOptions добавляем только один раз.
+    """
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self._icon_id = 0
+
+    def before_hooked_method(self, param):
+        try:
+            options = param.args[0] if param and hasattr(param, "args") and param.args else None
+            if not options:
+                return
+
+            # Сохраняем актуальный MessageSendPreview, чтобы принудительно схлопывать его позже
+            try:
+                self.plugin._last_preview = param.thisObject
+            except Exception:
+                pass
+
+            # Если пришел новый экземпляр меню — сбросим флаг "добавлено"
+            if getattr(self.plugin, "_last_item_options", None) is not options:
+                self.plugin._last_item_options = options
+                self.plugin._menu_item_added = False
+
+            # Добавляем пункт только если ещё не добавляли на этот экземпляр меню
+            if getattr(self.plugin, "_menu_item_added", False):
+                return
+
+            if not self.plugin._has_text_to_send():
+                return
+
+            title = self.plugin._get_title()
+            if not self._icon_id:
+                self._icon_id = TelegramUtils.get_fixed_icon_id()
+
+            # Оборачиваем действие так, чтобы закрывать именно текущее меню (options), а не полагаться на last-ref.
+            action = RunnableFactory(lambda opts=options: self.plugin._on_send_as_file_click(opts))
+
+            if self._icon_id > 0:
+                options.add(self._icon_id, title, action)
+            else:
+                options.add(title, action)
+
+            self.plugin._menu_item_added = True
+
+            # Пункт "Настройки" (по нажатию сворачиваем меню и открываем настройки)
+            settings_action = RunnableFactory(lambda opts=options: self.plugin._open_plugin_settings(opts))
+            if self._icon_id > 0:
+                options.add(self._icon_id, self.plugin._get_settings_title(), settings_action)
+            else:
+                options.add(self.plugin._get_settings_title(), settings_action)
+
+        except Exception as e:
+            _log(f"setItemOptions hook error: {e}")
+
+
+class ExamplePlugin(BasePlugin):
+    def on_plugin_load(self):
+        try:
+            set_item_options_hook = MessageSendPreview.getClass().getDeclaredMethod("setItemOptions", ItemOptions)
+            self.hook_method(set_item_options_hook, _SetItemOptionsHook(self))
+            self._busy = False
+            self._last_item_options = None
+            self._menu_item_added = False
+            self._last_preview = None
+            self._add_settings_menu_item()
+        except Exception as e:
+            self.log(f"Не удалось установить hook для меню: {e}")
+
+    # ---------- Settings (UI) ----------
+
+    def _is_ru(self) -> bool:
+        try:
+            return (Locale.getDefault().getLanguage() or "en").lower().startswith("ru")
+        except Exception:
+            return False
+
+    def create_settings(self):
+        """Создает страницу настроек плагина (RU/EN локализация)."""
+        ru = self._is_ru()
+
+        header = "Настройки отправки файлом" if ru else "Send-as-file settings"
+
+        label_ext = "Расширение файла" if ru else "File extension"
+        sub_ext = "По умолчанию: txt" if ru else "Default: txt"
+
+        label_name_fmt = "Формат названия файла" if ru else "File name pattern"
+        sub_name_fmt = (
+            "Переменные: {date} {time} {chars} {lines} {year} {month} {day} {hour} {minute} {second} {dialog_name}"
+            if ru else
+            "Variables: {date} {time} {chars} {lines} {year} {month} {day} {hour} {minute} {second} {dialog_name}"
+        )
+
+        label_sig = "Подпись к файлу (будет добавлена в конец)" if ru else "File signature (appended to content)"
+        sub_sig = (
+            "Переменные: {date} {time} {chars} {lines} {dialog_name}. Оставьте пустым чтобы отключить."
+            if ru else
+            "Variables: {date} {time} {chars} {lines} {dialog_name}. Leave empty to disable."
+        )
+
+        help_title = (
+            "Примеры переменных:" if ru else "Variables examples:"
+        )
+        help_lines = (
+            "{date} - дата (20241225)\n"
+            "{time} - время (143052)\n"
+            "{year} - год (2024)\n"
+            "{month} - месяц (12)\n"
+            "{day} - день (25)\n"
+            "{hour} - час (14)\n"
+            "{minute} - минута (30)\n"
+            "{second} - секунда (52)\n"
+            "{chars} - количество символов\n"
+            "{lines} - количество строк\n"
+            "{dialog_name} - имя диалога"
+            if ru else
+            "{date} - date (20241225)\n"
+            "{time} - time (143052)\n"
+            "{year} - year (2024)\n"
+            "{month} - month (12)\n"
+            "{day} - day (25)\n"
+            "{hour} - hour (14)\n"
+            "{minute} - minute (30)\n"
+            "{second} - second (52)\n"
+            "{chars} - characters count\n"
+            "{lines} - lines count\n"
+            "{dialog_name} - dialog name"
+        )
+
+        return [
+            Header(header),
+
+            Input(
+                key="file_extension",
+                text=label_ext,
+                default="txt",
+                subtext=sub_ext,
+                icon="msg_sendfile"
+            ),
+
+            Input(
+                key="file_name_format",
+                text=label_name_fmt,
+                default="message-{date}-{time}-{chars}-{lines}",
+                subtext=sub_name_fmt,
+                icon="group_edit_profile"
+            ),
+
+            Input(
+                key="file_signature",
+                text=label_sig,
+                default="",
+                subtext=sub_sig,
+                icon="profile_discuss"
+            ),
+
+            Divider(),
+            Header(help_title),
+            Divider(help_lines),
+        ]
+
+    def _add_settings_menu_item(self):
+        """Добавляет кнопку настроек в меню чата."""
+        try:
+            if getattr(self, "menu_item", None):
+                return
+            ru = self._is_ru()
+            self.menu_item = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text=("Настройки отправки файлом" if ru else "Send-as-file settings"),
+                icon="msg_settings_hw",
+                priority=5,
+                on_click=self._open_plugin_settings
+            ))
+        except Exception as e:
+            self.log(f"Не удалось добавить кнопку настроек в меню: {e}")
+
+    def _open_plugin_settings(self, context=None):
+        """
+        Открывает страницу настроек плагина.
+        ВАЖНО: сначала сворачиваем ItemOptions, иначе фрагмент настроек не откроется.
+        """
+        try:
+            # Если пришел текущий ItemOptions из контекстного меню — схлопнем его
+            opts = context if isinstance(context, ItemOptions) else None
+            self._collapse_menus(opts)
+
+            # Откроем настройки после короткой задержки, чтобы меню гарантированно закрылись
+            def delayed_open():
+                try:
+                    self._open_settings_activity()
+                except Exception as e:
+                    self.log(f"Ошибка при открытии настроек: {e}")
+
+            try:
+                AndroidUtilities.runOnUIThread(RunnableFactory(delayed_open), 120)
+            except Exception:
+                run_on_ui_thread(delayed_open)
+        except Exception as e:
+            self.log(f"Ошибка при открытии настроек плагина: {e}")
+
+    def _open_settings_activity(self):
+        """Инициализирует и отображает Activity с настройками."""
+        try:
+            java_plugin = PluginsController.getInstance().plugins.get(self.id)
+            last_fragment = get_last_fragment()
+            if last_fragment and java_plugin:
+                last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
+        except Exception as e:
+            self.log(f"Ошибка при отображении Activity настроек: {e}")
+
+    # ---------- Popup control ----------
+
+    def _dismiss_item_options(self, opts: ItemOptions = None):
+        try:
+            target = opts if opts is not None else getattr(self, "_last_item_options", None)
+            if target is None:
+                return
+            try:
+                target.dismiss()
+            except Exception:
+                try:
+                    popup = getattr(target, "actionBarPopupWindow", None)
+                    if popup is not None:
+                        try:
+                            try:
+                                popup.dismiss()
+                            except Exception:
+                                try:
+                                    popup.dismissWithAlphaAnimation()
+                                except Exception:
+                                    try:
+                                        popup.dismiss(True)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        finally:
+            self._last_item_options = None
+            self._menu_item_added = False
+
+    def _collapse_preview_force(self):
+        try:
+            preview = getattr(self, "_last_preview", None)
+            if preview is None:
+                return
+            for method_name, arg in (("dismiss", None), ("hide", None), ("dismissWithAlphaAnimation", None),
+                                     ("dismiss", True), ("dismiss", False)):
+                try:
+                    m = getattr(preview, method_name)
+                    if arg is None:
+                        m()
+                    else:
+                        m(arg)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _collapse_menus(self, opts: ItemOptions = None):
+        try:
+            self._dismiss_item_options(opts)
+            self._collapse_preview_force()
+        except Exception:
+            pass
+        run_on_ui_thread(lambda: (self._dismiss_item_options(opts), self._collapse_preview_force()))
+        try:
+            AndroidUtilities.runOnUIThread(RunnableFactory(lambda: (self._dismiss_item_options(opts), self._collapse_preview_force())), 120)
+        except Exception:
+            pass
+
+    # ---------- Reply panel control ----------
+
+    def _clear_reply_context_soft(self, chat_activity: ChatActivity):
+        """
+        Мягко снимает выбранный ответ из EnterView (без дёрганья клавиатуры).
+        """
+        if chat_activity is None:
+            return
+        enter_view = None
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+        except Exception:
+            enter_view = None
+        if enter_view is None:
+            return
+
+        # Самые частые сигнатуры
+        for args in (
+            (None, True, False),   # (message, animated, openKeyboard)
+            (None, False, False),
+            (None, False),
+            (None,),
+        ):
+            try:
+                getattr(enter_view, "setReplyingMessageObject")(*args)
+                return
+            except Exception:
+                pass
+
+    def _notify_message_sent_delegate(self, chat_activity: ChatActivity):
+        """
+        Триггерим стандартную логику после отправки через делегат EnterView, чтобы UI сам убрал reply как обычно.
+        """
+        if chat_activity is None:
+            return
+        enter_view = None
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+        except Exception:
+            enter_view = None
+        if enter_view is None:
+            return
+
+        delegate = None
+        try:
+            delegate = get_private_field(enter_view, "delegate")
+        except Exception:
+            delegate = None
+        if delegate is None:
+            return
+
+        # Пробуем распространённые сигнатуры onMessageSend(...)
+        for args in (
+            (None, True, 0, 0),
+            ("", True, 0, 0),
+            (None, True, 0),
+            ("", True, 0),
+        ):
+            try:
+                getattr(delegate, "onMessageSend")(*args)
+                return
+            except Exception:
+                continue
+
+    # ---------- Menu action ----------
+
+    def _clear_input_field(self, chat_activity: ChatActivity):
+        enter_view = None
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+        except Exception:
+            enter_view = None
+
+        if enter_view is None:
+            return
+
+        try:
+            enter_view.setFieldText("")
+            return
+        except Exception:
+            pass
+
+        try:
+            edit = enter_view.getEditField()
+            if edit is not None:
+                try:
+                    edit.setText("")
+                except Exception:
+                    pass
+                try:
+                    edit.setSelection(0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_send_as_file_click(self, options_instance: ItemOptions = None):
+        if getattr(self, "_busy", False):
+            return
+        self._busy = True
+
+        self._collapse_menus(options_instance)
+
+        try:
+            fragment = get_last_fragment()
+        except Exception:
+            fragment = None
+
+        if fragment is None or not isinstance(fragment, ChatActivity):
+            self._busy = False
+            return
+
+        text = self._get_current_input_text(fragment)
+        if not text or not str(text).strip():
+            self._busy = False
+            return
+
+        try:
+            self._clear_input_field(fragment)
+        except Exception:
+            pass
+
+        run_on_queue(lambda: self._prepare_and_send_txt(fragment, str(text)))
+
+    # -------- Helpers --------
+
+    def _get_title(self) -> str:
+        try:
+            lang = (Locale.getDefault().getLanguage() or "en").lower()
+        except Exception:
+            lang = "en"
+        ext = self.get_setting("file_extension", "txt") or "txt"
+        return ("Отправить файлом (.%s)" % ext) if lang.startswith("ru") else ("Send as file (.%s)" % ext)
+
+    def _get_settings_title(self) -> str:
+        try:
+            lang = (Locale.getDefault().getLanguage() or "en").lower()
+        except Exception:
+            lang = "en"
+        return "Настройки" if lang.startswith("ru") else "Settings"
+
+    def _safe_format(self, template: str, mapping: dict) -> str:
+        """
+        Безопасное форматирование: неизвестные плейсхолдеры оставляем как есть,
+        чтобы не было KeyError и 'подпись' работала всегда.
+        """
+        class SafeDict(dict):
+            def __missing__(self, key):
+                return "{" + key + "}"
+        try:
+            return str(template).format_map(SafeDict(mapping))
+        except Exception:
+            # На всякий случай, если внутри есть одинарные '{'
+            try:
+                fixed = str(template).replace("{", "{{").replace("}", "}}")
+                return fixed.format_map(SafeDict(mapping))
+            except Exception:
+                return str(template)
+
+    def _format_file_name(self, text: str, dialog_name: str = "") -> str:
+        """Форматирует название файла согласно настройкам пользователя."""
+        from datetime import datetime
+
+        # Получаем настройки
+        format_template = self.get_setting("file_name_format", "message-{date}-{time}-{chars}-{lines}") or "message-{date}-{time}-{chars}-{lines}"
+        extension = (self.get_setting("file_extension", "txt") or "txt").strip().lstrip(".")
+        if not extension:
+            extension = "txt"
+
+        # Подсчитываем статистику текста
+        chars_count = len(text or "")
+        lines_count = len((text or "").splitlines())
+
+        # Текущее время
+        now = datetime.now()
+
+        # Подстановка переменных
+        variables = dict(
+            date=now.strftime("%Y%m%d"),
+            time=now.strftime("%H%M%S"),
+            year=now.year,
+            month=now.month,
+            day=now.day,
+            hour=now.hour,
+            minute=now.minute,
+            second=now.second,
+            chars=chars_count,
+            lines=lines_count,
+            dialog_name=dialog_name or ""
+        )
+        formatted_name = self._safe_format(format_template, variables)
+
+        # Добавляем расширение
+        if not formatted_name.lower().endswith(f".{extension.lower()}"):
+            formatted_name = f"{formatted_name}.{extension}"
+
+        return formatted_name
+
+    def _format_file_signature(self, text: str, dialog_name: str = "") -> str:
+        """Форматирует подпись к файлу/сообщению согласно настройкам пользователя (по умолчанию пустая)."""
+        from datetime import datetime
+
+        signature_template = self.get_setting("file_signature", "") or ""
+
+        # Пустая строка — подпись отключена
+        if not str(signature_template).strip():
+            return ""
+
+        chars_count = len(text or "")
+        lines_count = len((text or "").splitlines())
+        now = datetime.now()
+
+        variables = dict(
+            date=now.strftime("%Y-%m-%d"),
+            time=now.strftime("%H:%M:%S"),
+            year=now.year,
+            month=now.month,
+            day=now.day,
+            hour=now.hour,
+            minute=now.minute,
+            second=now.second,
+            chars=chars_count,
+            lines=lines_count,
+            dialog_name=dialog_name or ""
+        )
+
+        return self._safe_format(signature_template, variables)
+
+    def _get_dialog_name(self, chat_activity: ChatActivity) -> str:
+        """Получает (приблизительное) название диалога."""
+        try:
+            dialog_id = chat_activity.getDialogId()
+            return "user" if dialog_id > 0 else "chat"
+        except Exception:
+            return "dialog"
+
+    def _has_text_to_send(self) -> bool:
+        fragment = get_last_fragment()
+        if fragment is None or not isinstance(fragment, ChatActivity):
+            return False
+        text = self._get_current_input_text(fragment)
+        return bool(text and str(text).strip())
+
+    def _get_current_input_text(self, chat_activity: ChatActivity) -> str:
+        enter_view = None
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+        except Exception:
+            enter_view = None
+
+        if enter_view is not None:
+            try:
+                txt = enter_view.getFieldText()
+                if txt is not None:
+                    return str(txt)
+            except Exception:
+                pass
+            try:
+                edit = enter_view.getEditField()
+                if edit is not None:
+                    t = edit.getText() if hasattr(edit, "getText") else None
+                    if t is not None:
+                        return str(t.toString())
+            except Exception:
+                pass
+
+        return ""
+
+    def _resolve_reply_objects(self, chat_activity: ChatActivity):
+        """
+        Извлекает текущий контекст ответа:
+        - replyToMsg (MessageObject)
+        - replyToTopMsg (MessageObject)
+        """
+        reply_msg = None
+        reply_top = None
+
+        # 1) ChatActivity public helpers
+        for name in ("getReplyingMessageObject", "getReplyingMessage", "getReplyMessageObject"):
+            try:
+                m = getattr(chat_activity, name, None)
+                if m:
+                    obj = m()
+                    if obj is not None:
+                        reply_msg = obj
+                        break
+            except Exception:
+                pass
+        for name in ("getReplyingTopMessage", "getThreadMessage", "getTopicMessage", "getTopMessage"):
+            try:
+                m = getattr(chat_activity, name, None)
+                if m:
+                    obj = m()
+                    if obj is not None:
+                        reply_top = obj
+                        break
+            except Exception:
+                pass
+
+        # 2) From EnterView (methods)
+        enter_view = None
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+        except Exception:
+            enter_view = None
+
+        if enter_view is not None:
+            if reply_msg is None:
+                for name in ("getReplyingMessageObject", "getReplyingMessage"):
+                    try:
+                        m = getattr(enter_view, name, None)
+                        if m:
+                            obj = m()
+                            if obj is not None:
+                                reply_msg = obj
+                                break
+                    except Exception:
+                        pass
+            if reply_top is None:
+                for name in ("getReplyingTopMessage", "getThreadMessage", "getTopicMessage", "getTopMessage"):
+                    try:
+                        m = getattr(enter_view, name, None)
+                        if m:
+                            obj = m()
+                            if obj is not None:
+                                reply_top = obj
+                                break
+                    except Exception:
+                        pass
+            # 3) Private fields
+            if reply_msg is None:
+                try:
+                    obj = get_private_field(enter_view, "replyingMessageObject")
+                    if obj is not None:
+                        reply_msg = obj
+                except Exception:
+                    pass
+            if reply_top is None:
+                for field in ("replyingTopMessage", "threadMessage", "topicMessage", "topMessage"):
+                    try:
+                        obj = get_private_field(enter_view, field)
+                        if obj is not None:
+                            reply_top = obj
+                            break
+                    except Exception:
+                        pass
+
+        # 4) Private fields in ChatActivity as fallback
+        if reply_msg is None:
+            try:
+                obj = get_private_field(chat_activity, "replyingMessageObject")
+                if obj is not None:
+                    reply_msg = obj
+            except Exception:
+                pass
+        if reply_top is None:
+            for field in ("replyingTopMessage", "threadMessage", "topicMessage", "topMessage"):
+                try:
+                    obj = get_private_field(chat_activity, field)
+                    if obj is not None:
+                        reply_top = obj
+                        break
+                except Exception:
+                    pass
+
+        try:
+            if reply_msg is not None and not isinstance(reply_msg, MessageObject):
+                reply_msg = None
+        except Exception:
+            pass
+        try:
+            if reply_top is not None and not isinstance(reply_top, MessageObject):
+                reply_top = None
+        except Exception:
+            pass
+
+        return reply_msg, reply_top
+
+    def _prepare_and_send_txt(self, chat_activity: ChatActivity, text: str):
+        try:
+            # Получаем название диалога
+            dialog_name = self._get_dialog_name(chat_activity)
+
+            # Форматируем имя файла согласно настройкам
+            fname = self._format_file_name(text, dialog_name)
+
+            # Директория
+            base_dir = None
+            try:
+                base_dir = AndroidUtilities.getCacheDir()
+            except Exception:
+                try:
+                    ctx = ApplicationLoader.applicationContext
+                    base_dir = ctx.getCacheDir()
+                except Exception:
+                    base_dir = None
+            if base_dir is None:
+                try:
+                    base_dir = ApplicationLoader.getFilesDirFixed()
+                except Exception:
+                    base_dir = ApplicationLoader.applicationContext.getFilesDir()
+
+            tmp_dir = File(base_dir, "plugin_send_as_file")
+            if not tmp_dir.exists():
+                tmp_dir.mkdirs()
+            out_file = File(tmp_dir, fname)
+
+            # Формируем содержимое файла с подписью
+            file_content = text or ""
+            signature = self._format_file_signature(text, dialog_name)
+            if str(signature).strip():
+                file_content += f"\n\n---\n{signature}"
+
+            # Записываем файл
+            fos = None
+            try:
+                fos = FileOutputStream(out_file)
+                fos.write(bytes(file_content, "utf-8"))
+                fos.flush()
+            finally:
+                if fos is not None:
+                    try:
+                        fos.close()
+                    except Exception:
+                        pass
+
+            # dialogId / account
+            dialog_id = 0
+            try:
+                dialog_id = chat_activity.getDialogId()
+            except Exception:
+                try:
+                    dialog_id = get_private_field(chat_activity, "dialog_id") or 0
+                except Exception:
+                    dialog_id = 0
+
+            current_account = 0
+            try:
+                current_account = chat_activity.getCurrentAccount()
+            except Exception:
+                try:
+                    current_account = get_private_field(chat_activity, "currentAccount") or 0
+                except Exception:
+                    current_account = 0
+
+            # Извлекаем контекст ответа (replyToMsg и replyToTopMsg) для корректной отправки в теме
+            reply_to_msg, reply_to_top_msg = self._resolve_reply_objects(chat_activity)
+
+            # Отправляем на UI (ПЕРЕДАЕМ подпись как caption)
+            run_on_ui_thread(lambda: self._send_document_file(
+                chat_activity, dialog_id, out_file, "text/plain", fname,
+                current_account, reply_to_msg, reply_to_top_msg, signature
+            ))
+        except Exception as e:
+            _log(f"Ошибка при подготовке/отправке: {e}")
+            run_on_ui_thread(self._reset_busy)
+
+    def _reset_busy(self):
+        self._busy = False
+
+    def _send_document_file(self, chat_activity: ChatActivity, dialog_id: int, file_obj: File, mime: str, file_name: str, account: int,
+                            reply_to_msg: MessageObject = None, reply_to_top_msg: MessageObject = None, caption_text: str = ""):
+        """
+        ВАЖНО: передаем ТОЛЬКО один источник (paths/originals ИЛИ uris), иначе некоторые сборки отправляют дубли.
+        Здесь используем paths+originals, uris оставляем пустым.
+        """
+        try:
+            abs_path = file_obj.getAbsolutePath()
+
+            paths = ArrayList()
+            originals = ArrayList()
+            uris = ArrayList()  # оставляем пустым, чтобы не было дублей
+
+            paths.add(abs_path)         # String
+            originals.add(abs_path)     # String
+
+            accountInstance = AccountInstance.getInstance(account)
+
+            # Пробрасываем replyToMsg и replyToTopMsg, а также подпись (caption_text)
+            SendMessagesHelper.prepareSendingDocuments(
+                accountInstance,
+                paths, originals, uris,
+                caption_text or "",  # <-- подпись к сообщению
+                mime,
+                jlong(dialog_id),
+                reply_to_msg, reply_to_top_msg,
+                None, None,
+                None,
+                True, 0,
+                None,
+                None, 0,
+                0, False, 0
+            )
+
+            # Схлопываем меню/превью после старта отправки
+            self._collapse_menus(None)
+
+            # 1) Сообщаем делегату EnterView, чтобы он выполнил стандартный post-send (снимает reply)
+            try:
+                self._notify_message_sent_delegate(chat_activity)
+            except Exception:
+                pass
+
+            # 2) На всякий случай мягко убираем reply вручную (если делегат не сработал)
+            try:
+                self._clear_reply_context_soft(chat_activity)
+            except Exception:
+                pass
+
+        except Exception as e:
+            _log(f"prepareSendingDocuments failed: {e}")
+        finally:
+            self._reset_busy()

@@ -1,0 +1,586 @@
+__id__ = "target_watch"
+__name__ = "Target Watch"
+__version__ = "1.2"
+__author__ = "MandreAI"
+__description__ = "Слежка за целевым ID: новые сообщения, правки и онлайн/офлайн. Диалоги по клику. Навбар MandreLib."
+__min_version__ = "11.12.1"
+__icon__ = "msg_history"
+
+import time
+from typing import Any, Dict, List
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from ui.settings import Header, Input, Divider, Text, Switch
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from client_utils import get_messages_controller
+from android.content import Intent
+from android.net import Uri
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment
+from hook_utils import find_class
+from mandre_lib import Mandre, MandreUI, MandreData
+
+from android.os import Bundle
+from org.telegram.ui import ChatActivity
+from org.telegram.messenger import DialogObject, NotificationCenter, MessageObject
+
+
+class TargetWatchPlugin(BasePlugin):
+    MAX_EVENTS = 300
+
+    def __init__(self):
+        super().__init__()
+        self._events_cache: List[Dict[str, Any]] = []
+        self._nc_hook = None
+        self._orig_text_map: Dict[int, str] = {}
+        self._recent_events: List[Dict[str, Any]] = []
+        self._orig_order: List[int] = []
+        self._last_settings_refresh_ts = 0.0
+        self._orig_order: List[int] = []
+        self._last_settings_refresh_ts = 0.0
+
+    def on_plugin_load(self):
+        try:
+            Mandre.use_persistent_storage(self)
+        except Exception:
+            pass
+        # Load cached original texts for edits
+        try:
+            self._orig_text_map = MandreData.read_persistent_json(self.id, "orig_text.json", {}) or {}
+        except Exception:
+            self._orig_text_map = {}
+        try:
+            self._orig_text_map = MandreData.read_persistent_json(self.id, "orig_text.json", {}) or {}
+        except Exception:
+            self._orig_text_map = {}
+
+        try:
+            Mandre.UI.setup_settings_bottom_bar(
+                plugin_instance=self,
+                items=[
+                    {"text": "Настройки", "icon": "msg_settings_14", "on_click": lambda: self._switch_tab(0)},
+                    {"text": "Журнал цели", "icon": "msg_list", "on_click": lambda: self._switch_tab(1)},
+                ],
+                active_index_key="active_tab"
+            )
+        except Exception as e:
+            log(f"[target_watch] BottomBar error: {e}")
+
+        for name in (
+            "TL_updateNewMessage",
+            "TL_updateNewChannelMessage",
+            "TL_updateEditMessage",
+            "TL_updateEditChannelMessage",
+            "TL_updateUserStatus",
+            "TL_updateUserName",
+            "TL_updateUserPhoto",
+        ):
+            try:
+                self.add_hook(name, match_substring=False, priority=0)
+            except Exception:
+                try:
+                    self.add_hook(name.replace("TL_", ""), match_substring=True, priority=0)
+                except Exception:
+                    pass
+
+        self._events_cache = MandreData.read_persistent_json(self.id, "events.json", []) or []
+
+        try:
+            self._install_nc_hook()
+        except Exception as e:
+            log(f"[target_watch] NC hook error: {e}")
+
+        try:
+            Mandre.schedule_task(self, "ensure_observer", 10, self._ensure_observer)
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        try:
+            if self._nc_hook:
+                self.unhook_method(self._nc_hook)
+                self._nc_hook = None
+        except Exception:
+            pass
+        try:
+            Mandre.apply_and_refresh_settings(self)
+        except Exception:
+            pass
+
+    def create_settings(self):
+        tab = self.get_setting("active_tab", 0)
+        if tab == 0:
+            return [
+                Header(text="Настройки слежки"),
+                Input(key="target_id", text="ID цели (user_id или dialog_id)", icon="msg_id", default=str(self.get_setting("target_id", ""))),
+                Divider(text="Подсказки"),
+                Text(text="Введите числовой ID пользователя (например 123456789) или dialog_id чата (например -100123456789).", icon="msg_info"),
+                Switch(key="log_edits", text="Логировать правки сообщений", icon="msg_edit", default=self.get_setting("log_edits", True)),
+                Divider(text="Журнал"),
+                Text(text="Очистить журнал", icon="menu_delete", accent=True, on_click=lambda _: self._clear_events()),
+            ]
+        else:
+            events = MandreData.read_persistent_json(self.id, "events.json", []) or []
+            self._events_cache = events
+            # Do not refresh settings inside create_settings to avoid recursion on Journal tab
+            items = [Header(text=f"Журнал цели ({len(events)})")]
+            if not events:
+                items.append(Text(text="Записей пока нет.", icon="msg_history"))
+                return items
+
+            total = len(events)
+            for ridx, ev in enumerate(reversed(events)):
+                ts = ev.get("ts", time.time())
+                tstruct = time.localtime(ts)
+                hhmm = f"{tstruct.tm_hour:02d}:{tstruct.tm_min:02d}"
+                kind = ev.get("type", "event")
+                preview = ev.get("text", "")
+                if kind == "edit":
+                    preview = ev.get("new_text", preview)
+                if kind in ("status_online","status_offline"):
+                    preview = "Онлайн" if kind == "status_online" else "Офлайн"
+                prefix = "[!] " if kind in ("edit","status_online","status_offline") else ""
+                label = f"{hhmm}  {prefix}{self._type_to_text(kind)} {preview}".strip()
+                orig_index = total - 1 - ridx
+                icon = "msg_edit" if kind == "edit" else ("msg_reactions" if kind in ("status_online","status_offline") else ("input_stickers" if kind == "sticker" else ("msg_video" if kind == "media_video" else ("msg_gallery" if kind == "media_photo" else "msg_message"))))
+                accent = kind in ("edit","status_online","status_offline")
+                items.append(Text(text=label, icon=icon, accent=accent))
+            return items
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        try:
+            target_str = str(self.get_setting("target_id", "")).strip()
+            if not target_str:
+                return HookResult()
+
+            target_user_id = None
+            target_dialog_id = None
+            try:
+                if target_str.startswith("-"):
+                    target_dialog_id = int(target_str)
+                else:
+                    target_user_id = int(target_str)
+            except Exception:
+                return HookResult()
+
+            # Fallback log for sends via TL updates (in case NotificationCenter misses)
+            if ("updateNewMessage" in update_name) or ("updateNewChannelMessage" in update_name):
+                msg = getattr(update, "message", None)
+                if msg is not None:
+                    did = self._dialog_id_from_message(msg)
+                    from_uid = self._from_user_id(msg)
+                    if (target_dialog_id is not None and did == target_dialog_id) or (target_user_id is not None and from_uid == target_user_id):
+                        text = getattr(msg, "message", "")
+                        mid = getattr(msg, "id", 0)
+                        ev_type = "message"
+                        deeplink = self._build_deeplink(did, mid)
+                        try:
+                            media = getattr(msg, "media", None)
+                            mcls = str(type(media)) if media is not None else ""
+                            document = getattr(media, "document", None) if media is not None else None
+                            if "messageMediaPhoto" in mcls:
+                                ev_type = "media_photo"
+                            elif document is not None:
+                                try:
+                                    if MessageObject.isStickerDocument(document):
+                                        ev_type = "sticker"
+                                    elif MessageObject.isVideoDocument(document):
+                                        ev_type = "media_video"
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        self._add_event({"type": ev_type, "dialog_id": did, "message_id": mid, "text": text or "(медиа)", "deeplink": deeplink, "ts": time.time()})
+
+            if ("updateEditMessage" in update_name or "updateEditChannelMessage" in update_name) and self.get_setting("log_edits", True):
+                msg = getattr(update, "message", None)
+                if msg is None:
+                    return HookResult()
+                did = self._dialog_id_from_message(msg)
+                from_uid = self._from_user_id(msg)
+                if (target_dialog_id is not None and did == target_dialog_id) or (target_user_id is not None and from_uid == target_user_id):
+                    mid = getattr(msg, "id", 0)
+                    new_text = getattr(msg, "message", "")
+                    prev_text = self._orig_text_map.get(mid) or self._get_prev_text(did, mid) or ""
+                    self._add_event({"type": "edit", "dialog_id": did, "message_id": mid, "prev_text": prev_text, "new_text": new_text, "ts": time.time()})
+
+            elif "updateUserStatus" in update_name:
+                uid = getattr(update, "user_id", None)
+                if target_user_id is not None and uid == target_user_id:
+                    status = getattr(update, "status", None)
+                    s = str(type(status))
+                    if "userStatusOnline" in s or "TL_userStatusOnline" in s:
+                        self._add_event({"type": "status_online", "dialog_id": target_user_id, "message_id": 0, "ts": time.time(), "status": "online"})
+                        try:
+                            BulletinHelper.show_success("Цель: онлайн")
+                        except Exception:
+                            pass
+                    else:
+                        self._add_event({"type": "status_offline", "dialog_id": target_user_id, "message_id": 0, "ts": time.time(), "status": "offline"})
+                        try:
+                            BulletinHelper.show_info("Цель: офлайн")
+                        except Exception:
+                            pass
+            elif "updateUserName" in update_name:
+                uid = getattr(update, "user_id", None)
+                if target_user_id is not None and uid == target_user_id:
+                    self._add_event({"type": "user_name", "dialog_id": target_user_id, "message_id": 0, "text": "Имя пользователя изменено", "ts": time.time()})
+            elif "updateUserPhoto" in update_name:
+                uid = getattr(update, "user_id", None)
+                if target_user_id is not None and uid == target_user_id:
+                    self._add_event({"type": "user_photo", "dialog_id": target_user_id, "message_id": 0, "text": "Аватарка пользователя изменена", "ts": time.time()})
+
+        except Exception as e:
+            log(f"[target_watch] update hook error: {e}")
+        return HookResult()
+
+    def _install_nc_hook(self):
+        if self._nc_hook:
+            return
+        NC = find_class("org.telegram.messenger.NotificationCenter")
+        if not NC:
+            return
+        NCClass = NC.getClass() if hasattr(NC, "getClass") else NC
+        methods = NCClass.getDeclaredMethods()
+        post_method = None
+        for m in methods:
+            try:
+                if m.getName() == "postNotificationName":
+                    post_method = m
+                    break
+            except Exception:
+                continue
+        if not post_method:
+            return
+        self._nc_hook = self.hook_method(post_method, _NewMessagesHook(self))
+
+    def _ensure_observer(self):
+        try:
+            tid = str(self.get_setting("target_id", "")).strip()
+            if not tid:
+                return
+            if not self._nc_hook:
+                self._install_nc_hook()
+        except Exception:
+            pass
+
+    def _switch_tab(self, index: int):
+        try:
+            self.set_setting("active_tab", int(index))
+            try:
+                Mandre.UI.update_bottom_bar(self.id, int(index))
+            except Exception:
+                pass
+            # Debounce refresh to avoid spam logs
+            try:
+                now = time.time()
+                if not hasattr(self, "_last_settings_refresh_ts"):
+                    self._last_settings_refresh_ts = 0.0
+                if (now - self._last_settings_refresh_ts) > 1.5:
+                    self._last_settings_refresh_ts = now
+                    Mandre.apply_and_refresh_settings(self)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _type_to_text(self, t: str) -> str:
+        mapping = {
+            "message": "цель отправила сообщение",
+            "edit": "цель отредактировала сообщение",
+            "status_online": "цель онлайн",
+            "status_offline": "цель офлайн",
+        }
+        return mapping.get(t, t)
+
+    def _build_deeplink(self, dialog_id: int, message_id: int) -> str:
+        try:
+            if dialog_id < 0:
+                internal = abs(dialog_id)
+                if internal > 1000000000000:
+                    internal -= 1000000000000
+                return f"https://t.me/c/{internal}/{message_id}"
+            else:
+                # for users/groups where public @ not known, fallback t.me/c form is not valid
+                # attempt to resolve username via MessagesController if available
+                mc = get_messages_controller()
+                user = mc.getUser(dialog_id) if mc else None
+                uname = getattr(user, "username", None) if user else None
+                if uname:
+                    return f"https://t.me/{uname}/{message_id}"
+        except Exception:
+            pass
+        return None
+
+    def _dialog_id_from_message(self, msg) -> int:
+        try:
+            peer = getattr(msg, "peer_id", None)
+            if peer is not None:
+                return DialogObject.getPeerDialogId(peer)
+        except Exception:
+            pass
+        try:
+            MO = find_class("org.telegram.messenger.MessageObject")
+            if MO:
+                mo = MO(self.get_setting("currentAccount", 0), msg, False)
+                return mo.getDialogId()
+        except Exception:
+            pass
+        return 0
+
+    def _from_user_id(self, msg) -> Any:
+        try:
+            from_id = getattr(msg, "from_id", None)
+            if from_id is None:
+                return None
+            uid = getattr(from_id, "user_id", None)
+            if uid is not None:
+                return uid
+        except Exception:
+            pass
+        return None
+
+    def _add_event(self, ev: Dict[str, Any]):
+        try:
+            events = MandreData.read_persistent_json(self.id, "events.json", []) or []
+            # Strong dedup: avoid multiple entries within 3s
+            try:
+                key = {
+                    "type": ev.get("type"),
+                    "dialog_id": ev.get("dialog_id"),
+                    "message_id": ev.get("message_id"),
+                    "status": ev.get("status"),
+                    "text": ev.get("text"),
+                }
+                now_ts = ev.get("ts", time.time())
+                # purge old cache
+                self._recent_events = [x for x in self._recent_events if (now_ts - x.get("ts", now_ts)) < 3.0]
+                for x in self._recent_events:
+                    if all(key.get(k) == x.get(k) for k in ("type","dialog_id","message_id","status")):
+                        return
+                key["ts"] = now_ts
+                self._recent_events.append(key)
+            except Exception:
+                pass
+            events.append(ev)
+            if len(events) > self.MAX_EVENTS:
+                events = events[-self.MAX_EVENTS:]
+            MandreData.write_persistent_json(self.id, "events.json", events)
+            self._events_cache = events
+        except Exception as e:
+            log(f"[target_watch] persist error: {e}")
+
+    def _clear_events(self):
+        try:
+            MandreData.write_persistent_json(self.id, "events.json", [])
+            self._events_cache = []
+            Mandre.apply_and_refresh_settings(self)
+        except Exception as e:
+            log(f"[target_watch] clear error: {e}")
+
+    def _show_event_dialog_by_index(self, idx: int):
+        try:
+            events = self._events_cache or MandreData.read_persistent_json(self.id, "events.json", []) or []
+            if idx < 0 or idx >= len(events):
+                return
+            self._show_event_dialog(events[idx])
+        except Exception as e:
+            log(f"[target_watch] dialog idx error: {e}")
+
+    def _show_event_dialog(self, ev: Dict[str, Any]):
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                return
+            builder = AlertDialogBuilder(activity)
+            t = ev.get("type")
+            # Early handling to ensure correct dialogs and link opening
+            try:
+                if t == "message":
+                    mid = int(ev.get("message_id", 0) or 0)
+                    txt = ev.get("text", "") or self._orig_text_map.get(mid, "(пусто)")
+                    builder.set_title("Отправленное сообщение")
+                    builder.set_message(txt)
+                    builder.set_positive_button("ОК", lambda d, w: None)
+                    builder.show()
+                    return
+                if t == "edit":
+                    builder.set_title("Редактирование")
+                    mid = int(ev.get("message_id", 0) or 0)
+                    prev_text = ev.get("prev_text", "") or self._orig_text_map.get(mid, "(нет данных)")
+                    new_text = ev.get("new_text", "") or "(нет данных)"
+                    builder.set_message(f"Изначально:\n{prev_text}\n\nРедактировано:\n{new_text}")
+                    builder.set_positive_button("ОК", lambda d, w: None)
+                    builder.show()
+                    return
+                if t in ("sticker", "media_photo", "media_video"):
+                    url = ev.get("deeplink")
+                    if url:
+                        try:
+                            intent = Intent(Intent.ACTION_VIEW)
+                            intent.setData(Uri.parse(url))
+                            builder.set_title("Открытие ссылки")
+                            activity.startActivity(intent)
+                            return
+                        except Exception:
+                            # Fallback: show the link so user can copy/open
+                            builder.set_title("Ссылка на медиа")
+                            builder.set_message(url)
+                            builder.set_positive_button("ОК", lambda d, w: None)
+                            builder.show()
+                            return
+            except Exception:
+                pass
+            if t == "edit":
+                builder.set_title("Редактирование")
+                prev_text = ev.get("prev_text", "") or "(нет данных — сообщение не было в кэше)"
+                new_text = ev.get("new_text", "") or "(нет данных)"
+                builder.set_message(f"Изначально:\n{prev_text}\n\nРедактировано:\n{new_text}")
+            elif t == "message":
+                builder.set_title("Отправленное сообщение")
+                builder.set_message(ev.get("text", "(пусто)"))
+            elif t in ("status_online", "status_offline"):
+                builder.set_title("Статус")
+                builder.set_message("Онлайн" if t == "status_online" else "Офлайн")
+            elif t in ("sticker","media_photo","media_video"):
+                # Open deep link instead of dialog
+                url = ev.get("deeplink")
+                if url:
+                    try:
+                        intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                        activity.startActivity(intent)
+                        return
+                    except Exception:
+                        pass
+                builder.set_title("Медиа")
+                builder.set_message("Не удалось открыть ссылку")
+            else:
+                builder.set_title("Событие")
+                builder.set_message(self._type_to_text(t))
+            builder.set_positive_button("OK", lambda d, w: None)
+            builder.show()
+        except Exception as e:
+            log(f"[target_watch] dialog error: {e}")
+
+
+class _NewMessagesHook(MethodHook):
+    def __init__(self, plugin: TargetWatchPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            args = getattr(param, "args", None)
+            if not args or len(args) < 3:
+                return
+            event_id = args[0]
+            if event_id != NotificationCenter.didReceiveNewMessages:
+                return
+            dialog_id = int(args[1]) if args[1] is not None else 0
+            messages = args[2]
+
+            target_str = str(self.plugin.get_setting("target_id", "")).strip()
+            if not target_str:
+                return
+            target_user_id = None
+            target_dialog_id = None
+            try:
+                if target_str.startswith("-"):
+                    target_dialog_id = int(target_str)
+                else:
+                    target_user_id = int(target_str)
+            except Exception:
+                return
+
+            try:
+                size = messages.size() if hasattr(messages, "size") else len(messages)
+            except Exception:
+                size = 0
+            for i in range(size):
+                try:
+                    msg_obj = messages.get(i) if hasattr(messages, "get") else messages[i]
+                except Exception:
+                    msg_obj = None
+                if not msg_obj:
+                    continue
+                message = getattr(msg_obj, "messageOwner", None)
+                if message is None:
+                    continue
+                did = self.plugin._dialog_id_from_message(message)
+                from_uid = self.plugin._from_user_id(message)
+                if ((target_dialog_id is not None and did == target_dialog_id) or (target_user_id is not None and from_uid == target_user_id)):
+                    text = getattr(message, "message", "")
+                    mid = getattr(message, "id", 0)
+                    self.plugin._cache_message_text(mid, text)
+                    # Detect media and build deeplink
+                    ev_type = "message"
+                    deeplink = None
+                    try:
+                        media = getattr(message, "media", None)
+                        if media is not None:
+                            mcls = str(type(media))
+                            document = getattr(media, "document", None)
+                            if "messageMediaPhoto" in mcls:
+                                ev_type = "media_photo"
+                            elif document is not None:
+                                try:
+                                    if MessageObject.isStickerDocument(document):
+                                        ev_type = "sticker"
+                                    elif MessageObject.isVideoDocument(document):
+                                        ev_type = "media_video"
+                                except Exception:
+                                    pass
+                        deeplink = self.plugin._build_deeplink(did if did else dialog_id, mid)
+                    except Exception:
+                        pass
+                    self.plugin._add_event({
+                        "type": ev_type,
+                        "dialog_id": did if did else dialog_id,
+                        "message_id": mid,
+                        "text": (text[:80] + "…") if isinstance(text, str) and len(text) > 80 else (text or "(медиа/сервис)"),
+                        "deeplink": deeplink,
+                        "ts": time.time(),
+                    })
+        except Exception:
+            pass
+    def _cache_message_text(self, mid: int, text: str):
+        try:
+            if mid:
+                self._orig_text_map[mid] = text or ""
+                self._orig_order.append(mid)
+                # prune to last 300
+                if len(self._orig_order) > 300:
+                    old_mid = self._orig_order.pop(0)
+                    try:
+                        self._orig_text_map.pop(old_mid, None)
+                    except Exception:
+                        pass
+                MandreData.write_persistent_json(self.id, "orig_text.json", self._orig_text_map)
+        except Exception:
+            pass
+
+    def _get_prev_text(self, dialog_id: int, message_id: int) -> str:
+        try:
+            return self._orig_text_map.get(message_id, "")
+        except Exception:
+            return ""
+
+    def _handle_journal_click(self, index: int):
+        try:
+            events = self._events_cache or MandreData.read_persistent_json(self.id, "events.json", []) or []
+            if index < 0 or index >= len(events):
+                return
+            ev = events[index]
+            t = ev.get("type")
+            if t in ("sticker","media_photo","media_video") and ev.get("deeplink"):
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity:
+                    intent = Intent(Intent.ACTION_VIEW, Uri.parse(ev.get("deeplink")))
+                    activity.startActivity(intent)
+                return
+            # else show dialog
+            self._show_event_dialog(ev)
+        except Exception:
+            pass
