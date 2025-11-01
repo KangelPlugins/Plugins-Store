@@ -1,0 +1,1276 @@
+__id__ = "miniPlayerPlus"
+__name__ = "miniPlayer+"
+__author__ = "@RnPlugins with @PluginIDE"
+__version__ = "1.0.0r"
+__description__ = """Визуальное улучшение мини проигрывателя телеграм (обложка на фоне с анимацией)
+
+Visual improvements to the Telegram mini player (animated background cover)"""
+
+__icon__ = "sPluginIDE/27"
+__min_version__ = "11.12.0"
+
+import math
+import os
+import random
+import threading
+import time
+from typing import Optional, Dict, Any, Iterable, List, Tuple
+
+try:
+    from PIL import Image, ImageFilter
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+import requests
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+from java import jclass, jarray, jbyte, dynamic_proxy
+from java.lang import Class as JavaClass
+from android.graphics import Color, BitmapFactory, Bitmap
+from android.graphics.drawable import BitmapDrawable, GradientDrawable
+from android.widget import ImageView, FrameLayout, TextView
+from android.view import Gravity, View
+from java.io import File
+
+from org.telegram.messenger import MediaController, ApplicationLoader, NotificationCenter, AndroidUtilities
+from org.telegram.ui.ActionBar import Theme
+
+
+def _dp_log(msg: str):
+    pass
+
+
+def _clip_text(text: str, limit: int = 96) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+class _FragmentContextViewHook(MethodHook):
+    def __init__(self, plugin, method_name: str):
+        self._plugin = plugin
+        self._method = method_name
+
+    def before_hooked_method(self, param):
+        self._plugin._trace_hook(self._method, "before", param)
+
+    def after_hooked_method(self, param):
+        self._plugin._trace_hook(self._method, "after", param)
+        fcv = getattr(param, "thisObject", None)
+        if fcv is None:
+            return
+        try:
+            self._plugin._ensure_overlay(fcv)
+            self._plugin._apply_text_shadow(fcv)
+            visible = True
+            if self._method == "checkPlayer":
+                try:
+                    visible = bool(param.args[0])
+                except Exception:
+                    visible = True
+            self._plugin._schedule_update_background(fcv, force_clear=not visible)
+            if visible and self._plugin._is_player_active():
+                self._plugin._start_visualizer_for(fcv)
+            else:
+                self._plugin._stop_visualizer_for(fcv)
+        except Exception:
+            pass
+
+
+class PlayerVisualizer(BasePlugin):
+    def on_plugin_load(self):
+        self._overlays: Dict[object, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._state_thread = None
+        self._nc_delegate = None
+        self._nc_event_map: Dict[int, str] = {}
+        self._nc_centers: List[Tuple[str, Any]] = []
+        self._fcv_internal_field = None
+
+        self._install_hooks()
+        self._register_media_observer()
+
+    def _trace_hook(self, method_name: str, stage: str, param: Any):
+        return
+
+    def _install_hooks(self):
+        try:
+            fcv_class = JavaClass.forName("org.telegram.ui.Components.FragmentContextView")
+        except Exception:
+            return
+
+        for field_name in ("frameLayout", "containerLayout", "contentView"):
+            try:
+                field = fcv_class.getDeclaredField(field_name)
+                if field.getType() == FrameLayout:
+                    field.setAccessible(True)
+                    self._fcv_internal_field = field
+                    break
+            except Exception:
+                continue
+
+        for method_name in ("checkCreateView", "checkPlayer"):
+            method = self._find_method_by_name(fcv_class, method_name)
+            if method is None:
+                continue
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                self.hook_method(method, _FragmentContextViewHook(self, method_name))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _find_method_by_name(java_class, target_name: str):
+        try:
+            methods = java_class.getDeclaredMethods()
+        except Exception:
+            return None
+        for m in methods:
+            try:
+                if m.getName() == target_name:
+                    return m
+            except Exception:
+                continue
+        return None
+
+    def _register_media_observer(self):
+        events = self._resolve_media_events()
+        if not events:
+            self._start_state_watchdog("notification constants unavailable")
+            return
+
+        centers: List[Tuple[str, Any]] = []
+        try:
+            center = NotificationCenter.getGlobalInstance()
+            if center:
+                centers.append(("global", center))
+        except Exception:
+            pass
+
+        try:
+            UserConfig = jclass("org.telegram.messenger.UserConfig")
+            acc = getattr(UserConfig, "selectedAccount", -1)
+            if isinstance(acc, int) and acc >= 0:
+                instance = NotificationCenter.getInstance(acc)
+                if instance:
+                    centers.append((f"account:{acc}", instance))
+        except Exception:
+            pass
+
+        if not centers:
+            self._start_state_watchdog("notification centers unavailable")
+            return
+
+        try:
+            NotificationCenterDelegate = jclass("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate")
+        except Exception:
+            self._start_state_watchdog("delegate class missing")
+            return
+
+        try:
+            is_iface = bool(NotificationCenterDelegate.isInterface())
+        except Exception:
+            is_iface = False
+
+        if not is_iface:
+            self._start_state_watchdog("delegate is class")
+            return
+
+        def did_received_notification(notification_id, account, *args):
+            try:
+                self._handle_notification(notification_id, account, args)
+            except Exception:
+                pass
+
+        delegate = None
+        try:
+            delegate = dynamic_proxy(NotificationCenterDelegate, {"didReceivedNotification": did_received_notification})
+        except Exception:
+            pass
+
+        if delegate is None:
+            self._start_state_watchdog("delegate creation failed")
+            return
+
+        self._nc_delegate = delegate
+        for center_name, center in centers:
+            for event_name, event_id in events:
+                try:
+                    center.addObserver(self._nc_delegate, event_id)
+                    self._nc_event_map[event_id] = event_name
+                except Exception:
+                    pass
+        self._nc_centers = centers
+        if not self._nc_event_map:
+            self._start_state_watchdog("observer subscriptions failed")
+
+    def _resolve_media_events(self) -> List[Tuple[str, int]]:
+        resolved: List[Tuple[str, int]] = []
+        preferred = (
+            "messagePlayingPlayStateChanged",
+            "messagePlayingProgressDidChanged",
+            "messagePlayingDidReset",
+            "messagePlayingGoingToStop",
+            "messagePlayingStopped",
+        )
+        for name in preferred:
+            try:
+                value = getattr(NotificationCenter, name, None)
+                if isinstance(value, int):
+                    resolved.append((name, value))
+            except Exception:
+                continue
+        return resolved
+
+    def _handle_notification(self, notification_id: int, account: int, args: Iterable[Any]):
+        if notification_id not in self._nc_event_map:
+            return
+        self._kick_all_instances(f"notification:{self._nc_event_map.get(notification_id)}")
+
+    def _start_state_watchdog(self, reason: str):
+        thread = getattr(self, "_state_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+
+        def loop():
+            last_key = object()
+            last_playing = object()
+            while not self._stop_event.is_set():
+                try:
+                    key = self._current_track_key()
+                    playing = self._is_player_active()
+                    if key != last_key or playing != last_playing:
+                        last_key = key
+                        last_playing = playing
+                        self._kick_all_instances("watchdog")
+                except Exception:
+                    pass
+
+                if self._stop_event.is_set():
+                    break
+                time.sleep(0.25)
+
+        watcher = threading.Thread(target=loop, name="PV-StateWatchdog", daemon=True)
+        self._state_thread = watcher
+        watcher.start()
+
+    def _stop_state_watchdog(self):
+        thread = getattr(self, "_state_thread", None)
+        if not thread:
+            return
+        self._state_thread = None
+        if thread.is_alive():
+            try:
+                thread.join(timeout=1.2)
+            except Exception:
+                pass
+
+    def _kick_all_instances(self, reason: str):
+        is_active = self._is_player_active()
+        with self._lock:
+            targets = list(self._overlays.keys())
+        for fcv in targets:
+            try:
+                data = self._overlays.get(fcv)
+                if not data or not data.get("ready"):
+                    self._ensure_overlay(fcv)
+                    data = self._overlays.get(fcv)
+                    if not data or not data.get("ready"):
+                        continue
+                is_visible = getattr(fcv, "isPlayerVisible", lambda: True)()
+                self._schedule_update_background(fcv, force_clear=not is_visible)
+                if is_visible and is_active:
+                    self._start_visualizer_for(fcv)
+                else:
+                    self._stop_visualizer_for(fcv)
+            except Exception:
+                pass
+
+    def on_plugin_unload(self):
+        self._stop_event.set()
+        self._unregister_media_observer()
+        with self._lock:
+            for fcv, data in list(self._overlays.items()):
+                self._cleanup_overlay(fcv, data)
+            self._overlays.clear()
+
+    def _cleanup_overlay(self, fcv, data):
+        try:
+            self._stop_visualizer_for(fcv, release=True)
+            self._release_bitmap(data.get("bitmap"))
+            container = data.get("container")
+            if not container:
+                return
+
+            def remove_ui():
+                try:
+                    parent = container.getParent()
+                    if parent is not None:
+                        parent.removeView(container)
+                except Exception:
+                    pass
+
+            run_on_ui_thread(remove_ui)
+        except Exception:
+            pass
+
+    def _release_bitmap(self, bitmap):
+        if bitmap is None:
+            return
+        try:
+            if isinstance(bitmap, Bitmap) and not bitmap.isRecycled():
+                bitmap.recycle()
+        except Exception:
+            pass
+
+    def _unregister_media_observer(self):
+        if self._nc_delegate and self._nc_centers:
+            for center_name, center in self._nc_centers:
+                for event_id in list(self._nc_event_map.keys()):
+                    try:
+                        center.removeObserver(self._nc_delegate, event_id)
+                    except Exception:
+                        pass
+        self._nc_delegate = None
+        self._nc_centers = []
+        self._nc_event_map.clear()
+        self._stop_state_watchdog()
+
+    @staticmethod
+    def _describe_java(obj) -> str:
+        if obj is None:
+            return "None"
+        try:
+            cls = obj.getClass()
+            return f"{cls.getSimpleName()}@#{obj.hashCode():x}"
+        except Exception:
+            return _clip_text(str(obj))
+
+    def _apply_text_shadow(self, fcv):
+        if fcv is None:
+            return
+        try:
+            song_field = fcv.getClass().getDeclaredField("songNameTextView")
+            song_field.setAccessible(True)
+            song_view = song_field.get(fcv)
+
+            artist_field = fcv.getClass().getDeclaredField("artistNameTextView")
+            artist_field.setAccessible(True)
+            artist_view = artist_field.get(fcv)
+
+            radius = AndroidUtilities.dp(2.0)
+            dx = 0
+            dy = AndroidUtilities.dp(1.0)
+            color = 0x4D000000
+
+            if isinstance(song_view, TextView):
+                song_view.setShadowLayer(radius, dx, dy, color)
+
+            if isinstance(artist_view, TextView):
+                artist_view.setShadowLayer(radius, dx, dy, color)
+        except Exception:
+            pass
+
+    def _ensure_overlay(self, fcv):
+        if fcv is None:
+            return
+        with self._lock:
+            data = self._overlays.get(fcv)
+            if data:
+                container = data.get("container")
+                if container is None or container.getParent() is None:
+                    self._overlays.pop(fcv, None)
+                else:
+                    return
+            self._overlays[fcv] = {"ready": False}
+
+        def create_ui():
+            with self._lock:
+                existing = self._overlays.get(fcv)
+                if not existing or existing.get("ready"):
+                    return
+
+            try:
+                parent_view = fcv
+                if self._fcv_internal_field is not None:
+                    try:
+                        internal = self._fcv_internal_field.get(fcv)
+                        if isinstance(internal, FrameLayout):
+                            parent_view = internal
+                    except Exception:
+                        pass
+
+                ctx = parent_view.getContext()
+                container = FrameLayout(ctx)
+                container.setClipToPadding(True)
+                container.setClipChildren(True)
+
+                bg = ImageView(ctx)
+                bg.setScaleType(ImageView.ScaleType.CENTER_CROP)
+                bg.setAlpha(0.58)
+
+                dim_overlay = View(ctx)
+                dim_overlay.setBackgroundColor(Color.parseColor("#66000000"))
+                dim_overlay.setAlpha(0.40)
+
+                shade = View(ctx)
+                shade_gradient = GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    [Color.parseColor("#5A000000"), Color.parseColor("#00000000")]
+                )
+                shade_gradient.setGradientType(GradientDrawable.LINEAR_GRADIENT)
+                shade.setBackground(shade_gradient)
+                shade.setAlpha(0.46)
+
+                lp_bg = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    Gravity.CENTER
+                )
+                container.addView(bg, lp_bg)
+                container.addView(
+                    dim_overlay,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                )
+                container.addView(
+                    shade,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                )
+
+                parent_view.addView(
+                    container,
+                    0,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                )
+                parent_view.setClipToPadding(True)
+                parent_view.setClipChildren(True)
+
+                data = {
+                    "container": container,
+                    "image": bg,
+                    "dim": dim_overlay,
+                    "shade": shade,
+                    "running": False,
+                    "visualizer": None,
+                    "anim_thread": None,
+                    # анимация и режимы
+                    "rot": random.uniform(0.0, 360.0),
+                    "rot_speed": 0.0,
+                    "rot_dir": random.choice((-1.0, 1.0)),
+                    "target_dir": 1.0,
+                    "orbit_phase": random.random() * math.tau,
+                    "orbit_speed": 0.010 + random.random() * 0.006,
+                    "scale": 1.0,
+                    "scale_phase": random.random() * math.tau,
+                    "scale_speed": 0.020 + random.random() * 0.010,
+                    "tx": 0.0,
+                    "ty": 0.0,
+                    "anim_mode": "rotate",
+                    "prev_mode": "rotate",
+                    "mode_t": 0.0,
+                    "mode_dur": 4.5 + random.random() * 3.5,
+                    "mode_blend": 1.0,
+                    "frame_budget_ms": 60,
+                    "last_ui_ts": 0.0,
+                    "last_vals": (0.0, 0.0, 0.0, 0.0),
+                    # аудио
+                    "amp": 0.0,
+                    "kick": 0.0,
+                    "beat_avg": 0.0,
+                    "last_kick_ms": 0,
+                    # фон
+                    "last_track_key": None,
+                    "last_w": -1,
+                    "last_h": -1,
+                    "bg_pending": False,
+                    "ready": True,
+                    "visualizer_fail_logged": False,
+                    "current_bg": ("gradient", None),
+                    "bitmap": None,
+                    "cover_path": None,
+                }
+                with self._lock:
+                    self._overlays[fcv] = data
+                self._fit_square_to_parent(parent_view, bg)
+                self._watch_layout(parent_view, fcv, bg)
+
+                self._update_overlay_mood(data, playing=self._is_player_active(), force=True)
+
+                try:
+                    visible = getattr(fcv, "isPlayerVisible", lambda: True)()
+                except Exception:
+                    visible = True
+                if visible:
+                    self._schedule_update_background(fcv)
+                    if self._is_player_active():
+                        self._start_visualizer_for(fcv)
+                else:
+                    self._schedule_update_background(fcv, force_clear=True)
+            except Exception:
+                with self._lock:
+                    self._overlays.pop(fcv, None)
+
+        run_on_ui_thread(create_ui)
+
+    def _watch_layout(self, parent_view, fcv, bg):
+        try:
+            OnLayoutChangeListener = jclass("android.view.View$OnLayoutChangeListener")
+        except Exception:
+            OnLayoutChangeListener = None
+
+        if OnLayoutChangeListener is None:
+            return
+
+        def on_layout_change(v, left, top, right, bottom, old_left, old_top, old_right, old_bottom):
+            try:
+                data = self._overlays.get(fcv)
+                if not data or not data.get("ready"):
+                    return
+                cw = right - left
+                ch = bottom - top
+                if cw != data["last_w"] or ch != data["last_h"]:
+                    data["last_w"], data["last_h"] = cw, ch
+                    self._fit_square_to_parent(parent_view, bg)
+            except Exception:
+                pass
+
+        try:
+            listener = dynamic_proxy(
+                OnLayoutChangeListener,
+                {"onLayoutChange": on_layout_change}
+            )
+        except TypeError:
+            try:
+                listener = dynamic_proxy(
+                    [OnLayoutChangeListener],
+                    {"onLayoutChange": on_layout_change}
+                )
+            except Exception:
+                listener = None
+        except Exception:
+            listener = None
+
+        if listener is None:
+            return
+
+        try:
+            parent_view.addOnLayoutChangeListener(listener)
+        except Exception:
+            pass
+
+    def _fit_square_to_parent(self, parent, bg: ImageView):
+        try:
+            w = max(1, parent.getWidth())
+            h = max(1, parent.getHeight())
+            side = int(math.sqrt(w * w + h * h))
+            lp = bg.getLayoutParams()
+            lp.width = side
+            lp.height = side
+            bg.setLayoutParams(lp)
+            bg.setPivotX(side / 2.0)
+            bg.setPivotY(side / 2.0)
+        except Exception:
+            pass
+
+    def _schedule_update_background(self, fcv, force_clear=False):
+        data = self._overlays.get(fcv)
+        if not data or not data.get("ready"):
+            return
+        if data.get("bg_pending"):
+            return
+        data["bg_pending"] = True
+
+        def worker():
+            try:
+                if force_clear:
+                    data["last_track_key"] = None
+                    if data.get("cover_path") and os.path.exists(data["cover_path"]):
+                        run_on_ui_thread(lambda: self._ensure_cover_visible(data))
+                    else:
+                        run_on_ui_thread(lambda: self._apply_gradient_background(data))
+                    return
+
+                key = self._current_track_key()
+                if key is None:
+                    run_on_ui_thread(lambda: self._ensure_cover_visible(data))
+                    return
+
+                current_type, current_path = data.get("current_bg", (None, None))
+                same_track = data.get("last_track_key") == key
+                data["last_track_key"] = key
+
+                should_fetch = not (same_track and current_type == "cover" and current_path and os.path.exists(current_path))
+
+                bitmap = None
+                blurred_path = None
+                if should_fetch:
+                    try:
+                        cover_path = self._extract_album_art_path()
+                        if not cover_path:
+                            title, artist = self._extract_metadata()
+                            cover_path = self._fetch_cover_online(title, artist)
+                        if cover_path and PIL_AVAILABLE and os.path.exists(cover_path):
+                            blurred_path = self._make_blurred_cache(cover_path, key)
+                        if blurred_path and os.path.exists(blurred_path):
+                            options = BitmapFactory.Options()
+                            options.inPreferredConfig = Bitmap.Config.ARGB_8888
+                            bitmap = BitmapFactory.decodeFile(blurred_path, options)
+                            if bitmap is None:
+                                blurred_path = None
+                    except Exception:
+                        pass
+
+                def apply_ui():
+                    current = self._overlays.get(fcv)
+                    if current is not data:
+                        self._release_bitmap(bitmap)
+                        return
+
+                    if bitmap is not None and blurred_path:
+                        self._apply_cover_bitmap(data, blurred_path, bitmap)
+                    elif not same_track:
+                        self._apply_gradient_background(data)
+                    else:
+                        self._ensure_cover_visible(data)
+
+                run_on_ui_thread(apply_ui)
+            finally:
+                current = self._overlays.get(fcv)
+                if current:
+                    current["bg_pending"] = False
+
+        threading.Thread(target=worker, name="PV-BG-Update", daemon=True).start()
+
+    def _apply_cover_bitmap(self, data: Dict[str, Any], path: str, new_bitmap):
+        try:
+            if new_bitmap is None or (isinstance(new_bitmap, Bitmap) and new_bitmap.isRecycled()):
+                raise ValueError("bitmap invalid")
+
+            bg: ImageView = data["image"]
+            current_type, current_path = data.get("current_bg", (None, None))
+            stored_bitmap = data.get("bitmap")
+
+            if stored_bitmap is new_bitmap and current_type == "cover" and current_path == path:
+                if bg.getDrawable() is None:
+                    bg.setImageDrawable(BitmapDrawable(bg.getResources(), new_bitmap))
+                return
+
+            drawable = BitmapDrawable(bg.getResources(), new_bitmap)
+            bg.setImageDrawable(drawable)
+            data["current_bg"] = ("cover", path)
+            data["cover_path"] = path
+            data["bitmap"] = new_bitmap
+
+            if stored_bitmap is not None and stored_bitmap is not new_bitmap:
+                self._release_bitmap(stored_bitmap)
+        except Exception:
+            if new_bitmap is not None and new_bitmap is not data.get("bitmap"):
+                self._release_bitmap(new_bitmap)
+            self._apply_gradient_background(data)
+
+    def _apply_cover_background(self, data: Dict[str, Any], path: str):
+        try:
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            options = BitmapFactory.Options()
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888
+            bitmap = BitmapFactory.decodeFile(path, options)
+            if bitmap is None:
+                raise ValueError("decode failed")
+            self._apply_cover_bitmap(data, path, bitmap)
+        except Exception:
+            self._apply_gradient_background(data)
+
+    def _apply_gradient_background(self, data: Dict[str, Any]):
+        try:
+            current_type, _ = data.get("current_bg", (None, None))
+            stored_bitmap = data.get("bitmap")
+            if current_type == "gradient" and stored_bitmap is None:
+                return
+
+            bg: ImageView = data["image"]
+            bg.setImageDrawable(self._make_theme_gradient())
+            data["current_bg"] = ("gradient", None)
+            
+            if stored_bitmap is not None:
+                data["bitmap"] = None
+                self._release_bitmap(stored_bitmap)
+        except Exception:
+            pass
+
+    def _ensure_cover_visible(self, data: Dict[str, Any]):
+        current_type, current_path = data.get("current_bg", (None, None))
+        stored_bitmap = data.get("bitmap")
+        if current_type == "cover" and current_path and os.path.exists(current_path):
+            if stored_bitmap is not None and not stored_bitmap.isRecycled():
+                if data.get("image") and data["image"].getDrawable() is not None:
+                    return
+        
+        path = data.get("cover_path", None)
+        if not path or not os.path.exists(path):
+            return
+
+        def ensure():
+            try:
+                self._apply_cover_background(data, path)
+            except Exception:
+                pass
+
+        run_on_ui_thread(ensure)
+
+    def _current_track_key(self) -> Optional[str]:
+        try:
+            mc = MediaController.getInstance()
+            mo = mc.getPlayingMessageObject()
+            if mo is None:
+                return None
+            msg = mo.messageOwner
+            return f"{getattr(msg, 'dialog_id', 0)}:{getattr(msg, 'id', 0)}"
+        except Exception:
+            return None
+
+    def _extract_metadata(self) -> Tuple[str, str]:
+        title = ""
+        artist = ""
+        try:
+            mc = MediaController.getInstance()
+            mo = mc.getPlayingMessageObject()
+            if mo is None:
+                return "", ""
+            try:
+                title = mo.getMusicTitle() or ""
+            except Exception:
+                title = ""
+            try:
+                artist = mo.getMusicAuthor() or ""
+            except Exception:
+                artist = ""
+        except Exception:
+            pass
+        return title, artist
+
+    def _make_theme_gradient(self):
+        try:
+            base = Theme.getColor(Theme.key_windowBackgroundWhite)
+        except Exception:
+            base = 0xFFFFFFFF
+        r = (base >> 16) & 0xFF
+        g = (base >> 8) & 0xFF
+        b = base & 0xFF
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        dark = luminance < 0.45
+        if dark:
+            colors = [Color.parseColor("#273047"), Color.parseColor("#101223")]
+        else:
+            colors = [Color.parseColor("#D9E3FF"), Color.parseColor("#FFFFFF")]
+        gd = GradientDrawable(GradientDrawable.Orientation.BL_TR, colors)
+        gd.setGradientType(GradientDrawable.LINEAR_GRADIENT)
+        return gd
+
+    def _make_blurred_cache(self, src_path: str, track_key: Optional[str] = None) -> Optional[str]:
+        try:
+            cache_dir = os.path.join(ApplicationLoader.getFilesDirFixed().getAbsolutePath(), "pv_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            suffix = "default"
+            if track_key:
+                suffix = str(abs(hash(track_key)) % 10_000_000)
+            out_path = os.path.join(cache_dir, f"cover_blur_{suffix}.jpg")
+            im = Image.open(src_path).convert("RGB")
+            max_side = 640
+            w, h = im.size
+            scale = max(w, h) / float(max_side)
+            if scale > 1.0:
+                im = im.resize((int(w / scale), int(h / scale)), Image.LANCZOS)
+            im = im.filter(ImageFilter.GaussianBlur(radius=18))
+            im.save(out_path, "JPEG", quality=64, optimize=True)
+            return out_path
+        except Exception:
+            return None
+
+    def _extract_album_art_path(self) -> Optional[str]:
+        try:
+            mc = MediaController.getInstance()
+            ai = mc.getAudioInfo()
+            if ai is not None:
+                cf = ai.getCoverFile()
+                if cf is not None and cf.exists():
+                    return cf.getAbsolutePath()
+            mo = mc.getPlayingMessageObject()
+            if mo is None:
+                return None
+            doc = mo.getDocument()
+            if doc is None:
+                return None
+            best_thumb = None
+            max_area = -1
+            thumbs = getattr(doc, "thumbs", None)
+            if thumbs:
+                iterator = None
+                try:
+                    iterator = thumbs.iterator()
+                except Exception:
+                    iterator = None
+                if iterator is not None:
+                    while iterator.hasNext():
+                        t = iterator.next()
+                        try:
+                            area = int(getattr(t, "w", 0)) * int(getattr(t, "h", 0))
+                        except Exception:
+                            area = 0
+                        if area > max_area:
+                            max_area = area
+                            best_thumb = t
+                else:
+                    for t in thumbs:
+                        try:
+                            area = int(getattr(t, "w", 0)) * int(getattr(t, "h", 0))
+                        except Exception:
+                            area = 0
+                        if area > max_area:
+                            max_area = area
+                            best_thumb = t
+            if best_thumb is None:
+                return None
+            FileLoader = jclass("org.telegram.messenger.FileLoader")
+            UserConfig = jclass("org.telegram.messenger.UserConfig")
+            fl = FileLoader.getInstance(UserConfig.selectedAccount)
+            pf = fl.getPathToAttach(best_thumb, True)
+            if pf is not None and pf.exists():
+                return pf.getAbsolutePath()
+            try:
+                fl.loadFile(best_thumb, True, False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return None
+
+    def _fetch_cover_online(self, title: str, artist: str) -> Optional[str]:
+        query = f"{artist} {title}".strip()
+        if not query:
+            return None
+        try:
+            resp = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": query, "media": "music", "limit": 1},
+                timeout=4.0
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            results = data.get("results") or []
+            if not results:
+                return None
+            art = results[0].get("artworkUrl100")
+            if not art:
+                return None
+            art = art.replace("100x100bb", "1200x1200bb")
+            img_resp = requests.get(art, timeout=6.0)
+            if img_resp.status_code != 200:
+                return None
+            cache_dir = os.path.join(ApplicationLoader.getFilesDirFixed().getAbsolutePath(), "pv_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            path = os.path.join(cache_dir, "cover_online_temp.jpg")
+            with open(path, "wb") as f:
+                f.write(img_resp.content)
+            return path
+        except Exception:
+            return None
+
+    # ===== АНИМАЦИЯ: плавные режимы и без лагов =====
+    def _start_visualizer_for(self, fcv):
+        if not self._is_player_active():
+            self._stop_visualizer_for(fcv, release=False)
+            return
+
+        data = self._overlays.get(fcv)
+        if not data or not data.get("ready"):
+            return
+        if data.get("running"):
+            self._update_overlay_mood(data, playing=True)
+            self._ensure_cover_visible(data)
+            return
+
+        data["running"] = True
+        data["rot_speed"] = 0.0
+        data["amp"] = 0.0
+        data["kick"] = 0.0
+        data["beat_avg"] = 0.0
+        data["last_kick_ms"] = 0
+        data["anim_mode"] = random.choice(("rotate", "drift", "pulse"))
+        data["prev_mode"] = data["anim_mode"]
+        data["mode_t"] = 0.0
+        data["mode_dur"] = 4.5 + random.random() * 3.5
+        data["mode_blend"] = 1.0
+        data["last_ui_ts"] = 0.0
+        data["last_vals"] = (data["rot"], data["scale"], data["tx"], data["ty"])
+
+        self._update_overlay_mood(data, playing=True, force=True)
+        self._ensure_cover_visible(data)
+        self._init_visualizer_async(data)
+        self._launch_anim_thread(data)
+
+    def _init_visualizer_async(self, data: Dict[str, Any]):
+        def task():
+            prev = data.get("visualizer")
+            if prev is not None:
+                try:
+                    prev.setEnabled(False)
+                except Exception:
+                    pass
+                try:
+                    prev.release()
+                except Exception:
+                    pass
+                data["visualizer"] = None
+
+            try:
+                Visualizer = jclass("android.media.audiofx.Visualizer")
+            except Exception:
+                return
+
+            vis = None
+            try:
+                mc = None
+                try:
+                    mc = MediaController.getInstance()
+                except Exception:
+                    mc = None
+                audio_session = 0
+                if mc is not None:
+                    try:
+                        audio_session = mc.getAudioSessionId()
+                    except Exception:
+                        audio_session = 0
+                vis = Visualizer(audio_session)
+                try:
+                    vis.setEnabled(False)
+                except Exception:
+                    pass
+
+                size_candidates: List[int] = []
+                try:
+                    capture_range = Visualizer.getCaptureSizeRange()
+                    if capture_range and len(capture_range) > 1:
+                        hi = int(capture_range[1])
+                        lo = int(capture_range[0])
+                        if hi > 0:
+                            size_candidates.append(hi)
+                        if lo > 0 and lo != hi:
+                            size_candidates.append(lo)
+                except Exception:
+                    pass
+                for fallback_size in (192, 128, 96):
+                    if fallback_size not in size_candidates:
+                        size_candidates.append(fallback_size)
+
+                success = False
+                last_exc = None
+                for candidate in size_candidates:
+                    try:
+                        vis.setCaptureSize(candidate)
+                        success = True
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        try:
+                            vis.setEnabled(False)
+                        except Exception:
+                            pass
+                if not success:
+                    raise RuntimeError(f"captureSize failed: {last_exc}")
+
+                try:
+                    max_rate = Visualizer.getMaxCaptureRate()
+                    vis.setDataCaptureListener(None, max_rate // 2, False, False)
+                except Exception:
+                    pass
+
+                vis.setEnabled(True)
+                data["visualizer"] = vis
+            except Exception:
+                if vis is not None:
+                    try:
+                        vis.release()
+                    except Exception:
+                        pass
+                data["visualizer"] = None
+
+        run_on_ui_thread(task)
+
+    def _choose_next_mode(self, current: str) -> str:
+        pool = ["rotate", "drift", "pulse"]
+        try:
+            pool.remove(current)
+        except ValueError:
+            pass
+        weights = {"rotate": 0.35, "drift": 0.45, "pulse": 0.20}
+        s = sum(weights[m] for m in pool)
+        r = random.random() * s
+        acc = 0.0
+        for m in pool:
+            acc += weights[m]
+            if r <= acc:
+                return m
+        return pool[0] if pool else current
+
+    def _launch_anim_thread(self, data: Dict[str, Any]):
+        thread = data.get("anim_thread")
+        if thread is not None and thread.is_alive():
+            return
+
+        def anim_loop():
+            try:
+                prev_ts = time.time()
+                while data.get("running") and not self._stop_event.is_set():
+                    now = time.time()
+                    dt = max(0.016, min(0.12, now - prev_ts))
+                    prev_ts = now
+                    try:
+                        self._update_amp_and_beat(data)
+                        amp = data["amp"]
+                        kick = data["kick"]
+
+                        data["mode_t"] += dt
+                        if data["mode_t"] >= data["mode_dur"] or (kick > 0.75 and random.random() < 0.18):
+                            data["prev_mode"] = data["anim_mode"]
+                            data["anim_mode"] = self._choose_next_mode(data["anim_mode"])
+                            data["mode_t"] = 0.0
+                            data["mode_dur"] = 4.0 + random.random() * 4.5
+                            data["mode_blend"] = 0.0
+                        if data["mode_blend"] < 1.0:
+                            data["mode_blend"] = min(1.0, data["mode_blend"] + dt / 0.6)
+
+                        if kick > 0.7 and random.random() < 0.12:
+                            data["target_dir"] *= -1.0
+
+                        def mode_targets(mode: str):
+                            if mode == "rotate":
+                                rot_sp = (4.0 + amp * 8.0 + kick * 12.0) * data["target_dir"]
+                                scl = 1.02 + amp * 0.18 + kick * 0.25
+                                tx = math.sin(data["orbit_phase"]) * (4.0 + amp * 6.0 + kick * 8.0)
+                                ty = math.cos(data["orbit_phase"] * 0.8) * (3.0 + amp * 5.0 + kick * 6.0)
+                                return rot_sp, scl, tx, ty
+                            if mode == "drift":
+                                rot_sp = (1.0 + amp * 2.0) * data["target_dir"]
+                                scl = 1.01 + amp * 0.10
+                                tx = math.sin(data["orbit_phase"]) * (8.0 + amp * 10.0)
+                                ty = math.cos(data["orbit_phase"] * 0.9) * (6.0 + amp * 8.0)
+                                return rot_sp, scl, tx, ty
+                            rot_sp = (0.6 + amp * 1.2) * data["target_dir"]
+                            scl = 1.02 + amp * 0.28 + (0.02 * math.sin(data["scale_phase"] * 2.0))
+                            return rot_sp, scl, 0.0, 0.0
+
+                        data["orbit_phase"] += data["orbit_speed"] * (1.0 + amp * 0.6)
+                        data["scale_phase"] += data["scale_speed"] * (1.0 + amp * 0.5)
+
+                        rot_sp_prev, scl_prev, tx_prev, ty_prev = mode_targets(data["prev_mode"])
+                        rot_sp_cur, scl_cur, tx_cur, ty_cur = mode_targets(data["anim_mode"])
+                        blend = data["mode_blend"]
+                        rot_sp_tgt = rot_sp_prev * (1.0 - blend) + rot_sp_cur * blend
+                        scl_tgt = scl_prev * (1.0 - blend) + scl_cur * blend
+                        tx_tgt = tx_prev * (1.0 - blend) + tx_cur * blend
+                        ty_tgt = ty_prev * (1.0 - blend) + ty_cur * blend
+                        scl_tgt += kick * 0.12
+
+                        data["rot_speed"] = 0.85 * data["rot_speed"] + 0.15 * rot_sp_tgt
+                        data["rot_speed"] = max(-12.0, min(12.0, data["rot_speed"]))
+                        data["rot"] = (data["rot"] + data["rot_speed"] * dt) % 360.0
+                        data["scale"] = 0.8 * data["scale"] + 0.2 * scl_tgt
+                        data["tx"] = 0.8 * data["tx"] + 0.2 * tx_tgt
+                        data["ty"] = 0.8 * data["ty"] + 0.2 * ty_tgt
+
+                        img = data["image"]
+                        last_rot, last_scl, last_tx, last_ty = data["last_vals"]
+                        need_ui = (
+                            abs(last_rot - data["rot"]) > 0.35 or
+                            abs(last_scl - data["scale"]) > 0.01 or
+                            abs(last_tx - data["tx"]) > 0.6 or
+                            abs(last_ty - data["ty"]) > 0.6 or
+                            (now - data["last_ui_ts"]) > 0.12
+                        )
+
+                        if need_ui:
+                            def apply_ui():
+                                try:
+                                    img.setRotation(data["rot"])
+                                    img.setScaleX(data["scale"])
+                                    img.setScaleY(data["scale"])
+                                    img.setTranslationX(data["tx"])
+                                    img.setTranslationY(data["ty"])
+                                except Exception:
+                                    pass
+
+                            run_on_ui_thread(apply_ui)
+                            data["last_vals"] = (data["rot"], data["scale"], data["tx"], data["ty"])
+                            data["last_ui_ts"] = now
+
+                        if random.random() < 0.08:
+                            self._ensure_cover_visible(data)
+
+                    except Exception:
+                        pass
+                    time.sleep(0.06 if amp > 0.1 else 0.075)
+            except Exception:
+                pass
+            finally:
+                data["anim_thread"] = None
+                data["running"] = False
+                self._update_overlay_mood(data, playing=False, force=True)
+
+        thread = threading.Thread(target=anim_loop, name="PV-Anim", daemon=True)
+        data["anim_thread"] = thread
+        thread.start()
+
+    def _update_amp_and_beat(self, data: Dict[str, Any]):
+        vis = data.get("visualizer")
+        if vis is None:
+            t = time.time()
+            data["amp"] = 0.28 + 0.16 * (0.5 + 0.5 * math.sin(t * 1.05))
+            data["kick"] = max(0.0, data.get("kick", 0.0) - 0.08)
+            return
+
+        amp_updated = False
+        try:
+            size = max(64, vis.getCaptureSize())
+            waveform = jarray(jbyte)(size)
+            if vis.getWaveForm(waveform) == 0:
+                total = 0.0
+                for b in waveform:
+                    v = (int(b) - 128) / 128.0
+                    total += v * v
+                rms = math.sqrt(total / max(1, len(waveform)))
+                amp = max(0.0, min(1.0, rms * 1.7))
+                data["amp"] = 0.54 * data["amp"] + 0.46 * amp
+                amp_updated = True
+        except Exception:
+            pass
+
+        try:
+            size = max(64, vis.getCaptureSize())
+            fft = jarray(jbyte)(size)
+            if vis.getFft(fft) == 0:
+                bins = size // 2
+                low_bins = max(4, int(bins * 0.22))
+                energy = 0.0
+                for i in range(0, low_bins * 2, 2):
+                    re = int(fft[i]) - 128
+                    im = int(fft[i + 1]) - 128
+                    energy += math.sqrt(re * re + im * im)
+                low_energy = energy / max(1, low_bins)
+                avg = data["beat_avg"] if data["beat_avg"] > 0 else low_energy
+                avg = 0.90 * avg + 0.10 * low_energy
+                data["beat_avg"] = avg
+                now_ms = int(time.time() * 1000)
+                threshold = 1.27
+                refractory = 120
+                if low_energy > avg * threshold and (now_ms - data.get("last_kick_ms", 0) > refractory):
+                    data["kick"] = min(1.0, data.get("kick", 0.0) + 1.0)
+                    data["last_kick_ms"] = now_ms
+                else:
+                    data["kick"] = max(0.0, data.get("kick", 0.0) - 0.10)
+        except Exception:
+            data["kick"] = max(0.0, data.get("kick", 0.0) - 0.12)
+
+        if not amp_updated:
+            t = time.time()
+            data["amp"] = 0.28 + 0.16 * (0.5 + 0.5 * math.sin(t * 1.05))
+
+    def _stop_visualizer_for(self, fcv, release=False):
+        if fcv is None:
+            return
+        data = self._overlays.get(fcv)
+        if not data or not data.get("ready"):
+            return
+        if data.get("running"):
+            data["running"] = False
+        vis = data.get("visualizer")
+        if vis is not None and release:
+            try:
+                vis.setEnabled(False)
+            except Exception:
+                pass
+            try:
+                vis.release()
+            except Exception:
+                pass
+            data["visualizer"] = None
+
+        img = data.get("image")
+        if img is not None:
+            def reset_view():
+                try:
+                    img.setRotation(0.0)
+                    img.setScaleX(1.0)
+                    img.setScaleY(1.0)
+                    img.setTranslationX(0.0)
+                    img.setTranslationY(0.0)
+                except Exception:
+                    pass
+            run_on_ui_thread(reset_view)
+        data["rot"] = 0.0
+        data["rot_speed"] = 0.0
+        data["scale"] = 1.0
+        data["tx"] = 0.0
+        data["ty"] = 0.0
+        data["amp"] = 0.0
+        data["kick"] = 0.0
+        data["beat_avg"] = 0.0
+        data["last_kick_ms"] = 0
+        self._update_overlay_mood(data, playing=False)
+
+    def _update_overlay_mood(self, data: Dict[str, Any], playing: bool, force: bool = False):
+        dim_target = 0.26 if playing else 0.45
+        shade_target = 0.34 if playing else 0.52
+
+        def apply():
+            dim_view = data.get("dim")
+            shade_view = data.get("shade")
+            try:
+                duration = 200 if not force else 0
+                if dim_view is not None:
+                    anim = dim_view.animate().alpha(dim_target)
+                    anim.setDuration(duration).start()
+                    if force:
+                        dim_view.setAlpha(dim_target)
+                if shade_view is not None:
+                    anim = shade_view.animate().alpha(shade_target)
+                    anim.setDuration(duration).start()
+                    if force:
+                        shade_view.setAlpha(shade_target)
+            except Exception:
+                if dim_view is not None:
+                    dim_view.setAlpha(dim_target)
+                if shade_view is not None:
+                    shade_view.setAlpha(shade_target)
+
+        run_on_ui_thread(apply)
+        if playing:
+            self._ensure_cover_visible(data)
+
+    def _is_player_active(self) -> bool:
+        try:
+            mc = MediaController.getInstance()
+            if mc is None:
+                return False
+            message = mc.getPlayingMessageObject()
+            if message is not None:
+                return mc.isPlayingMessage(message)
+            return mc.isMusicPlaying()
+        except Exception:
+            return False
