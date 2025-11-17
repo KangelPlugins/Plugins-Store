@@ -1,0 +1,518 @@
+__id__ = "secure_archive"
+__name__ = "Secure Archive"
+__version__ = "2.5.0-fixed"
+__author__ = "LegacyFreeman"
+__description__ = "Защита архива и чатов: системная аутентификация + открытие архива при долгом нажатии ярлыка FAB."
+__min_version__ = "11.9.0"
+__icon__ = "lock_solar"
+
+import weakref
+import threading
+import time
+from typing import Optional, Set
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from hook_utils import find_class
+from ui.settings import Header, Switch, Divider, Input
+
+DEFAULT_AUTH_RESET_DELAY_SECONDS = 10
+REQUEST_CODE_CONFIRM_DEVICE_CREDENTIALS = 1337
+
+try:
+    DialogsActivity = find_class("org.telegram.ui.DialogsActivity")
+    ChatActivity = find_class("org.telegram.ui.ChatActivity")
+    Activity = find_class("android.app.Activity")
+    Intent = find_class("android.content.Intent")
+    Integer = find_class("java.lang.Integer")
+    KeyguardManager = find_class("android.app.KeyguardManager")
+    MotionEvent = find_class("android.view.MotionEvent")
+
+    JAVA_CLASSES_FOUND = True
+except Exception:
+    JAVA_CLASSES_FOUND = False
+
+
+class SecureArchivePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.is_session_authenticated = False
+        self._is_authenticating = False
+        self._protected_item_ref = None
+        self._protected_ids_cache: Set[int] = set()
+        self._auth_reset_timer: Optional[threading.Timer] = None
+
+        self._success_callback = None
+        self._failure_callback = None
+        self._activity_hook = None
+
+        self._dialogs_resume_hook = None
+        self._dialogs_pause_hook = None
+        self._chat_resume_hook = None
+        self._chat_pause_hook = None
+
+        self._press_start_time = 0.0
+
+        # cache last found fab weakref to avoid repeated searches
+        self._fab_ref = None
+
+    # --------------------------
+    # Настройки
+    # --------------------------
+    def create_settings(self):
+        return [
+            Header(text="Secure Archive — Настройки"),     
+            Divider(text="Используется системная аутентификация."),
+            Header(text="Долгое нажатие FAB ✏️"),
+            Divider(text="Первое удержание запускает проверку, повторное открывает архив."),
+            Header(text="Важная информация"),
+            Divider(text="Функция доступа по долгому нажатию FAB активна только с установленным плагином UiTweaks: Общее - Расширение ярлыка FAB - Зажатие открывает - Архив."),
+            Divider(text="Защита"),
+            Switch(
+                key="archive_lock_enabled",
+                text="Защитить архив",
+                default=True,
+                icon="chats_archive_solar"
+            ),
+            Input(
+                key="protected_chat_ids",
+                text="Защищённые чаты",
+                default="",
+                icon="msg_block_solar",
+                on_change=lambda val: self._update_protected_ids_cache(val)
+            ),
+            Divider(text="Общие"),
+            Input(
+                key="auth_reset_delay",
+                text="Доверенное время (сек)",
+                default=str(DEFAULT_AUTH_RESET_DELAY_SECONDS),
+                icon="msg_timer_solar"
+            ),
+        ]
+
+    def _update_protected_ids_cache(self, ids_string: str):
+        try:
+            self._protected_ids_cache = {int(i.strip()) for i in ids_string.split(",") if i.strip()}
+        except Exception:
+            self._protected_ids_cache = set()
+
+    # --------------------------
+    # Жизненный цикл
+    # --------------------------
+    def on_plugin_load(self):
+        if not JAVA_CLASSES_FOUND:
+            return
+        self._hook_lifecycle_methods()
+        # try applying hooks (will search FAB). wrap in ui-thread to be safe.
+        try:
+            run_on_ui_thread(self._apply_hooks)
+        except Exception:
+            self._apply_hooks()
+        self._update_protected_ids_cache(self.get_setting("protected_chat_ids", ""))
+
+    def on_plugin_unload(self):
+        self._unhook_activity_result()
+        self._unhook_lifecycle_methods()
+        self._cancel_auth_reset_timer()
+        # clear any stored fab listener if needed
+        self._fab_ref = None
+
+    def _cancel_auth_reset_timer(self):
+        if self._auth_reset_timer and self._auth_reset_timer.is_alive():
+            try:
+                self._auth_reset_timer.cancel()
+            except Exception:
+                pass
+        self._auth_reset_timer = None
+
+    def _reset_auth_state(self):
+        self.is_session_authenticated = False
+        self._auth_reset_timer = None
+
+    # --------------------------
+    # Проверка (только системная)
+    # --------------------------
+    def _show_lock_screen_prompt(self, success_callback=None, failure_callback=None):
+        try:
+            fragment = self._protected_item_ref() if self._protected_item_ref else None
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                if failure_callback:
+                    run_on_ui_thread(failure_callback)
+                return
+            keyguard_manager = activity.getSystemService("keyguard")
+            if not keyguard_manager or not keyguard_manager.isKeyguardSecure():
+                if success_callback:
+                    run_on_ui_thread(success_callback)
+                return
+            intent = keyguard_manager.createConfirmDeviceCredentialIntent(
+                "Подтверждение личности", "Для доступа к защищённому разделу"
+            )
+            if intent is None:
+                if failure_callback:
+                    run_on_ui_thread(failure_callback)
+                return
+            self._success_callback = success_callback
+            self._failure_callback = failure_callback
+            self._hook_activity_result(activity)
+            activity.startActivityForResult(intent, REQUEST_CODE_CONFIRM_DEVICE_CREDENTIALS)
+        except Exception:
+            if failure_callback:
+                run_on_ui_thread(failure_callback)
+
+    def _hook_activity_result(self, activity):
+        self._unhook_activity_result()
+
+        class ActivityResultHook(MethodHook):
+            def __init__(self, plugin):
+                super().__init__()
+                self.plugin_ref = weakref.ref(plugin)
+
+            def before_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin:
+                    return
+                try:
+                    request_code, result_code = param.args[0], param.args[1]
+                except Exception:
+                    return
+                if request_code == REQUEST_CODE_CONFIRM_DEVICE_CREDENTIALS:
+                    plugin._is_authenticating = False
+                    plugin._unhook_activity_result()
+                    try:
+                        if result_code == Activity.RESULT_OK:
+                            if plugin._success_callback:
+                                run_on_ui_thread(plugin._success_callback)
+                        else:
+                            if plugin._failure_callback:
+                                run_on_ui_thread(plugin._failure_callback)
+                    finally:
+                        plugin._success_callback = None
+                        plugin._failure_callback = None
+                    # prevent original handler if needed
+                    try:
+                        param.setResult(None)
+                    except Exception:
+                        pass
+
+        try:
+            method = activity.getClass().getDeclaredMethod("onActivityResult", Integer.TYPE, Integer.TYPE, Intent)
+            self._activity_hook = self.hook_method(method, ActivityResultHook(self))
+        except Exception:
+            # best-effort: if reflection fails, we silently continue
+            pass
+
+    def _unhook_activity_result(self):
+        if self._activity_hook:
+            try:
+                self.unhook_method(self._activity_hook)
+            except Exception:
+                pass
+            self._activity_hook = None
+
+    # --------------------------
+    # Результаты проверки
+    # --------------------------
+    def _on_auth_success(self):
+        self.is_session_authenticated = True
+        self._is_authenticating = False
+        BulletinHelper.show_success("Доступ разрешён.")
+
+    def _on_auth_failure(self):
+        self._is_authenticating = False
+        frag = self._protected_item_ref() if self._protected_item_ref else None
+        if frag:
+            try:
+                frag.finishFragment()
+            except Exception:
+                pass
+        BulletinHelper.show_error("Доступ запрещён.")
+
+    # --------------------------
+    # FAB Shortcut через TouchListener
+    # --------------------------
+    def _apply_hooks(self):
+        try:
+            fab = self._get_fab()
+            if fab:
+                # cache weakref to avoid repetitive searches
+                try:
+                    self._fab_ref = weakref.ref(fab)
+                except Exception:
+                    self._fab_ref = None
+
+                # ensure listener set on UI thread
+                def set_listener():
+                    try:
+                        # create a touch listener compatible with Java signature (View, MotionEvent) -> bool
+                        # Using a Python callable that returns boolean
+                        fab.setOnTouchListener(lambda v, event: self._handle_fab_touch(event) or False)
+                    except Exception:
+                        pass
+
+                try:
+                    run_on_ui_thread(set_listener)
+                except Exception:
+                    set_listener()
+        except Exception as e:
+            BulletinHelper.show_error(f"Ошибка apply_hooks: {e}")
+
+    def _handle_fab_touch(self, event):
+        try:
+            action = None
+            try:
+                action = event.getAction()
+            except Exception:
+                # fallback: if event.action exists
+                action = getattr(event, "action", None)
+            if action == MotionEvent.ACTION_DOWN:
+                self._press_start_time = time.time()
+            elif action == MotionEvent.ACTION_UP:
+                press_duration = time.time() - getattr(self, "_press_start_time", 0)
+                if press_duration > 0.6:  # >600 ms
+                    return self._trigger_auth_or_archive()
+        except Exception:
+            pass
+        return False
+
+    def _trigger_auth_or_archive(self):
+        if not self.is_session_authenticated:
+            BulletinHelper.show_info("Запущена проверка через системную аутентификацию.")
+            self._show_lock_screen_prompt(
+                success_callback=lambda: self._on_auth_success(),
+                failure_callback=lambda: self._on_auth_failure()
+            )
+        else:
+            try:
+                activity = None
+                try:
+                    activity = self.get_current_activity()
+                except Exception:
+                    activity = None
+                if activity:
+                    intent = Intent(activity, DialogsActivity)
+                    try:
+                        intent.putExtra("folderId", 1)  # архив
+                    except Exception:
+                        # some Intent impls require different putExtra invocation - best effort
+                        try:
+                            intent.putExtra("folderId", Integer(1))
+                        except Exception:
+                            pass
+                    activity.startActivity(intent)
+                    BulletinHelper.show_success("Открыт архив.")
+            except Exception:
+                BulletinHelper.show_error("Не удалось открыть архив.")
+        return True
+
+    # --------------------------
+    # Поиск FAB (надёжно)
+    # --------------------------
+    def _get_fab(self):
+        """
+        Попытка вернуть FloatingActionButton или похожую вьюшку.
+        Сначала пробуем взять из кэша, затем рекурсивно ищем в decorView.
+        Ищем по имени класса содержащему 'floatingactionbutton' или по имени класса/ид, содержащему 'fab'.
+        """
+        try:
+            # return cached
+            if self._fab_ref:
+                try:
+                    cached = self._fab_ref()
+                    if cached:
+                        return cached
+                except Exception:
+                    self._fab_ref = None
+
+            activity = None
+            try:
+                activity = self.get_current_activity()
+            except Exception:
+                activity = None
+            if not activity:
+                return None
+
+            try:
+                window = activity.getWindow()
+                if not window:
+                    return None
+                decor = window.getDecorView()
+                if not decor:
+                    return None
+                found = self._find_fab_recursive(decor)
+                if found:
+                    try:
+                        self._fab_ref = weakref.ref(found)
+                    except Exception:
+                        self._fab_ref = None
+                return found
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _find_fab_recursive(self, view):
+        """
+        Рекурсивный обход дерева view. Возвращаем первый найденный view, у которого:
+        - имя класса содержит 'floatingactionbutton' или 'fab', либо
+        - класс содержит 'material' и 'button' (best-effort).
+        """
+        try:
+            if not view:
+                return None
+            # try class name
+            try:
+                cls_name = view.getClass().getName()
+                if cls_name:
+                    cls_name_l = str(cls_name).lower()
+                    if "floatingactionbutton" in cls_name_l or "fab" in cls_name_l:
+                        return view
+                    if "material" in cls_name_l and "button" in cls_name_l:
+                        return view
+            except Exception:
+                pass
+
+            # try view id/name (best-effort)
+            try:
+                vid = view.getId()
+                if vid and vid != 0:
+                    try:
+                        # attempt to get resource entry name (may throw)
+                        res_name = view.getResources().getResourceEntryName(vid)
+                        if res_name:
+                            rn = str(res_name).lower()
+                            if "fab" in rn or "floating" in rn or "action" in rn:
+                                return view
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # if view is ViewGroup, iterate children
+            try:
+                child_count = view.getChildCount()
+            except Exception:
+                child_count = 0
+
+            for i in range(child_count):
+                try:
+                    child = view.getChildAt(i)
+                    found = self._find_fab_recursive(child)
+                    if found:
+                        return found
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    # --------------------------
+    # Хуки жизненного цикла
+    # --------------------------
+    def _hook_lifecycle_methods(self):
+        try:
+            if not self._dialogs_resume_hook:
+                resume_method = DialogsActivity.getClass().getDeclaredMethod("onResume")
+                self._dialogs_resume_hook = self.hook_method(resume_method, self.LifecycleHook(self, "resume"))
+                pause_method = DialogsActivity.getClass().getDeclaredMethod("onPause")
+                self._dialogs_pause_hook = self.hook_method(pause_method, self.LifecycleHook(self, "pause"))
+
+            if not self._chat_resume_hook:
+                resume_method = ChatActivity.getClass().getDeclaredMethod("onResume")
+                self._chat_resume_hook = self.hook_method(resume_method, self.LifecycleHook(self, "resume"))
+                pause_method = ChatActivity.getClass().getDeclaredMethod("onPause")
+                self._chat_pause_hook = self.hook_method(pause_method, self.LifecycleHook(self, "pause"))
+        except Exception:
+            pass
+
+    def _unhook_lifecycle_methods(self):
+        for h in [self._dialogs_resume_hook, self._dialogs_pause_hook, self._chat_resume_hook, self._chat_pause_hook]:
+            if h:
+                try:
+                    self.unhook_method(h)
+                except Exception:
+                    pass
+        self._dialogs_resume_hook = None
+        self._dialogs_pause_hook = None
+        self._chat_resume_hook = None
+        self._chat_pause_hook = None
+
+    # --------------------------
+    # LifecycleHook
+    # --------------------------
+    class LifecycleHook(MethodHook):
+        def __init__(self, plugin, hook_type):
+            super().__init__()
+            self.plugin_ref = weakref.ref(plugin)
+            self.hook_type = hook_type
+
+        def _is_target_protected(self, plugin, fragment):
+            try:
+                is_archive = False
+                try:
+                    # safe check: fragment might be instance of DialogsActivity or wrapper that provides getArguments
+                    is_dialogs = isinstance(fragment, DialogsActivity)
+                    if is_dialogs:
+                        args = fragment.getArguments()
+                        if args:
+                            is_archive = args.getInt("folderId", 0) == 1
+                except Exception:
+                    is_archive = False
+            except Exception:
+                is_archive = False
+
+            if is_archive and plugin.get_setting("archive_lock_enabled", True):
+                return True
+
+            try:
+                if isinstance(fragment, ChatActivity):
+                    dialog_id = fragment.getDialogId()
+                    if dialog_id in plugin._protected_ids_cache:
+                        return True
+            except Exception:
+                pass
+            return False
+
+        def after_hooked_method(self, param):
+            if self.hook_type != "resume":
+                return
+            plugin = self.plugin_ref()
+            if not plugin:
+                return
+            fragment = param.thisObject
+            if not self._is_target_protected(plugin, fragment):
+                return
+            plugin._protected_item_ref = weakref.ref(fragment)
+            plugin._cancel_auth_reset_timer()
+            if plugin.is_session_authenticated:
+                return
+            try:
+                fragment.finishFragment()
+            except Exception:
+                pass
+            if plugin._is_authenticating:
+                return
+            plugin._is_authenticating = True
+            plugin._show_lock_screen_prompt(
+                success_callback=lambda: plugin._on_auth_success(),
+                failure_callback=lambda: plugin._on_auth_failure()
+            )
+
+        def before_hooked_method(self, param):
+            if self.hook_type != "pause":
+                return
+            plugin = self.plugin_ref()
+            if not plugin:
+                return
+            fragment = param.thisObject
+            if not self._is_target_protected(plugin, fragment):
+                return
+            if plugin.is_session_authenticated:
+                try:
+                    delay = int(plugin.get_setting("auth_reset_delay", str(DEFAULT_AUTH_RESET_DELAY_SECONDS)))
+                except Exception:
+                    delay = DEFAULT_AUTH_RESET_DELAY_SECONDS
+                plugin._cancel_auth_reset_timer()
+                plugin._auth_reset_timer = threading.Timer(delay, plugin._reset_auth_state)
+                plugin._auth_reset_timer.start()
