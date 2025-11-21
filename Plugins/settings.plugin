@@ -1,0 +1,936 @@
+__id__ = "plugins_settings"
+__name__ = "Settings GUI"
+__description__ = "Добавляет кнопку 'test' в список плагинов. По клику открывает красивый GUI настроек для выбранного плагина (если возможно)."
+__author__ ="@pl_meow"
+__version__ = "1.0.0"
+__icon__ = "kitty_cats_vk/25"
+__min_version__ = "11.12.1"
+
+import traceback
+from typing import Any, List, Optional
+import json
+
+from base_plugin import BasePlugin, MethodHook, MenuItemData, MenuItemType
+from android_utils import log, run_on_ui_thread, OnClickListener
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Input, Divider, Text, Selector
+from android.os import Process
+from android.content import Intent
+
+from android.view import Gravity, View, ViewGroup, MotionEvent, WindowManager
+from android.widget import FrameLayout, TextView, LinearLayout, ScrollView, Button, ImageView
+from android.graphics import Color, Typeface
+from android.graphics.drawable import GradientDrawable, ColorDrawable
+from android.util import TypedValue
+
+from org.telegram.messenger import R
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.ActionBar import Theme, BottomSheet
+from com.exteragram.messenger.plugins import PluginsController
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+
+from java import dynamic_proxy, jclass
+from java.util import ArrayList
+
+# --- Drag Listener ---
+class DragTouchListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, plugin, params):
+        super().__init__()
+        self.plugin = plugin
+        self.params = params
+        self.start_x = 0.0
+        self.start_y = 0.0
+        self.initial_touch_x = 0.0
+        self.initial_touch_y = 0.0
+        self.init_x = 0
+        self.init_y = 0
+        self.is_drag = False
+        self.slop = AndroidUtilities.dp(5) # Smaller slop for better sensitivity
+
+    def onTouch(self, v, event):
+        if not self.plugin.get_setting("enable_drag", False): return False
+        action = event.getAction()
+        
+        if action == MotionEvent.ACTION_DOWN:
+            self.start_x = event.getRawX()
+            self.start_y = event.getRawY()
+            self.initial_touch_x = self.start_x
+            self.initial_touch_y = self.start_y
+            
+            # Normalize gravity to TOP|LEFT for absolute positioning
+            if (self.params.gravity & Gravity.BOTTOM) == Gravity.BOTTOM:
+                self.params.gravity = Gravity.TOP | Gravity.LEFT
+                self.params.leftMargin = int(v.getX())
+                self.params.topMargin = int(v.getY())
+                self.params.bottomMargin = 0
+                self.params.rightMargin = 0
+                v.setLayoutParams(self.params)
+            
+            self.init_x = self.params.leftMargin
+            self.init_y = self.params.topMargin
+            self.is_drag = False
+            return True
+            
+        elif action == MotionEvent.ACTION_MOVE:
+            dx = event.getRawX() - self.start_x
+            dy = event.getRawY() - self.start_y
+            total_dx = abs(event.getRawX() - self.initial_touch_x)
+            total_dy = abs(event.getRawY() - self.initial_touch_y)
+            
+            if not self.is_drag and (total_dx > self.slop or total_dy > self.slop):
+                self.is_drag = True
+            
+            if self.is_drag:
+                v.setTranslationX(dx)
+                v.setTranslationY(dy)
+            return True
+            
+        elif action == MotionEvent.ACTION_UP:
+            if self.is_drag:
+                dx = event.getRawX() - self.start_x
+                dy = event.getRawY() - self.start_y
+                
+                new_x = int(self.init_x + dx)
+                new_y = int(self.init_y + dy)
+                
+                v.setTranslationX(0.0)
+                v.setTranslationY(0.0)
+                
+                self.params.leftMargin = new_x
+                self.params.topMargin = new_y
+                v.setLayoutParams(self.params)
+                
+                self.plugin.set_setting("btn_x", new_x)
+                self.plugin.set_setting("btn_y", new_y)
+            else:
+                v.performClick()
+            self.is_drag = False
+            return True
+        return False
+
+class RunnableImpl(dynamic_proxy(jclass("java.lang.Runnable"))):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+    def run(self):
+        try:
+            self.func()
+        except Exception:
+            pass
+
+class HeightLimiter(dynamic_proxy(find_class("android.view.ViewTreeObserver$OnGlobalLayoutListener"))):
+    def __init__(self, scroll, content, max_h):
+        super().__init__()
+        self.scroll = scroll
+        self.content = content
+        self.max_h = max_h
+
+    def onGlobalLayout(self):
+        try:
+            if self.content.getHeight() > self.max_h:
+                p = self.scroll.getLayoutParams()
+                if p.height != self.max_h:
+                    p.height = self.max_h
+                    self.scroll.setLayoutParams(p)
+        except Exception:
+            pass
+class CustomSheetDragListener(dynamic_proxy(View.OnTouchListener)):
+    def __init__(self, target_view, header_view, window_manager, root_layout, root_params):
+        super().__init__()
+        self.target_view = target_view
+        self.header_view = header_view
+        self.wm = window_manager 
+        self.root = root_layout
+        self.params = root_params
+        
+        self.start_raw_y = 0.0
+        self.start_trans_y = 0.0
+        self.is_dragging = False
+        self.slop = AndroidUtilities.dp(5)
+        self.is_collapsed = False
+        self.full_height = 0
+        self.LAYER_HARDWARE = 2
+        self.LAYER_NONE = 0
+
+    def _get_collapsed_height(self):
+        # Accurate height: header content + container's bottom padding
+        return self.header_view.getHeight() + self.target_view.getPaddingBottom()
+
+    def onTouch(self, v, event):
+        action = event.getAction()
+        
+        if action == MotionEvent.ACTION_DOWN:
+            if not self.is_collapsed:
+                self.full_height = self.target_view.getHeight()
+            
+            if self.full_height == 0:
+                self.full_height = self.target_view.getHeight()
+
+            self.start_raw_y = event.getRawY()
+            if not self.is_collapsed:
+                self.start_trans_y = self.target_view.getTranslationY()
+            
+            self.target_view.setLayerType(self.LAYER_HARDWARE, None)
+            self.is_dragging = False
+            return True
+            
+        elif action == MotionEvent.ACTION_MOVE:
+            dy = event.getRawY() - self.start_raw_y
+            
+            if not self.is_dragging and abs(dy) > self.slop:
+                self.is_dragging = True
+                if self.is_collapsed:
+                    collapsed_h = self._get_collapsed_height()
+                    max_trans = float(self.full_height - collapsed_h)
+                    self.target_view.setTranslationY(max_trans)
+                    
+                    lp = self.target_view.getLayoutParams()
+                    lp.height = self.full_height
+                    self.target_view.setLayoutParams(lp)
+                    
+                    if self.wm:
+                        self.params.height = WindowManager.LayoutParams.WRAP_CONTENT
+                        self.wm.updateViewLayout(self.root, self.params)
+                    
+                    self.start_trans_y = max_trans
+                    self.is_collapsed = False
+            
+            if self.is_dragging:
+                new_trans = self.start_trans_y + dy
+                h = self.full_height if self.full_height > 0 else self.target_view.getHeight()
+                collapsed_h = self._get_collapsed_height()
+                max_trans = float(h - collapsed_h)
+                
+                if new_trans < 0: new_trans = 0
+                if new_trans > max_trans: new_trans = max_trans
+                self.target_view.setTranslationY(new_trans)
+            return True
+            
+        elif action == MotionEvent.ACTION_UP or action == MotionEvent.ACTION_CANCEL:
+            self.target_view.setLayerType(self.LAYER_NONE, None)
+            
+            if self.is_dragging:
+                current_trans = self.target_view.getTranslationY()
+                h = self.full_height if self.full_height > 0 else self.target_view.getHeight()
+                collapsed_h = self._get_collapsed_height()
+                max_trans = float(h - collapsed_h)
+                
+                if current_trans > max_trans * 0.5:
+                    self._animate_collapse(max_trans)
+                else:
+                    self.target_view.animate().translationY(0.0).setDuration(200).start()
+                    self.is_collapsed = False
+            else:
+                if action == MotionEvent.ACTION_UP:
+                    v.performClick()
+            
+            self.is_dragging = False
+            return True
+        return False
+
+    def _restore_collapsed_state(self):
+        try:
+            lp = self.target_view.getLayoutParams()
+            lp.height = self._get_collapsed_height()
+            self.target_view.setLayoutParams(lp)
+            self.target_view.setTranslationY(0.0)
+            self.is_collapsed = True
+        except:
+            pass
+
+    def _animate_collapse(self, target_trans):
+        def on_end():
+            self._restore_collapsed_state()
+        self.target_view.animate().translationY(target_trans).setDuration(200).withEndAction(RunnableImpl(on_end)).start()
+# --- Helpers ---
+
+def create_gradient(color_int, radius_dp):
+    d = GradientDrawable()
+    d.setShape(GradientDrawable.RECTANGLE)
+    d.setCornerRadius(AndroidUtilities.dp(radius_dp))
+    d.setColor(color_int)
+    return d
+
+class ClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+    def onClick(self, v):
+        self.func(v)
+
+class TestButtonPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hooks = []
+        self._active_overlays = []
+        self._button_tag = "neko_test_fab"
+
+    def on_plugin_load(self):
+        self._update_hooks()
+        self.log("TestButtonPlugin loaded.")
+
+    def on_plugin_unload(self):
+        self._remove_hooks()
+        self._remove_button_from_current_view()
+        for overlay in list(self._active_overlays):
+            try:
+                if overlay and overlay.getParent():
+                    overlay.getParent().removeView(overlay)
+            except:
+                pass
+        self._active_overlays.clear()
+        self.log("TestButtonPlugin unloaded. Restarting app...")
+        self._restart_app()
+    def _restart_app(self):
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            
+            if activity:
+                # 1. Minimize to desktop
+                activity.moveTaskToBack(True)
+                
+                def restore():
+                    try:
+                        # 2. Instantly bring back to front
+                        ctx = activity.getApplicationContext()
+                        pm = ctx.getPackageManager()
+                        intent = pm.getLaunchIntentForPackage(ctx.getPackageName())
+                        if intent:
+                            intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_NEW_TASK)
+                            ctx.startActivity(intent)
+                    except: pass
+                
+                # Execute almost immediately
+                run_on_ui_thread(restore, 30)
+        except: pass
+
+    def _update_hooks(self):
+        self._remove_hooks()
+        if self.get_setting("show_in_plugins_list", True):
+            self._hook_activity("com.exteragram.messenger.plugins.ui.PluginsActivity")
+            run_on_ui_thread(self._inject_button_immediate)
+        else:
+            run_on_ui_thread(self._remove_button_from_current_view)
+            
+        if self.get_setting("replace_std_settings", False):
+            self._hook_present_fragment()
+
+    def _remove_hooks(self):
+        for hook in self._hooks:
+            self.unhook_method(hook)
+        self._hooks.clear()
+    def _hook_present_fragment(self):
+        try:
+            BaseFragment = find_class("org.telegram.ui.ActionBar.BaseFragment")
+            if not BaseFragment:
+                return
+            # presentFragment(BaseFragment fragment)
+            present_method = BaseFragment.getClass().getDeclaredMethod("presentFragment", BaseFragment)
+            present_method.setAccessible(True)
+            hook = self.hook_method(present_method, self.PresentFragmentHook(self))
+            self._hooks.append(hook)
+        except Exception as e:
+            self.log(f"Error hooking presentFragment: {e}")
+
+    class PresentFragmentHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                # 1. Check if we are in PluginsActivity
+                caller = param.thisObject
+                if "PluginsActivity" not in str(caller.getClass().getName()):
+                    return
+
+                # 2. Check if opening PluginSettingsActivity
+                fragment = param.args[0]
+                if "PluginSettingsActivity" not in str(fragment.getClass().getName()):
+                    return
+
+                # 3. Hijack
+                plugin_field = fragment.getClass().getDeclaredField("plugin")
+                plugin_field.setAccessible(True)
+                java_plugin = plugin_field.get(fragment)
+                
+                if java_plugin:
+                    py_instance = self.plugin._get_python_instance(java_plugin.getId())
+                    if py_instance and hasattr(py_instance, 'create_settings'):
+                        settings = py_instance.create_settings()
+                        if settings:
+                            self.plugin._show_custom_settings_gui(java_plugin, settings)
+                            # Cancel original presentation and return True (success)
+                            param.setResult(True)
+            except Exception as e:
+                log(f"PresentFragmentHook error: {e}")
+    def _inject_button_immediate(self):
+        try:
+            frag = get_last_fragment()
+            if frag and "PluginsActivity" in str(frag.getClass().getName()):
+                view = frag.getFragmentView()
+                if isinstance(view, FrameLayout):
+                    self._inject_test_button(view)
+        except Exception:
+            pass
+
+
+    def create_settings(self):
+        return [
+            Header("Настройки кнопки"),
+            Switch(
+                key="show_in_plugins_list",
+                text="Кнопка в списке плагинов",
+                default=True,
+                icon="msg_plugins",
+            ),
+            Switch(
+                key="enable_drag",
+                text="Разрешить перетаскивание",
+                default=False,
+                icon="msg_move"
+            ),
+            Header("Позиция"),
+            Text(text=f"X: {self.get_setting('btn_x', 'Default')}", icon="msg_info"),
+            Text(text=f"Y: {self.get_setting('btn_y', 'Default')}", icon="msg_info"),
+            Header("Настройки GUI"),
+            Switch(
+                key="use_custom_gui",
+                text="Использовать красивый GUI",
+                subtext="Пытаться отобразить настройки в кастомном BottomSheet при нажатии кнопки TEST.",
+                default=True,
+                icon="msg_customize"
+            ),
+            Switch(
+                key="replace_std_settings",
+                text="Заменить стандартные настройки",
+                subtext="Открывать красивый GUI при нажатии на любой плагин в стандартном списке (если возможно).",
+                default=False,
+                icon="msg_settings",
+                on_change=lambda v: self._update_hooks()
+            ),
+            Selector(
+                key="gui_max_height_percent",
+                text="Макс. высота GUI",
+                items=["25%", "30%", "35%", "40%", "45%", "50%", "55%", "60%"],
+                default=7,
+                icon="msg_panel_top",
+            ),
+            Selector(
+                key="animation_speed",
+                text="Скорость анимации",
+                items=["Быстро", "Нормально", "Медленно"],
+                default=1,
+                icon="msg_speed"
+            )
+        ]
+
+    def _hook_activity(self, class_name):
+        try:
+            TargetClass = find_class(class_name)
+            if not TargetClass:
+                return
+            Context = find_class("android.content.Context")
+            create_view_method = TargetClass.getClass().getDeclaredMethod("createView", Context)
+            create_view_method.setAccessible(True)
+            hook = self.hook_method(create_view_method, self.ActivityViewHook(self))
+            self._hooks.append(hook)
+        except Exception as e:
+            self.log(f"Error hooking {class_name}: {e}")
+
+    class ActivityViewHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def after_hooked_method(self, param):
+            try:
+                view = param.getResult()
+                if isinstance(view, FrameLayout):
+                    self.plugin._inject_test_button(view)
+            except Exception as e:
+                log(f"Error injecting button: {e}")
+    def _inject_test_button(self, parent_view: FrameLayout):
+        context = parent_view.getContext()
+        if parent_view.findViewWithTag(self._button_tag):
+            return
+
+        btn = ImageView(context)
+        btn.setTag(self._button_tag)
+        btn.setImageResource(R.drawable.msg_settings)
+        btn.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+        btn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12))
+        
+        bg_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+        btn.setBackground(create_gradient(bg_color, 28))
+        btn.setElevation(AndroidUtilities.dp(10))
+        btn.setColorFilter(Color.WHITE)
+
+        btn.setOnClickListener(ClickListener(lambda v: self._on_test_click()))
+
+        size = AndroidUtilities.dp(56)
+        params = FrameLayout.LayoutParams(size, size)
+        
+        saved_x = self.get_setting("btn_x", None)
+        saved_y = self.get_setting("btn_y", None)
+
+        if saved_x is not None and saved_y is not None:
+            params.gravity = Gravity.TOP | Gravity.LEFT
+            params.leftMargin = int(saved_x)
+            params.topMargin = int(saved_y)
+        else:
+            params.gravity = Gravity.BOTTOM | Gravity.END
+            params.setMargins(0, 0, AndroidUtilities.dp(20), AndroidUtilities.dp(20))
+        
+        btn.setOnTouchListener(DragTouchListener(self, params))
+        parent_view.addView(btn, params)
+        btn.bringToFront()
+    def _remove_button_from_current_view(self):
+        # Пытаемся найти и удалить кнопку в текущем фрагменте
+        try:
+            fragment = get_last_fragment()
+            if fragment:
+                view = fragment.getFragmentView()
+                if isinstance(view, FrameLayout):
+                    btn = view.findViewWithTag(self._button_tag)
+                    if btn:
+                        view.removeView(btn)
+                        view.invalidate()
+                        view.requestLayout()
+        except Exception:
+            pass
+
+    def _on_test_click(self):
+        controller = PluginsController.getInstance()
+        plugins_map = controller.plugins
+        plugin_ids = list(plugins_map.keySet().toArray())
+        plugin_ids.sort()
+        
+        if not plugin_ids:
+            BulletinHelper.show_error("Нет установленных плагинов.")
+            return
+
+        items = []
+        for pid in plugin_ids:
+            p = plugins_map.get(pid)
+            name = p.getName()
+            
+            def make_click(target_id):
+                # We need to capture the current GUI closure context if possible, 
+                # but _show_custom_settings_gui logic handles one overlay.
+                # To implement "close selector then open settings", we pass a flag or handle it in _on_test_click logic.
+                return lambda v: (self._close_all_overlays(), self._open_plugin_options(target_id))
+            
+            items.append(Text(
+                text=f"{name} ({pid})",
+                icon="msg_plugins",
+                on_click=make_click(pid)
+            ))
+            
+        class PluginListHeader:
+            def getName(self): return "Выберите плагин"
+            def getId(self): return "plugin_selector"
+            
+        self._show_custom_settings_gui(PluginListHeader(), items)
+    def _close_all_overlays(self):
+        # Helper to close all open custom GUIs (e.g. selector) before opening new one
+        for overlay in list(self._active_overlays):
+            try:
+                if overlay and overlay.getParent():
+                    overlay.getParent().removeView(overlay)
+            except:
+                pass
+        self._active_overlays.clear()
+
+    def _open_plugin_options(self, plugin_id):
+        controller = PluginsController.getInstance()
+        java_plugin = controller.plugins.get(plugin_id)
+        
+        if not java_plugin:
+            BulletinHelper.show_error("Плагин не найден.")
+            return
+
+        use_custom = self.get_setting("use_custom_gui", True)
+        
+        if use_custom:
+            # Пытаемся получить Python-инстанс для вызова create_settings
+            py_instance = self._get_python_instance(plugin_id)
+            if py_instance and hasattr(py_instance, 'create_settings'):
+                try:
+                    settings_list = py_instance.create_settings()
+                    if settings_list:
+                        self._show_custom_settings_gui(java_plugin, settings_list)
+                        return
+                    else:
+                        BulletinHelper.show_info("У плагина нет настроек.")
+                        return
+                except Exception as e:
+                    log(f"Error creating settings for {plugin_id}: {e}")
+                    # Fallback to standard
+        
+        # Стандартное открытие
+        fragment = get_last_fragment()
+        if fragment:
+            fragment.presentFragment(PluginSettingsActivity(java_plugin))
+
+    def _get_python_instance(self, plugin_id):
+        try:
+            controller = PluginsController.getInstance()
+            python_engine = controller.engines.get("python")
+            if not python_engine:
+                return None
+            
+            try:
+                instances_field = python_engine.getClass().getDeclaredField("pluginInstances")
+                instances_field.setAccessible(True)
+                instances = instances_field.get(python_engine)
+                if instances:
+                    return instances.get(plugin_id)
+            except Exception:
+                pass
+            
+            return None
+        except Exception as e:
+            log(f"Error getting python instance: {e}")
+            return None
+    def _show_custom_settings_gui(self, java_plugin, settings_list):
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity: 
+                 return
+
+            root_view = activity.findViewById(16908290)
+            if not root_view:
+                return
+
+            root_layout = FrameLayout(activity)
+            self._active_overlays.append(root_layout)
+            
+            scrim = View(activity)
+            scrim.setBackgroundColor(Color.TRANSPARENT)
+            scrim.setClickable(False) 
+            root_layout.addView(scrim, FrameLayout.LayoutParams(-1, -1))
+
+            panel = LinearLayout(activity)
+            panel.setOrientation(LinearLayout.VERTICAL)
+            bg_drawable = GradientDrawable()
+            bg_drawable.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+            bg_drawable.setCornerRadii([float(AndroidUtilities.dp(16))] * 4 + [0, 0, 0, 0])
+            panel.setBackground(bg_drawable)
+            panel.setPadding(0, 0, 0, AndroidUtilities.dp(10))
+            panel.setClickable(True)
+            
+            panel_params = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
+            panel_params.gravity = Gravity.BOTTOM
+            root_layout.addView(panel, panel_params)
+
+            def close_gui():
+                try:
+                    panel.animate().translationY(float(panel.getHeight())).setDuration(250).setInterpolator(find_class("android.view.animation.AccelerateInterpolator")()).withEndAction(RunnableImpl(lambda: self._remove_overlay(root_view, root_layout))).start()
+                except Exception as e:
+                    self._remove_overlay(root_view, root_layout)
+            
+            header_layout = LinearLayout(activity)
+            header_layout.setOrientation(LinearLayout.HORIZONTAL)
+            header_layout.setGravity(Gravity.CENTER_VERTICAL)
+            header_layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(10), AndroidUtilities.dp(16))
+
+            title_tv = TextView(activity)
+            title_tv.setText(f"{java_plugin.getName()}")
+            title_tv.setTextSize(20)
+            title_tv.setTypeface(None, Typeface.BOLD)
+            title_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            
+            title_tv.setOnTouchListener(CustomSheetDragListener(panel, header_layout, None, root_layout, None))
+            
+            header_layout.addView(title_tv, LinearLayout.LayoutParams(0, -2, 1.0))
+
+            close_btn = TextView(activity)
+            close_btn.setText("✕")
+            close_btn.setTextSize(18)
+            close_btn.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+            close_btn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
+            close_btn.setOnClickListener(ClickListener(lambda v: close_gui()))
+            header_layout.addView(close_btn)
+
+            panel.addView(header_layout)
+
+            display_metrics = activity.getResources().getDisplayMetrics()
+            screen_height = display_metrics.heightPixels
+            h_idx = self.get_setting("gui_max_height_percent", 7)
+            h_pct = 0.25 + (h_idx * 0.05)
+            max_h = int(screen_height * h_pct)
+            scroll = ScrollView(activity)
+            
+            content_layout = LinearLayout(activity)
+            content_layout.setOrientation(LinearLayout.VERTICAL)
+            content_layout.setPadding(0, 0, 0, AndroidUtilities.dp(20))
+
+            scroll.addView(content_layout)
+            panel.addView(scroll, LinearLayout.LayoutParams(-1, -2))
+            try:
+                content_layout.getViewTreeObserver().addOnGlobalLayoutListener(HeightLimiter(scroll, content_layout, max_h))
+            except Exception as e:
+                log(f"HeightLimiter attach error: {e}")
+
+            self._render_settings_items(activity, content_layout, settings_list, java_plugin.getId(), close_gui)
+
+            root_view.addView(root_layout, FrameLayout.LayoutParams(-1, -1))
+
+            DecelerateInterpolator = find_class("android.view.animation.DecelerateInterpolator")
+            
+            class OnLayoutListener(dynamic_proxy(find_class("android.view.ViewTreeObserver$OnGlobalLayoutListener"))):
+                def __init__(self, view):
+                    super().__init__()
+                    self.view = view
+                
+                def onGlobalLayout(self):
+                    try:
+                        self.view.getViewTreeObserver().removeOnGlobalLayoutListener(self)
+                        height = self.view.getHeight()
+                        if height > 0:
+                            self.view.setTranslationY(float(height))
+                            self.view.animate().translationY(0.0).setDuration(350).setInterpolator(DecelerateInterpolator(1.5)).start()
+                    except:
+                        pass
+
+            panel.getViewTreeObserver().addOnGlobalLayoutListener(OnLayoutListener(panel))
+
+        except Exception as e:
+            log(f"Failed to show custom GUI: {e}\n{traceback.format_exc()}")
+    def _remove_overlay(self, parent, overlay):
+        try:
+            if overlay in self._active_overlays:
+                self._active_overlays.remove(overlay)
+            if overlay.getParent():
+                parent.removeView(overlay)
+        except:
+            pass
+            log(f"Failed to show custom GUI: {e}\n{traceback.format_exc()}")
+
+    def _render_settings_items(self, context, parent, items, plugin_id, close_callback=None):
+        py_instance = self._get_python_instance(plugin_id)
+        controller = PluginsController.getInstance()
+
+        # Helper for touch feedback animation
+        def _animate_press(view, callback):
+            view.animate().scaleX(0.95).scaleY(0.95).setDuration(100).withEndAction(RunnableImpl(lambda:
+                view.animate().scaleX(1.0).scaleY(1.0).setDuration(100).withEndAction(RunnableImpl(callback)).start()
+            )).start()
+
+        for item in items:
+            try:
+                cls_name = item.__class__.__name__
+                
+                if cls_name == "Header":
+                    tv = TextView(context)
+                    tv.setText(item.text)
+                    tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueHeader))
+                    tv.setTextSize(14)
+                    tv.setTypeface(None, Typeface.BOLD)
+                    tv.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(16), AndroidUtilities.dp(22), AndroidUtilities.dp(6))
+                    parent.addView(tv)
+
+                elif cls_name == "Text":
+                    row = LinearLayout(context)
+                    row.setOrientation(LinearLayout.HORIZONTAL)
+                    row.setGravity(Gravity.CENTER_VERTICAL)
+                    row.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(12), AndroidUtilities.dp(22), AndroidUtilities.dp(12))
+                    row.setBackground(Theme.getSelectorDrawable(True))
+                    
+                    tv = TextView(context)
+                    tv.setText(item.text)
+                    tv.setTextSize(16)
+                    color = Theme.key_windowBackgroundWhiteBlackText
+                    if hasattr(item, 'red') and item.red: color = Theme.key_text_RedRegular
+                    elif hasattr(item, 'accent') and item.accent: color = Theme.key_windowBackgroundWhiteBlueText
+                    tv.setTextColor(Theme.getColor(color))
+                    
+                    row.addView(tv, LinearLayout.LayoutParams(0, -2, 1.0))
+                    
+                    if hasattr(item, 'on_click') and item.on_click:
+                        def on_text_click(v, cb=item.on_click):
+                            _animate_press(v, lambda: cb(v))
+                        row.setOnClickListener(ClickListener(on_text_click))
+                        row.setClickable(True)
+                    
+                    parent.addView(row, LinearLayout.LayoutParams(-1, -2))
+
+                elif cls_name == "Switch":
+                    key = item.key
+                    default = item.default
+                    current_val = controller.getPluginSettingBoolean(plugin_id, key, default)
+
+                    row = LinearLayout(context)
+                    row.setOrientation(LinearLayout.HORIZONTAL)
+                    row.setGravity(Gravity.CENTER_VERTICAL)
+                    row.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(12), AndroidUtilities.dp(22), AndroidUtilities.dp(12))
+                    row.setBackground(Theme.getSelectorDrawable(True))
+
+                    text_layout = LinearLayout(context)
+                    text_layout.setOrientation(LinearLayout.VERTICAL)
+                    
+                    tv = TextView(context)
+                    tv.setText(item.text)
+                    tv.setTextSize(16)
+                    tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                    text_layout.addView(tv)
+
+                    if hasattr(item, 'subtext') and item.subtext:
+                        sub = TextView(context)
+                        sub.setText(item.subtext)
+                        sub.setTextSize(13)
+                        sub.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                        text_layout.addView(sub)
+
+                    row.addView(text_layout, LinearLayout.LayoutParams(0, -2, 1.0))
+
+                    AndroidSwitch = find_class("android.widget.Switch")
+                    sw = AndroidSwitch(context)
+                    sw.setChecked(current_val)
+                    
+                    def create_switch_handler(switch_view, setting_key, setting_item):
+                        def handler(v=None):
+                            new_state = not switch_view.isChecked()
+                            switch_view.setChecked(new_state)
+                            if py_instance:
+                                py_instance.set_setting(setting_key, new_state)
+                            else:
+                                controller.putPluginSetting(plugin_id, setting_key, new_state)
+                            if hasattr(setting_item, 'on_change') and setting_item.on_change:
+                                try: setting_item.on_change(new_state)
+                                except: pass
+                        return handler
+
+                    sw.setClickable(False) 
+                    row.setOnClickListener(ClickListener(create_switch_handler(sw, key, item)))
+                    
+                    row.addView(sw)
+                    parent.addView(row, LinearLayout.LayoutParams(-1, -2))
+
+                elif cls_name == "Divider":
+                    div = View(context)
+                    div.setBackgroundColor(Theme.getColor(Theme.key_divider))
+                    # Add margins if inside a group, but here simplified
+                    parent.addView(div, LinearLayout.LayoutParams(-1, 1))
+                    if hasattr(item, 'text') and item.text:
+                        tv = TextView(context)
+                        tv.setText(item.text)
+                        tv.setTextSize(13)
+                        tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                        tv.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(6), AndroidUtilities.dp(22), AndroidUtilities.dp(6))
+                        parent.addView(tv)
+
+                elif cls_name == "Input":
+                    key = item.key
+                    default = str(item.default)
+                    current_val = controller.getPluginSettingString(plugin_id, key, default)
+                    
+                    row = LinearLayout(context)
+                    row.setOrientation(LinearLayout.VERTICAL)
+                    row.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(12), AndroidUtilities.dp(22), AndroidUtilities.dp(12))
+                    row.setBackground(Theme.getSelectorDrawable(True))
+                    
+                    lbl = TextView(context)
+                    lbl.setText(item.text)
+                    lbl.setTextSize(16)
+                    lbl.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                    row.addView(lbl)
+                    
+                    val_tv = TextView(context)
+                    val_tv.setText(current_val)
+                    val_tv.setTextSize(14)
+                    val_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+                    val_tv.setPadding(0, AndroidUtilities.dp(4), 0, 0)
+                    row.addView(val_tv)
+                    
+                    def create_input_handler(setting_key, setting_item, display_view):
+                        def handler(v):
+                            def show_dialog():
+                                builder = AlertDialogBuilder(context)
+                                builder.set_title(setting_item.text)
+                                from org.telegram.ui.Components import EditTextBoldCursor
+                                input_field = EditTextBoldCursor(context)
+                                val = controller.getPluginSettingString(plugin_id, setting_key, str(setting_item.default))
+                                input_field.setText(val)
+                                input_field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                                input_field.setTextSize(16)
+                                input_field.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(10), AndroidUtilities.dp(20), AndroidUtilities.dp(10))
+                                builder.set_view(input_field)
+                                def save(d, w):
+                                    new_text = str(input_field.getText())
+                                    if py_instance:
+                                        py_instance.set_setting(setting_key, new_text)
+                                    else:
+                                        controller.putPluginSetting(plugin_id, setting_key, new_text)
+                                    display_view.setText(new_text)
+                                    if hasattr(setting_item, 'on_change') and setting_item.on_change:
+                                        try: setting_item.on_change(new_text)
+                                        except: pass
+                                    d.dismiss()
+                                builder.set_positive_button("OK", save)
+                                builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+                                builder.show()
+                            _animate_press(v, show_dialog)
+                        return handler
+
+                    row.setOnClickListener(ClickListener(create_input_handler(key, item, val_tv)))
+                    parent.addView(row, LinearLayout.LayoutParams(-1, -2))
+
+                elif cls_name == "Selector":
+                    key = item.key
+                    default = item.default
+                    items_list = item.items
+                    # Get current index
+                    current_idx = controller.getPluginSettingInt(plugin_id, key, default)
+                    if current_idx < 0 or current_idx >= len(items_list):
+                        current_idx = 0
+                    
+                    row = LinearLayout(context)
+                    row.setOrientation(LinearLayout.VERTICAL)
+                    row.setPadding(AndroidUtilities.dp(22), AndroidUtilities.dp(12), AndroidUtilities.dp(22), AndroidUtilities.dp(12))
+                    row.setBackground(Theme.getSelectorDrawable(True))
+                    
+                    lbl = TextView(context)
+                    lbl.setText(item.text)
+                    lbl.setTextSize(16)
+                    lbl.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                    row.addView(lbl)
+                    
+                    val_tv = TextView(context)
+                    val_tv.setText(str(items_list[current_idx]))
+                    val_tv.setTextSize(14)
+                    val_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+                    val_tv.setPadding(0, AndroidUtilities.dp(4), 0, 0)
+                    row.addView(val_tv)
+
+                    def create_selector_handler(s_key, s_item, display_view, s_items):
+                        def handler(v):
+                            def show_dialog():
+                                builder = AlertDialogBuilder(context)
+                                builder.set_title(s_item.text)
+                                def on_item_click(dialog, which):
+                                    if py_instance:
+                                        py_instance.set_setting(s_key, which)
+                                    else:
+                                        controller.putPluginSetting(plugin_id, s_key, which)
+                                    display_view.setText(str(s_items[which]))
+                                    if hasattr(s_item, 'on_change') and s_item.on_change:
+                                        try: s_item.on_change(which)
+                                        except: pass
+                                    dialog.dismiss()
+                                builder.set_items(s_items, on_item_click)
+                                builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+                                builder.show()
+                            _animate_press(v, show_dialog)
+                        return handler
+
+                    row.setOnClickListener(ClickListener(create_selector_handler(key, item, val_tv, items_list)))
+                    parent.addView(row, LinearLayout.LayoutParams(-1, -2))
+
+            except Exception as e:
+                log(f"Error rendering item {item}: {e}")
+#Создано с любовью к котикам >^ w ^<
