@@ -1,0 +1,731 @@
+__id__ = "tgraph_neko"
+__name__ = "Tgraph"
+__description__ = """Удобная работа с telegra.ph
+
+Создавайте статьи прямо из настроек плагина! Токен генерируется автоматически."""
+__author__ = "@pl_meow"
+__version__ = "1.0.0"
+__icon__ = "kitty_cats_vk/12"
+__min_version__ = "11.12.1"
+
+import requests
+import json
+import os
+import traceback
+from typing import Any
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Input, Text, Divider, Switch, EditText, Selector
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from markdown_utils import parse_markdown
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, get_last_fragment
+from org.telegram.ui import MessageSendPreview, ChatActivity, DialogsActivity
+from org.telegram.ui.Components import ItemOptions
+from org.telegram.messenger import R, SendMessagesHelper, UserConfig, MessagesController, Utilities, MediaController
+from java.lang import Runnable, Class
+from java.util import ArrayList
+from java import cast
+from java import dynamic_proxy
+import datetime
+from android.os import Bundle
+from hook_utils import find_class, get_private_field
+from base_plugin import MethodHook, HookResult, HookStrategy
+from client_utils import send_message, send_request, RequestCallback
+from org.telegram.tgnet import TLRPC
+import time
+
+class RunnableImpl(dynamic_proxy(Runnable)):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+    def run(self):
+        try:
+            self.func()
+        except Exception as e:
+            log(f"RunnableImpl Error: {e}")
+
+class _SendMenuHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            item_options = param.args[0]
+            if not item_options:
+                return
+
+            fragment = get_last_fragment()
+            # Relaxed check to support ExternalActionActivity (Share from other apps)
+            if not fragment:
+                return
+            
+            text = self.plugin._get_current_input_text(fragment)
+            media_paths = self.plugin._get_selected_media_paths()
+            
+            if (not text or not text.strip()) and not media_paths:
+                return
+
+            def on_click_action():
+                try:
+                    item_options.dismiss()
+                except Exception:
+                    pass
+                self.plugin._handle_send_as_telegraph(fragment, text, media_paths)
+            # Попытка найти иконку, безопасный фоллбэк
+            icon_res = getattr(R.drawable, "msg_link", getattr(R.drawable, "ic_link", 0))
+            if icon_res != 0:
+                item_options.add(icon_res, "Отправить как Telegraph", RunnableImpl(on_click_action))
+        except Exception as e:
+            log(f"_SendMenuHook Error: {e}")
+# Получаем класс интерфейса безопасно
+DialogsActivityDelegate = find_class("org.telegram.ui.DialogsActivity$DialogsActivityDelegate")
+
+class SelectChatDelegate(dynamic_proxy(DialogsActivityDelegate)):
+    def __init__(self, plugin, url):
+        super().__init__()
+        self.plugin = plugin
+        self.url = url
+
+    def didSelectDialogs(self, *args):
+        try:
+            # args[0] -> fragment, args[1] -> dids (ArrayList), args[2] -> message, args[3] -> paramBoolean
+            if len(args) > 1:
+                dids = args[1]
+                if dids and not dids.isEmpty():
+                    selected = dids.get(0)
+                    peer_id = selected
+                    
+                    # Обработка TopicKey (для тем в группах)
+                    if hasattr(selected, "dialogId"):
+                        peer_id = selected.dialogId
+                    
+                    # Приводим к int (long) для корректной передачи в JNI
+                    try:
+                        peer_id = int(peer_id)
+                    except (ValueError, TypeError):
+                        pass
+                        
+                    self.plugin._send_url_msg(peer_id, self.url)
+            
+            if len(args) > 0 and args[0]:
+                args[0].finishFragment()
+        except Exception as e:
+            log(f"[{__id__}] SelectChatDelegate Error: {e}")
+        return True
+
+class TgraphPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.token = None
+        self.hooks = []
+
+    def on_plugin_load(self):
+        # Загружаем токен или генерируем новый, если его нет
+        self.token = self.get_setting("telegraph_token", None)
+        if not self.token:
+            run_on_queue(self._generate_new_token)
+        else:
+            log(f"[{__id__}] Loaded existing token.")
+        try:
+            # Используем java.lang.Class.forName для получения реальных объектов Class,
+            # так как find_class возвращает Python-обертку, у которой нет методов рефлексии (getDeclaredMethod).
+            JClass = find_class("java.lang.Class")
+            
+            # Получаем java.lang.Class для целевого класса и параметра
+            MessageSendPreview_Cls = JClass.forName("org.telegram.ui.MessageSendPreview")
+            ItemOptions_Cls = JClass.forName("org.telegram.ui.Components.ItemOptions")
+            
+            if MessageSendPreview_Cls and ItemOptions_Cls:
+                # Ищем метод setItemOptions(ItemOptions options)
+                hook_method = MessageSendPreview_Cls.getDeclaredMethod("setItemOptions", ItemOptions_Cls)
+                hook_method.setAccessible(True)
+                
+                self.hooks.append(self.hook_method(hook_method, _SendMenuHook(self)))
+                log(f"[{__id__}] Hooked MessageSendPreview successfully.")
+        except Exception as e:
+            log(f"[{__id__}] Failed to hook MessageSendPreview: {e}")
+
+    def _generate_new_token(self):
+        try:
+            # Создаем новый аккаунт для получения токена
+            response = requests.get("https://api.telegra.ph/createAccount?short_name=ExteraUser&author_name=ExteraGram")
+            data = response.json()
+            if data.get("ok"):
+                self.token = data["result"]["access_token"]
+                self.set_setting("telegraph_token", self.token)
+                log(f"[{__id__}] Generated new token: {self.token}")
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Токен telegra.ph создан!"))
+                # Обновляем UI настроек, если пользователь уже там
+                run_on_ui_thread(lambda: self._reload_settings())
+            else:
+                error_msg = data.get("error", "Unknown error")
+                log(f"[{__id__}] Failed to create account: {error_msg}")
+        except Exception as e:
+            log(f"[{__id__}] Error generating token: {e}")
+
+    def create_settings(self):
+        token_display = self.token if self.token else "Загрузка/Отсутствует..."
+        
+        return [
+            Header("Редактор Tgraph"),
+            Selector(
+                key="title_mode",
+                text="Источник заголовка",
+                items=["Время", "Первая строка", "Свой текст"],
+                default=0,
+                icon="msg_title"
+            ),
+            Input(
+                key="tg_title",
+                text="Заголовок",
+                default="",
+                subtext="Введите заголовок статьи",
+                icon="msg_title"
+            ),
+            Input(
+                key="tg_content",
+                text="Содержание",
+                default="",
+                subtext="Введите текст статьи (можно многострочный)...",
+                icon="msg_text"
+            ),
+            Text(
+                text="Создать пост",
+                icon="msg_send",
+                accent=True,
+                on_click=self._on_create_click
+            ),
+            Divider(),
+            Header("Настройки отправки"),
+            Selector(
+                key="send_mode",
+                text="Вид ссылки",
+                items=["·—–—· (Скрытая)", "Простая ссылка", "Свой текст"],
+                default=0,
+                icon="msg_link"
+            ),
+            Input(
+                key="custom_link_text",
+                text="Текст ссылки",
+                subtext="Используется в режиме 'Свой текст'",
+                default="Читать",
+                icon="msg_text"
+            ),
+            Selector(
+                key="preview_mode",
+                text="Предпросмотр",
+                items=["Снизу", "Сверху", "Скрыть"],
+                default=2,
+                icon="msg_web"
+            ),
+            Divider(),
+            Header("Настройки аккаунта"),
+            Text(
+                text=f"Текущий токен:\n{token_display}",
+                icon="msg_key",
+                on_click=self._copy_token
+            ),
+            Text(
+                text="Сменить токен",
+                icon="msg_edit",
+                on_click=self._show_change_token_dialog
+            ),
+            Text(
+                text="Сгенерировать новый токен",
+                icon="msg_retry",
+                red=True,
+                on_click=self._force_new_token
+            ),
+            Divider(),
+            Switch(key="debug", text="Debug режим", default=False, icon="msg_log")
+        ]
+    def _prepare_content(self, text_input, title_setting):
+        """Обрабатывает текст и заголовок согласно настройкам."""
+        mode = self.get_setting("title_mode", 0)
+        
+        title = ""
+        content = text_input
+
+        if mode == 0: # Время
+            title = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        elif mode == 1: # Первая строка
+            lines = text_input.split('\n')
+            first_line_index = -1
+            
+            # Ищем первую непустую строку
+            for i, line in enumerate(lines):
+                if line.strip():
+                    title = line.strip()
+                    first_line_index = i
+                    break
+            
+            if first_line_index != -1:
+                # Удаляем заголовок из тела, сохраняя остальные переносы
+                # Берем слайс после найденной строки
+                remaining_lines = lines[first_line_index + 1:]
+                # Удаляем пустые строки в начале остатка, если нужно (опционально, здесь оставляем как есть или стрипим)
+                content = "\n".join(remaining_lines).strip()
+            else:
+                # Если текст пустой или только пробелы
+                title = "Без заголовка"
+                
+        elif mode == 2: # Свой текст
+            title = title_setting if title_setting else "Без заголовка"
+
+        return title, content
+
+    def _on_create_click(self, view):
+        raw_title = self.get_setting("tg_title", "")
+        raw_content = self.get_setting("tg_content", "")
+        
+        if not raw_content:
+            BulletinHelper.show_error("Заполните содержание!")
+            return
+        
+        if not self.token:
+             BulletinHelper.show_error("Токен отсутствует! Сгенерируйте новый.")
+             return
+
+        title, content = self._prepare_content(raw_content, raw_title)
+
+        BulletinHelper.show_info("Создаю статью...")
+        run_on_queue(lambda: self._create_page_task(title, content))
+    def _text_to_nodes(self, text):
+        try:
+            from markdown_utils import parse_markdown
+            parsed = parse_markdown(text)
+            text = parsed.text
+            entities = [e.to_tlrpc_object() for e in parsed.entities]
+        except Exception:
+            # Если парсинг не удался, возвращаем текст как есть
+            # Можно добавить логирование ошибки
+            return [{"tag": "p", "children": [text]}] if text else []
+
+        u16_text = text.encode('utf-16-le')
+        
+        def u16_slice(start, end):
+            s = max(0, min(start * 2, len(u16_text)))
+            e = max(0, min(end * 2, len(u16_text)))
+            return u16_text[s:e].decode('utf-16-le')
+
+        # 1. Выделяем блоки PRE (код), так как они не должны биться на параграфы
+        pre_blocks = [e for e in entities if isinstance(e, TLRPC.TL_messageEntityPre)]
+        pre_blocks.sort(key=lambda x: x.offset)
+
+        nodes = []
+        cursor = 0
+
+        def process_inline_text(start_offset, end_offset):
+            chunk = u16_slice(start_offset, end_offset)
+            if not chunk: return
+            
+            lines = chunk.split('\n')
+            current_line_start = start_offset
+            
+            for line in lines:
+                line_len = len(line.encode('utf-16-le')) // 2
+                line_end = current_line_start + line_len
+                
+                p_node = {"tag": "p", "children": []}
+                
+                if not line:
+                    # Пустая строка -> <br>
+                    p_node["children"].append({"tag": "br"})
+                else:
+                    # Собираем сущности для этой строки
+                    relevant_entities = []
+                    for e in entities:
+                        if isinstance(e, TLRPC.TL_messageEntityPre): continue
+                        
+                        e_end = e.offset + e.length
+                        # Проверка пересечения
+                        if e.offset < line_end and e_end > current_line_start:
+                            local_start = max(e.offset, current_line_start)
+                            local_end = min(e_end, line_end)
+                            relevant_entities.append({
+                                'type': e,
+                                'start': local_start - current_line_start,
+                                'end': local_end - current_line_start
+                            })
+                    
+                    # Разбиваем строку на сегменты по границам сущностей
+                    points = {0, line_len}
+                    for e in relevant_entities:
+                        points.add(e['start'])
+                        points.add(e['end'])
+                    
+                    sorted_points = sorted(list(points))
+                    
+                    for i in range(len(sorted_points) - 1):
+                        seg_start = sorted_points[i]
+                        seg_end = sorted_points[i+1]
+                        seg_text = u16_slice(current_line_start + seg_start, current_line_start + seg_end)
+                        
+                        if not seg_text: continue
+                        
+                        active_ents = [ent['type'] for ent in relevant_entities 
+                                       if ent['start'] <= seg_start and ent['end'] >= seg_end]
+                        
+                        current_node = seg_text
+                        
+                        # Применяем теги. Порядок: ссылка -> код -> стиль
+                        for ent in active_ents:
+                            tag = None
+                            attrs = None
+                            if isinstance(ent, TLRPC.TL_messageEntityBold): tag = "b"
+                            elif isinstance(ent, TLRPC.TL_messageEntityItalic): tag = "i"
+                            elif isinstance(ent, TLRPC.TL_messageEntityCode): tag = "code"
+                            elif isinstance(ent, TLRPC.TL_messageEntityStrike): tag = "s"
+                            elif isinstance(ent, TLRPC.TL_messageEntityUnderline): tag = "u"
+                            elif isinstance(ent, TLRPC.TL_messageEntityTextUrl): 
+                                tag = "a"
+                                attrs = {"href": ent.url}
+                            
+                            if tag:
+                                node = {"tag": tag, "children": [current_node]}
+                                if attrs: node["attrs"] = attrs
+                                current_node = node
+                        
+                        p_node["children"].append(current_node)
+
+                nodes.append(p_node)
+                current_line_start += line_len + 1
+
+        for pre in pre_blocks:
+            if cursor < pre.offset:
+                process_inline_text(cursor, pre.offset)
+            
+            pre_content = u16_slice(pre.offset, pre.offset + pre.length)
+            nodes.append({"tag": "pre", "children": [pre_content]})
+            cursor = pre.offset + pre.length
+            
+        u16_total = len(u16_text) // 2
+        if cursor < u16_total:
+            process_inline_text(cursor, u16_total)
+            
+        return nodes
+
+    def _create_page_task(self, title, text_content):
+        try:
+            # Конвертируем Markdown в Nodes с сохранением форматирования
+            content_nodes = self._text_to_nodes(text_content)
+            content_json = json.dumps(content_nodes)
+            
+            url = "https://api.telegra.ph/createPage"
+            # Передаем параметры как data (form-encoded), контент как JSON-строку
+            payload = {
+                "access_token": self.token,
+                "title": title,
+                "content": content_json,
+                "return_content": "false"
+            }
+            
+            response = requests.post(url, data=payload, timeout=15)
+            res_data = response.json()
+            
+            if res_data.get("ok"):
+                page_url = res_data["result"]["url"]
+                run_on_ui_thread(lambda: self._show_success_dialog(page_url))
+                # Очищаем поля после успешной отправки (опционально)
+                self.set_setting("tg_title", "")
+                self.set_setting("tg_content", "")
+                run_on_ui_thread(lambda: self._reload_settings())
+            else:
+                error = res_data.get("error", "Unknown error")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка API: {error}"))
+                
+        except Exception as e:
+            log(f"[{__id__}] Error creating page: {e}\n{traceback.format_exc()}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка сети/кода: {e}"))
+    def _show_success_dialog(self, url):
+        fragment = get_last_fragment()
+        if not fragment: return
+        
+        activity = fragment.getParentActivity()
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Статья создана! 🎉")
+        builder.set_message(f"Ссылка:\n{url}")
+        
+        def copy_action(d, w):
+            from android.content import Context, ClipData
+            clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
+            clip = ClipData.newPlainText("Telegraph Link", url)
+            clipboard.setPrimaryClip(clip)
+            BulletinHelper.show_success("Ссылка скопирована!")
+            d.dismiss()
+
+        def send_action(d, w):
+            d.dismiss()
+            self._open_chat_selection(url)
+
+        builder.set_positive_button("Копировать", copy_action)
+        builder.set_neutral_button("Отправить в...", send_action)
+        builder.set_negative_button("Закрыть", lambda d, w: d.dismiss())
+        builder.show()
+
+    def _copy_token(self, view):
+        if not self.token:
+            return
+        try:
+            from org.telegram.messenger import AndroidUtilities
+            AndroidUtilities.addToClipboard(self.token)
+            BulletinHelper.show_success("Токен скопирован!")
+        except Exception as e:
+             BulletinHelper.show_error(f"Ошибка копирования: {e}")
+
+    def _show_change_token_dialog(self, view):
+        fragment = get_last_fragment()
+        if not fragment: return
+        activity = fragment.getParentActivity()
+        
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Сменить токен")
+        
+        # Создаем поле ввода через рефлексию или напрямую, если доступно
+        from android.widget import EditText
+        input_field = EditText(activity)
+        input_field.setText(self.token if self.token else "")
+        builder.set_view(input_field)
+        
+        def save_action(d, w):
+            new_token = str(input_field.getText()).strip()
+            if new_token:
+                self.token = new_token
+                self.set_setting("telegraph_token", new_token)
+                BulletinHelper.show_success("Токен обновлен!")
+                self._reload_settings()
+            d.dismiss()
+            
+        builder.set_positive_button("Сохранить", save_action)
+        builder.set_negative_button("Отмена", lambda d,w: d.dismiss())
+        builder.show()
+
+    def _force_new_token(self, view):
+        BulletinHelper.show_info("Генерирую новый токен...")
+        run_on_queue(self._generate_new_token)
+
+    def _reload_settings(self):
+        # Трюк для обновления UI настроек
+        self.set_setting("_refresh_trigger", str(time.time()), reload_settings=True)
+
+    def on_plugin_unload(self):
+        for hook in self.hooks:
+            self.unhook_method(hook)
+        self.hooks.clear()
+
+    def _get_current_input_text(self, chat_activity):
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+            if enter_view:
+                edit_field = enter_view.getEditField()
+                if edit_field and edit_field.getText():
+                    return str(edit_field.getText().toString())
+        except Exception as e:
+            log(f"[{__id__}] Error getting input text: {e}")
+        return ""
+
+    def _clear_input_field(self, chat_activity):
+        try:
+            enter_view = get_private_field(chat_activity, "chatActivityEnterView")
+            if enter_view:
+                enter_view.setFieldText("")
+        except Exception as e:
+            log(f"[{__id__}] Error clearing input: {e}")
+    def _get_selected_media_paths(self):
+        paths = []
+        try:
+            selected_photos = MediaController.getInstance().selectedPhotos
+            if selected_photos:
+                for i in range(selected_photos.size()):
+                    entry = selected_photos.get(i)
+                    if hasattr(entry, "path") and entry.path:
+                        paths.append(str(entry.path))
+                    elif hasattr(entry, "imagePath") and entry.imagePath:
+                        paths.append(str(entry.imagePath))
+        except Exception as e:
+            log(f"[{__id__}] Error getting media: {e}")
+        return paths
+
+    def _upload_file_to_telegraph(self, path):
+        try:
+            if not os.path.exists(path):
+                return None
+            
+            mime_type = "image/jpeg"
+            if path.lower().endswith(".png"): mime_type = "image/png"
+            elif path.lower().endswith(".gif"): mime_type = "image/gif"
+            elif path.lower().endswith(".mp4"): mime_type = "video/mp4"
+            
+            with open(path, "rb") as f:
+                response = requests.post(
+                    "https://telegra.ph/upload",
+                    files={"file": ("blob", f, mime_type)},
+                    headers={"User-Agent": "Python-Telegraph-Client"},
+                    timeout=30
+                )
+            
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0 and "src" in data[0]:
+                return "https://telegra.ph" + data[0]["src"]
+            else:
+                log(f"[{__id__}] Upload failed: {data}")
+                return None
+        except Exception as e:
+            log(f"[{__id__}] Upload error: {e}")
+            return None
+    def _handle_send_as_telegraph(self, fragment, text, media_paths=None):
+        if not self.token:
+             run_on_ui_thread(lambda: BulletinHelper.show_error("Токен не установлен! Зайдите в настройки плагина."))
+             return
+        
+        # Получаем настройки заголовка
+        custom_title_setting = self.get_setting("tg_title", "")
+        title, content = self._prepare_content(text, custom_title_setting)
+        
+        msg = "Публикация в Telegraph..."
+        if media_paths:
+            msg = f"Загрузка медиа ({len(media_paths)}) и публикация..."
+            
+        BulletinHelper.show_info(msg)
+        run_on_queue(lambda: self._process_telegraph_send(fragment, title, content, media_paths))
+
+    def _process_telegraph_send(self, fragment, title, text_content, media_paths=None):
+        try:
+            content_nodes = self._text_to_nodes(text_content)
+            
+            # Обработка и загрузка медиа
+            if media_paths:
+                media_nodes = []
+                for path in media_paths:
+                    src = self._upload_file_to_telegraph(path)
+                    if src:
+                        tag = "video" if path.lower().endswith(".mp4") else "img"
+                        media_nodes.append({"tag": tag, "attrs": {"src": src}})
+                
+                # Добавляем медиа в начало контента
+                if media_nodes:
+                    content_nodes = media_nodes + content_nodes
+
+            content_json = json.dumps(content_nodes)
+            
+            response = requests.post(
+                "https://api.telegra.ph/createPage",
+                data={
+                    "access_token": self.token,
+                    "title": title,
+                    "content": content_json,
+                    "return_content": "false"
+                },
+                timeout=30
+            ).json()
+            
+            if response.get("ok"):
+                page_url = response["result"]["url"]
+                run_on_ui_thread(lambda: self._finalize_send(fragment, page_url))
+            else:
+                error = response.get("error", "Unknown error")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка API: {error}"))
+        except Exception as e:
+            log(f"[{__id__}] Error in process_telegraph_send: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {e}"))
+    def _finalize_send(self, fragment, url):
+        try:
+            # Очищаем выбранные медиа
+            try:
+                MediaController.getInstance().selectedPhotos.clear()
+            except Exception:
+                pass
+                
+            self._clear_input_field(fragment)
+            self._send_url_msg(fragment.getDialogId(), url)
+        except Exception as e:
+            error_text = str(e)
+            log(f"[{__id__}] Error finalizing send: {error_text}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {error_text}"))
+
+    def _open_chat_selection(self, url):
+        fragment = get_last_fragment()
+        if not fragment: return
+        
+        bundle = Bundle()
+        bundle.putBoolean("onlySelect", True)
+        bundle.putInt("dialogsType", 3)
+        bundle.putString("selectAlertString", "Отправить ссылку")
+        
+        dialogs = DialogsActivity(bundle)
+        dialogs.setDelegate(SelectChatDelegate(self, url))
+        fragment.presentFragment(dialogs)
+
+    def _send_url_msg(self, peer_id, url):
+        try:
+            send_mode = self.get_setting("send_mode", 0)
+            preview_mode = self.get_setting("preview_mode", 2)
+            custom_text = self.get_setting("custom_link_text", "Читать")
+
+            message_text = url
+            # Используем Java ArrayList для совместимости с API Telegram
+            entities = ArrayList()
+            
+            if send_mode == 0: # Hidden
+                message_text = "·—–—·"
+                ent = TLRPC.TL_messageEntityTextUrl()
+                ent.offset = 0
+                ent.length = len(message_text.encode('utf-16-le')) // 2
+                ent.url = url
+                entities.add(ent)
+            elif send_mode == 2: # Custom text
+                message_text = custom_text if custom_text else "Читать"
+                ent = TLRPC.TL_messageEntityTextUrl()
+                ent.offset = 0
+                ent.length = len(message_text.encode('utf-16-le')) // 2
+                ent.url = url
+                entities.add(ent)
+            
+            # --- ЛОГИКА ОТПРАВКИ ---
+            
+            if preview_mode == 2: # РЕЖИМ 'СКРЫТЬ' (Только через прямой запрос)
+                req = TLRPC.TL_messages_sendMessage()
+                req.peer = MessagesController.getInstance(UserConfig.selectedAccount).getInputPeer(peer_id)
+                req.message = message_text
+                req.random_id = Utilities.random.nextLong()
+                
+                flags = 0
+                req.no_webpage = True
+                flags |= 2 
+                
+                if not entities.isEmpty():
+                    req.entities = entities
+                    flags |= 8
+                
+                req.flags = flags
+                
+                def cb(r, e):
+                    if e:
+                        log(f"[{__id__}] Send error: {e.text}")
+                    else:
+                        run_on_ui_thread(lambda: BulletinHelper.show_success("Ссылка отправлена!"))
+
+                send_request(req, RequestCallback(cb))
+                
+            else: # ОБЫЧНЫЙ РЕЖИМ (Быстрый, Optimistic UI)
+                params = SendMessagesHelper.SendMessageParams()
+                params.peer = peer_id
+                params.message = message_text
+                params.entities = entities
+                
+                if preview_mode == 1: # Сверху
+                    if hasattr(params, 'invert_media'):
+                        params.invert_media = True
+                
+                SendMessagesHelper.getInstance(UserConfig.selectedAccount).sendMessage(params)
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Ссылка отправлена!"))
+            
+        except Exception as e:
+            error_text = str(e)
+            log(f"[{__id__}] Error in _send_url_msg: {error_text}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка отправки: {error_text}"))
+
+#Создано с любовью к котикам >^ w ^<
