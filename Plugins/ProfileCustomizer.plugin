@@ -1,0 +1,2213 @@
+"""
+-*- coding: @gemeguardian -*-
+Без них бы ничего не было:
+@swagnonher @RnPlugins
+"""
+__id__ = "ProfileCustomizer"
+__name__ = "Profile Customizer"
+__author__ = "@gemeguardian"
+__version__ = "1.0.0"
+__min_version__ = "11.12.0"
+
+import os
+import re
+import threading
+import time
+import traceback
+import weakref
+from datetime import datetime
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from hook_utils import find_class
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Divider, Text
+
+# Проверяем наличие Divider
+HAS_DIVIDER = True
+try:
+    Divider
+except NameError:
+    HAS_DIVIDER = False
+from ui.alert import AlertDialogBuilder
+
+from android.app import Activity
+from android.content import Intent, ClipboardManager, ClipData, Context
+from android.net import Uri
+from android.view import View, ViewGroup
+from android.widget import EditText
+from android.text import InputType
+
+from android.graphics import (
+    BitmapFactory, Bitmap, Color, LinearGradient, Paint, Shader, Matrix
+)
+from java.io import File, BufferedInputStream, FileOutputStream
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities
+
+try:
+    from java import jclass, jarray
+except Exception:
+    jclass = None
+    jarray = None
+
+if jclass is not None:
+    try:
+        JCanvas = jclass("android.graphics.Canvas")
+        JActionBar = jclass("org.telegram.ui.ActionBar.ActionBar")
+    except Exception:
+        JCanvas = None
+        JActionBar = None
+else:
+    JCanvas = None
+    JActionBar = None
+
+JAVA_ARRAY_AVAILABLE = jarray is not None
+
+_SENTINEL = object()
+_TAG = "[ProfileCustomizer]"
+
+
+class ProfileHeaderImagePlugin(BasePlugin):
+    """
+    Кастом верхнего баннера профиля: фон (пер‑профиль/глобально), стиль текста, эффекты (blur/darken).
+    Логирование включено, просмотр логов из плагина убран.
+    """
+
+    SETTINGS_ENABLE = "profileHeader.enable"
+    SETTINGS_SOURCE_GLOBAL = "profileHeader.source"
+    SETTINGS_FADE = "profileHeader.fade"
+
+    SETTINGS_BLUR_INTENSITY = "profileHeader.blurIntensity"         # 1..100
+    SETTINGS_DARKEN_INTENSITY = "profileHeader.darkenIntensity"     # 1..100
+    SETTINGS_EFFECT_DEFAULT = "profileHeader.defaultEffect"         # "none" | "blur" | "darken"
+
+    # Avatar Banner Settings
+    SETTINGS_AVATAR_BANNER_ENABLE = "profileHeader.avatarBanner.enable"     # bool
+    SETTINGS_AVATAR_BANNER_EFFECT = "profileHeader.avatarBanner.effect"     # "blur" | "darken" | "none"
+
+    # Debug Settings
+    SETTINGS_DEBUG_ENABLE = "profileHeader.debug.enable"     # bool
+
+    TEXTMODE_PREFIX = "profileHeader.textMode."  # per-profile: "", "light", "dark"
+    EFFECT_PREFIX = "profileHeader.effect."      # per-profile: "", "none", "blur", "darken"
+
+    FILE_PICKER_REQUEST_CODE = 33101
+
+    def __init__(self):
+        super().__init__()
+        self._last_target_fragment_ref = None
+        self._activity_hook = None
+
+        self._bmp_map = {}
+        self._bmp_blur_map = {}
+        self._src_map = {}
+
+        self._plugin_dir = ""
+        self._hook_on_draw_ref = None
+        self._hooked_topview_classname = None
+        self._watcher_stop = False
+
+        self._theme_hook_refs = []
+        self._theme_keys = {}
+
+        self._last_blur_percent = None
+
+        self._log_buffer = []
+        self._debug_enabled = False
+
+        try:
+            self._CanvasClass = find_class("android.graphics.Canvas")
+        except Exception:
+            self._CanvasClass = None
+
+    # ====================== ЛОГИ ======================
+
+    def _log(self, msg: str, also_ui: bool = False):
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = f"{ts} {msg}"
+            self._log_buffer.append(line)
+            if len(self._log_buffer) > 300:
+                self._log_buffer = self._log_buffer[-200:]
+            log(f"{_TAG} {msg}")
+            if also_ui:
+                try:
+                    BulletinHelper.show(f"{_TAG} {msg}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _menu_show_logs(self, ctx):
+        try:
+            fragment = ctx.get("fragment")
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                BulletinHelper.show("Нет активити для показа логов")
+                return
+            self._dump_logs_dialog(activity)
+        except Exception:
+            pass
+
+    def _dump_logs_dialog(self, parent_activity):
+        try:
+            text = "\n".join(self._log_buffer[-200:]) if self._log_buffer else "Логи пусты."
+            b = AlertDialogBuilder(parent_activity)
+            b.set_title("Логи ProfileCustomizer")
+            b.set_message(text)
+            b.set_positive_button("OK", None)
+            b.set_neutral_button("Скопировать в буфер обмена", lambda d, w: self._copy_logs_to_clipboard(parent_activity))
+            b.show()
+        except Exception:
+            try:
+                BulletinHelper.show("Не удалось показать логи")
+            except Exception:
+                pass
+
+    def _copy_logs_to_clipboard(self, parent_activity=None):
+        try:
+            text = "\n".join(self._log_buffer[-200:]) if self._log_buffer else "Логи пусты."
+
+            # Получаем ClipboardManager через ApplicationLoader
+            clipboard = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+
+            # Создаем ClipData с логами
+            clip = ClipData.newPlainText("ProfileCustomizer Logs", text)
+            clipboard.setPrimaryClip(clip)
+
+            BulletinHelper.show("Логи скопированы в буфер обмена")
+        except Exception as e:
+            try:
+                BulletinHelper.show("Не удалось скопировать логи в буфер обмена")
+            except Exception:
+                pass
+
+    # ====================== Жизненный цикл ======================
+
+    def on_plugin_load(self):
+        self._ensure_defaults()
+        self._ensure_plugin_dir()
+
+        # Загружаем состояние Debug
+        self._debug_enabled = self._get_bool(self.SETTINGS_DEBUG_ENABLE, False)
+
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                text="Кастомный фон",
+                icon="msg_gallery",
+                on_click=self._menu_set_custom_bg,
+                priority=1000
+            ))
+        except Exception:
+            pass
+
+        self._install_theme_hooks()
+
+        t = threading.Thread(target=self._watcher_loop, name="ProfileCustomizerWatcher", daemon=True)
+        t.start()
+
+    def on_plugin_unload(self):
+        self._watcher_stop = True
+        if self._hook_on_draw_ref:
+            try:
+                self.unhook_method(self._hook_on_draw_ref)
+            except Exception:
+                pass
+            self._hook_on_draw_ref = None
+        self._hooked_topview_classname = None
+
+        for ref in self._theme_hook_refs:
+            try:
+                if ref:
+                    self.unhook_method(ref)
+            except Exception:
+                pass
+        self._theme_hook_refs = []
+
+        if self._activity_hook:
+            try:
+                self._activity_hook.unhook()
+            except Exception:
+                pass
+            self._activity_hook = None
+
+    # ====================== Настройки UI ======================
+
+    def create_settings(self):
+        return self._build_settings()
+
+    def get_settings(self):
+        return self._build_settings()
+
+    def _build_settings(self):
+        try:
+            # --- Подготовка значений для элементов управления ---
+            blur_percent = self._get_percent(self.SETTINGS_BLUR_INTENSITY, 60)
+            darken_percent = self._get_percent(self.SETTINGS_DARKEN_INTENSITY, 70)
+            is_avatar_banner_enabled = self._get_bool(self.SETTINGS_AVATAR_BANNER_ENABLE, True)
+
+            effect_options = ["Размытие", "Затемнение", "Без эффекта"]
+            effect_values = ["blur", "darken", "none"]
+            current_effect_value = self._get_effect_str(self.SETTINGS_AVATAR_BANNER_EFFECT, "darken")
+            try:
+                effect_default_index = effect_values.index(current_effect_value)
+            except ValueError:
+                effect_default_index = 0
+
+            # --- Построение списка UI компонентов ---
+            rows = [
+                Header(text="Настройки Profile Customizer")
+            ]
+
+            # --- Секция: Кастомный фон ---
+            rows.append(Header(text="Кастомный фон"))
+            rows.append(Input(
+                key=self.SETTINGS_BLUR_INTENSITY,
+                text="Сила размытия",
+                subtext="От 1 до 100. По умолчанию: 60.",
+                default=str(blur_percent),
+                on_change=self._on_blur_intensity_changed
+            ))
+            rows.append(Input(
+                key=self.SETTINGS_DARKEN_INTENSITY,
+                text="Сила затемнения",
+                subtext="От 1 до 100. По умолчанию: 70.",
+                default=str(darken_percent),
+                on_change=self._on_darken_intensity_changed
+            ))
+            if HAS_DIVIDER:
+                rows.append(Divider(text="Для установки фона откройте профиль и выберите 'Кастомный фон' в меню."))
+            else:
+                rows.append(Text(
+                    text="Для установки фона откройте профиль и выберите 'Кастомный фон' в меню."
+                ))
+
+            if HAS_DIVIDER:
+                rows.append(Divider())
+
+            # --- Секция: Баннер по аватарке ---
+            rows.append(Header(text="Баннер по аватарке"))
+            rows.append(Switch(
+                key=self.SETTINGS_AVATAR_BANNER_ENABLE,
+                text="Включить баннер из аватара",
+                subtext="Использовать аватарку профиля как фон.",
+                default=is_avatar_banner_enabled,
+                on_change=self._on_avatar_banner_enable_changed
+            ))
+            # Только показываем селектор если функция включена
+            if is_avatar_banner_enabled:
+                rows.append(Text(
+                    text=f"Эффект для аватара: {effect_options[effect_default_index]}",
+                    on_click=lambda view: self._show_effect_choice_dialog()
+                ))
+            if HAS_DIVIDER:
+                rows.append(Divider(text="Эта функция имеет приоритет над кастомным фоном, установленным вручную."))
+            else:
+                rows.append(Text(
+                    text="Эта функция имеет приоритет над кастомным фоном, установленным вручную."
+                ))
+
+            if HAS_DIVIDER:
+                rows.append(Divider())
+
+            # --- Секция: Debug ---
+            rows.append(Header(text="Debug"))
+            rows.append(Switch(
+                key=self.SETTINGS_DEBUG_ENABLE,
+                text="Включить логирование",
+                subtext="Включить детальное логирование для отладки.",
+                default=self._debug_enabled,
+                on_change=self._on_debug_changed
+            ))
+            if self._debug_enabled:
+                rows.append(Text(
+                    text="Показать логи",
+                    on_click=lambda view: self._show_debug_logs()
+                ))
+
+            return rows
+        except Exception:
+            return [Header("ProfileCustomizer"), Text("Ошибка настроек")]
+
+    def _show_effect_choice_dialog(self):
+        """Показывает диалог выбора эффекта для баннера из аватара"""
+        try:
+            fragment = get_last_fragment()
+            parent = fragment.getParentActivity() if fragment else None
+            if parent is None:
+                self._notify("Не удалось получить текущий экран для диалога.")
+                return
+
+            effect_options = ["Размытие", "Затемнение", "Без эффекта"]
+            effect_values = ["blur", "darken", "none"]
+
+            def on_effect_selected(dialog_builder, index):
+                try:
+                    selected_effect = effect_values[index]
+                    self.set_setting(self.SETTINGS_AVATAR_BANNER_EFFECT, selected_effect)
+                    self._reload_plugin_settings()
+                    self._notify(f"Эффект установлен: {effect_options[index]}")
+                except IndexError:
+                    pass
+                except Exception:
+                    pass
+
+            builder = AlertDialogBuilder(parent)
+            builder.set_title("Выбор эффекта для аватара")
+            builder.set_items(effect_options, on_effect_selected)
+            builder.set_negative_button("Отмена", None)
+            builder.show()
+        except Exception:
+            pass
+
+    # ====================== Меню профиля ======================
+
+    def _menu_set_custom_bg(self, ctx):
+        try:
+            fragment = ctx.get("fragment")
+            if fragment is None:
+                self._alert("Ошибка", "Не удалось получить фрагмент профиля")
+                return
+
+            self._last_target_fragment_ref = weakref.ref(fragment)
+            key = self._get_profile_key_from_fragment(fragment)
+            if key is None:
+                self._alert("Ошибка", "Не удалось определить профиль")
+                return
+
+            parent = fragment.getParentActivity()
+            if parent is None:
+                self._alert("Ошибка", "Нет активити")
+                return
+
+            # Показываем диалог выбора действия
+            builder = AlertDialogBuilder(parent)
+            builder.set_title("Кастомный фон профиля")
+
+            options = [
+                "Указать URL/путь",
+                "Выбрать из галереи",
+                "Баннер из аватара",
+                "Удалить фон"
+            ]
+
+            def on_option_selected(dlg, which):
+                if which == 0:  # URL/путь
+                    self._show_url_input_dialog(parent, key)
+                elif which == 1:  # Галерея
+                    self._launch_file_picker(key)
+                elif which == 2:  # Баннер из аватара
+                    self._set_profile_source(key, f"avatar://{key}")
+                    # Удаляем per-profile эффект, чтобы использовался эффект из настроек баннера
+                    try:
+                        self.delete_setting(self._k_effect(key))
+                    except Exception:
+                        pass
+                    self._drop_bitmap_cache_for_key(key)
+                    self._invalidate_profile_view(fragment)
+                    self._notify("Фон установлен: баннер из аватара")
+                elif which == 3:  # Удалить фон
+                    self._set_profile_source(key, "none")
+                    self._set_profile_text_mode(key, "")
+                    self._set_profile_effect(key, "none")
+                    self._drop_bitmap_cache_for_key(key)
+                    self._notify("Фон удалён")
+
+            builder.set_items(options, on_option_selected)
+            builder.set_negative_button("Отмена", None)
+            builder.show()
+        except Exception:
+            pass
+
+    def _show_url_input_dialog(self, parent, key):
+        """Показывает диалог ввода URL/пути для фона"""
+        try:
+            et = EditText(parent)
+            et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI)
+            current = self._get_profile_source(key) or ""
+
+            # Не показываем avatar:// в поле ввода
+            if not str(current).startswith("avatar://"):
+                try:
+                    if current:
+                        et.setText(current)
+                        et.setSelection(len(current))
+                except Exception:
+                    pass
+
+            builder = AlertDialogBuilder(parent)
+            builder.set_title("Кастомный фон профиля")
+            builder.set_message(f"Профиль: {key}\nВставьте URL/путь/URI изображения")
+            builder.set_view(et)
+            builder.set_positive_button("Применить", lambda dlg, which: self._apply_menu_input_for_key(et, key))
+            builder.set_negative_button("Отмена", None)
+            builder.show()
+        except Exception:
+            pass
+
+    def _apply_menu_input_for_key(self, et, key):
+        try:
+            value = str(et.getText()).strip()
+            if not value:
+                self._notify("Пустой источник")
+                return
+            self._set_profile_source(key, value)
+            self._set_bool(self.SETTINGS_ENABLE, True)
+            self._drop_bitmap_cache_for_key(key)
+            self._notify("Источник сохранён")
+            f = self._safe_get_fragment()
+            self._invalidate_profile_view(f)
+            run_on_ui_thread(lambda: self._prompt_effect_choice(key, then=lambda: self._prompt_text_mode_choice(key)))
+        except Exception:
+            pass
+
+    # ====================== FilePicker hook ======================
+
+    class _ActivityResultHook(MethodHook):
+        def __init__(self, plugin, profile_key):
+            self.plugin = plugin
+            self.profile_key = profile_key
+
+        def before_hooked_method(self, param):
+            try:
+                request_code = param.args[0]
+                result_code = param.args[1]
+                data = param.args[2]
+                if request_code == self.plugin.FILE_PICKER_REQUEST_CODE:
+                    param.setResult(None)
+                    if result_code == Activity.RESULT_OK and data is not None:
+                        uri = data.getData()
+                        if uri is not None:
+                            threading.Thread(
+                                target=self.plugin._handle_file_uri_for_key,
+                                args=(uri, self.profile_key),
+                                daemon=True
+                            ).start()
+                    try:
+                        if self.plugin._activity_hook:
+                            self.plugin._activity_hook.unhook()
+                            self.plugin._activity_hook = None
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.plugin._log(f"_ActivityResultHook error: {e}")
+
+    def _launch_file_picker(self, profile_key):
+        try:
+            fragment = self._safe_get_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                BulletinHelper.show("Не удалось получить текущий экран.")
+                return
+
+            if self._activity_hook:
+                try:
+                    self._activity_hook.unhook()
+                except Exception:
+                    pass
+                self._activity_hook = None
+
+            IntegerTYPE = find_class("java.lang.Integer").TYPE
+            method = activity.getClass().getDeclaredMethod("onActivityResult", IntegerTYPE, IntegerTYPE, Intent)
+            self._activity_hook = self.hook_method(method, self._ActivityResultHook(self, profile_key))
+
+            intent = Intent(Intent.ACTION_GET_CONTENT)
+            intent.setType("image/*")
+            activity.startActivityForResult(
+                Intent.createChooser(intent, "Выберите изображение"),
+                self.FILE_PICKER_REQUEST_CODE
+            )
+        except Exception:
+            pass
+
+    def _handle_file_uri_for_key(self, uri: Uri, profile_key: str):
+        try:
+            cr = ApplicationLoader.applicationContext.getContentResolver()
+            ins = cr.openInputStream(uri)
+            if not ins:
+                run_on_ui_thread(lambda: BulletinHelper.show("Не удалось открыть файл"))
+                return
+            fname = f"profile_{self._sanitize_key(profile_key)}.img"
+            out_path = os.path.join(self._plugin_dir, fname)
+            out = FileOutputStream(out_path)
+            try:
+                buf = bytearray(8192)
+                while True:
+                    r = ins.read(buf)
+                    if r == -1:
+                        break
+                    out.write(buf, 0, r)
+            finally:
+                try:
+                    ins.close()
+                except Exception:
+                    pass
+                try:
+                    out.close()
+                except Exception:
+                    pass
+
+            self._set_profile_source(profile_key, out_path)
+            self._set_bool(self.SETTINGS_ENABLE, True)
+            self._drop_bitmap_cache_for_key(profile_key)
+
+            def _done_ui():
+                self._notify("Изображение сохранено и применено")
+                self._invalidate_profile_view(self._safe_get_fragment())
+                self._prompt_effect_choice(profile_key, then=lambda: self._prompt_text_mode_choice(profile_key))
+
+            run_on_ui_thread(_done_ui)
+        except Exception:
+            run_on_ui_thread(lambda: BulletinHelper.show("Ошибка обработки файла"))
+
+    # ====================== Режим текста ======================
+
+    def _prompt_text_mode_choice(self, key: str):
+        try:
+            fragment = self._safe_get_fragment()
+            parent = fragment.getParentActivity() if fragment else None
+            if parent is None:
+                return
+            b = AlertDialogBuilder(parent)
+            b.set_title("Стиль текста поверх фона")
+            b.set_message("Выберите цвет текста под аватаркой для этого профиля")
+            b.set_positive_button("Светлый", lambda dlg, which: self._apply_text_mode_choice(key, "light"))
+            b.set_negative_button("Тёмный", lambda dlg, which: self._apply_text_mode_choice(key, "dark"))
+            b.set_neutral_button("Не менять", lambda dlg, which: self._apply_text_mode_choice(key, ""))
+            b.show()
+        except Exception:
+            pass
+
+    def _apply_text_mode_choice(self, key: str, mode: str):
+        try:
+            self._set_profile_text_mode(key, mode)
+            # Если режим сброшен, нужно явно сбросить цвета темы
+            if not mode or mode == "":
+                self._reset_theme_colors()
+            self._invalidate_profile_view(self._safe_get_fragment())
+            if mode == "light":
+                self._notify("Текст установлен: светлый")
+            elif mode == "dark":
+                self._notify("Текст установлен: тёмный")
+            else:
+                self._notify("Режим текста сброшен (по умолчанию)")
+        except Exception:
+            pass
+
+    def _get_profile_text_mode(self, key: str) -> str:
+        try:
+            v = self.get_setting(self._k_textmode(key), "")
+            s = "" if v is None else str(v).strip().lower()
+            return s if s in ("light", "dark") else ""
+        except Exception:
+            return ""
+
+    def _set_profile_text_mode(self, key: str, value: str):
+        try:
+            value = (value or "").strip().lower()
+            if value not in ("light", "dark", ""):
+                value = ""
+            self.set_setting(self._k_textmode(key), value)
+        except Exception:
+            pass
+
+    def _k_textmode(self, key: str) -> str:
+        return f"{self.TEXTMODE_PREFIX}{key}"
+
+    # ====================== Эффекты ======================
+
+    def _sanitize_effect(self, value: str) -> str:
+        s = (value or "").strip().lower()
+        return s if s in ("none", "blur", "darken") else "none"
+
+    def _prompt_effect_choice(self, key: str, then=None):
+        try:
+            fragment = self._safe_get_fragment()
+            parent = fragment.getParentActivity() if fragment else None
+            if parent is None:
+                if then:
+                    then()
+                return
+            b = AlertDialogBuilder(parent)
+            b.set_title("Эффект фона")
+            b.set_message("Выберите эффект для баннера в этом профиле")
+            b.set_positive_button("Размытие", lambda dlg, which: self._apply_effect_choice(key, "blur", then))
+            b.set_negative_button("Затемнить", lambda dlg, which: self._apply_effect_choice(key, "darken", then))
+            b.set_neutral_button("Без эффектов", lambda dlg, which: self._apply_effect_choice(key, "none", then))
+            b.show()
+        except Exception:
+            try:
+                if then:
+                    then()
+            except Exception:
+                pass
+
+    def _apply_effect_choice(self, key: str, effect: str, then=None):
+        try:
+            self._set_profile_effect(key, effect)
+            self._drop_bitmap_cache_for_key(key)
+            self._invalidate_profile_view(self._safe_get_fragment())
+            eff_name = {"none": "без эффектов", "blur": "размытие", "darken": "затемнение"}.get(effect, effect)
+            self._notify(f"Эффект установлен: {eff_name}")
+        except Exception:
+            pass
+        finally:
+            try:
+                if then:
+                    then()
+            except Exception:
+                pass
+
+    def _k_effect(self, key: str) -> str:
+        return f"{self.EFFECT_PREFIX}{key}"
+
+    def _get_profile_effect(self, key: str) -> str:
+        try:
+            # Проверяем если источник это avatar:// (либо глобально, либо per-profile)
+            src = self._get_profile_source(key)
+            is_avatar_source = str(src).startswith("avatar://")
+
+            # Сначала проверяем настройку per-profile эффекта
+            v = self.get_setting(self._k_effect(key), None)
+            if v is not None and str(v).strip() != "":
+                s = self._sanitize_effect(v)
+                # Если это avatar источник и per-profile эффект "none" - используем настройки баннера
+                if is_avatar_source and s == "none":
+                    avatar_effect = self._get_effect_str(self.SETTINGS_AVATAR_BANNER_EFFECT, "darken")
+                    return avatar_effect
+                return s
+
+            if is_avatar_source:
+                # Используем эффект из настроек баннера аватара
+                avatar_effect = self._get_effect_str(self.SETTINGS_AVATAR_BANNER_EFFECT, "darken")
+                return avatar_effect
+
+            # Иначе используем дефолтный эффект
+            default_effect = self._get_effect_str(self.SETTINGS_EFFECT_DEFAULT, "blur")
+            return default_effect
+        except Exception:
+            return self._get_effect_str(self.SETTINGS_EFFECT_DEFAULT, "blur")
+
+    def _set_profile_effect(self, key: str, value: str):
+        try:
+            self.set_setting(self._k_effect(key), self._sanitize_effect(value))
+        except Exception:
+            pass
+
+    # ====================== Размытие ======================
+
+    def _alloc_int_array(self, n: int):
+        # Создание int[] совместимо для разных окружений Chaquopy
+        arr = None
+        if JAVA_ARRAY_AVAILABLE:
+            try:
+                arr = jarray('i')(int(n))
+            except Exception:
+                try:
+                    arr = jarray('I')(int(n))
+                except Exception:
+                    arr = None
+        if arr is None:
+            try:
+                IntegerTYPE = find_class("java.lang.Integer").TYPE
+                Array = find_class("java.lang.reflect.Array")
+                arr = Array.newInstance(IntegerTYPE, int(n))
+            except Exception:
+                arr = None
+        return arr
+
+    def _array_get(self, arr, i: int) -> int:
+        try:
+            return int(arr[i])
+        except Exception:
+            try:
+                Array = find_class("java.lang.reflect.Array")
+                return int(Array.get(arr, int(i)))
+            except Exception:
+                return 0
+
+    def _array_set(self, arr, i: int, val: int) -> bool:
+        try:
+            arr[i] = int(val)
+            return True
+        except Exception:
+            try:
+                Array = find_class("java.lang.reflect.Array")
+                Array.set(arr, int(i), int(val))
+                return True
+            except Exception:
+                return False
+
+    def _get_blurred_bitmap_for_key(self, key: str, bmp):
+        try:
+            blur_percent = self._get_percent(self.SETTINGS_BLUR_INTENSITY, 60)
+            if self._last_blur_percent != blur_percent:
+                try:
+                    self._bmp_blur_map.clear()
+                except Exception:
+                    self._bmp_blur_map = {}
+                self._last_blur_percent = blur_percent
+
+            cached = self._bmp_blur_map.get(key)
+            if cached:
+                cached_bmp, cached_percent = cached
+                if cached_percent == blur_percent and cached_bmp is not None and not cached_bmp.isRecycled():
+                    return cached_bmp
+
+            bw = bmp.getWidth()
+            bh = bmp.getHeight()
+            if bw <= 2 or bh <= 2:
+                return bmp
+
+            ratio = max(1, min(100, int(blur_percent))) / 100.0
+            max_side = max(bw, bh)
+            # Mild-to-medium blur mapping: keep more resolution to avoid over-blur
+            downscale_factor = max(0.45, min(0.85, 0.85 - 0.40 * ratio))  # 0.45..0.85
+            target_side = int(max(360, max_side * downscale_factor))
+            target_side = min(target_side, 1080)
+            scale = min(1.0, float(target_side) / float(max_side))
+            sw = max(2, int(bw * scale))
+            sh = max(2, int(bh * scale))
+            small = Bitmap.createScaledBitmap(bmp, sw, sh, True)
+
+            # Softer, milder blur range
+            radius = int(5 + ratio * 22)  # ~5..27
+            radius = max(2, min(radius, max(2, min(sw, sh) // 2 - 1)))
+            passes = 2 if blur_percent < 75 else 3
+
+            # Prefer RenderScript blur when available for high quality (milder settings)
+            blurred_small = None
+            rs_radius = min(20.0, float(max(2.0, radius * 0.8)))  # cap lower and scale down
+            rs_passes = 1 if blur_percent < 85 else 2
+            try:
+                blurred_small = self._renderscript_blur(small, radius=rs_radius, passes=rs_passes)
+            except Exception:
+                blurred_small = None
+            if blurred_small is None:
+                blurred_small = self._box_blur_bitmap(small, radius=radius, passes=passes)
+            if blurred_small is None:
+                return bmp
+
+            # Optional mild post-smoothing upscale
+            try:
+                blurred = Bitmap.createScaledBitmap(blurred_small, sw, sh, True)
+            except Exception:
+                blurred = blurred_small
+
+            try:
+                if blurred_small is not None and blurred_small != blurred and not blurred_small.isRecycled():
+                    blurred_small.recycle()
+            except Exception:
+                pass
+
+            self._bmp_blur_map[key] = (blurred, blur_percent)
+            return blurred
+        except Exception:
+            return bmp
+
+    def _box_blur_bitmap(self, bmp, radius=10, passes=2):
+        try:
+            w = bmp.getWidth()
+            h = bmp.getHeight()
+            if w <= 1 or h <= 1:
+                return bmp
+
+            radius = max(1, int(radius))
+            passes = max(1, int(passes))
+            total = w * h
+
+            # Чтение пикселей в Java int[]
+            arr_in = self._alloc_int_array(total)
+            if arr_in is None:
+                return bmp
+            try:
+                bmp.getPixels(arr_in, 0, w, 0, 0, w, h)
+            except Exception:
+                return bmp
+            pixels = [self._array_get(arr_in, i) for i in range(total)]
+
+            a = [0] * total
+            r = [0] * total
+            g = [0] * total
+            b = [0] * total
+            for i, px in enumerate(pixels):
+                a[i] = (px >> 24) & 0xFF
+                r[i] = (px >> 16) & 0xFF
+                g[i] = (px >> 8) & 0xFF
+                b[i] = px & 0xFF
+
+            def blur_lines(buf_in, buf_out, line_count, line_len, rad):
+                window = rad * 2 + 1
+                for line in range(line_count):
+                    base = line * line_len
+                    acc = 0
+                    for i in range(-rad, rad + 1):
+                        idx = base + (0 if i < 0 else (line_len - 1 if i >= line_len else i))
+                        acc += buf_in[idx]
+                    for x in range(line_len):
+                        buf_out[base + x] = acc // window
+                        left = x - rad
+                        right = x + rad + 1
+                        left_idx = base + (0 if left < 0 else left)
+                        right_idx = base + (line_len - 1 if right >= line_len else right)
+                        acc += buf_in[right_idx] - buf_in[left_idx]
+
+            def blur_cols(buf_in, buf_out, line_count, line_len, rad):
+                window = rad * 2 + 1
+                for x in range(line_len):
+                    acc = 0
+                    for i in range(-rad, rad + 1):
+                        row = 0 if i < 0 else (line_count - 1 if i >= line_count else i)
+                        acc += buf_in[row * line_len + x]
+                    for y in range(line_count):
+                        idx = y * line_len + x
+                        buf_out[idx] = acc // window
+                        up = y - rad
+                        down = y + rad + 1
+                        up_row = 0 if up < 0 else up
+                        down_row = line_count - 1 if down >= line_count else down
+                        acc += buf_in[down_row * line_len + x] - buf_in[up_row * line_len + x]
+
+            tmp = [0] * total
+            for _ in range(passes):
+                blur_lines(r, tmp, h, w, radius); r, tmp = tmp, r
+                blur_lines(g, tmp, h, w, radius); g, tmp = tmp, g
+                blur_lines(b, tmp, h, w, radius); b, tmp = tmp, b
+                blur_cols(r, tmp, h, w, radius); r, tmp = tmp, r
+                blur_cols(g, tmp, h, w, radius); g, tmp = tmp, g
+                blur_cols(b, tmp, h, w, radius); b, tmp = tmp, b
+
+            out_pixels = [0] * total
+            for i in range(total):
+                out_pixels[i] = ((a[i] & 0xFF) << 24) | ((r[i] & 0xFF) << 16) | ((g[i] & 0xFF) << 8) | (b[i] & 0xFF)
+
+            out_bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+            # Запись пикселей: используем Java int[] для совместимости
+            arr_out = self._alloc_int_array(total)
+            if arr_out is None:
+                try:
+                    out_bmp.setPixels(out_pixels, 0, w, 0, 0, w, h)
+                    return out_bmp
+                except Exception:
+                    return bmp
+            for i, v in enumerate(out_pixels):
+                if not self._array_set(arr_out, i, v):
+                    return bmp
+            try:
+                out_bmp.setPixels(arr_out, 0, w, 0, 0, w, h)
+            except Exception:
+                return bmp
+            return out_bmp
+        except Exception:
+            return bmp
+
+    # ====================== Watcher ======================
+
+    def _watcher_loop(self):
+        while not self._watcher_stop:
+            try:
+                fragment = get_last_fragment()
+                if fragment is not None and fragment.getClass().getName().endswith(".ProfileActivity"):
+                    topview = self._find_topview_instance(fragment)
+                    if topview is not None:
+                        self._ensure_hook_on_topview_instance(topview)
+                time.sleep(0.7)
+            except Exception:
+                time.sleep(1.0)
+
+    def _find_topview_instance(self, fragment):
+        try:
+            cls = fragment.getClass()
+            for fname in ("topView", "mTopView"):
+                try:
+                    f = cls.getDeclaredField(fname)
+                    f.setAccessible(True)
+                    v = f.get(fragment)
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            root = fragment.getFragmentView()
+            if root is None:
+                return None
+            stack = [root]
+            while stack:
+                v = stack.pop()
+                try:
+                    name = v.getClass().getName()
+                    if name.endswith("ProfileActivity$TopView") or "ProfileActivity$TopView" in name:
+                        return v
+                except Exception:
+                    pass
+                if isinstance(v, ViewGroup):
+                    for i in range(v.getChildCount() - 1, -1, -1):
+                        try:
+                            stack.append(v.getChildAt(i))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return None
+
+    def _ensure_hook_on_topview_instance(self, topview):
+        try:
+            cls = topview.getClass()
+            clsname = cls.getName()
+
+            if self._hook_on_draw_ref is not None and self._hooked_topview_classname == clsname:
+                return
+
+            if self._hook_on_draw_ref is not None and self._hooked_topview_classname is not None:
+                try:
+                    self.unhook_method(self._hook_on_draw_ref)
+                except Exception:
+                    pass
+                self._hook_on_draw_ref = None
+                self._hooked_topview_classname = None
+
+            canvas_param = JCanvas if JCanvas is not None else self._CanvasClass
+            if canvas_param is None:
+                return
+
+            ondraw = cls.getDeclaredMethod("onDraw", canvas_param)
+            ondraw.setAccessible(True)
+            self._hook_on_draw_ref = self.hook_method(ondraw, _TopViewOnDrawHook(self))
+            self._hooked_topview_classname = clsname
+        except Exception:
+            pass
+
+    # ====================== Рендер и источники ======================
+
+    def _load_avatar_bitmap(self, key: str):
+        """
+        Загружает аватар профиля/чата как Bitmap
+        key формата: "uid_12345" или "cid_67890"
+        """
+        try:
+            from android.graphics import BitmapFactory
+            from java.io import File as JFile
+
+            # Парсим key для извлечения ID
+            if key.startswith("uid_"):
+                user_id = int(key[4:])
+                is_user = True
+            elif key.startswith("cid_"):
+                chat_id = int(key[4:])
+                is_user = False
+            else:
+                return None
+
+            # Получаем текущий аккаунт
+            UserConfig = find_class("org.telegram.messenger.UserConfig")
+            current_account = UserConfig.selectedAccount
+
+            # Получаем MessagesController
+            MessagesController = find_class("org.telegram.messenger.MessagesController")
+            controller = MessagesController.getInstance(current_account)
+
+            if is_user:
+                # Загружаем пользователя
+                User = find_class("org.telegram.tgnet.TLRPC$User")
+                user = controller.getUser(user_id)
+                if user is None:
+                    return None
+
+                # Получаем фото профиля
+                photo = user.photo
+                if photo is None:
+                    return None
+
+                # Получаем FileLocation из photo.photo_big
+                file_location = photo.photo_big
+            else:
+                # Загружаем чат
+                Chat = find_class("org.telegram.tgnet.TLRPC$Chat")
+                chat = controller.getChat(abs(chat_id))
+                if chat is None:
+                    return None
+
+                # Получаем фото чата
+                photo = chat.photo
+                if photo is None:
+                    return None
+
+                # Получаем FileLocation из photo.photo_big
+                file_location = photo.photo_big
+
+            if file_location is None:
+                return None
+
+            # Получаем путь к файлу через FileLoader
+            FileLoader = find_class("org.telegram.messenger.FileLoader")
+            file_loader = FileLoader.getInstance(current_account)
+
+            # Получаем директорию для аватаров
+            avatar_file = file_loader.getPathToAttach(file_location, True)
+
+            if avatar_file is None or not avatar_file.exists():
+                return None
+
+            # Загружаем Bitmap из файла
+            bitmap = BitmapFactory.decodeFile(avatar_file.getAbsolutePath())
+            return bitmap
+
+        except Exception as e:
+            return None
+
+    def _ensure_bitmap_for_key(self, key: str):
+        if not self._get_bool(self.SETTINGS_ENABLE, False):
+            return None
+        src = self._get_profile_source(key)
+        if not src:
+            return None
+
+        cached = self._bmp_map.get(key)
+        if cached is not None and self._src_map.get(key) == src and not cached.isRecycled():
+            return cached
+
+        bmp = None
+        try:
+            # Обработка протокола avatar:// для загрузки аватара профиля
+            if str(src).startswith("avatar://"):
+                try:
+                    bmp = self._load_avatar_bitmap(key)
+                    if bmp is not None:
+                        bmp = self._cap_bitmap_size(bmp, 4096, 4096)
+                        self._bmp_map[key] = bmp
+                        self._src_map[key] = str(src)
+                        return bmp
+                    else:
+                        # Если аватар не загрузился, пробуем использовать глобальный источник как fallback
+                        global_src = self._get_str(self.SETTINGS_SOURCE_GLOBAL, "").strip()
+                        if global_src and not global_src.startswith("avatar://"):
+                            src = global_src
+                        else:
+                            return None
+                except Exception:
+                    # Если ошибка при загрузке аватара, пробуем глобальный источник
+                    global_src = self._get_str(self.SETTINGS_SOURCE_GLOBAL, "").strip()
+                    if global_src and not global_src.startswith("avatar://"):
+                        src = global_src
+                    else:
+                        return None
+
+            if str(src).startswith("file://"):
+                try:
+                    p = Uri.parse(src).getPath()
+                    src = p if p else src[7:]
+                except Exception:
+                    src = src[7:]
+
+            if str(src).startswith("http://") or str(src).startswith("https://"):
+                target = self._get_cache_path_for_key(key)
+                ok = False
+                try:
+                    import requests
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Android 13; exteraGram Plugin)",
+                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                        "Referer": str(src)
+                    }
+                    r = requests.get(str(src), stream=True, timeout=25, headers=headers, allow_redirects=True)
+                    r.raise_for_status()
+                    with open(target, "wb") as f:
+                        for chunk in r.iter_content(65536):
+                            if chunk:
+                                f.write(chunk)
+                    ok = True
+                except Exception:
+                    ok = False
+                if not ok:
+                    try:
+                        from java.net import URL as JURL
+                        conn = JURL(str(src)).openConnection()
+                        try:
+                            conn.setInstanceFollowRedirects(True)
+                            conn.setConnectTimeout(20000)
+                            conn.setReadTimeout(25000)
+                            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android 13; exteraGram Plugin)")
+                            conn.setRequestProperty("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+                            conn.setRequestProperty("Referer", str(src))
+                        except Exception:
+                            pass
+                        inp = BufferedInputStream(conn.getInputStream())
+                        out = FileOutputStream(target)
+                        buf = bytearray(64 * 1024)
+                        while True:
+                            read = inp.read(buf)
+                            if read == -1:
+                                break
+                            out.write(buf, 0, read)
+                        try:
+                            out.close(); inp.close()
+                        except Exception:
+                            pass
+                        ok = True
+                    except Exception:
+                        ok = False
+                if ok:
+                    bmp = self._decode_bitmap_file(target)
+                else:
+                    self._alert("Ошибка загрузки", "Не удалось скачать изображение")
+                    return None
+
+            elif str(src).startswith("content://"):
+                try:
+                    ctx = ApplicationLoader.applicationContext
+                    uri = Uri.parse(str(src))
+                    stream = ctx.getContentResolver().openInputStream(uri)
+                    if stream is not None:
+                        bis = BufferedInputStream(stream)
+                        bmp = BitmapFactory.decodeStream(bis)
+                        try:
+                            bis.close(); stream.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    self._alert("Ошибка чтения URI", "Не удалось открыть контент")
+            else:
+                bmp = self._decode_bitmap_file(str(src))
+
+            if bmp is None:
+                self._alert("Картинка", "Не удалось декодировать изображение")
+                return None
+
+            bmp = self._cap_bitmap_size(bmp, 4096, 4096)
+            self._bmp_map[key] = bmp
+            self._src_map[key] = str(src)
+            return bmp
+        except Exception:
+            return None
+
+    def _decode_bitmap_file(self, path):
+        try:
+            if not path:
+                return None
+            f = File(path)
+            if not f.exists():
+                return None
+            opts = BitmapFactory.Options()
+            opts.inPreferredConfig = Bitmap.Config.ARGB_8888
+            bmp = BitmapFactory.decodeFile(path, opts)
+            return bmp
+        except Exception:
+            return None
+
+    def _cap_bitmap_size(self, bmp, max_w=2048, max_h=2048):
+        try:
+            w = bmp.getWidth()
+            h = bmp.getHeight()
+            if w <= max_w and h <= max_h:
+                return bmp
+            scale = min(max_w / float(max(1, w)), max_h / float(max(1, h)))
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            return Bitmap.createScaledBitmap(bmp, nw, nh, True)
+        except Exception:
+            return bmp
+
+    # ====================== Директория и ключи ======================
+
+    def _ensure_plugin_dir(self):
+        try:
+            base_dir = ApplicationLoader.getFilesDirFixed()
+            if base_dir:
+                plugin_folder = File(base_dir, self.id)
+                if not plugin_folder.exists():
+                    plugin_folder.mkdirs()
+                self._plugin_dir = plugin_folder.getAbsolutePath()
+        except Exception:
+            pass
+
+    def _get_profile_source(self, key: str) -> str:
+        # Сначала проверяем per-profile источник (наивысший приоритет)
+        per = self.get_setting(self._k_src(key), "")
+        per_str = str(per).strip()
+
+        # Если явно установлено "none" - значит фон удалён для этого профиля
+        if per_str == "none":
+            return ""
+
+        if per_str:
+            # Если есть per-profile настройка, используем её
+            return per_str
+
+        # Проверяем настройку баннера из аватара (только если нет per-profile настройки)
+        is_avatar_banner_enabled = self._get_bool(self.SETTINGS_AVATAR_BANNER_ENABLE, True)
+
+        if is_avatar_banner_enabled:
+            # Проверяем есть ли глобальный источник
+            global_src = self._get_str(self.SETTINGS_SOURCE_GLOBAL, "").strip()
+
+            if global_src and not global_src.startswith("avatar://"):
+                # Если есть глобальный источник, используем его
+                return global_src
+            else:
+                # Иначе используем аватар
+                return f"avatar://{key}"
+
+        # Иначе используем глобальный источник
+        return self._get_str(self.SETTINGS_SOURCE_GLOBAL, "").strip()
+
+    def _set_profile_source(self, key: str, value: str):
+        self.set_setting(self._k_src(key), value)
+
+    def _k_src(self, key: str) -> str:
+        return f"profileHeader.source.{key}"
+
+    def _sanitize_key(self, key: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_\-\.]", "_", key)
+
+    def _get_cache_path_for_key(self, key: str):
+        fname = f"cache_{self._sanitize_key(key)}.jpg"
+        try:
+            base = self._plugin_dir or ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath()
+        except Exception:
+            base = ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath()
+        return os.path.join(base, fname)
+
+    def _drop_bitmap_cache_for_key(self, key: str):
+        try:
+            if key in self._bmp_map:
+                del self._bmp_map[key]
+            if key in self._bmp_blur_map:
+                try:
+                    del self._bmp_blur_map[key]
+                except Exception:
+                    pass
+            if key in self._src_map:
+                del self._src_map[key]
+        except Exception:
+            pass
+
+    def _safe_get_fragment(self):
+        try:
+            if self._last_target_fragment_ref:
+                f = self._last_target_fragment_ref()
+                if f is not None:
+                    return f
+        except Exception:
+            pass
+        try:
+            return get_last_fragment()
+        except Exception:
+            return None
+
+    def _invalidate_profile_view(self, fragment):
+        try:
+            if fragment is None:
+                fragment = get_last_fragment()
+            if fragment is not None and fragment.getClass().getName().endswith(".ProfileActivity"):
+                view = fragment.getFragmentView()
+                if view is not None:
+                    run_on_ui_thread(lambda: view.invalidate())
+        except Exception:
+            pass
+
+    def _get_profile_key_from_fragment(self, fragment) -> str:
+        try:
+            cls = fragment.getClass()
+            try:
+                m = cls.getDeclaredMethod("getDialogId")
+                m.setAccessible(True)
+                did = m.invoke(fragment)
+                if did is not None:
+                    val = int(did)
+                    return f"cid_{-val}" if val < 0 else f"uid_{val}"
+            except Exception:
+                pass
+            for name in ("dialogId", "dialog_id"):
+                try:
+                    f = cls.getDeclaredField(name)
+                    f.setAccessible(True)
+                    val = f.get(fragment)
+                    if val is not None:
+                        val = int(val)
+                        return f"cid_{-val}" if val < 0 else f"uid_{val}"
+                except Exception:
+                    pass
+            uid = None
+            cid = None
+            for name in ("userId", "user_id"):
+                try:
+                    f = cls.getDeclaredField(name)
+                    f.setAccessible(True)
+                    uid = int(f.get(fragment)); break
+                except Exception:
+                    pass
+            for name in ("chatId", "chat_id"):
+                try:
+                    f = cls.getDeclaredField(name)
+                    f.setAccessible(True)
+                    cid = int(f.get(fragment)); break
+                except Exception:
+                    pass
+            if cid and cid > 0:
+                return f"cid_{cid}"
+            if uid and uid > 0:
+                return f"uid_{uid}"
+        except Exception:
+            pass
+        return "unknown"
+
+    # ====================== Theme.getColor хуки ======================
+
+    def _install_theme_hooks(self):
+        try:
+            ThemeClass = find_class("org.telegram.ui.ActionBar.Theme")
+            StringClass = find_class("java.lang.String")
+            IntegerTYPE = find_class("java.lang.Integer").TYPE
+            BooleanTYPE = find_class("java.lang.Boolean").TYPE
+            RPClass = None
+            try:
+                RPClass = find_class("org.telegram.ui.ActionBar.Theme$ResourcesProvider")
+            except Exception:
+                RPClass = None
+
+            self._theme_keys = {}
+            for name in ("key_profile_title", "key_avatar_subtitleInProfileBue", "key_avatar_subtitleInProfileBlue"):
+                try:
+                    f = ThemeClass.getDeclaredField(name)
+                    f.setAccessible(True)
+                    val = int(f.get(None))
+                    self._theme_keys[name] = val
+                except Exception:
+                    pass
+
+            methods_to_hook = []
+            for sig in (
+                ("getColor", (IntegerTYPE,)),
+                ("getColor", (IntegerTYPE, BooleanTYPE)),
+                ("getColorOrDefault", (IntegerTYPE,)),
+            ):
+                try:
+                    m = ThemeClass.getDeclaredMethod(sig[0], *sig[1])
+                    methods_to_hook.append(("int", m))
+                except Exception:
+                    pass
+            if RPClass is not None:
+                for sig in (
+                    ("getColor", (IntegerTYPE, RPClass)),
+                    ("getColorOrDefault", (IntegerTYPE, RPClass)),
+                ):
+                    try:
+                        m = ThemeClass.getDeclaredMethod(sig[0], *sig[1])
+                        methods_to_hook.append(("int", m))
+                    except Exception:
+                        pass
+
+            for sig in (
+                ("getColor", (StringClass,)),
+                ("getColorOrDefault", (StringClass,)),
+            ):
+                try:
+                    m = ThemeClass.getDeclaredMethod(sig[0], *sig[1])
+                    methods_to_hook.append(("str", m))
+                except Exception:
+                    pass
+            if RPClass is not None:
+                for sig in (
+                    ("getColor", (StringClass, RPClass)),
+                    ("getColorOrDefault", (StringClass, RPClass)),
+                ):
+                    try:
+                        m = ThemeClass.getDeclaredMethod(sig[0], *sig[1])
+                        methods_to_hook.append(("str", m))
+                    except Exception:
+                        pass
+
+            self._theme_hook_refs = []
+            for kind, method in methods_to_hook:
+                try:
+                    if kind == "int":
+                        ref = self.hook_method(method, _ThemeGetColorIntHook(self))
+                    else:
+                        ref = self.hook_method(method, _ThemeGetColorStrHook(self))
+                    if ref:
+                        self._theme_hook_refs.append(ref)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _resolve_text_colors(self, mode: str):
+        if mode == "light":
+            return (Color.WHITE, Color.argb(230, 255, 255, 255))
+        else:
+            return (Color.BLACK, Color.argb(210, 0, 0, 0))
+
+    def _current_profile_textmode(self):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return ("", None)
+        except Exception:
+            return ("", None)
+        try:
+            name = fragment.getClass().getName()
+            if not (name.endswith(".ProfileActivity") or name.endswith("ProfileActivity")):
+                return ("", fragment)
+            key = self._get_profile_key_from_fragment(fragment)
+            mode = self._get_profile_text_mode(key)
+            return (mode, fragment)
+        except Exception:
+            return ("", fragment)
+
+    def _apply_theme_overrides(self, mode: str):
+        try:
+            name_color, sub_color = self._resolve_text_colors(mode)
+            ThemeClass = find_class("org.telegram.ui.ActionBar.Theme")
+            StringClass = find_class("java.lang.String")
+            IntegerTYPE = find_class("java.lang.Integer").TYPE
+        except Exception:
+            return
+        for key, color in (("profile_title", name_color),
+                           ("avatar_subtitleInProfileBue", sub_color),
+                           ("avatar_subtitleInProfileBlue", sub_color)):
+            try:
+                m = ThemeClass.getDeclaredMethod("setColor", StringClass, IntegerTYPE)
+                m.setAccessible(True)
+                m.invoke(None, key, int(color))
+            except Exception:
+                pass
+            try:
+                BooleanTYPE = find_class("java.lang.Boolean").TYPE
+                m2 = ThemeClass.getDeclaredMethod("setColor", StringClass, IntegerTYPE, BooleanTYPE)
+                m2.setAccessible(True)
+                m2.invoke(None, key, int(color), False)
+            except Exception:
+                pass
+        try:
+            k = self._theme_keys
+            for ikey, color in (
+                (k.get("key_profile_title"), name_color),
+                (k.get("key_avatar_subtitleInProfileBue"), sub_color),
+                (k.get("key_avatar_subtitleInProfileBlue"), sub_color),
+            ):
+                if ikey is None:
+                    continue
+                try:
+                    m = ThemeClass.getDeclaredMethod("setColor", IntegerTYPE, IntegerTYPE)
+                    m.setAccessible(True)
+                    m.invoke(None, int(ikey), int(color))
+                except Exception:
+                    pass
+                try:
+                    BooleanTYPE = find_class("java.lang.Boolean").TYPE
+                    m2 = ThemeClass.getDeclaredMethod("setColor", IntegerTYPE, IntegerTYPE, BooleanTYPE)
+                    m2.setAccessible(True)
+                    m2.invoke(None, int(ikey), int(color), False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _reset_theme_colors(self):
+        """Сбрасывает цвета темы к значениям по умолчанию"""
+        try:
+            ThemeClass = find_class("org.telegram.ui.ActionBar.Theme")
+            StringClass = find_class("java.lang.String")
+            IntegerTYPE = find_class("java.lang.Integer").TYPE
+
+            # Пытаемся вызвать методы для удаления кастомных цветов
+            # Метод 1: Попробуем removeCustomColors
+            try:
+                m = ThemeClass.getDeclaredMethod("removeCustomColors", StringClass)
+                m.setAccessible(True)
+                for key_name in ("profile_title", "avatar_subtitleInProfileBue", "avatar_subtitleInProfileBlue"):
+                    try:
+                        m.invoke(None, key_name)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Метод 2: Пробуем setColor с флагом saveOverride=false для очистки
+            try:
+                BooleanTYPE = find_class("java.lang.Boolean").TYPE
+                m_set = ThemeClass.getDeclaredMethod("setColor", StringClass, IntegerTYPE, BooleanTYPE)
+                m_set.setAccessible(True)
+
+                # Получаем дефолтные цвета темы
+                m_default = ThemeClass.getDeclaredMethod("getDefaultColor", StringClass)
+                m_default.setAccessible(True)
+
+                for key_name in ("profile_title", "avatar_subtitleInProfileBue", "avatar_subtitleInProfileBlue"):
+                    try:
+                        default_color = m_default.invoke(None, key_name)
+                        m_set.invoke(None, key_name, int(default_color), False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Метод 3: Сброс по integer ключам
+            try:
+                BooleanTYPE = find_class("java.lang.Boolean").TYPE
+                m_set = ThemeClass.getDeclaredMethod("setColor", IntegerTYPE, IntegerTYPE, BooleanTYPE)
+                m_set.setAccessible(True)
+                m_default = ThemeClass.getDeclaredMethod("getDefaultColor", IntegerTYPE)
+                m_default.setAccessible(True)
+
+                k = self._theme_keys
+                for key_name, ikey in k.items():
+                    if ikey is None:
+                        continue
+                    try:
+                        default_color = m_default.invoke(None, int(ikey))
+                        m_set.invoke(None, int(ikey), int(default_color), False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _apply_text_colors(self, topview, outer, mode: str):
+        try:
+            if not mode:
+                return
+            name_color, sub_color = self._resolve_text_colors(mode)
+            use_shadow = (mode == "light")
+            shadow_color = Color.argb(110, 0, 0, 0) if use_shadow else Color.argb(0, 0, 0, 0)
+
+            self._apply_theme_overrides(mode)
+
+            def _apply_to_tv_or_array(val, is_primary: bool):
+                try:
+                    try:
+                        val.setTextColor(name_color if is_primary else sub_color)
+                        val.setShadowLayer(
+                            2.0 if (is_primary and use_shadow) else (1.5 if (not is_primary and use_shadow) else 0.0),
+                            0.0,
+                            1.0 if (is_primary and use_shadow) else (0.5 if (not is_primary and use_shadow) else 0.0),
+                            shadow_color
+                        )
+                        return
+                    except Exception:
+                        pass
+                    length = None
+                    try:
+                        length = len(val)
+                    except Exception:
+                        try:
+                            length = val.length
+                        except Exception:
+                            length = None
+                    if length is None:
+                        try:
+                            Array = find_class("java.lang.reflect.Array")
+                            length = Array.getLength(val)
+                            for i in range(int(length)):
+                                try:
+                                    item = Array.get(val, i)
+                                except Exception:
+                                    item = None
+                                if item is None:
+                                    continue
+                                try:
+                                    item.setTextColor(name_color if is_primary else sub_color)
+                                    item.setShadowLayer(
+                                        2.0 if (is_primary and use_shadow) else (1.5 if (not is_primary and use_shadow) else 0.0),
+                                        0.0,
+                                        1.0 if (is_primary and use_shadow) else (0.5 if (not is_primary and use_shadow) else 0.0),
+                                        shadow_color
+                                    )
+                                except Exception:
+                                    pass
+                            return
+                        except Exception:
+                            return
+                    for i in range(int(length)):
+                        try:
+                            item = val[i]
+                        except Exception:
+                            try:
+                                Array = find_class("java.lang.reflect.Array")
+                                item = Array.get(val, i)
+                            except Exception:
+                                item = None
+                        if item is None:
+                            continue
+                        try:
+                            item.setTextColor(name_color if is_primary else sub_color)
+                            item.setShadowLayer(
+                                2.0 if (is_primary and use_shadow) else (1.5 if (not is_primary and use_shadow) else 0.0),
+                                0.0,
+                                1.0 if (is_primary and use_shadow) else (0.5 if (not is_primary and use_shadow) else 0.0),
+                                shadow_color
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            for host in (topview, outer):
+                if host is None:
+                    continue
+                cls = host.getClass()
+                for fname in ("nameTextView", "titleTextView", "nameView", "titleView"):
+                    try:
+                        f = cls.getDeclaredField(fname); f.setAccessible(True)
+                        val = f.get(host)
+                        if val is not None:
+                            _apply_to_tv_or_array(val, is_primary=True)
+                    except Exception:
+                        pass
+                for fname in ("onlineTextView", "statusTextView", "subtitleTextView", "subtitleView"):
+                    try:
+                        f = cls.getDeclaredField(fname); f.setAccessible(True)
+                        val = f.get(host)
+                        if val is not None:
+                            _apply_to_tv_or_array(val, is_primary=False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # ====================== Helpers (defaults, settings, alerts) ======================
+
+    def _ensure_defaults(self):
+        try:
+            if self.get_setting(self.SETTINGS_ENABLE, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_ENABLE, True)  # Включаем по умолчанию!
+            if self.get_setting(self.SETTINGS_SOURCE_GLOBAL, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_SOURCE_GLOBAL, "")
+            if self.get_setting(self.SETTINGS_FADE, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_FADE, 90)
+            if self.get_setting(self.SETTINGS_BLUR_INTENSITY, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_BLUR_INTENSITY, 60)
+            if self.get_setting(self.SETTINGS_DARKEN_INTENSITY, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_DARKEN_INTENSITY, 70)
+            if self.get_setting(self.SETTINGS_EFFECT_DEFAULT, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_EFFECT_DEFAULT, "blur")
+            if self.get_setting(self.SETTINGS_DEBUG_ENABLE, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_DEBUG_ENABLE, False)
+            if self.get_setting(self.SETTINGS_AVATAR_BANNER_ENABLE, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_AVATAR_BANNER_ENABLE, True)
+            if self.get_setting(self.SETTINGS_AVATAR_BANNER_EFFECT, _SENTINEL) is _SENTINEL:
+                self.set_setting(self.SETTINGS_AVATAR_BANNER_EFFECT, "darken")
+            self._last_blur_percent = self._get_percent(self.SETTINGS_BLUR_INTENSITY, 60)
+        except Exception:
+            pass
+
+    def _get_bool(self, key, default=False):
+        try:
+            v = self.get_setting(key, default)
+            if v is default:
+                return default
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, int):
+                return v != 0
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on", "y")
+            return bool(v)
+        except Exception:
+            return default
+
+    def _set_bool(self, key, value: bool):
+        try:
+            self.set_setting(key, bool(value))
+        except Exception:
+            pass
+
+    def _get_str(self, key, default=""):
+        try:
+            v = self.get_setting(key, default)
+            return "" if v is None else str(v)
+        except Exception:
+            return default
+
+    def _set_str(self, key, value: str):
+        try:
+            self.set_setting(key, value)
+        except Exception:
+            pass
+
+    def _get_int(self, key, default=0):
+        try:
+            v = self.get_setting(key, default)
+            if v is default:
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    def _set_int(self, key, value: int):
+        try:
+            self.set_setting(key, int(value))
+        except Exception:
+            pass
+
+    def _get_percent(self, key, default=50):
+        try:
+            v = self.get_setting(key, default)
+            v = int(v)
+        except Exception:
+            v = default
+        return max(1, min(100, int(v)))
+
+    def _set_percent(self, key, value: int):
+        self._set_int(key, max(1, min(100, int(value))))
+        self._reload_plugin_settings()
+
+    def _get_effect_str(self, key, default="none"):
+        try:
+            v = self.get_setting(key, default)
+            s = ("" if v is None else str(v)).strip().lower()
+            return s if s in ("none", "blur", "darken") else default
+        except Exception:
+            return default
+
+    def _can_use_bulletin(self):
+        try:
+            if hasattr(self, "_bulletin_ok"):
+                return bool(self._bulletin_ok)
+        except Exception:
+            pass
+        ok = False
+        try:
+            B = find_class("org.telegram.ui.Components.Bulletin")
+            try:
+                inners = B.getDeclaredClasses()
+                Array = find_class("java.lang.reflect.Array")
+                ln = Array.getLength(inners)
+                for i in range(int(ln)):
+                    try:
+                        cls = Array.get(inners, i)
+                        name = cls.getName()
+                        if name.endswith("$BottomSheet") or name.endswith("BottomSheet"):
+                            ok = True; break
+                    except Exception:
+                        pass
+            except Exception:
+                # If cannot list inner classes, assume basic Bulletin exists but BottomSheet may not
+                ok = False
+        except Exception:
+            ok = False
+        try:
+            self._bulletin_ok = ok
+        except Exception:
+            pass
+        return ok
+
+    def _toast(self, text):
+        try:
+            Toast = find_class("android.widget.Toast")
+            ctx = ApplicationLoader.applicationContext
+            dur = getattr(Toast, "LENGTH_SHORT", 0)
+            t = Toast.makeText(ctx, str(text), int(dur))
+            t.show()
+        except Exception:
+            pass
+
+    def _notify(self, text):
+        try:
+            if self._can_use_bulletin():
+                BulletinHelper.show(text)
+                return
+        except Exception:
+            pass
+        self._toast(text)
+
+    def _alert(self, title, message):
+        try:
+            if self._can_use_bulletin():
+                BulletinHelper.show(f"{title}: {message}")
+                return
+        except Exception:
+            pass
+        self._toast(f"{title}: {message}")
+
+    def _reload_plugin_settings(self):
+        try:
+            PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+            inst = PC.getInstance()
+            try:
+                inst.loadPluginSettings(self.id)
+            except Exception:
+                inst.loadPluginSettings()
+        except Exception:
+            pass
+
+    def _renderscript_blur(self, bmp, radius=12.0, passes=1):
+        try:
+            RS = find_class("android.renderscript.RenderScript")
+            Allocation = find_class("android.renderscript.Allocation")
+            ScriptIntrinsicBlur = find_class("android.renderscript.ScriptIntrinsicBlur")
+            Element = find_class("android.renderscript.Element")
+        except Exception:
+            return None
+        try:
+            ctx = ApplicationLoader.applicationContext
+            rs = RS.create(ctx)
+        except Exception:
+            return None
+        try:
+            in_bmp = bmp
+            out_bmp = None
+            r = float(radius)
+            if r < 0.1:
+                r = 0.1
+            if r > 25.0:
+                r = 25.0
+            pcount = max(1, int(passes))
+            for _ in range(pcount):
+                try:
+                    inp = Allocation.createFromBitmap(rs, in_bmp)
+                    out = Allocation.createTyped(rs, inp.getType())
+                    script = ScriptIntrinsicBlur.create(rs, Element.U8_4(rs))
+                    script.setRadius(r)
+                    script.setInput(inp)
+                    script.forEach(out)
+                    tmp = Bitmap.createBitmap(in_bmp.getWidth(), in_bmp.getHeight(), Bitmap.Config.ARGB_8888)
+                    out.copyTo(tmp)
+                    try:
+                        script.destroy(); inp.destroy(); out.destroy()
+                    except Exception:
+                        pass
+                    in_bmp = tmp
+                    out_bmp = tmp
+                except Exception:
+                    out_bmp = None
+                    break
+            try:
+                rs.destroy()
+            except Exception:
+                pass
+            return out_bmp
+        except Exception:
+            try:
+                rs.destroy()
+            except Exception:
+                pass
+            return None
+
+    def _add_numeric_input(self, rows, key, label, default_value, subtext, on_change):
+        # Try several constructor signatures to ensure interactivity across builds
+        try:
+            rows.append(Input(key=key, text=label, default=str(default_value), subtext=subtext, on_change=on_change))
+            return
+        except Exception:
+            pass
+        try:
+            rows.append(Input(key=key, title=label, hint=subtext or "", default=str(default_value), on_change=on_change))
+            return
+        except Exception:
+            pass
+        try:
+            rows.append(Input(key=key, text=label, default=str(default_value)))
+            return
+        except Exception:
+            pass
+
+    def _on_blur_intensity_changed(self, value):
+        try:
+            v = int(str(value).strip())
+            # Clamp value between 1 and 100
+            v = max(1, min(100, v))
+            self.set_setting(self.SETTINGS_BLUR_INTENSITY, v)
+        except (ValueError, TypeError):
+            pass
+
+    def _on_darken_intensity_changed(self, value):
+        try:
+            v = int(str(value).strip())
+            # Clamp value between 1 and 100
+            v = max(1, min(100, v))
+            self.set_setting(self.SETTINGS_DARKEN_INTENSITY, v)
+        except (ValueError, TypeError):
+            pass
+
+    def _on_avatar_banner_enable_changed(self, new_value):
+        """Обработчик изменения настройки включения баннера из аватара"""
+        try:
+            self.set_setting(self.SETTINGS_AVATAR_BANNER_ENABLE, bool(new_value))
+            self._reload_plugin_settings()
+        except Exception:
+            pass
+
+    def _on_debug_changed(self, new_value):
+        """Обработчик изменения настройки Debug"""
+        try:
+            self._debug_enabled = bool(new_value)
+            self.set_setting(self.SETTINGS_DEBUG_ENABLE, bool(new_value))
+            self._reload_plugin_settings()
+            if self._debug_enabled:
+                self._log("Debug mode enabled", also_ui=True)
+            else:
+                BulletinHelper.show("Debug mode disabled")
+        except Exception:
+            pass
+
+    def _show_debug_logs(self):
+        """Показывает логи для отладки"""
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity:
+                BulletinHelper.show("Нет активити для показа логов")
+                return
+            self._dump_logs_dialog(activity)
+        except Exception:
+            pass
+
+
+# ====================== Theme hooks ======================
+
+class _ThemeGetColorIntHook(MethodHook):
+    def __init__(self, plugin: ProfileHeaderImagePlugin):
+        self.p = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            mode, fragment = self.p._current_profile_textmode()
+            if not mode:
+                return
+            clsname = fragment.getClass().getName() if fragment else ""
+            if not (clsname.endswith(".ProfileActivity") or clsname.endswith("ProfileActivity")):
+                return
+
+            key_int = int(param.args[0])
+            name_color, sub_color = self.p._resolve_text_colors(mode)
+            k = self.p._theme_keys
+
+            if key_int == k.get("key_profile_title"):
+                param.setResult(name_color)
+            elif key_int == k.get("key_avatar_subtitleInProfileBue") or key_int == k.get("key_avatar_subtitleInProfileBlue"):
+                param.setResult(sub_color)
+        except Exception:
+            return
+
+
+class _ThemeGetColorStrHook(MethodHook):
+    def __init__(self, plugin: ProfileHeaderImagePlugin):
+        self.p = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            mode, fragment = self.p._current_profile_textmode()
+            if not mode:
+                return
+            clsname = fragment.getClass().getName() if fragment else ""
+            if not (clsname.endswith(".ProfileActivity") or clsname.endswith("ProfileActivity")):
+                return
+
+            key_str = str(param.args[0] or "").strip()
+            if not key_str:
+                return
+            name_color, sub_color = self.p._resolve_text_colors(mode)
+
+            if key_str == "profile_title":
+                param.setResult(name_color)
+            elif key_str in ("avatar_subtitleInProfileBue", "avatar_subtitleInProfileBlue"):
+                param.setResult(sub_color)
+        except Exception:
+            return
+
+
+# ====================== TopView onDraw ======================
+
+class _TopViewOnDrawHook(MethodHook):
+    def __init__(self, plugin: ProfileHeaderImagePlugin):
+        self.p = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.p._get_bool(self.p.SETTINGS_ENABLE, False):
+                return
+            topview = param.thisObject
+            if topview is None:
+                return
+            outer = None
+            try:
+                f = topview.getClass().getDeclaredField("this$0")
+                f.setAccessible(True)
+                outer = f.get(topview)
+            except Exception:
+                outer = None
+            if outer is None:
+                return
+            key = self.p._get_profile_key_from_fragment(outer)
+            mode = self.p._get_profile_text_mode(key)
+            if mode:
+                self.p._apply_text_colors(topview, outer, mode)
+        except Exception as e:
+            self.p._log(f"before onDraw error: {e}")
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.p._get_bool(self.p.SETTINGS_ENABLE, False):
+                return
+
+            topview = param.thisObject
+            canvas = param.args[0]
+            if canvas is None or topview is None:
+                return
+
+            outer = None
+            try:
+                f = topview.getClass().getDeclaredField("this$0")
+                f.setAccessible(True)
+                outer = f.get(topview)
+            except Exception:
+                outer = None
+
+            key = "unknown"
+            try:
+                if outer is not None:
+                    key = self.p._get_profile_key_from_fragment(outer)
+            except Exception:
+                pass
+
+            bmp = self.p._ensure_bitmap_for_key(key)
+            if bmp is None:
+                return
+
+            try:
+                effect = self.p._get_profile_effect(key)
+            except Exception:
+                effect = self.p._get_effect_str(self.p.SETTINGS_EFFECT_DEFAULT, "blur")
+            # Sanitize effect value to ensure it's one of the valid options
+            if effect not in ("blur", "darken", "none"):
+                effect = "blur"
+
+            y1 = None
+            progress = 0.0
+            try:
+                actionBar = outer.getActionBar() if outer is not None else None
+                status = AndroidUtilities.statusBarHeight
+                try:
+                    ab_h = JActionBar.getCurrentActionBarHeight()
+                except Exception:
+                    ab_h = AndroidUtilities.dp(56)
+                height = ab_h + (status if (actionBar is not None and actionBar.getOccupyStatusBar()) else 0)
+                extraHeight = 0.0
+                searchTransitionOffset = 0.0
+                mediaHeaderAnimationProgress = 0.0
+
+                for fname in ("extraHeight", "searchTransitionOffset", "mediaHeaderAnimationProgress"):
+                    try:
+                        ff = outer.getClass().getDeclaredField(fname)
+                        ff.setAccessible(True)
+                        val = ff.get(outer)
+                        if fname == "extraHeight":
+                            extraHeight = float(val)
+                        elif fname == "searchTransitionOffset":
+                            searchTransitionOffset = float(val)
+                        else:
+                            mediaHeaderAnimationProgress = float(val)
+                    except Exception:
+                        pass
+
+                progress = max(0.0, min(1.0, float(mediaHeaderAnimationProgress)))
+                v_total = float(extraHeight + height + searchTransitionOffset)
+                y1 = int(v_total * (1.0 - progress))
+            except Exception:
+                pass
+
+            if y1 is None or y1 <= 0:
+                y1 = AndroidUtilities.dp(240)
+
+            try:
+                tvh = topview.getMeasuredHeight()
+                if tvh > 0:
+                    y1 = min(int(y1), int(tvh))
+            except Exception:
+                pass
+
+            w = topview.getMeasuredWidth()
+            if w <= 0 or y1 <= 0:
+                return
+
+            if effect == "blur":
+                bmp_draw = self.p._get_blurred_bitmap_for_key(key, bmp)
+            else:
+                bmp_draw = bmp
+
+            bw = bmp_draw.getWidth()
+            bh = bmp_draw.getHeight()
+            if bw <= 0 or bh <= 0:
+                return
+
+            visible_factor = 1.0 - progress
+            if visible_factor <= 0.02:
+                return
+
+            # Slightly overscale to avoid gaps and keep smoothness
+            scale = max(w / float(bw), y1 / float(bh)) * 1.02
+            sw = bw * scale
+            sh = bh * scale
+            dx = (w - sw) * 0.5
+            dy = (y1 - sh) * 0.5
+
+            matrix = Matrix()
+            matrix.reset()
+            matrix.postScale(float(scale), float(scale))
+            matrix.postTranslate(float(dx), float(dy))
+
+            save_id = canvas.save()
+            try:
+                try:
+                    canvas.clipRect(0, 0, int(w), int(y1))
+                except Exception:
+                    canvas.clipRect(int(0), int(0), int(w), int(y1))
+
+                paint_bitmap = Paint()
+                try:
+                    paint_bitmap.setFilterBitmap(True)
+                    paint_bitmap.setDither(True)
+                    paint_bitmap.setAlpha(255)
+                except Exception:
+                    pass
+
+                canvas.drawBitmap(bmp_draw, matrix, paint_bitmap)
+
+                if effect == "darken":
+                    try:
+                        darken_percent = self.p._get_percent(self.p.SETTINGS_DARKEN_INTENSITY, 70)
+                        overlay_alpha = int(255 * (darken_percent / 100.0))
+                        if overlay_alpha > 0:
+                            paint_o = Paint()
+                            paint_o.setStyle(Paint.Style.FILL)
+                            paint_o.setDither(True)
+                            paint_o.setAntiAlias(True)
+                            paint_o.setARGB(overlay_alpha, 0, 0, 0)
+                            canvas.drawRect(0, 0, w, y1, paint_o)
+                    except Exception as e:
+                        self.p._log(f"darken overlay error: {e}")
+
+                fade_alpha = self.p._get_int(self.p.SETTINGS_FADE, 90)
+                fade_alpha = int(max(0, min(255, int(fade_alpha * (1.0 - progress)))))
+                if fade_alpha > 0:
+                    grad_h = int(max(1, y1 * 0.35))
+                    paint = Paint()
+                    shader = LinearGradient(
+                        0, y1 - grad_h, 0, y1,
+                        Color.argb(0, 0, 0, 0),
+                        Color.argb(fade_alpha, 0, 0, 0),
+                        Shader.TileMode.CLAMP
+                    )
+                    paint.setShader(shader)
+                    canvas.drawRect(0, y1 - grad_h, w, y1, paint)
+            finally:
+                try:
+                    canvas.restoreToCount(save_id)
+                except Exception:
+                    try:
+                        canvas.restore()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.p._log(f"after onDraw error: {e}")
+
+
+# Экспорт
+Plugin = ProfileHeaderImagePlugin
