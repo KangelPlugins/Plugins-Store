@@ -1,0 +1,6944 @@
+"""
+╭─────────────────────────────────────────────────────────────╮
+│                                                             │
+│  ███╗   ███╗ █████╗ ███╗   ██╗██████╗ ██████╗ ███████╗      │
+│  ████╗ ████║██╔══██╗████╗  ██║██╔══██╗██╔══██╗██╔════╝      │
+│  ██╔████╔██║███████║██╔██╗ ██║██║  ██║██████╔╝█████╗        │
+│  ██║╚██╔╝██║██╔══██║██║╚██╗██║██║  ██║██╔══██╗██╔══╝        │
+│  ██║ ╚═╝ ██║██║  ██║██║ ╚████║██████╔╝██║  ██║███████╗      │
+│  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚══════╝      │
+│                                                             │
+│         █████╗ ██╗                                          │
+│        ██╔══██╗██║    ╭───────────────────╮                 │
+│        ███████║██║    │© 2024-2025        │                 │
+│        ██╔══██║██║    │Licensed Product   │                 │
+│        ██║  ██║██║    │All Rights Reserved│                 │
+│        ╚═╝  ╚═╝╚═╝    ╰───────────────────╯                 │
+│                                                             │
+│  ╭───────────────────────────────────────────────────────╮  │
+│  │ Unauthorized use, reproduction or distribution        │  │
+│  │ of this software is strictly prohibited               │  │
+│  ╰───────────────────────────────────────────────────────╯  │
+│                                                             │
+╰─────────────────────────────────────────────────────────────╯
+"""
+#    /\_/\
+#   ( o.o )
+#    > ^ <
+# Этот котик проверил код, и он идеален. Мяу!
+# Переписана система локализации: удален старый мусор, добавлена поддержка TARGETlang и авто-рефреш.
+__id__ = "mandre_lib"
+__name__ = "MandreLib"
+__version__ = "1.7" 
+__author__ = """MandreAI & СвагаНеТута
+@swagnonher & @MandreAI_bot"""
+__description__ = "Бибилотека для создания плагинов \n\n Документация: https://manderelib.vercel.app/"
+__min_version__ = "11.9.0"
+__icon__ = "DoubtfulCoffeeTurkey_by_fStikBot/12"
+
+# --- Импорты ---
+import traceback
+import asyncio
+import time
+import threading
+import os
+import json
+import importlib.util 
+import zipfile
+import shutil
+import requests
+import re
+import sys
+import io
+import html
+import shlex
+import types
+import struct
+import inspect
+import functools
+from html.parser import HTMLParser  # <--- ДОБАВИТЬ ЭТО
+from datetime import datetime
+from typing import Callable, List, Optional, Dict, Any
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from client_utils import get_last_fragment, get_messages_controller, get_user_config, run_on_queue, get_messages_storage, get_send_messages_helper
+from android_utils import run_on_ui_thread, log, OnClickListener
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Text, Divider, Input, Switch, Selector
+from hook_utils import find_class, get_private_field
+
+# Импорты для UI, хуков и эффектов
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader, LocaleController, R, Utilities, SendMessagesHelper
+from org.telegram.ui.Components import AvatarDrawable, BackupImageView, RecyclerListView
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import LayoutHelper
+from org.telegram.ui.ActionBar import BottomSheet, ActionBarPopupWindow
+from org.telegram.ui import LaunchActivity
+from android.widget import LinearLayout, EditText, ScrollView, TextView, ImageView, FrameLayout
+from android.view import View, Gravity
+from android.media import ImageReader
+from android.text import TextWatcher, TextUtils
+from android.os import Handler, Looper, Build, VibrationEffect, Bundle, Environment
+from android.telephony import TelephonyManager
+from android.app import Activity
+from android.content import Intent, Context
+from android.net import Uri
+from android.hardware.display import DisplayManager, VirtualDisplay
+from android.media.projection import MediaProjectionManager
+from androidx.core.content import FileProvider
+from androidx.core.app import NotificationCompat, NotificationManagerCompat, Person
+from hook_utils import find_class
+from java.io import File, FileOutputStream, ByteArrayOutputStream
+from java import dynamic_proxy, jclass
+from java.lang import Runnable, Float as JFloat, Class as JClass, Integer as JInteger
+from java.lang import Runnable as JRunnable
+from java.util import ArrayList, Locale, TimeZone
+from com.exteragram.messenger.plugins import PluginsController
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from android.graphics import Color, Bitmap, Canvas, Paint, PorterDuff, PorterDuffXfermode, Rect, RectF, BitmapFactory, PixelFormat
+from android.graphics.drawable import GradientDrawable, ColorDrawable
+from android.animation import ObjectAnimator, AnimatorSet  # <--- Добавили AnimatorSet
+from android.view.animation import DecelerateInterpolator
+from android.util import TypedValue, DisplayMetrics
+from java.nio import ByteBuffer
+
+try:
+    from android.transition import TransitionManager, TransitionSet, ChangeBounds, Fade, AutoTransition, ChangeTransform, ChangeClipBounds
+    from android.view import ViewGroup
+    from android.view.animation import AccelerateDecelerateInterpolator
+except ImportError:
+    pass
+# --- Новые импорты для TTS, аутентификации и уведомлений ---
+try:
+    TextToSpeech = find_class("android.speech.tts.TextToSpeech")
+    KeyguardManager = find_class("android.app.KeyguardManager")
+    # Уведомления
+    NotificationChannel = find_class("android.app.NotificationChannel")
+    NotificationManager = find_class("android.app.NotificationManager")
+    PendingIntent = find_class("android.app.PendingIntent")
+    IconCompat = find_class("androidx.core.graphics.drawable.IconCompat")
+    
+    JAVA_EXT_CLASSES_FOUND = True
+except Exception:
+    JAVA_EXT_CLASSES_FOUND = False
+# ----------------------------------------
+
+try:
+    SpeechRecognizer = find_class("android.speech.SpeechRecognizer")
+    RecognitionListener = find_class("android.speech.RecognitionListener")
+    RecognizerIntent = find_class("android.speech.RecognizerIntent")
+    # Intent и Bundle уже должны быть импортированы ранее, но на всякий случай:
+    # Intent = find_class("android.content.Intent")
+    # Bundle = find_class("android.os.Bundle")
+except Exception:
+    pass
+
+
+MANDRE_REPO_URL = "https://coidarashka.github.io/MandreLesta/" 
+
+# --- Глобальное состояние для стрима ---
+_LATEST_FRAME = None
+_FRAME_LOCK = threading.Lock()
+
+
+# --- Глобальные переменные для библиотеки ---
+_TG_ALIAS_MAP = {}
+_tg_hook_installed = False
+_make_ripple_method = None
+
+_TASK_LOCK = threading.Lock()
+_TASKS = {}
+_RUNNING_TASKS = set()
+_SCHEDULER_HANDLER = Handler(Looper.getMainLooper())
+_SCHEDULER_RUNNABLE = None
+
+_DATA_LOCK = threading.Lock()
+_PERSISTENT_PLUGINS = set()
+_RESTORING_PLUGINS = set()
+
+# --- Глобальные переменные для Suggestions ---
+_SUGGESTIONS_REGISTRY = {}
+_suggestions_hook_installed = False
+
+_BOTTOM_BAR_CONFIGS = {}
+_bottom_bar_hooks_installed = False
+
+_COMMAND_LOCK = threading.Lock()
+_COMMANDS = {}
+_mandrelib_instance = None
+
+# Старая переменная _LOCALIZATIONS удалена. Используем только кэш.
+_LOCALIZATION_CACHE = {}
+
+FILE_PICK_REQUEST_CODE = 42069
+
+# --- Новые глобальные переменные ---
+_AUTH_REQUEST_CODE = 1337
+_auth_hook = None
+_auth_success_cb = None
+_auth_failure_cb = None
+
+# ---- MandreLib PIP: bootstrap and install pure Python wheels (none-any) ----
+WHEELS_PIP_CORE = {
+    "setuptools": "https://files.pythonhosted.org/packages/a3/dc/17031897dae0efacfea57dfd3a82fdd2a2aeb58e0ff71b77b87e44edc772/setuptools-80.9.0-py3-none-any.whl",
+    "pip": "https://files.pythonhosted.org/packages/44/3c/d717024885424591d5376220b5e836c2d5293ce2011523c9de23ff7bf068/pip-25.3-py3-none-any.whl",
+    "wheel": "https://files.pythonhosted.org/packages/0b/2c/87f3254fd8ffd29e4c02732eee68a83a1d3c346ae39bc6822dcbcb697f2b/wheel-0.45.1-py3-none-any.whl",
+}
+
+WHEELS_ASYNC_STACK = [
+    ("typing_extensions", "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl"),
+    ("idna", "https://files.pythonhosted.org/packages/0e/61/66938bbb5fc52dbdf84594873d5b51fb1f7c7794e9c0f5bd885f30bc507b/idna-3.11-py3-none-any.whl"),
+    ("certifi", "https://files.pythonhosted.org/packages/70/7d/9bc192684cea499815ff478dfcdc13835ddf401365057044fb721ec6bddb/certifi-2025.11.12-py3-none-any.whl"),
+    ("sniffio", "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl"),
+    ("h11", "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl"),
+    ("anyio", "https://files.pythonhosted.org/packages/15/b3/9b1a8074496371342ec1e796a96f99c82c945a339cd81a8e73de28b4cf9e/anyio-4.11.0-py3-none-any.whl"),
+    ("httpcore", "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl"),
+    ("httpx", "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl"),
+    ("aiofiles", "https://files.pythonhosted.org/packages/bc/8a/340a1555ae33d7354dbca4faa54948d76d89a27ceef032c8c3bc661d003e/aiofiles-25.1.0-py3-none-any.whl"),
+    ("dramatiq", "https://files.pythonhosted.org/packages/38/4b/4a538e5c324d5d2f788f437531419c7331c7f958591c7b6075b5ce931520/dramatiq-2.0.0-py3-none-any.whl"),
+]
+
+WHEELS_SERVER_STACK = [
+    ("click", "https://files.pythonhosted.org/packages/76/0a/18cf030fd68043ac15635597e7e649e37d88de110320820e2e6b5b08f22e/click-8.1.3-py3-none-any.whl"),
+    ("anyio", "https://files.pythonhosted.org/packages/15/b3/9b1a8074496371342ec1e796a96f99c82c945a339cd81a8e73de28b4cf9e/anyio-4.11.0-py3-none-any.whl"),
+    ("asgiref", "https://files.pythonhosted.org/packages/72/39/5d0c4e09e299236ba496a95822dd773e1ba49d7d38e29746d3b42a9308b1/asgiref-3.8.1-py3-none-any.whl"),
+    ("h11", "https://files.pythonhosted.org/packages/95/04/ff642e65ad6b90db43e668d70ffb6736436c7ce41fcc549f4e9472234127/h11-0.14.0-py3-none-any.whl"),
+    ("starlette", "https://files.pythonhosted.org/packages/99/22/30243323731a4d697163644df2663279354d77b22b640a4ce289a83dc99f/starlette-0.46.0-py3-none-any.whl"),
+    ("pydantic", "https://files.pythonhosted.org/packages/9f/90/1942e6127760d657d4a2d2e644b4d238307d2072b79304dfce24bc3247cd/pydantic-1.10.13-py3-none-any.whl"),
+    ("fastapi", "https://files.pythonhosted.org/packages/8f/58/2d4807857b4498b1977a0e7df4082d263b9778929622ba42be3f9d127989/fastapi-0.110.0-py3-none-any.whl"),
+    ("uvicorn", "https://files.pythonhosted.org/packages/01/28/57a26a9a9373d2c7303e8fc7df20b7df3430e06a370cf027d294be38a9b7/uvicorn-0.27.1-py3-none-any.whl"),
+]
+
+# --- TimePicker Imports & Constants ---
+try:
+    Typeface = find_class("android.graphics.Typeface")
+    InputType = find_class("android.text.InputType")
+    ViewTreeObserver = find_class("android.view.ViewTreeObserver")
+    Dialog = find_class("android.app.Dialog")
+    ViewGroup = find_class("android.view.ViewGroup")
+    MotionEvent = find_class("android.view.MotionEvent")
+    # !!! ДОБАВЛЕНО !!!
+    Runnable = find_class("java.lang.Runnable") 
+    
+    from java import jint
+except: 
+    jint = int
+
+# Цветовая палитра TimePicker (MD3 Dark)
+_TP_C_SURFACE = 0xFF2B2B2B
+_TP_C_CLOCK_BG = 0xFF363636
+_TP_C_PRIMARY = 0xFFC4EED0
+_TP_C_ON_PRIMARY = 0xFF0F2F18
+_TP_C_CONTAINER = 0xFF334B40
+_TP_C_TEXT_MAIN = 0xFFE3E3E3
+_TP_C_TEXT_SEC = 0xFFC4C7C5
+_TP_C_INPUT_BG = 0xFF363636
+
+def _tp_to_jint(val):
+    val = int(val)
+    if val > 0x7FFFFFFF: val -= 0x100000000
+    return jint(val)
+    
+def _tp_create_bg(radius, color, stroke_w=0, stroke_c=0):
+    d = GradientDrawable()
+    d.setCornerRadius(AndroidUtilities.dp(radius))
+    d.setColor(_tp_to_jint(color))
+    if stroke_w > 0: d.setStroke(AndroidUtilities.dp(stroke_w), _tp_to_jint(stroke_c))
+    return d
+
+class _IOCapture:
+    def __init__(self):
+        self.stdout_buf = io.StringIO()
+        self.stderr_buf = io.StringIO()
+        self._old_out = None
+        self._old_err = None
+    def __enter__(self):
+        self._old_out, self._old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = self.stdout_buf, self.stderr_buf
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        sys.stdout, sys.stderr = self._old_out, self._old_err
+    def getvalue(self):
+        return self.stdout_buf.getvalue(), self.stderr_buf.getvalue()
+
+def _mandrelib_get_pip_dirs():
+    try:
+        app_files = str(ApplicationLoader.getFilesDirFixed())
+    except Exception:
+        try:
+            app_files = str(ApplicationLoader.applicationContext.getFilesDir())
+        except Exception:
+            app_files = "."
+    base_dir = os.path.join(app_files, "mandre_pip")
+    wheel_dir = os.path.join(base_dir, "wheels")
+    site_dir = os.path.join(base_dir, "site-packages")
+    log_file = os.path.join(base_dir, "pip.log")
+    for p in [base_dir, wheel_dir, site_dir]:
+        try:
+            os.makedirs(p, exist_ok=True)
+        except Exception:
+            pass
+    return base_dir, wheel_dir, site_dir, log_file
+
+def _mandrelib_log_pip(msg: str):
+    try:
+        _, _, _, log_file = _mandrelib_get_pip_dirs()
+        line = f"[MandreLib PIP] {msg}"
+        log(line)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def _mandrelib_ensure_site_on_path(site_dir: str):
+    if site_dir not in sys.path:
+        sys.path.insert(0, site_dir)
+        _mandrelib_log_pip(f"sys.path += {site_dir}")
+
+def _mandrelib_bootstrap_pip() -> bool:
+    try:
+        import pip  # noqa: F401
+        _mandrelib_log_pip("pip already importable")
+        return True
+    except Exception:
+        _mandrelib_log_pip("pip not importable: bootstrapping from wheels")
+    _, wheel_dir, site_dir, _ = _mandrelib_get_pip_dirs()
+    # Download wheels
+    for name, url in WHEELS_PIP_CORE.items():
+        try:
+            fname = os.path.join(wheel_dir, url.split("/")[-1])
+            if not os.path.exists(fname) or os.path.getsize(fname) == 0:
+                _mandrelib_log_pip(f"Downloading {name} from {url}")
+                r = requests.get(url, timeout=30)
+                r.raise_for_status()
+                with open(fname, "wb") as f:
+                    f.write(r.content)
+                _mandrelib_log_pip("Saved %s -> %s (%d bytes)" % (name, fname, len(r.content)))
+            else:
+                _mandrelib_log_pip("Using cached wheel: %s" % fname)
+        except Exception as e:
+            _mandrelib_log_pip("ERROR download %s: %s" % (name, e))
+            return False
+    # Extract to site-packages
+    try:
+        for f in os.listdir(wheel_dir):
+            if f.endswith(".whl"):
+                whl_path = os.path.join(wheel_dir, f)
+                _mandrelib_log_pip("Extracting %s -> %s" % (whl_path, site_dir))
+                with zipfile.ZipFile(whl_path) as zf:
+                    zf.extractall(site_dir)
+        _mandrelib_ensure_site_on_path(site_dir)
+        import importlib
+        importlib.invalidate_caches()
+        import pip  # noqa: F401
+        _mandrelib_log_pip("pip import OK after extraction")
+        return True
+    except Exception as e:
+        _mandrelib_log_pip("ERROR extract/import pip: %s" % e)
+        return False
+
+def _mandrelib_pip_main(argv):
+    try:
+        from pip._internal.cli.main import main as pip_main
+    except Exception:
+        try:
+            import pip
+            pip_main = getattr(pip, "main", None)
+        except Exception:
+            pip_main = None
+    if pip_main is None:
+        return 1, "", "pip main not found"
+    _mandrelib_log_pip("pip argv: %s" % (argv,))
+    with _IOCapture() as cap:
+        code = 0
+        try:
+            code = pip_main(argv)
+        except BaseException as be:
+            code = getattr(be, "code", 1) if isinstance(be, SystemExit) else 1
+        out, err = cap.getvalue()
+    if code is None:
+        code = 0
+    _mandrelib_log_pip("pip exit=%s\nSTDOUT:\n%s\nSTDERR:\n%s" % (code, out, err))
+    return code, out, err
+
+def _mandrelib_pip_normalize(argv: list, site_dir: str, settings_getter) -> list:
+    if not argv:
+        return ["help"]
+    
+    argv = list(argv)
+    cmd = argv[0]
+    rest = argv[1:]
+    flags = []
+
+    # --- 1. Настройка аргументов и Репозитория ---
+    try:
+        # Тихий режим
+        if settings_getter("pip_quiet", False):
+            flags += ["-q"]
+        
+        # Основной индекс (обычно PyPI)
+        idx = settings_getter("pip_index_url", "").strip()
+        if idx:
+            flags += ["--index-url", idx]
+        
+        # --- ТВОЙ РЕПОЗИТОРИЙ ---
+        # Подключаем как дополнительный источник
+        flags += ["--extra-index-url", MANDRE_REPO_URL]
+        
+        # Разрешаем хост (на случай проблем с SSL)
+        import urllib.parse
+        host = urllib.parse.urlparse(MANDRE_REPO_URL).netloc
+        if host:
+            flags += ["--trusted-host", host]
+
+        # Доп. аргументы из настроек пользователя
+        custom_args = settings_getter("pip_args", "").strip()
+        if custom_args:
+            import shlex
+            flags += shlex.split(custom_args)
+    except Exception:
+        pass
+
+    # --- 2. Настройка платформы Android (ОБЯЗАТЕЛЬНО) ---
+    if cmd == "install":
+        has_target = any(a in ("-t", "--target") for a in rest)
+        if not has_target:
+            rest = ["--target", site_dir] + rest
+
+        try:
+            import sys
+            from android.os import Build
+            
+            # Версия питона (например, 311 для 3.11)
+            py_ver_nodot = f"{sys.version_info.major}{sys.version_info.minor}"
+            
+            impl_args = [
+                "--implementation", "cp",
+                "--python-version", py_ver_nodot,
+                "--abi", f"cp{py_ver_nodot}"
+            ]
+            
+            # Проверяем архитектуру (ARM64)
+            abis = list(Build.SUPPORTED_ABIS)
+            is_arm64 = "arm64-v8a" in abis
+            
+            platform_args = []
+            
+            if is_arm64:
+                # Генерируем список платформ, чтобы pip принял твой файл из репо
+                # Pip будет искать совпадения в твоем репозитории
+                supported_apis = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34]
+                
+                for api in supported_apis:
+                    platform_args.extend(["--platform", f"android_{api}_arm64_v8a"])
+            else:
+                _mandrelib_log_pip(f"Warning: Not ARM64! ABIs: {abis}")
+
+            # Собираем всё вместе:
+            # 1. Параметры питона
+            # 2. Список платформ
+            # 3. Запрет на компиляцию (--only-binary :all:)
+            if platform_args:
+                rest = impl_args + platform_args + ["--only-binary", ":all:"] + rest
+                
+        except Exception as e:
+            _mandrelib_log_pip(f"Platform config error: {e}")
+
+        # Стандартные флаги безопасности и обновления
+        rest = ["--no-build-isolation", "--no-warn-conflicts", "--upgrade", "--ignore-requires-python"] + rest
+
+    return [cmd] + flags + rest
+
+class MandrePip:
+    """Internal PIP Wrapper. Use MandreInstall for public API."""
+    @staticmethod
+    def ensure_ready(silent: bool = False) -> bool:
+        _, _, site_dir, _ = _mandrelib_get_pip_dirs()
+        _mandrelib_ensure_site_on_path(site_dir)
+        ok = _mandrelib_bootstrap_pip()
+        try:
+            if not silent:
+                if ok:
+                    # BulletinHelper может быть недоступен при ранней инициализации
+                    pass 
+                else:
+                    log("[MandrePip] Failed to bootstrap pip")
+        except Exception:
+            pass
+        return ok
+
+    @staticmethod
+    def pip(args) -> tuple:
+        if isinstance(args, str):
+            try:
+                args = shlex.split(args)
+            except Exception:
+                args = args.split()
+        _, _, site_dir, _ = _mandrelib_get_pip_dirs()
+        _mandrelib_ensure_site_on_path(site_dir)
+        if not _mandrelib_bootstrap_pip():
+            return 1, "", "bootstrap failed"
+        
+        # Получаем геттер настроек
+        getter = lambda k, d=None: _mandrelib_instance.get_setting(k, d) if _mandrelib_instance else d
+        
+        normalized = _mandrelib_pip_normalize(args, site_dir, getter)
+        return _mandrelib_pip_main(normalized)
+
+    @staticmethod
+    def install(spec: str) -> tuple:
+        return MandrePip.pip(["install", spec])
+
+    @staticmethod
+    def site_dir() -> str:
+        return _mandrelib_get_pip_dirs()[2]
+
+    @staticmethod
+    def import_module(mod: str):
+        _ = MandrePip.ensure_ready(silent=True)
+        _mandrelib_ensure_site_on_path(MandrePip.site_dir())
+        return __import__(mod)
+
+
+class MandreInstall:
+    """
+    Правильный установщик.
+    Автоматически настраивает PIP под Android архитектуру и ставит нативные колеса.
+    """
+    def __new__(cls, target):
+        if target == "check_status":
+            return MandrePip.ensure_ready(silent=True)
+
+        try:
+            if not MandrePip.ensure_ready(silent=True):
+                BulletinHelper.show_error("PIP не готов")
+                return None
+
+            if isinstance(target, (list, tuple)):
+                for s in target:
+                    MandreInstall._install_one(s)
+            else:
+                MandreInstall._install_one(target)
+        except Exception as e:
+            log(f"[MandreInstall] Error: {e}")
+        
+        return None
+
+    @staticmethod
+    def _install_one(spec):
+        spec_str = str(spec)
+        
+        # 1. Пробуем импортировать (если это имя пакета, а не файл)
+        if not spec_str.endswith(".whl") and "://" not in spec_str and "/" not in spec_str:
+            try:
+                MandrePip.import_module(spec_str)
+                log(f"[MandreInstall] {spec_str} уже установлен.")
+                return
+            except Exception:
+                pass
+        
+        # 2. Установка
+        log(f"[MandreInstall] Установка: {spec_str}")
+        
+        # Передаем URL или имя пакета напрямую в pip.
+        # Благодаря новой _mandrelib_pip_normalize, pip примет Android-колесо.
+        code, out, err = MandrePip.install(spec_str)
+        
+        if code == 0:
+            log(f"[MandreInstall] Успешно: {spec_str}")
+            # Можно показать тост, если это был один файл
+            if spec_str.endswith(".whl"):
+                BulletinHelper.show_success(f"Установлен: {spec_str.split('/')[-1]}")
+        else:
+            log(f"[MandreInstall] Ошибка pip:\n{err}")
+            BulletinHelper.show_error(f"Ошибка установки: {err[:100]}...")
+
+class MandreWeb:
+    @staticmethod
+    def render_html_to_png(html: str,
+                           on_result: Callable[[bool, str], None],
+                           width: int = 1024,
+                           height: int = 768,
+                           base_url: str = "about:blank",
+                           capture_delays_ms: list = None,
+                           bg_color: tuple = (26, 30, 36),
+                           file_prefix: str = "mandre_web_"):
+        if capture_delays_ms is None:
+            capture_delays_ms = [900, 1500, 2200]
+        def ui_runner():
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if not activity:
+                    try: on_result(False, "no_activity")
+                    except Exception: pass
+                    return
+                from android.webkit import WebView, WebViewClient
+                from android.view import View
+                from android.os import Handler, Looper
+                from android.graphics import Bitmap, Canvas
+                # Prepare WebView
+                wv = WebView(activity)
+                settings = wv.getSettings()
+                try:
+                    settings.setJavaScriptEnabled(True)
+                    settings.setDomStorageEnabled(True)
+                    settings.setLoadsImagesAutomatically(True)
+                except Exception:
+                    pass
+                # Size offscreen
+                MS = View.MeasureSpec
+                wv.measure(MS.makeMeasureSpec(width, MS.EXACTLY), MS.makeMeasureSpec(height, MS.EXACTLY))
+                wv.layout(0, 0, width, height)
+                # BG color
+                try:
+                    from android.graphics import Color
+                    wv.setBackgroundColor(Color.argb(255, *bg_color))
+                except Exception:
+                    pass
+                # Load content
+                wv.setWebViewClient(WebViewClient())
+                wv.loadDataWithBaseURL(base_url, html, "text/html", "utf-8", None)
+                # Output path
+                cache_dir = ApplicationLoader.applicationContext.getCacheDir()
+                ts = int(time.time() * 1000)
+                out_path = os.path.join(str(cache_dir), f"{file_prefix}{ts}.png")
+                result_flag = {"ok": False}
+
+                def capture_once():
+                    try:
+                        bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        canvas = Canvas(bmp)
+                        wv.draw(canvas)
+                        # Save
+                        fos = FileOutputStream(out_path)
+                        try:
+                            bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                        finally:
+                            try: fos.close()
+                            except Exception: pass
+                        result_flag["ok"] = True
+                        try: on_result(True, out_path)
+                        except Exception: pass
+                    except Exception as e:
+                        log(f"[MandreWeb] capture error: {e}")
+
+                class _Run(dynamic_proxy(JRunnable)):
+                    def run(self_inner):
+                        if not result_flag["ok"]:
+                            capture_once()
+
+                h = Handler(Looper.getMainLooper())
+                for d in capture_delays_ms:
+                    h.postDelayed(_Run(), int(d))
+            except Exception as e:
+                log(f"[MandreWeb] flow error: {e}")
+                try: on_result(False, str(e))
+                except Exception: pass
+        run_on_ui_thread(ui_runner)
+
+class MandreSend:
+    @staticmethod
+    def png(path: str, caption: str = None):
+        def send_on_ui():
+            try:
+                fragment = get_last_fragment()
+                if not fragment: return
+                account = fragment.getCurrentAccount()
+                dialog_id = fragment.getDialogId()
+                from org.telegram.messenger import SendMessagesHelper, AccountInstance
+                
+                # --- ЛОГИКА ФОРМАТИРОВАНИЯ ---
+                final_caption = caption or ""
+                entities = None
+                
+                # Если есть текст и доступен парсер, обрабатываем Markdown
+                if final_caption and hasattr(Mandre, 'Text'):
+                    try:
+                        parsed = Mandre.Text.parse(final_caption, mode="markdown")
+                        final_caption = parsed["message"]
+                        entities = parsed["entities"]
+                    except Exception as e:
+                        log(f"[MandreSend] Markdown parse error: {e}")
+                # -----------------------------
+
+                generated = None
+                try:
+                    send_helper = get_send_messages_helper()
+                    generated = send_helper.generatePhotoSizes(path, None)
+                except Exception:
+                    pass
+                
+                success = False
+                
+                # 1. Отправка как фото
+                if generated is not None:
+                    try:
+                        # Передаем entities (7-й аргумент)
+                        params = SendMessagesHelper.SendMessageParams.of(
+                            generated, 
+                            path, 
+                            dialog_id, 
+                            None, None, 
+                            final_caption, 
+                            entities, # <--- СЮДА ПЕРЕДАЕМ ENTITIES
+                            None, None, 
+                            True, 
+                            0, 0, 0, 
+                            None, 
+                            False
+                        )
+                        
+                        try:
+                            inst = AccountInstance.getInstance(account)
+                            SendMessagesHelper.getInstance(inst).sendMessage(params)
+                        except Exception:
+                            SendMessagesHelper.getInstance(account).sendMessage(params)
+                        
+                        success = True
+                    except Exception as e:
+                        log(f"[MandreSend] Photo send failed: {e}")
+                
+                # 2. Фолбэк: Отправка как документ
+                if not success:
+                    try:
+                        AccountInstanceClass = find_class("org.telegram.messenger.AccountInstance")
+                        acc_inst = AccountInstanceClass.getInstance(account)
+                        
+                        # Передаем entities (11-й аргумент)
+                        SendMessagesHelper.prepareSendingDocument(
+                            acc_inst,                   
+                            path,                       
+                            path,                       
+                            None,                       
+                            None,                       
+                            "image/png",                
+                            dialog_id,                  
+                            None, None, None, None, 
+                            entities, # <--- СЮДА ПЕРЕДАЕМ ENTITIES
+                            True,                       
+                            0,                          
+                            None,                       
+                            final_caption, # <--- И ТЕКСТ СЮДА (16-й аргумент)
+                            0,                          
+                            False                       
+                        )
+                    except Exception as e2:
+                        log(f"[MandreSend] Document send failed: {e2}")
+                        # Совсем старый метод (без форматирования)
+                        try:
+                            SendMessagesHelper.prepareSendingDocument(
+                                account, path, path, None, final_caption, "image/png",
+                                dialog_id, None, None, None, None, None, True, 0, None, None, 0, False
+                            )
+                        except: pass
+
+            except Exception as e:
+                log(f"[MandreSend] Critical error: {e}")
+
+        run_on_ui_thread(send_on_ui)
+
+class _TTSState:
+    tts = None
+    init_ok = False
+    engine = None
+    deferred = False
+_TTS_STATE = _TTSState()
+GOOGLE_TTS_PKG = "com.google.android.tts"
+# ----------------------------------------
+
+class _TGIntentHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            if not _TG_ALIAS_MAP or not param.args or len(param.args) < 1: return
+            intent = param.args[0]
+            if not intent: return
+            data = intent.getData()
+            if not data: return
+            url = str(data.toString())
+            if not url.startswith("tg://"): return
+            path = url[5:].lstrip('/')
+            for alias, cb in list(_TG_ALIAS_MAP.items()):
+                if path.startswith(alias):
+                    log(f"[MandreLib] Перехвачен tg:// алиас: '{alias}'")
+                    run_on_ui_thread(lambda: cb(intent))
+                    param.setResult(True)
+                    return
+        except Exception: log(f"[MandreLib] Ошибка в _TGIntentHook: {traceback.format_exc()}")
+
+def _ensure_tg_hook(plugin_self: BasePlugin):
+    global _tg_hook_installed
+    if _tg_hook_installed: return
+    try:
+        LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+        IntentClass = find_class("android.content.Intent")
+        LAClass = LaunchActivity.getClass() if hasattr(LaunchActivity, "getClass") else LaunchActivity
+        hooked = False
+        for method in LAClass.getDeclaredMethods():
+            if method.getName() == "handleIntent":
+                params = method.getParameterTypes()
+                if params and len(params) > 0 and (params[0] == IntentClass or params[0].getName() == "android.content.Intent"):
+                    plugin_self.hook_method(method, _TGIntentHook())
+                    hooked = True
+        if hooked: _tg_hook_installed = True; log("[MandreLib] Хук для tg:// алиасов успешно установлен.")
+        else: _tg_hook_installed = True; log("[MandreLib] Не удалось найти подходящий метод handleIntent для хука.")
+    except Exception: log(f"[MandreLib] Не удалось установить хук для tg:// алиасов: {traceback.format_exc()}")
+
+def _scheduler_tick():
+    global _SCHEDULER_RUNNABLE
+    with _TASK_LOCK:
+        tasks_snapshot = list(_TASKS.items())
+    now = time.time()
+    for key, info in tasks_snapshot:
+        if now >= info["next_ts"] and key not in _RUNNING_TASKS:
+            _RUNNING_TASKS.add(key)
+            
+            def task_wrapper(k=key, cb=info["cb"]):
+                try:
+                    cb()
+                except Exception:
+                    log(f"[MandreLib] Ошибка в задаче '{k}': {traceback.format_exc()}")
+                finally:
+                    with _TASK_LOCK:
+                        _RUNNING_TASKS.discard(k)
+            
+            run_on_queue(task_wrapper)
+            
+            with _TASK_LOCK:
+                if key in _TASKS:
+                    _TASKS[key]["next_ts"] = now + _TASKS[key]["interval"]
+    
+    with _TASK_LOCK:
+        if _TASKS:
+            _SCHEDULER_HANDLER.postDelayed(_SCHEDULER_RUNNABLE, 1000)
+        else:
+            _SCHEDULER_RUNNABLE = None
+            log("[MandreLib] Планировщик остановлен, задач нет.")
+
+class _SchedulerRunnable(dynamic_proxy(Runnable)):
+    def run(self):
+        try:
+            _scheduler_tick()
+        except Exception as e:
+            log(f"[MandreLib] Критическая ошибка в планировщике: {e}")
+
+class MandreData:
+    @staticmethod
+    def _get_base_data_dir() -> File:
+        base_dir = File(ApplicationLoader.getFilesDirFixed(), "plugins")
+        data_dir = File(base_dir, "mandre_lib_data")
+        if not data_dir.exists(): data_dir.mkdirs()
+        return data_dir
+
+    @staticmethod
+    def get_persistent_path(plugin_id: str, filename: str) -> str:
+        plugin_dir = File(MandreData._get_base_data_dir(), plugin_id)
+        if not plugin_dir.exists(): plugin_dir.mkdirs()
+        return File(plugin_dir, filename).getAbsolutePath()
+
+    # --- Синхронные методы (для совместимости) ---
+    @staticmethod
+    def write_persistent_json(plugin_id: str, filename: str, data: Any):
+        path = MandreData.get_persistent_path(plugin_id, filename)
+        with _DATA_LOCK:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception as e: log(f"[MandreData] Ошибка записи в {path}: {e}")
+
+    @staticmethod
+    def read_persistent_json(plugin_id: str, filename: str, default: Any = None) -> Any:
+        path = MandreData.get_persistent_path(plugin_id, filename)
+        with _DATA_LOCK:
+            if not os.path.exists(path): return default
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                log(f"[MandreData] Ошибка чтения {path}: {e}")
+                return default
+    
+    # --- Асинхронные методы (НОВЫЕ) ---
+    @staticmethod
+    async def write_persistent_json_async(plugin_id: str, filename: str, data: Any):
+        """Асинхронная запись JSON. Не блокирует UI."""
+        try:
+            import aiofiles
+            path = MandreData.get_persistent_path(plugin_id, filename)
+            async with aiofiles.open(path, mode='w', encoding='utf-8') as f:
+                # json.dumps выполняется синхронно, но запись в файл асинхронна
+                content = json.dumps(data, ensure_ascii=False, indent=2)
+                await f.write(content)
+        except ImportError:
+            log("[MandreData] aiofiles не установлен. Вызываю синхронный метод.")
+            MandreData.write_persistent_json(plugin_id, filename, data)
+        except Exception as e:
+            log(f"[MandreData] Async write error: {e}")
+
+    @staticmethod
+    async def read_persistent_json_async(plugin_id: str, filename: str, default: Any = None) -> Any:
+        """Асинхронное чтение JSON."""
+        try:
+            import aiofiles
+            path = MandreData.get_persistent_path(plugin_id, filename)
+            if not os.path.exists(path): return default
+            
+            async with aiofiles.open(path, mode='r', encoding='utf-8') as f:
+                content = await f.read()
+                return json.loads(content)
+        except ImportError:
+            return MandreData.read_persistent_json(plugin_id, filename, default)
+        except Exception as e:
+            log(f"[MandreData] Async read error: {e}")
+            return default
+
+    @staticmethod
+    def list_persistent_plugins() -> List[str]:
+        plugins = []
+        base_dir = MandreData._get_base_data_dir()
+        if not base_dir.exists(): return []
+        for plugin_id_dir in base_dir.listFiles():
+            if plugin_id_dir.isDirectory():
+                if "_validation_test_" not in plugin_id_dir.getName():
+                    plugins.append(plugin_id_dir.getName())
+        return plugins
+    
+    @staticmethod
+    def list_files_for_plugin(plugin_id: str) -> List[str]:
+        files = []
+        plugin_dir = File(MandreData._get_base_data_dir(), plugin_id)
+        if plugin_dir.isDirectory():
+            for data_file in plugin_dir.listFiles():
+                if data_file.isFile():
+                    files.append(data_file.getName())
+        return files
+
+    @staticmethod
+    def delete_persistent_plugin_data(plugin_id: str) -> bool:
+        plugin_dir = File(MandreData._get_base_data_dir(), plugin_id)
+        with _DATA_LOCK:
+            try:
+                if plugin_dir.exists() and plugin_dir.isDirectory():
+                    for f in plugin_dir.listFiles():
+                        f.delete()
+                    plugin_dir.delete()
+                    log(f"[MandreData] Все данные для плагина {plugin_id} удалены.")
+                    return True
+            except Exception as e:
+                log(f"[MandreData] Не удалось удалить данные для {plugin_id}: {e}")
+        return False
+
+class _BottomBarHooks:
+    class ViewCreatedHook(MethodHook):
+        def after_hooked_method(self, param):
+            try:
+                fragment = param.thisObject
+                if not isinstance(fragment, PluginSettingsActivity): return
+                
+                java_plugin_obj = get_private_field(fragment, "plugin")
+                if not java_plugin_obj or not hasattr(java_plugin_obj, "getId"): return
+                
+                plugin_id = java_plugin_obj.getId()
+                if plugin_id not in _BOTTOM_BAR_CONFIGS: return
+                
+                config = _BOTTOM_BAR_CONFIGS[plugin_id]
+                
+                python_plugin_instance = config.get("plugin_instance")
+                if not python_plugin_instance:
+                    log(f"[MandreLib] Не удалось найти Python-экземпляр для {plugin_id}")
+                    return
+
+                active_index = python_plugin_instance.get_setting(config["active_index_key"], 0)
+                config["active_index"] = active_index
+
+                root_view = get_private_field(fragment, "fragmentView")
+                if not root_view or not isinstance(root_view, FrameLayout):
+                    log("[MandreLib] Не удалось получить root_view (fragmentView) для BottomBar.")
+                    return
+
+                list_view = get_private_field(fragment, "listView")
+                if list_view and isinstance(list_view, RecyclerListView):
+                    list_view.setPadding(0, 0, 0, AndroidUtilities.dp(80))
+
+                MandreUI._create_and_add_bar(activity=fragment.getParentActivity(), root_view=root_view, config=config)
+            except Exception:
+                log(f"[MandreLib] Ошибка в хуке ViewCreated: {traceback.format_exc()}")
+                
+    class ViewDestroyedHook(MethodHook):
+        def before_hooked_method(self, param):
+            try:
+                fragment = param.thisObject
+                if not isinstance(fragment, PluginSettingsActivity): return
+                
+                plugin = get_private_field(fragment, "plugin")
+                if plugin and hasattr(plugin, "getId") and plugin.getId() in _BOTTOM_BAR_CONFIGS:
+                    plugin_id = plugin.getId()
+                    bar = _BOTTOM_BAR_CONFIGS[plugin_id].get("view_instance")
+                    if bar and bar.getParent():
+                        bar.getParent().removeView(bar)
+                        _BOTTOM_BAR_CONFIGS[plugin_id]["view_instance"] = None
+                        _BOTTOM_BAR_CONFIGS[plugin_id]["ui_elements"] = []
+                        log(f"[MandreLib] BottomBar для плагина {plugin_id} удален при уничтожении View.")
+            except Exception:
+                log(f"[MandreLib] Ошибка в хуке ViewDestroyed: {traceback.format_exc()}")
+
+# --- Новые внутренние функции для TTS ---
+def _internal_ensure_tts():
+    ctx = ApplicationLoader.applicationContext
+    if not ctx: return False
+    if _TTS_STATE.tts and _TTS_STATE.init_ok: return True
+    if _TTS_STATE.deferred: return False
+    _TTS_STATE.deferred = True
+
+    def init_on_ui():
+        try:
+            class _OnInit(dynamic_proxy(TextToSpeech.OnInitListener)):
+                def onInit(self, status):
+                    _TTS_STATE.init_ok = (status == TextToSpeech.SUCCESS)
+                    if _TTS_STATE.init_ok:
+                        try: _TTS_STATE.tts.setLanguage(Locale.getDefault())
+                        except: pass
+                    else: log(f"[MandreLib TTS] init failed: status={status}")
+
+            listener = _OnInit()
+            try: _TTS_STATE.tts = TextToSpeech(ctx, listener, GOOGLE_TTS_PKG); _TTS_STATE.engine = GOOGLE_TTS_PKG
+            except: _TTS_STATE.tts = TextToSpeech(ctx, listener); _TTS_STATE.engine = None
+        except Exception as e: log(f"[MandreLib TTS] init error: {e}")
+        finally: _TTS_STATE.deferred = False
+    
+    run_on_ui_thread(init_on_ui)
+    return False
+
+def _internal_shutdown_tts():
+    try:
+        if _TTS_STATE.tts:
+            try: _TTS_STATE.tts.stop()
+            except: pass
+            try: _TTS_STATE.tts.shutdown()
+            except: pass
+            _TTS_STATE.tts = None
+            _TTS_STATE.init_ok = False
+            log("[MandreLib TTS] движок остановлен.")
+    except Exception as e: log(f"[MandreLib TTS] shutdown error: {e}")
+# -----------------------------------
+
+class MandreTTS:
+    @staticmethod
+    def speak(text: str):
+        """Озвучивает текст, используя системный TTS."""
+        try:
+            if not text or TextUtils.isEmpty(text): return
+            if not (_TTS_STATE.tts and _TTS_STATE.init_ok):
+                if not _internal_ensure_tts():
+                    log("[MandreLib TTS] Инициализация... Попробуйте через секунду.")
+                    BulletinHelper.show_info("Инициализация синтезатора...")
+                    return
+
+            def speak_on_ui():
+                try: _TTS_STATE.tts.speak(text, TextToSpeech.QUEUE_FLUSH, None, "mandre_tts")
+                except: _TTS_STATE.tts.speak(text, TextToSpeech.QUEUE_FLUSH, None)
+            
+            run_on_ui_thread(speak_on_ui)
+        except Exception as e: log(f"[MandreLib TTS] speak error: {e}")
+
+class _AuthActivityResultHook(MethodHook):
+    def before_hooked_method(self, param):
+        global _auth_hook, _auth_success_cb, _auth_failure_cb
+        try:
+            request_code, result_code = param.args[0], param.args[1]
+            if request_code == _AUTH_REQUEST_CODE:
+                param.setResult(None) # Предотвращаем дальнейшую обработку
+                if result_code == Activity.RESULT_OK:
+                    if callable(_auth_success_cb): run_on_ui_thread(_auth_success_cb)
+                else:
+                    if callable(_auth_failure_cb): run_on_ui_thread(_auth_failure_cb)
+        except Exception: log(f"[MandreLib Auth] Ошибка в хуке результата: {traceback.format_exc()}")
+        finally:
+            if _auth_hook: _mandrelib_instance.unhook_method(_auth_hook); _auth_hook = None
+            _auth_success_cb = None; _auth_failure_cb = None
+
+class MandreAuth:
+    @staticmethod
+    def request(on_success: Callable, on_failure: Callable, title: str = "Подтверждение личности", description: str = "Это необходимо для доступа."):
+        """Запрашивает аутентификацию через экран блокировки устройства."""
+        global _auth_hook, _auth_success_cb, _auth_failure_cb
+        
+        def runner():
+            global _auth_hook, _auth_success_cb, _auth_failure_cb
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if not activity:
+                    BulletinHelper.show_error("Не удалось получить доступ к текущему экрану."); run_on_ui_thread(on_failure); return
+
+                keyguard = activity.getSystemService("keyguard")
+                if not keyguard or not keyguard.isKeyguardSecure():
+                    BulletinHelper.show_info("Экран блокировки не настроен. Доступ разрешен."); run_on_ui_thread(on_success); return
+
+                _auth_success_cb, _auth_failure_cb = on_success, on_failure
+                intent = keyguard.createConfirmDeviceCredentialIntent(title, description)
+                if not intent:
+                    BulletinHelper.show_error("Не удалось создать запрос аутентификации."); run_on_ui_thread(on_failure); return
+
+                if _auth_hook: _mandrelib_instance.unhook_method(_auth_hook)
+                
+                method = activity.getClass().getDeclaredMethod("onActivityResult", JInteger.TYPE, JInteger.TYPE, Intent)
+                _auth_hook = _mandrelib_instance.hook_method(method, _AuthActivityResultHook())
+                
+                activity.startActivityForResult(intent, _AUTH_REQUEST_CODE)
+            except Exception:
+                log(f"[MandreLib Auth] Ошибка при вызове экрана блокировки: {traceback.format_exc()}")
+                BulletinHelper.show_error("Ошибка аутентификации."); run_on_ui_thread(on_failure)
+        
+        run_on_ui_thread(runner)
+
+class MandreDevice:
+    @staticmethod
+    def get_device_info() -> Dict[str, Any]:
+        """Получает подробную информацию об устройстве."""
+        try:
+            context = ApplicationLoader.applicationContext
+            if not context:
+                return {"error": "Не удалось получить контекст приложения"}
+            
+            device_info = {}
+            
+            # Базовая информация об устройстве
+            device_info["manufacturer"] = Build.MANUFACTURER or "Unknown"
+            device_info["model"] = Build.MODEL or "Unknown"
+            device_info["brand"] = Build.BRAND or "Unknown"
+            device_info["product"] = Build.PRODUCT or "Unknown"
+            device_info["device"] = Build.DEVICE or "Unknown"
+            device_info["board"] = Build.BOARD or "Unknown"
+            device_info["hardware"] = Build.HARDWARE or "Unknown"
+            
+            # Информация об Android
+            device_info["android_version"] = Build.VERSION.RELEASE or "Unknown"
+            device_info["api_level"] = Build.VERSION.SDK_INT
+            device_info["codename"] = Build.VERSION.CODENAME or "Unknown"
+            device_info["incremental"] = Build.VERSION.INCREMENTAL or "Unknown"
+            
+            # Информация о сборке
+            device_info["build_id"] = Build.ID or "Unknown"
+            device_info["build_type"] = Build.TYPE or "Unknown"
+            device_info["build_tags"] = Build.TAGS or "Unknown"
+            device_info["build_time"] = Build.TIME
+            device_info["build_user"] = Build.USER or "Unknown"
+            device_info["build_host"] = Build.HOST or "Unknown"
+            device_info["build_fingerprint"] = Build.FINGERPRINT or "Unknown"
+            
+            # Информация о дисплее
+            try:
+                from android.util import DisplayMetrics
+                from android.view import WindowManager
+                
+                wm = context.getSystemService("window")
+                if wm:
+                    display = wm.getDefaultDisplay()
+                    if display:
+                        metrics = DisplayMetrics()
+                        display.getMetrics(metrics)
+                        
+                        device_info["screen_width"] = metrics.widthPixels
+                        device_info["screen_height"] = metrics.heightPixels
+                        device_info["screen_density"] = metrics.density
+                        device_info["screen_density_dpi"] = metrics.densityDpi
+                        device_info["screen_xdpi"] = metrics.xdpi
+                        device_info["screen_ydpi"] = metrics.ydpi
+            except Exception as e:
+                device_info["screen_error"] = str(e)
+            
+            # Информация о памяти
+            try:
+                from android.app import ActivityManager
+                
+                am = context.getSystemService("activity")
+                if am:
+                    memory_info = am.getMemoryInfo()
+                    if memory_info:
+                        device_info["total_memory_mb"] = memory_info.totalMem // (1024 * 1024)
+                        device_info["available_memory_mb"] = memory_info.availMem // (1024 * 1024)
+            except Exception as e:
+                device_info["memory_error"] = str(e)
+            
+            # Информация о процессоре
+            device_info["cpu_abi"] = Build.CPU_ABI or "Unknown"
+            device_info["cpu_abi2"] = Build.CPU_ABI2 or "Unknown"
+            device_info["supported_abis"] = list(Build.SUPPORTED_ABIS) if hasattr(Build, 'SUPPORTED_ABIS') else []
+            
+            # Информация о телефоне (если доступно)
+            try:
+                tm = context.getSystemService("phone")
+                if tm:
+                    device_info["phone_type"] = tm.getPhoneType()
+                    device_info["network_operator"] = tm.getNetworkOperator() or "Unknown"
+                    device_info["network_operator_name"] = tm.getNetworkOperatorName() or "Unknown"
+                    device_info["sim_operator"] = tm.getSimOperator() or "Unknown"
+                    device_info["sim_operator_name"] = tm.getSimOperatorName() or "Unknown"
+                    device_info["sim_country_iso"] = tm.getSimCountryIso() or "Unknown"
+                    device_info["sim_serial"] = tm.getSimSerialNumber() or "Unknown"
+                    device_info["subscriber_id"] = tm.getSubscriberId() or "Unknown"
+            except Exception as e:
+                device_info["phone_error"] = str(e)
+            
+            # Информация о приложении
+            try:
+                package_info = context.getPackageManager().getPackageInfo(context.getPackageName(), 0)
+                device_info["app_version_name"] = package_info.versionName or "Unknown"
+                device_info["app_version_code"] = package_info.versionCode
+                device_info["app_package"] = context.getPackageName()
+            except Exception as e:
+                device_info["app_error"] = str(e)
+            
+            # Дополнительная информация
+            device_info["is_emulator"] = MandreDevice._is_emulator()
+            device_info["is_rooted"] = MandreDevice._is_rooted()
+            device_info["locale"] = str(Locale.getDefault())
+            device_info["timezone"] = str(TimeZone.getDefault().getID())
+            
+            # Время получения информации
+            device_info["timestamp"] = int(time.time())
+            device_info["timestamp_formatted"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            
+            return device_info
+            
+        except Exception as e:
+            log(f"[MandreLib Device] Ошибка получения информации об устройстве: {e}")
+            return {"error": str(e)}
+    
+    @staticmethod
+    def _is_emulator() -> bool:
+        """Проверяет, запущено ли приложение в эмуляторе."""
+        try:
+            return (Build.FINGERPRINT and "generic" in Build.FINGERPRINT) or \
+                   (Build.MODEL and "google_sdk" in Build.MODEL) or \
+                   (Build.MODEL and "Android SDK built for x86" in Build.MODEL) or \
+                   (Build.MANUFACTURER and "Genymotion" in Build.MANUFACTURER) or \
+                   (Build.HARDWARE and "goldfish" in Build.HARDWARE) or \
+                   (Build.PRODUCT and "sdk" in Build.PRODUCT) or \
+                   (Build.PRODUCT and "google_sdk" in Build.PRODUCT)
+        except:
+            return False
+    
+    @staticmethod
+    def _is_rooted() -> bool:
+        """Проверяет, есть ли root права на устройстве."""
+        try:
+            # Проверяем наличие su
+            su_paths = ["/system/bin/su", "/system/xbin/su", "/sbin/su", "/system/su", "/system/bin/.ext/.su"]
+            for path in su_paths:
+                if os.path.exists(path):
+                    return True
+            
+            # Проверяем наличие busybox
+            if os.path.exists("/system/bin/busybox") or os.path.exists("/system/xbin/busybox"):
+                return True
+                
+            return False
+        except:
+            return False
+    
+    @staticmethod
+    def get_simple_info() -> str:
+        """Возвращает краткую информацию об устройстве в виде строки."""
+        try:
+            info = MandreDevice.get_device_info()
+            if "error" in info:
+                return f"Ошибка: {info['error']}"
+            
+            return f"{info.get('manufacturer', 'Unknown')} {info.get('model', 'Unknown')} (Android {info.get('android_version', 'Unknown')}, API {info.get('api_level', 'Unknown')})"
+        except Exception as e:
+            return f"Ошибка получения информации: {e}"
+
+# !!! ВСТАВЬТЕ ССЫЛКУ НА mandre_v8.dex !!!
+DEX_URL = "https://github.com/coidarashka/MandreLib-Modules/raw/refs/heads/main/fakeda.dex"
+DEX_CLASS_NAME = "dex.mandre.MandreSettingsDex"
+
+class MandreDex:
+    _loader_class = None
+    _parse_method = None
+    _is_loaded = False
+    _is_loading = False
+
+    @staticmethod
+    def ensure_loaded(plugin_instance):
+        if MandreDex._is_loaded: return True
+        if MandreDex._is_loading: return False
+        MandreDex._is_loading = True
+        
+        def load_task():
+            try:
+                context = LaunchActivity.instance.getApplicationContext()
+                # v7 для сброса кэша
+                dex_path = os.path.join(str(context.getFilesDir()), "fakeda.dex")
+
+                if not os.path.exists(dex_path):
+                    plugin_instance.log(f"[MandreDex] Downloading v8 from {DEX_URL}...")
+                    try:
+                        r = requests.get(DEX_URL, timeout=30)
+                        r.raise_for_status()
+                        with open(dex_path, "wb") as f: f.write(r.content)
+                        plugin_instance.log(f"[MandreDex] Downloaded {len(r.content)} bytes.")
+                    except Exception as e:
+                        plugin_instance.log(f"[MandreDex] Download Failed: {e}")
+                        MandreDex._is_loading = False
+                        return
+
+                try:
+                    from dalvik.system import InMemoryDexClassLoader
+                    with open(dex_path, "rb") as f: dex_bytes = f.read()
+                    
+                    class_loader = InMemoryDexClassLoader(ByteBuffer.wrap(dex_bytes), context.getClassLoader())
+                    MandreDex._loader_class = class_loader.loadClass(DEX_CLASS_NAME)
+                    
+                    StringCls = jclass("java.lang.String")
+                    ContextCls = jclass("android.content.Context")
+                    HashMapCls = jclass("java.util.HashMap")
+                    HandlerCls = jclass("android.os.Handler")
+                    
+                    MandreDex._parse_method = MandreDex._loader_class.getDeclaredMethod(
+                        "parse", StringCls, HashMapCls, HandlerCls, ContextCls
+                    )
+                    
+                    MandreDex._is_loaded = True
+                    plugin_instance.log("[MandreDex] Engine v7 Loaded.")
+                    
+                except Exception as e:
+                    plugin_instance.log(f"[MandreDex] Load Error: {e}")
+                    if os.path.exists(dex_path): os.remove(dex_path)
+            
+            except Exception as e:
+                plugin_instance.log(f"[MandreDex] Critical: {e}")
+            finally:
+                MandreDex._is_loading = False
+
+        from client_utils import run_on_queue
+        run_on_queue(load_task)
+        return False
+
+    @staticmethod
+    def generate_items(plugin_instance, dsl, context):
+        if not MandreDex._is_loaded: return None
+
+        # 1. Собираем настройки
+        HashMap = jclass("java.util.HashMap")
+        settings_map = HashMap()
+        try:
+            keys = re.findall(r'(?:key|name)\s*=\s*"([^"]+)"', dsl)
+            for key in keys:
+                val = plugin_instance.get_setting(key, None)
+                if val is not None:
+                    settings_map.put(key, str(val))
+        except: pass
+
+        # 2. ИСПРАВЛЕНИЕ: Реализуем Handler.Callback (интерфейс), а не Handler (класс)
+        Handler = jclass("android.os.Handler")
+        HandlerCallback = jclass("android.os.Handler$Callback")
+        Looper = jclass("android.os.Looper")
+        
+        class BridgeCallback(dynamic_proxy(HandlerCallback)):
+            def handleMessage(self, msg):
+                try:
+                    what = msg.what
+                    if what == 1: # LOG
+                        plugin_instance.log(f"[Native] {msg.obj}")
+                    elif what == 2: # SET SETTING
+                        data = msg.getData()
+                        key = data.getString("key")
+                        val_str = data.getString("value")
+                        
+                        if val_str == "true": val = True
+                        elif val_str == "false": val = False
+                        else: val = val_str
+                        
+                        plugin_instance.set_setting(key, val)
+                    elif what == 3: # CLICK
+                        method = str(msg.obj)
+                        if hasattr(plugin_instance, method):
+                            try: getattr(plugin_instance, method)()
+                            except Exception as e: plugin_instance.log(f"Click Error: {e}")
+                        else:
+                            plugin_instance.log(f"Method '{method}' not found")
+                except Exception as e:
+                    plugin_instance.log(f"Callback Error: {e}")
+                return True # Возвращаем True, т.к. сообщение обработано
+
+        # Создаем настоящий Android Handler и передаем ему наш Python-колбэк
+        # Используем MainLooper, чтобы быть уверенными в потоке
+        handler = Handler(Looper.getMainLooper(), BridgeCallback())
+
+        try:
+            # Вызов Java метода
+            return MandreDex._parse_method.invoke(None, dsl, settings_map, handler, context)
+        except Exception as e:
+            plugin_instance.log(f"[MandreDex] Generation Failed: {e}")
+            return None
+
+# --- Settings ---
+
+class MandreSettings:
+    _dsl_cache = {}
+    _plugin_ref = {}
+
+    @staticmethod
+    def render(plugin, spec):
+        if isinstance(spec, str):
+            # Логируем, что мы получили DSL
+            plugin.log(f"[Settings] Received DSL length: {len(spec)}")
+            
+            MandreSettings._dsl_cache[plugin.id] = spec
+            MandreSettings._plugin_ref[plugin.id] = plugin
+            MandreDex.ensure_loaded(plugin)
+            
+            return [
+                {"type": "header", "text": "Mandre Engine"},
+                {"type": "text", "text": "Loading interface...", "icon": "msg_round_video"}
+            ]
+        return spec if isinstance(spec, list) else []
+
+    @staticmethod
+    def get_dsl(plugin_id):
+        return MandreSettings._dsl_cache.get(plugin_id)
+
+    @staticmethod
+    def get_plugin(plugin_id):
+        return MandreSettings._plugin_ref.get(plugin_id)
+
+
+
+# --- Hook ---
+
+class SettingsFillItemsHook(MethodHook):
+    def after_hooked_method(self, param):
+        UItem = jclass("org.telegram.ui.Components.UItem")
+        items = param.args[0]
+        
+        try:
+            activity = param.thisObject
+            plugin_obj = get_private_field(activity, "plugin")
+            if not plugin_obj: return
+            
+            plugin_id = plugin_obj.getId()
+            dsl = MandreSettings.get_dsl(plugin_id)
+            
+            if dsl:
+                py_plugin = MandreSettings.get_plugin(plugin_id)
+                
+                if not MandreDex._is_loaded:
+                    MandreDex.ensure_loaded(py_plugin)
+                    return 
+
+                native_items = MandreDex.generate_items(py_plugin, dsl, activity.getContext())
+                
+                # ВАЖНО: Проверка результата
+                if native_items is not None:
+                    if native_items.size() > 0:
+                        items.clear()
+                        items.addAll(native_items)
+                    else:
+                        # Список пустой, но движок отработал. Значит парсинг не нашел тегов.
+                        items.add(UItem.asHeader("Parsing Error"))
+                        items.add(UItem.asShadow("Engine returned 0 items.\nCheck logs for 'Native' tags."))
+                else:
+                     items.add(UItem.asHeader("Engine Error"))
+                     items.add(UItem.asShadow("Engine returned NULL"))
+
+        except Exception as e:
+            try:
+                items.add(UItem.asHeader("Python Hook Error"))
+                items.add(UItem.asShadow(str(e)))
+            except: pass
+
+
+class MandreNotification:
+    @staticmethod
+    def show_simple(title: str, text: str, channel_id: str = "mandrelib_notifications"):
+        """Показывает простое уведомление."""
+        try:
+            context = ApplicationLoader.applicationContext
+            if not context:
+                return
+            
+            # Создаем канал для Android 8.0+
+            if Build.VERSION.SDK_INT >= 26:
+                notification_manager = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                if notification_manager.getNotificationChannel(channel_id) is None:
+                    channel = NotificationChannel(channel_id, "MandreLib Notifications", NotificationManager.IMPORTANCE_DEFAULT)
+                    notification_manager.createNotificationChannel(channel)
+            
+            # Создаем уведомление
+            builder = NotificationCompat.Builder(context, channel_id)
+            builder.setSmallIcon(R.drawable.msg_notifications_solar)
+            builder.setContentTitle(title)
+            builder.setContentText(text)
+            builder.setColor(Theme.getColor(Theme.key_actionBarDefault))
+            builder.setAutoCancel(True)
+            builder.setPriority(0) # NotificationCompat.PRIORITY_DEFAULT
+            builder.setDefaults(-1) # NotificationCompat.DEFAULT_ALL
+            
+            # Показываем уведомление
+            notification_manager_compat = NotificationManagerCompat.from_(context)
+            notification_id = int(time.time()) % 10000
+            notification_manager_compat.notify(notification_id, builder.build())
+            
+            log(f"[MandreLib Notification] Показано простое уведомление: {title}")
+            
+        except Exception as e:
+            log(f"[MandreLib Notification] Ошибка показа простого уведомления: {e}")
+    
+    @staticmethod
+    def show_dialog(sender_name: str, message: str, avatar_url: str = None, channel_id: str = "mandrelib_dialog_notifications"):
+        """Показывает уведомление в стиле диалога с аватаром."""
+        try:
+            context = ApplicationLoader.applicationContext
+            if not context:
+                return
+            
+            # Создаем канал для Android 8.0+
+            if Build.VERSION.SDK_INT >= 26:
+                notification_manager = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                if notification_manager.getNotificationChannel(channel_id) is None:
+                    channel = NotificationChannel(channel_id, "MandreLib Dialog Notifications", NotificationManager.IMPORTANCE_DEFAULT)
+                    notification_manager.createNotificationChannel(channel)
+            
+            # Загружаем и обрабатываем аватар
+            avatar_bitmap = None
+            if avatar_url:
+                try:
+                    import requests
+                    response = requests.get(avatar_url, timeout=5)
+                    if response.status_code == 200:
+                        image_bytes = response.content
+                        decoded_bitmap = BitmapFactory.decodeByteArray(image_bytes, 0, len(image_bytes))
+                        avatar_bitmap = MandreNotification._get_circular_bitmap(decoded_bitmap)
+                except:
+                    pass
+            
+            # Создаем Person для отправителя
+            sender_builder = Person.Builder().setName(sender_name)
+            if avatar_bitmap:
+                icon = IconCompat.createWithBitmap(avatar_bitmap)
+                sender_builder.setIcon(icon)
+            sender = sender_builder.build()
+            
+            # Создаем Person для получателя
+            user = Person.Builder().setName("You").build()
+            
+            # Создаем MessagingStyle
+            messaging_style = NotificationCompat.MessagingStyle(user)
+            messaging_style.setGroupConversation(False)
+            
+            timestamp = int(time.time() * 1000)
+            msg = NotificationCompat.MessagingStyle.Message(message, timestamp, sender)
+            messaging_style.addMessage(msg)
+            
+            # Создаем уведомление
+            builder = NotificationCompat.Builder(context, channel_id)
+            builder.setStyle(messaging_style)
+            builder.setSmallIcon(R.drawable.msg_notifications_solar)
+            builder.setColor(Theme.getColor(Theme.key_actionBarDefault))
+            builder.setAutoCancel(True)
+            builder.setPriority(0) # NotificationCompat.PRIORITY_DEFAULT
+            builder.setDefaults(-1) # NotificationCompat.DEFAULT_ALL
+            
+            # Показываем уведомление
+            notification_manager_compat = NotificationManagerCompat.from_(context)
+            notification_id = int(time.time()) % 10000
+            notification_manager_compat.notify(notification_id, builder.build())
+            
+            log(f"[MandreLib Notification] Показано диалог уведомление от {sender_name}")
+            
+        except Exception as e:
+            log(f"[MandreLib Notification] Ошибка показа диалог уведомления: {e}")
+    
+    @staticmethod
+    def _get_circular_bitmap(bitmap):
+        """Обрезает Bitmap в круг."""
+        if bitmap is None:
+            return None
+        
+        width = bitmap.getWidth()
+        height = bitmap.getHeight()
+        
+        output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(output)
+        
+        paint = Paint()
+        rect = Rect(0, 0, width, height)
+        rect_f = RectF(rect)
+        
+        paint.setAntiAlias(True)
+        canvas.drawARGB(0, 0, 0, 0)
+        paint.setARGB(255, 255, 255, 255)
+        canvas.drawOval(rect_f, paint)
+        
+        paint.setXfermode(PorterDuffXfermode(PorterDuff.Mode.SRC_IN))
+        canvas.drawBitmap(bitmap, rect, rect, paint)
+        
+        return output
+
+class MandreShare:
+    @staticmethod
+    def share_text(text: str, title: str = "Поделиться"):
+        """Открывает системный диалог 'Поделиться' с текстом."""
+        try:
+            if not text or not text.strip():
+                BulletinHelper.show_error("Текст для отправки пуст.")
+                return
+                
+            def share_runner():
+                try:
+                    fragment = get_last_fragment()
+                    if not fragment:
+                        BulletinHelper.show_error("Не удалось получить доступ к текущему экрану.")
+                        return
+                        
+                    context = fragment.getParentActivity()
+                    if not context:
+                        BulletinHelper.show_error("Не удалось получить контекст приложения.")
+                        return
+                    
+                    intent = Intent(Intent.ACTION_SEND)
+                    intent.setType("text/plain")
+                    intent.putExtra(Intent.EXTRA_TEXT, text)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    
+                    chooser = Intent.createChooser(intent, title)
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    
+                    context.startActivity(chooser)
+                    log(f"[MandreLib Share] Открыт диалог 'Поделиться' с текстом: {text[:50]}...")
+                    
+                except Exception as e:
+                    log(f"[MandreLib Share] Ошибка при открытии диалога 'Поделиться': {e}")
+                    BulletinHelper.show_error(f"Ошибка при открытии диалога: {str(e)}")
+            
+            run_on_ui_thread(share_runner)
+            
+        except Exception as e:
+            log(f"[MandreLib Share] Критическая ошибка: {e}")
+            BulletinHelper.show_error("Критическая ошибка при открытии диалога 'Поделиться'.")
+    
+    @staticmethod
+    def share_file(file_path: str, title: str = "Поделиться файлом", mime_type: str = None):
+        """Открывает системный диалог 'Поделиться' с файлом."""
+        try:
+            if not file_path or not file_path.strip():
+                BulletinHelper.show_error("Путь к файлу не указан.")
+                return
+                
+            if not os.path.exists(file_path):
+                BulletinHelper.show_error("Файл не найден.")
+                return
+                
+            if not os.path.isfile(file_path):
+                BulletinHelper.show_error("Указанный путь не является файлом.")
+                return
+                
+            def share_runner():
+                try:
+                    fragment = get_last_fragment()
+                    if not fragment:
+                        BulletinHelper.show_error("Не удалось получить доступ к текущему экрану.")
+                        return
+                        
+                    context = fragment.getParentActivity()
+                    if not context:
+                        BulletinHelper.show_error("Не удалось получить контекст приложения.")
+                        return
+                    
+                    # Определяем MIME-тип если не указан
+                    current_mime_type = mime_type
+                    if not current_mime_type:
+                        current_mime_type = MandreShare._get_file_mime_type(file_path)
+                    
+                    # Копируем файл в Downloads/exteraGram
+                    import shutil
+                    from android.os import Environment
+                    
+                    source_file = File(file_path)
+                    filename = source_file.getName()
+                    
+                    download_dir = Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_DOWNLOADS
+                    )
+                    exteragram_dir = File(download_dir, "exteraGram")
+                    
+                    if not exteragram_dir.exists():
+                        exteragram_dir.mkdirs()
+                    
+                    dest_file = File(exteragram_dir, filename)
+                    
+                    # Копируем файл
+                    shutil.copy2(file_path, dest_file.getAbsolutePath())
+                    log(f"[MandreLib Share] Файл скопирован в: {dest_file.getAbsolutePath()}")
+                    
+                    # Создаем URI для файла
+                    authority = ApplicationLoader.getApplicationId() + ".provider"
+                    uri = FileProvider.getUriForFile(context, authority, dest_file)
+                    
+                    # Создаем Intent для отправки файла
+                    intent = Intent(Intent.ACTION_SEND)
+                    intent.setType(current_mime_type)
+                    intent.putExtra(Intent.EXTRA_STREAM, uri)
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    
+                    chooser = Intent.createChooser(intent, title)
+                    context.startActivity(chooser)
+                    
+                    success_msg = f"Файл готов к отправке: {filename}"
+                    BulletinHelper.show_success(success_msg)
+                    log(f"[MandreLib Share] Открыт диалог 'Поделиться' с файлом: {filename}")
+                    
+                    # Очищаем временный файл через 5 минут
+                    threading.Thread(
+                        target=lambda: MandreShare._cleanup_temp_file(dest_file.getAbsolutePath(), 300),
+                        daemon=True
+                    ).start()
+                    
+                except Exception as e:
+                    log(f"[MandreLib Share] Ошибка при открытии диалога 'Поделиться' с файлом: {e}")
+                    BulletinHelper.show_error(f"Ошибка при открытии диалога: {str(e)}")
+            
+            run_on_ui_thread(share_runner)
+            
+        except Exception as e:
+            log(f"[MandreLib Share] Критическая ошибка при отправке файла: {e}")
+            BulletinHelper.show_error("Критическая ошибка при отправке файла.")
+    
+    @staticmethod
+    def _get_file_mime_type(file_path: str) -> str:
+        """Определяет MIME-тип файла по его расширению."""
+        try:
+            ext = file_path.lower().split('.')[-1] if '.' in file_path else ''
+            mime_types = {
+                # Изображения
+                'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 
+                'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp',
+                'svg': 'image/svg+xml', 'ico': 'image/x-icon',
+                
+                # Видео
+                'mp4': 'video/mp4', 'webm': 'video/webm', 'mov': 'video/quicktime',
+                'avi': 'video/x-msvideo', 'mkv': 'video/x-matroska',
+                
+                # Аудио
+                'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'ogg': 'audio/ogg',
+                'm4a': 'audio/mp4', 'aac': 'audio/aac', 'flac': 'audio/flac',
+                
+                # Документы
+                'pdf': 'application/pdf', 'doc': 'application/msword',
+                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                'xls': 'application/vnd.ms-excel',
+                'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'ppt': 'application/vnd.ms-powerpoint',
+                'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                'txt': 'text/plain', 'rtf': 'application/rtf',
+                
+                # Архивы
+                'zip': 'application/zip', 'rar': 'application/x-rar-compressed',
+                '7z': 'application/x-7z-compressed', 'tar': 'application/x-tar',
+                'gz': 'application/gzip',
+                
+                # JSON/XML
+                'json': 'application/json', 'xml': 'application/xml',
+                'html': 'text/html', 'css': 'text/css', 'js': 'application/javascript',
+                
+                # Telegram специфичные
+                'tgs': 'application/x-tgsticker'
+            }
+            return mime_types.get(ext, 'application/octet-stream')
+        except Exception:
+            return 'application/octet-stream'
+    
+    @staticmethod
+    def _cleanup_temp_file(file_path: str, delay_seconds: int):
+        """Удаляет временный файл через указанное время."""
+        try:
+            time.sleep(delay_seconds)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                log(f"[MandreLib Share] Временный файл удален: {file_path}")
+        except Exception as e:
+            log(f"[MandreLib Share] Ошибка удаления временного файла: {e}")
+
+class MandreSheetContrl:
+    """
+    Контроллер для управления активным BottomSheet с улучшенными анимациями.
+    """
+    def __init__(self):
+        self.root = None
+        self.context = None
+        self.sheet = None
+        self.view_creators = {}
+        self.callbacks = {}
+        self._views_cache = {} 
+        self._is_ready = False
+
+    def _init_internal(self, context, root, sheet, creators, callbacks):
+        self.context = context
+        self.root = root
+        self.sheet = sheet
+        self.view_creators = creators
+        self.callbacks = callbacks
+        self._is_ready = True
+
+    def lock_swipe_on_interaction(self, view_id: str):
+        """Блокирует свайп при взаимодействии с View"""
+        view = self.get_view(view_id)
+        if not view: return
+        try:
+            ViewOnTouchListener = find_class("android.view.View$OnTouchListener")
+            class _TouchLocker(dynamic_proxy(ViewOnTouchListener)):
+                def onTouch(self, v, event):
+                    action = event.getAction()
+                    if action == 0: v.getParent().requestDisallowInterceptTouchEvent(True)
+                    elif action == 1 or action == 3: v.getParent().requestDisallowInterceptTouchEvent(False)
+                    return False
+            view.setOnTouchListener(_TouchLocker())
+        except Exception: pass
+
+    def update(self, new_dsl: str, new_callbacks: Dict[str, Callable] = None):
+        if not self._is_ready: return
+        if new_callbacks: self.callbacks = new_callbacks
+
+        def runner():
+            try:
+                data = MandreUI._parse_sheet_dsl(new_dsl)
+                if not data: return
+
+                # 1. Фиксация высоты (чтобы лист не прыгал)
+                current_height = self.root.getHeight()
+                params = self.root.getLayoutParams()
+                params.height = current_height
+                self.root.setLayoutParams(params)
+
+                # 2. МАГИЯ: Используем Mandre.Animation для умного перехода
+                # ease="standard" для плавной смены, или "bounce" для пружины
+                Mandre.Animation.magic_layout(self.root, duration=400, type="complex", ease="standard")
+
+                # 3. Ребилд контента
+                self.root.removeAllViews()
+                self._views_cache.clear()
+                
+                # Заполняем контент (animate=False, т.к. magic_layout сам всё сделает)
+                MandreUI._fill_sheet_content(self.context, self.root, data, self.callbacks, self.view_creators, self, animate_entry=False)
+                
+                # 4. Снимаем фиксацию высоты
+                params.height = -2 
+                self.root.setLayoutParams(params)
+                
+            except Exception as e:
+                log(f"[MandreSheetContrl] Update error: {e}")
+
+        run_on_ui_thread(runner)
+
+    def dismiss(self):
+        if self.sheet:
+            try: self.sheet.dismiss()
+            except: pass
+
+    def get_view(self, view_id: str):
+        return self._views_cache.get(view_id)
+
+    def _register_view(self, vid, view):
+        if vid: self._views_cache[vid] = view
+        
+# --- Internal TimePicker Logic ---
+
+class _TPProxies:
+    class Click(dynamic_proxy(View.OnClickListener)):
+        def __init__(self, func): super().__init__(); self.f = func
+        def onClick(self, v): self.f(v)
+
+    class Touch(dynamic_proxy(View.OnTouchListener)):
+        def __init__(self, func): super().__init__(); self.f = func
+        def onTouch(self, v, e): return self.f(v, e)
+
+    class Watcher(dynamic_proxy(TextWatcher)):
+        def __init__(self, cb): super().__init__(); self.cb = cb
+        def beforeTextChanged(self, s, start, count, after): pass
+        def onTextChanged(self, s, start, before, count): pass
+        def afterTextChanged(self, s): self.cb(s)
+
+    class Layout(dynamic_proxy(ViewTreeObserver.OnGlobalLayoutListener)):
+        def __init__(self, view, callback):
+            super().__init__()
+            self.view = view; self.callback = callback
+        def onGlobalLayout(self):
+            try:
+                w = self.view.getWidth(); h = self.view.getHeight()
+                if w > 0 and h > 0:
+                    self.callback(w, h)
+                    self.view.getViewTreeObserver().removeOnGlobalLayoutListener(self)
+            except: pass
+
+    class Focus(dynamic_proxy(View.OnFocusChangeListener)):
+        def __init__(self, func): super().__init__(); self.f = func
+        def onFocusChange(self, v, hasFocus): self.f(v, hasFocus)
+    
+    # !!! НОВЫЙ КЛАСС !!!
+    class Run(dynamic_proxy(Runnable)):
+        def __init__(self, f): super().__init__(); self.f = f
+        def run(self): 
+            try: self.f()
+            except: pass
+
+class _ClockFaceController:
+    def __init__(self, context, on_change):
+        self.context = context; self.on_change = on_change
+        self.root = FrameLayout(context)
+        self.selector_iv = ImageView(context)
+        self.root.addView(self.selector_iv, LayoutHelper.createFrame(-1, -1))
+        self.numbers_layout = FrameLayout(context)
+        self.root.addView(self.numbers_layout, LayoutHelper.createFrame(-1, -1))
+        self.number_views = []; self.is_hours = True; self.current_val = 0
+        self.w = 0; self.h = 0
+        self.p_bg = Paint(Paint.ANTI_ALIAS_FLAG); self.p_bg.setColor(_tp_to_jint(_TP_C_CLOCK_BG))
+        self.p_line = Paint(Paint.ANTI_ALIAS_FLAG); self.p_line.setColor(_tp_to_jint(_TP_C_PRIMARY)); self.p_line.setStrokeWidth(AndroidUtilities.dp(2))
+        self.p_dot = Paint(Paint.ANTI_ALIAS_FLAG); self.p_dot.setColor(_tp_to_jint(_TP_C_PRIMARY))
+        self.numbers_layout.setOnTouchListener(_TPProxies.Touch(self.handle_touch))
+        self.root.getViewTreeObserver().addOnGlobalLayoutListener(_TPProxies.Layout(self.root, self.on_layout))
+
+    def get_view(self): return self.root
+    def on_layout(self, w, h): self.w = w; self.h = h; self.redraw_visuals(); self.position_numbers()
+
+    def setup_mode(self, is_hours, val):
+        self.is_hours = is_hours; self.current_val = val
+        self.numbers_layout.removeAllViews(); self.number_views = []
+        if is_hours: self._add_nums(range(1, 13), 0.83); self._add_nums(range(13, 25), 0.56)
+        else: self._add_nums(range(0, 60, 5), 0.83)
+        if self.w > 0: self.position_numbers(); self.redraw_visuals(); self.highlight_numbers()
+
+    def _add_nums(self, rng, scale):
+        for val in rng:
+            disp, logic_val = val, val
+            if self.is_hours and val == 24: disp = 0; logic_val = 0
+            tv = TextView(self.context); tv.setText(f"{disp:02d}" if not self.is_hours else str(disp))
+            tv.setTextSize(14); tv.setTypeface(Typeface.DEFAULT_BOLD); tv.setGravity(Gravity.CENTER)
+            tv.setTextColor(_tp_to_jint(_TP_C_TEXT_MAIN)); tv.setIncludeFontPadding(False)
+            size = AndroidUtilities.dp(32)
+            self.numbers_layout.addView(tv, LayoutHelper.createFrame(size, size, Gravity.CENTER))
+            self.number_views.append({"v": tv, "val": logic_val, "scale": scale})
+
+    def position_numbers(self):
+        if self.w == 0: return
+        radius = min(self.w, self.h) / 2
+        for item in self.number_views:
+            tv, val, dist = item["v"], item["val"], radius * item["scale"]
+            angle = ((val % 12 or 12) * 30 - 90) if self.is_hours else (val * 6 - 90)
+            import math
+            rad = math.radians(angle)
+            tv.setTranslationX(dist * math.cos(rad)); tv.setTranslationY(dist * math.sin(rad))
+
+    def redraw_visuals(self):
+        if self.w == 0: return
+        bmp = Bitmap.createBitmap(self.w, self.h, Bitmap.Config.ARGB_8888); c = Canvas(bmp)
+        cx, cy, max_r = self.w / 2, self.h / 2, min(self.w, self.h) / 2
+        c.drawCircle(cx, cy, max_r, self.p_bg)
+        angle = (self.current_val % 12 or 12) * 30 if self.is_hours else self.current_val * 6
+        is_inner = self.is_hours and (self.current_val == 0 or self.current_val > 12)
+        c.drawCircle(cx, cy, AndroidUtilities.dp(4), self.p_dot)
+        import math
+        rad = math.radians(angle - 90); length = max_r * (0.56 if is_inner else 0.83)
+        ex, ey = cx + length * math.cos(rad), cy + length * math.sin(rad)
+        c.drawLine(cx, cy, ex, ey, self.p_line); c.drawCircle(ex, ey, AndroidUtilities.dp(20), self.p_dot)
+        self.selector_iv.setImageBitmap(bmp); self.highlight_numbers()
+
+    def highlight_numbers(self):
+        for item in self.number_views:
+            item["v"].setTextColor(_tp_to_jint(_TP_C_ON_PRIMARY if item["val"] == self.current_val else _TP_C_TEXT_MAIN))
+
+    def handle_touch(self, v, event):
+        action = event.getAction()
+        if action in [0, 2, 1]: # DOWN, MOVE, UP
+            import math
+            x, y = event.getX(), event.getY(); cx, cy = self.w / 2, self.h / 2
+            angle_deg = (math.degrees(math.atan2(y - cy, x - cx)) + 90) % 360
+            dist, max_r = math.sqrt((x-cx)**2 + (y-cy)**2), min(self.w, self.h) / 2
+            if self.is_hours:
+                snap = int(round(angle_deg / 30)) % 12 or 12
+                val = (0 if snap == 12 else snap + 12) if dist < (max_r * 0.70) else (12 if snap == 12 else snap)
+            else: val = int(round(angle_deg / 6)) % 60
+            self.current_val = val; self.redraw_visuals()
+            self.on_change(val, action == 1)
+            return True
+        return False
+
+class _MD3TimePicker:
+    def __init__(self, context, h, m, callback):
+        self.ctx = context; self.h = h; self.m = m; self.cb = callback
+        self.is_input_mode = False; self.edit_hour = True
+        self.interpolator = DecelerateInterpolator()
+
+    def show(self):
+        self.dialog = Dialog(self.ctx); self.dialog.requestWindowFeature(1) # NO_TITLE
+        win = self.dialog.getWindow(); win.setBackgroundDrawable(ColorDrawable(0)); win.setGravity(Gravity.CENTER)
+        
+        root = LinearLayout(self.ctx); root.setOrientation(1); root.setBackground(_tp_create_bg(28, _TP_C_SURFACE))
+        root.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(24), AndroidUtilities.dp(24), AndroidUtilities.dp(12))
+        self.dialog.setContentView(root, ViewGroup.LayoutParams(AndroidUtilities.dp(324), -2))
+        
+        header = TextView(self.ctx); header.setText("Введите время"); header.setTextSize(12); header.setTextColor(_tp_to_jint(_TP_C_TEXT_SEC))
+        root.addView(header)
+        
+        self.disp_layout = LinearLayout(self.ctx); self.disp_layout.setOrientation(0); self.disp_layout.setGravity(17)
+        self.disp_layout.setPadding(0, AndroidUtilities.dp(24), 0, AndroidUtilities.dp(24))
+        self.tv_h = self._mk_display(True); self.tv_m = self._mk_display(False)
+        sep = TextView(self.ctx); sep.setText(":"); sep.setTextSize(52); sep.setTextColor(_tp_to_jint(_TP_C_TEXT_MAIN)); sep.setPadding(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), AndroidUtilities.dp(8))
+        self.disp_layout.addView(self.tv_h); self.disp_layout.addView(sep); self.disp_layout.addView(self.tv_m)
+        root.addView(self.disp_layout)
+        
+        self.content = FrameLayout(self.ctx); root.addView(self.content, LayoutHelper.createLinear(-1, -2))
+        self.clock_controller = _ClockFaceController(self.ctx, self._on_clock); self.clock_view = self.clock_controller.get_view()
+        self.content.addView(self.clock_view, LayoutHelper.createFrame(-1, 320))
+        self.input_layout = self._mk_input_layout(); self.input_layout.setVisibility(8); self.content.addView(self.input_layout, LayoutHelper.createFrame(-1, -2, 17))
+        
+        footer = LinearLayout(self.ctx); footer.setGravity(16); lp = LinearLayout.LayoutParams(-1, -2); lp.topMargin = AndroidUtilities.dp(12); footer.setLayoutParams(lp)
+        self.ic_mode = ImageView(self.ctx); self.ic_mode.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(8), AndroidUtilities.dp(8), AndroidUtilities.dp(8))
+        self.ic_mode.setColorFilter(_tp_to_jint(_TP_C_TEXT_SEC), PorterDuff.Mode.SRC_IN)
+        self.ic_mode.setOnClickListener(_TPProxies.Click(lambda v: self.toggle_mode()))
+        footer.addView(self.ic_mode, LayoutHelper.createLinear(40, 40)); footer.addView(View(self.ctx), LinearLayout.LayoutParams(0, 0, 1.0))
+        footer.addView(self._mk_btn("Отмена", lambda v: self.dialog.dismiss())); footer.addView(self._mk_btn("OK", lambda v: self.finish()))
+        root.addView(footer)
+        self.refresh_ui(); self.dialog.show()
+
+    def _mk_display(self, is_h):
+        tv = TextView(self.ctx); tv.setTextSize(52); tv.setTypeface(Typeface.DEFAULT); tv.setPadding(AndroidUtilities.dp(16), 0, AndroidUtilities.dp(16), 0)
+        tv.setOnClickListener(_TPProxies.Click(lambda v: self.set_target(is_h)))
+        return tv
+    def _mk_btn(self, txt, cb):
+        b = TextView(self.ctx); b.setText(txt); b.setTextColor(_tp_to_jint(_TP_C_PRIMARY)); b.setTextSize(14)
+        b.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf")); b.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(10), AndroidUtilities.dp(12), AndroidUtilities.dp(10))
+        b.setOnClickListener(_TPProxies.Click(cb))
+        return b
+    def _mk_input_layout(self):
+        ll = LinearLayout(self.ctx); ll.setGravity(17); ll.setPadding(0, AndroidUtilities.dp(24), 0, AndroidUtilities.dp(24))
+        self.et_h = self._mk_et(True); self.et_m = self._mk_et(False)
+        sep = TextView(self.ctx); sep.setText(":"); sep.setTextSize(32); sep.setTextColor(_tp_to_jint(_TP_C_TEXT_MAIN)); sep.setPadding(AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12), 0)
+        ll.addView(self.et_h); ll.addView(sep); ll.addView(self.et_m)
+        return ll
+    def _mk_et(self, is_h):
+        wrap = LinearLayout(self.ctx); wrap.setOrientation(1)
+        et = EditText(self.ctx); et.setTextSize(32); et.setTextColor(_tp_to_jint(_TP_C_TEXT_MAIN)); et.setBackground(_tp_create_bg(8, _TP_C_INPUT_BG))
+        et.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12)); et.setInputType(InputType.TYPE_CLASS_NUMBER); et.setGravity(17); et.setWidth(AndroidUtilities.dp(96))
+        et.setOnFocusChangeListener(_TPProxies.Focus(lambda v, h: et.setBackground(_tp_create_bg(8, _TP_C_CONTAINER, 2, _TP_C_PRIMARY) if h else _tp_create_bg(8, _TP_C_INPUT_BG)) or et.setTextColor(_tp_to_jint(_TP_C_PRIMARY if h else _TP_C_TEXT_MAIN))))
+        et.addTextChangedListener(_TPProxies.Watcher(lambda s: self._on_text(s, is_h)))
+        lbl = TextView(self.ctx); lbl.setText("Час" if is_h else "Мин"); lbl.setTextSize(12); lbl.setTextColor(_tp_to_jint(_TP_C_TEXT_SEC)); lbl.setPadding(0, AndroidUtilities.dp(4), 0, 0)
+        wrap.addView(et); wrap.addView(lbl)
+        if is_h: self.ref_et_h = et
+        else: self.ref_et_m = et
+        return wrap
+    def _on_text(self, s, is_h):
+        try:
+            val = int(str(s))
+            if is_h and 0<=val<=23: self.h = val
+            if not is_h and 0<=val<=59: self.m = val
+        except: pass
+    def _on_clock(self, val, fin):
+        if self.edit_hour: self.h = val
+        else: self.m = val
+        self.refresh_display()
+        if fin and self.edit_hour: self.set_target(False)
+    def set_target(self, is_h): self.edit_hour = is_h; self.refresh_ui()
+    def toggle_mode(self): self.is_input_mode = not self.is_input_mode; self._anim_switch()
+    
+    def _anim_switch(self):
+        res = ApplicationLoader.applicationContext.getResources().getIdentifier("msg_schedule" if self.is_input_mode else "input_keyboard", "drawable", ApplicationLoader.applicationContext.getPackageName())
+        if res != 0: self.ic_mode.setImageResource(res)
+        self.refresh_display()
+        v_out, v_in = ([self.disp_layout, self.clock_view], [self.input_layout]) if self.is_input_mode else ([self.input_layout], [self.disp_layout, self.clock_view])
+        
+        # FIX: Using _TPProxies.Run
+        for v in v_out: 
+            v.animate().cancel()
+            v.animate().alpha(0).scaleX(0.85).scaleY(0.85).setDuration(150)\
+                .setInterpolator(self.interpolator)\
+                .withEndAction(_TPProxies.Run(lambda v=v: v.setVisibility(8)))\
+                .start()
+        
+        for v in v_in:
+            if v == self.clock_view and not self.is_input_mode: self.clock_controller.setup_mode(self.edit_hour, self.h if self.edit_hour else self.m)
+            if v == self.input_layout and self.is_input_mode: self.ref_et_h.setText(f"{self.h:02d}"); self.ref_et_m.setText(f"{self.m:02d}")
+            
+            v.setVisibility(0); v.setAlpha(0); v.setScaleX(0.85); v.setScaleY(0.85)
+            v.animate().cancel()
+            v.animate().alpha(1).scaleX(1).scaleY(1).setDuration(300).setStartDelay(100)\
+                .setInterpolator(self.interpolator).setListener(None)\
+                .withEndAction(None)\
+                .start()
+    
+    def refresh_ui(self):
+        res = ApplicationLoader.applicationContext.getResources().getIdentifier("msg_schedule" if self.is_input_mode else "input_keyboard", "drawable", ApplicationLoader.applicationContext.getPackageName())
+        if res != 0: self.ic_mode.setImageResource(res)
+        self.refresh_display()
+        if self.is_input_mode: self.disp_layout.setVisibility(8); self.clock_view.setVisibility(8); self.input_layout.setVisibility(0); self.ref_et_h.setText(f"{self.h:02d}"); self.ref_et_m.setText(f"{self.m:02d}")
+        else: self.input_layout.setVisibility(8); self.disp_layout.setVisibility(0); self.clock_view.setVisibility(0); self.clock_controller.setup_mode(self.edit_hour, self.h if self.edit_hour else self.m)
+    
+    def refresh_display(self):
+        self.tv_h.setText(f"{self.h:02d}"); self.tv_m.setText(f"{self.m:02d}")
+        b_act, b_no = _tp_create_bg(8, _TP_C_CONTAINER), _tp_create_bg(8, 0)
+        self.tv_h.setBackground(b_act if self.edit_hour else b_no); self.tv_h.setTextColor(_tp_to_jint(_TP_C_PRIMARY if self.edit_hour else _TP_C_TEXT_MAIN))
+        self.tv_m.setBackground(b_no if self.edit_hour else b_act); self.tv_m.setTextColor(_tp_to_jint(_TP_C_TEXT_MAIN if self.edit_hour else _TP_C_PRIMARY))
+    
+    def finish(self):
+        if self.cb: self.cb(self.h, self.m)
+        self.dialog.dismiss()
+
+class MandreUI:
+    @staticmethod
+    def pick_time(on_time_selected: Callable[[int, int], None], initial_hour: int = 12, initial_minute: int = 0):
+        """
+        Открывает Material Design 3 Time Picker.
+        :param on_time_selected: Колбэк (hour, minute)
+        :param initial_hour: Начальный час (0-23)
+        :param initial_minute: Начальная минута (0-59)
+        """
+        def runner():
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if not activity:
+                    BulletinHelper.show_error("Ошибка UI: нет Activity")
+                    return
+                
+                # Внутренний колбэк для обработки исключений в пользовательском коде
+                def safe_cb(h, m):
+                    try: on_time_selected(h, m)
+                    except Exception as e: log(f"[MandreUI TimePicker] Callback error: {e}")
+
+                picker = _MD3TimePicker(activity, initial_hour, initial_minute, safe_cb)
+                picker.show()
+            except Exception as e:
+                log(f"[MandreUI] Ошибка открытия TimePicker: {traceback.format_exc()}")
+        
+        run_on_ui_thread(runner)
+
+    @staticmethod
+    def _internal_invoke_ripple(x: float, y: float, intensity: float):
+        global _make_ripple_method
+        try:
+            if not _make_ripple_method:
+                LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+                LAClass = LaunchActivity.getClass() if hasattr(LaunchActivity, "getClass") else LaunchActivity
+                _make_ripple_method = LAClass.getDeclaredMethod("makeRipple", JFloat.TYPE, JFloat.TYPE, JFloat.TYPE)
+                _make_ripple_method.setAccessible(True)
+            if _make_ripple_method:
+                _make_ripple_method.invoke(None, JFloat(x), JFloat(y), JFloat(intensity))
+        except Exception as e: log(f"[MandreLib] Ошибка вызова ripple: {e}")
+
+    @staticmethod
+    def _internal_perform_vibration(context: Any, intensity: float):
+        try:
+            vibrator = context.getSystemService("vibrator")
+            if not vibrator: return
+            amp = int(min(255, max(1, 255 * (intensity / 3.0))))
+            duration = 20
+            if Build.VERSION.SDK_INT >= 26: vibrator.vibrate(VibrationEffect.createOneShot(duration, amp))
+            else: vibrator.vibrate(duration)
+        except Exception as e: log(f"[MandreLib] Ошибка вибрации: {e}")
+
+    @staticmethod
+    def ripple(intensity: float = 2.0, vibrate: bool = True):
+        def effect_runner():
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if not activity: return
+                view = activity.getWindow().getDecorView()
+                center_x, center_y = float(view.getWidth() / 2.0), float(view.getHeight() / 2.0)
+                MandreUI._internal_invoke_ripple(center_x, center_y, intensity)
+                if vibrate: MandreUI._internal_perform_vibration(activity, intensity)
+            except Exception as e: log(f"[MandreLib] Ошибка при запуске эффекта ripple: {e}")
+        run_on_ui_thread(effect_runner)
+
+    @staticmethod
+    def _apply_spring_press(view):
+        """Добавляет эффект пружины при нажатии на View"""
+        try:
+            ViewOnTouchListener = find_class("android.view.View$OnTouchListener")
+            MotionEvent = find_class("android.view.MotionEvent")
+            
+            class _SpringTouch(dynamic_proxy(ViewOnTouchListener)):
+                def onTouch(self, v, event):
+                    action = event.getAction()
+                    if action == MotionEvent.ACTION_DOWN:
+                        # Сжатие
+                        Mandre.Animation.spring(v, "scale", 0.92, stiffness=1000, damping=0.7)
+                    elif action == MotionEvent.ACTION_UP or action == MotionEvent.ACTION_CANCEL:
+                        # Отскок обратно
+                        Mandre.Animation.spring(v, "scale", 1.0, stiffness=1500, damping=0.5)
+                    return False # Не перехватываем клик
+            
+            view.setOnTouchListener(_SpringTouch())
+        except: pass
+
+    @staticmethod
+    def show(title: str, items: List[str], on_select: Callable[[int, str], None], message: Optional[str] = None, cancel_text: Optional[str] = "Отмена"):
+        def dialog_runner():
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if not activity: BulletinHelper.show_error("Ошибка UI: не удалось получить контекст."); return
+                builder = AlertDialogBuilder(activity)
+                builder.set_title(title)
+                if message: builder.set_message(message)
+                def internal_on_select_proxy(dialog, index: int):
+                    try:
+                        if 0 <= index < len(items): on_select(index, items[index])
+                    except Exception as e: log(f"[MandreLib] Ошибка в колбэке on_select: {e}")
+                    finally: dialog.dismiss()
+                builder.set_items(items, internal_on_select_proxy)
+                if cancel_text: builder.set_negative_button(cancel_text, lambda d, w: d.dismiss())
+                builder.show()
+            except Exception as e: log(f"[MandreLib] Не удалось создать диалог: {e}")
+        run_on_ui_thread(dialog_runner)
+
+    @staticmethod
+    def select_chat(title: str, on_select: Callable[[Dict[str, Any]], None], search_hint: str = "Поиск по названию или ID...", cancel_text: str = "Отмена"):
+        INITIAL_LOAD_COUNT = 25; BATCH_LOAD_COUNT = 35; VIEW_POOL_SIZE = 30
+        def dialog_starter():
+            fragment = get_last_fragment()
+            context = fragment.getParentActivity() if fragment else None
+            if not context: BulletinHelper.show_error("Ошибка UI: не удалось получить контекст."); return
+            spinner = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            spinner.set_message("Загрузка чатов...").show().set_cancelable(False)
+            def _initial_load_task():
+                try:
+                    mc = get_messages_controller(); user_config = get_user_config(); dialogs_copy = ArrayList(mc.getDialogs(0))
+                    def process_dialog(dialog):
+                        dialog_id, chat_title, chat_obj = dialog.id, None, None
+                        if dialog_id == user_config.getClientUserId(): chat_title, chat_obj = "Избранное", mc.getUser(dialog_id)
+                        elif dialog_id > 0: user = mc.getUser(dialog_id); chat_title, chat_obj = ((f"{user.first_name or ''} {user.last_name or ''}".strip(), user) if user else (None, None))
+                        elif dialog_id < 0: chat = mc.getChat(-dialog_id); chat_title, chat_obj = ((chat.title, chat) if chat else (None, None))
+                        return {"title": chat_title.strip(), "id": dialog_id, "obj": chat_obj} if chat_title else None
+                    run_on_ui_thread(lambda: _display_dialog_on_ui(dialogs_copy, process_dialog))
+                except Exception: log(f"[MandreLib] Ошибка загрузки чатов: {traceback.format_exc()}"); run_on_ui_thread(lambda: (spinner.dismiss(), BulletinHelper.show_error("Не удалось загрузить чаты.")))
+            def _display_dialog_on_ui(dialogs_copy, process_dialog_func):
+                all_chats_python = []; root_layout = LinearLayout(context); root_layout.setOrientation(LinearLayout.VERTICAL)
+                search_field = EditText(context); search_field.setHint(search_hint); search_field.setSingleLine(True); search_field.setTextColor(Theme.getColor(Theme.key_dialogTextBlack)); search_field.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint)); search_field.setBackground(None); search_field.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(10), AndroidUtilities.dp(16), AndroidUtilities.dp(10)); root_layout.addView(search_field)
+                scroll_view = ScrollView(context); root_layout.addView(scroll_view, LinearLayout.LayoutParams(-1, -1, 1.0)); chat_list_layout = LinearLayout(context); chat_list_layout.setOrientation(LinearLayout.VERTICAL); scroll_view.addView(chat_list_layout)
+                loading_indicator = TextView(context); loading_indicator.setText("Загрузка..."); loading_indicator.setPadding(0, AndroidUtilities.dp(10), 0, AndroidUtilities.dp(10)); loading_indicator.setGravity(Gravity.CENTER)
+                builder = AlertDialogBuilder(context); builder.set_title(title)
+                view_pool = []
+                for _ in range(VIEW_POOL_SIZE):
+                    row = LinearLayout(context); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8)); row.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_dialogButtonSelector), 2))
+                    avatar = BackupImageView(context); avatar.setRoundRadius(AndroidUtilities.dp(20)); name = TextView(context); name.setTextSize(16); name.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                    row.addView(avatar, LinearLayout.LayoutParams(AndroidUtilities.dp(40), AndroidUtilities.dp(40))); params = LinearLayout.LayoutParams(-2, -2); params.leftMargin = AndroidUtilities.dp(16); row.addView(name, params)
+                    row.setVisibility(View.GONE); chat_list_layout.addView(row); view_pool.append({"row": row, "avatar": avatar, "name": name, "click_listener": None})
+                def internal_on_select_proxy(db, chat_info):
+                    try: on_select(chat_info)
+                    except Exception as e: log(f"[MandreLib] Ошибка в колбэке on_select: {e}")
+                    finally: db.dismiss()
+                def update_visible_list(chats_to_show, show_loading):
+                    for i in range(VIEW_POOL_SIZE):
+                        pool_item, row = view_pool[i], view_pool[i]["row"]
+                        if i < len(chats_to_show):
+                            chat_info = chats_to_show[i]; pool_item["name"].setText(chat_info["title"])
+                            if chat_info["obj"]: pool_item["avatar"].setForUserOrChat(chat_info["obj"], AvatarDrawable(chat_info["obj"]))
+                            else: pool_item["avatar"].clearImage()
+                            click_listener = OnClickListener(lambda _, info=chat_info: internal_on_select_proxy(builder, info)); row.setOnClickListener(click_listener); pool_item["click_listener"] = click_listener; row.setVisibility(View.VISIBLE)
+                        else: row.setVisibility(View.GONE)
+                    if loading_indicator.getParent(): chat_list_layout.removeView(loading_indicator)
+                    if show_loading: chat_list_layout.addView(loading_indicator)
+                def batch_loader(offset):
+                    if offset >= dialogs_copy.size(): run_on_ui_thread(lambda: update_visible_list(all_chats_python, False)); return
+                    new_batch = [process_dialog_func(dialogs_copy.get(i)) for i in range(offset, min(offset + BATCH_LOAD_COUNT, dialogs_copy.size())) if process_dialog_func(dialogs_copy.get(i))]
+                    all_chats_python.extend(new_batch)
+                    if not search_field.getText().toString(): run_on_ui_thread(lambda: update_visible_list(all_chats_python, True))
+                    run_on_queue(lambda: batch_loader(offset + BATCH_LOAD_COUNT))
+                handler, sr, sg = Handler(Looper.getMainLooper()), [None], [0]
+                def perform_filter_task(q, g):
+                    filtered = all_chats_python if not q else [c for c in all_chats_python if q.lower() in c['title'].lower() or q in str(c['id'])]
+                    if g == sg[0]: run_on_ui_thread(lambda: update_visible_list(filtered[:VIEW_POOL_SIZE], False))
+                class SearchWatcher(dynamic_proxy(TextWatcher)):
+                    def afterTextChanged(self, s):
+                        if sr[0]: handler.removeCallbacks(sr[0])
+                        sg[0] += 1; q, g = s.toString(), sg[0]
+                        class DebouncedRunnable(dynamic_proxy(Runnable)):
+                            def run(self): run_on_queue(lambda: perform_filter_task(q, g))
+                        sr[0] = DebouncedRunnable(); handler.postDelayed(sr[0], 250)
+                    def beforeTextChanged(self, s, st, c, a): pass
+                    def onTextChanged(self, s, st, b, c): pass
+                search_field.addTextChangedListener(SearchWatcher()); builder.set_view(root_layout); builder.set_negative_button(cancel_text, lambda d, w: d.dismiss()); builder.show()
+                spinner.dismiss()
+                initial_batch = [process_dialog_func(dialogs_copy.get(i)) for i in range(min(INITIAL_LOAD_COUNT, dialogs_copy.size())) if process_dialog_func(dialogs_copy.get(i))]
+                all_chats_python.extend(initial_batch); show_loading = dialogs_copy.size() > INITIAL_LOAD_COUNT
+                update_visible_list(all_chats_python, show_loading)
+                if show_loading: run_on_queue(lambda: batch_loader(INITIAL_LOAD_COUNT))
+            run_on_queue(_initial_load_task)
+        run_on_ui_thread(dialog_starter)
+    
+    @staticmethod
+    def _create_and_add_bar(activity, root_view, config):
+        # 1. РЕЗОЛВИНГ ЦВЕТОВ
+        
+        # Фон бара
+        bg_color = config.get("bg_color")
+        if bg_color is None:
+            bg_color = Theme.getColor(Theme.key_windowBackgroundWhite)
+        config["bg_color"] = bg_color
+
+        # Цвет пилюли (фон активной кнопки)
+        active_pill_color = config.get("active_bg_color")
+        if active_pill_color is None:
+            active_pill_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+        config["active_bg_color"] = active_pill_color
+
+        # Цвет ИКОНКИ активной (должен быть контрастным к пилюле)
+        # Обычно это цвет текста внутри кнопки
+        active_icon_color = config.get("active_color")
+        if active_icon_color is None:
+            active_icon_color = Theme.getColor(Theme.key_featuredStickers_buttonText)
+        config["active_color"] = active_icon_color
+
+        # Цвет ТЕКСТА активного (должен быть контрастным к ФОНУ бара)
+        # Берем основной цвет текста приложения (в темной теме он белый/светлый)
+        # Либо можно взять key_windowBackgroundWhiteBlueText (акцентный)
+        active_text_color_val = config.get("active_text_color")
+        if active_text_color_val is None:
+            # Используем акцентный цвет текста, он обычно хорошо читается и совпадает с темой
+            active_text_color_val = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText)
+        config["active_text_color"] = active_text_color_val
+
+        # Цвет неактивных элементов (серый)
+        inactive_content_color = config.get("inactive_color")
+        if inactive_content_color is None:
+            inactive_content_color = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText)
+        config["inactive_color"] = inactive_content_color
+
+        # 2. СОЗДАНИЕ КОНТЕЙНЕРА
+        bar_container = FrameLayout(activity)
+        
+        bg_drawable = GradientDrawable()
+        bg_drawable.setColor(bg_color)
+        bg_drawable.setCornerRadius(AndroidUtilities.dp(config["corner_radius_dp"]))
+        
+        if config.get("stroke_width_dp", 0) > 0:
+            bg_drawable.setStroke(AndroidUtilities.dp(config["stroke_width_dp"]), config["stroke_color"])
+            
+        bar_container.setBackground(bg_drawable)
+        
+        if Build.VERSION.SDK_INT >= 21:
+            bar_container.setElevation(AndroidUtilities.dp(4))
+            try:
+                from android.view import ViewOutlineProvider
+                bar_container.setOutlineProvider(ViewOutlineProvider.BACKGROUND)
+                bar_container.setClipToOutline(True)
+            except: pass
+
+        items_layout = LinearLayout(activity)
+        items_layout.setOrientation(LinearLayout.HORIZONTAL)
+        items_layout.setWeightSum(float(len(config["items"])))
+        bar_container.addView(items_layout, LayoutHelper.createFrame(-1, -1))
+        
+        ui_elements = []
+        
+        for i, item in enumerate(config["items"]):
+            item_click_area = FrameLayout(activity)
+            item_click_area.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 2))
+            
+            lp = LinearLayout.LayoutParams(0, -1, 1.0)
+            items_layout.addView(item_click_area, lp)
+
+            # --- PILL ---
+            pill_view = View(activity)
+            pill_bg = GradientDrawable()
+            pill_bg.setColor(active_pill_color)
+            pill_bg.setCornerRadius(AndroidUtilities.dp(16)) 
+            pill_view.setBackground(pill_bg)
+            
+            pill_w = AndroidUtilities.dp(64)
+            pill_h = AndroidUtilities.dp(32)
+            
+            pill_params = FrameLayout.LayoutParams(pill_w, pill_h)
+            pill_params.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP
+            pill_params.topMargin = AndroidUtilities.dp(12)
+            pill_view.setLayoutParams(pill_params)
+            
+            is_active = (i == config["active_index"])
+            pill_view.setAlpha(1.0 if is_active else 0.0)
+            pill_view.setScaleX(1.0 if is_active else 0.5)
+            pill_view.setScaleY(1.0 if is_active else 0.5)
+            
+            item_click_area.addView(pill_view)
+
+            # --- CONTENT ---
+            content_container = LinearLayout(activity)
+            content_container.setOrientation(LinearLayout.VERTICAL)
+            content_container.setGravity(Gravity.CENTER)
+            
+            # Icon
+            icon_view = ImageView(activity)
+            res_id = ApplicationLoader.applicationContext.getResources().getIdentifier(item.get("icon"), "drawable", ApplicationLoader.applicationContext.getPackageName())
+            if res_id != 0:
+                icon_view.setImageResource(res_id)
+            
+            icon_size = AndroidUtilities.dp(24)
+            content_container.addView(icon_view, LinearLayout.LayoutParams(icon_size, icon_size))
+
+            # Text
+            text_view = TextView(activity)
+            text_view.setText(item.get("text", ""))
+            text_view.setTextSize(12) 
+            text_view.setTypeface(AndroidUtilities.bold())
+            text_view.setGravity(Gravity.CENTER)
+            text_params = LinearLayout.LayoutParams(-2, -2)
+            text_params.topMargin = AndroidUtilities.dp(4)
+            content_container.addView(text_view, text_params)
+
+            cont_params = FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL | Gravity.TOP)
+            cont_params.topMargin = AndroidUtilities.dp(16)
+            item_click_area.addView(content_container, cont_params)
+
+            # Initial Colors applying
+            # Иконка зависит от того, внутри пилюли она или нет
+            # Текст всегда на фоне бара
+            
+            if is_active:
+                icon_view.setColorFilter(active_icon_color)
+                text_view.setTextColor(active_text_color_val)
+            else:
+                icon_view.setColorFilter(inactive_content_color)
+                text_view.setTextColor(inactive_content_color)
+            
+            # Handler
+            def create_click_handler(index, on_click_callback, plugin_instance):
+                def handler(v):
+                    Mandre.UI.update_bottom_bar(plugin_instance.id, index)
+                    if callable(on_click_callback):
+                        try: on_click_callback()
+                        except: pass
+                    try: v.performHapticFeedback(3)
+                    except: pass
+                    Mandre.apply_and_refresh_settings(plugin_instance)
+                return handler
+
+            on_click_callback = item.get("on_click")
+            item_click_area.setOnClickListener(OnClickListener(create_click_handler(i, on_click_callback, config["plugin_instance"])))
+            
+            ui_elements.append({
+                "icon": icon_view, 
+                "text": text_view, 
+                "pill": pill_view,
+                "active_icon_color": active_icon_color, # Цвет иконки (для пилюли)
+                "active_text_color": active_text_color_val, # Цвет текста (для фона)
+                "inactive_color": inactive_content_color
+            })
+
+        # Bar Position
+        bar_height = AndroidUtilities.dp(80)
+        bar_params = FrameLayout.LayoutParams(-1, bar_height)
+        bar_params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL
+        
+        margin_side = AndroidUtilities.dp(16)
+        margin_bottom = AndroidUtilities.dp(16)
+        
+        bar_params.setMargins(margin_side, 0, margin_side, margin_bottom)
+        
+        root_view.addView(bar_container, bar_params)
+        
+        # Anim entry
+        bar_container.setTranslationY(AndroidUtilities.dp(100))
+        bar_container.setAlpha(0.0)
+        
+        try:
+            animset = AnimatorSet()
+            animset.playTogether([
+                ObjectAnimator.ofFloat(bar_container, "translationY", float(AndroidUtilities.dp(100)), 0.0),
+                ObjectAnimator.ofFloat(bar_container, "alpha", 0.0, 1.0)
+            ])
+            animset.setDuration(400)
+            animset.setInterpolator(DecelerateInterpolator())
+            animset.start()
+        except Exception as e:
+            bar_container.setTranslationY(0.0)
+            bar_container.setAlpha(1.0)
+        
+        config["view_instance"] = bar_container
+        config["ui_elements"] = ui_elements
+
+    @staticmethod
+    def update_bottom_bar(plugin_id: str, active_index: int):
+        def updater():
+            if plugin_id not in _BOTTOM_BAR_CONFIGS: return
+            config = _BOTTOM_BAR_CONFIGS[plugin_id]
+            
+            if config.get("active_index") == active_index: return
+            config["active_index"] = active_index
+            
+            ui_elements = config.get("ui_elements", [])
+            for i, elements in enumerate(ui_elements):
+                is_active = (i == active_index)
+                
+                # Colors logic fixed for Dark Mode readability
+                icon_color = elements["active_icon_color"] if is_active else elements["inactive_color"]
+                text_color = elements["active_text_color"] if is_active else elements["inactive_color"]
+                
+                try:
+                    elements["icon"].setColorFilter(icon_color)
+                    elements["text"].setTextColor(text_color)
+                except Exception:
+                    pass
+                
+                pill = elements["pill"]
+                if is_active:
+                    pill.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).setDuration(250).setInterpolator(DecelerateInterpolator()).start()
+                else:
+                    pill.animate().alpha(0.0).scaleX(0.5).scaleY(0.5).setDuration(200).start()
+
+        run_on_ui_thread(updater)
+
+    @staticmethod
+    def setup_settings_bottom_bar(
+        plugin_instance: BasePlugin,
+        items: List[Dict[str, Any]],
+        active_index_key: str = "active_tab",
+        # Цвета ставим в None, чтобы они брались из темы Telegram динамически
+        bg_color: int = None, 
+        active_color: int = None,
+        inactive_color: int = None,
+        active_bg_color: int = None,
+        stroke_color: int = 0, # По умолчанию без обводки
+        stroke_width_dp: int = 0,
+        corner_radius_dp: int = 20 # Скругление как у MD3 контейнеров
+    ):
+        global _bottom_bar_hooks_installed
+        plugin_id = plugin_instance.id
+
+        _BOTTOM_BAR_CONFIGS[plugin_id] = {
+            "plugin_id": plugin_id, "plugin_instance": plugin_instance,
+            "items": items, "active_index_key": active_index_key,
+            "bg_color": bg_color, 
+            "active_color": active_color, 
+            "inactive_color": inactive_color,
+            "active_bg_color": active_bg_color, 
+            "stroke_color": stroke_color,
+            "stroke_width_dp": stroke_width_dp, 
+            "corner_radius_dp": corner_radius_dp,
+            "view_instance": None, "ui_elements": []
+        }
+
+        if _bottom_bar_hooks_installed:
+            return
+
+        try:
+            ContextClass = find_class("android.content.Context")
+            create_method = PluginSettingsActivity.getClass().getDeclaredMethod("createView", ContextClass)
+            plugin_instance.hook_method(create_method, _BottomBarHooks.ViewCreatedHook())
+            
+            destroy_method = PluginSettingsActivity.getClass().getDeclaredMethod("onFragmentDestroy")
+            plugin_instance.hook_method(destroy_method, _BottomBarHooks.ViewDestroyedHook())
+            
+            _bottom_bar_hooks_installed = True
+            log("[MandreLib] Хуки для BottomBar успешно установлены.")
+        except Exception:
+            log(f"[MandreLib] Не удалось установить хуки для BottomBar: {traceback.format_exc()}")
+
+    @staticmethod
+    def show_bottom_sheet(plugin_instance: BasePlugin, dsl: str, callbacks: Dict[str, Callable] = None, view_creators: Dict[str, Callable] = None) -> MandreSheetContrl:
+        if callbacks is None: callbacks = {}
+        if view_creators is None: view_creators = {}
+        
+        controller = MandreSheetContrl()
+        
+        def runner():
+            try:
+                fragment = get_last_fragment()
+                context = fragment.getParentActivity() if fragment else None
+                if not context: return
+
+                data = MandreUI._parse_sheet_dsl(dsl)
+                if not data: return
+
+                sheet = BottomSheet(context, False)
+                
+                # Корневой контейнер
+                root = LinearLayout(context)
+                root.setOrientation(LinearLayout.VERTICAL)
+                root.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(10), AndroidUtilities.dp(20), AndroidUtilities.dp(20))
+
+                controller._init_internal(context, root, sheet, view_creators, callbacks)
+                
+                # Заполняем контент с включенной анимацией появления
+                MandreUI._fill_sheet_content(context, root, data, callbacks, view_creators, controller, animate_entry=True)
+
+                sheet.setCustomView(root)
+                sheet.show()
+            except Exception as e:
+                log(f"[MandreUI] Sheet error: {e}")
+                BulletinHelper.show_error(f"UI Error: {e}")
+
+        run_on_ui_thread(runner)
+        return controller
+
+    @staticmethod
+    def _fill_sheet_content(context, root, data, callbacks, view_creators, controller, animate_entry=False):
+        def get_size(item_dict, key, default):
+            try: return int(item_dict.get(key, default))
+            except: return default
+
+        # Список всех добавленных view для анимации
+        added_views = []
+
+        def add_view(v, layout_params=None):
+            if not layout_params:
+                layout_params = LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12)
+            root.addView(v, layout_params)
+            added_views.append(v)
+        
+        # --- HELPER: Эффект нажатия (Spring) ---
+        def apply_spring_press(view):
+            try:
+                ViewOnTouchListener = find_class("android.view.View$OnTouchListener")
+                MotionEvent = find_class("android.view.MotionEvent")
+                
+                class _SpringTouch(dynamic_proxy(ViewOnTouchListener)):
+                    def onTouch(self, v, event):
+                        action = event.getAction()
+                        if action == MotionEvent.ACTION_DOWN:
+                            Mandre.Animation.spring(v, "scale", 0.92, stiffness=1000, damping=0.7)
+                        elif action == MotionEvent.ACTION_UP or action == MotionEvent.ACTION_CANCEL:
+                            Mandre.Animation.spring(v, "scale", 1.0, stiffness=1500, damping=0.5)
+                        return False
+                view.setOnTouchListener(_SpringTouch())
+            except: pass
+
+        # --- Title ---
+        if data.get("title"):
+            title_tv = TextView(context)
+            title_tv.setText(str(data["title"]))
+            title_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, get_size(data, "title_size", 20))
+            title_tv.setTypeface(AndroidUtilities.bold())
+            title_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            
+            # Для заголовка используем add_view
+            add_view(title_tv, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12))
+            controller._register_view(data.get("id"), title_tv)
+
+        # --- Tags (Smart Layout) ---
+        if data.get("tags"):
+            tags_container = LinearLayout(context)
+            tags_container.setOrientation(LinearLayout.HORIZONTAL)
+            tags_container.setWeightSum(float(len(data["tags"])))
+            
+            for tag in data["tags"]:
+                tag_frame = FrameLayout(context)
+                bg = GradientDrawable()
+                bg.setCornerRadius(AndroidUtilities.dp(8))
+                
+                col_str = tag.get("color")
+                text_color = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText)
+                bg_col_val = 0x20000000
+                
+                if col_str:
+                    try: 
+                        c = Color.parseColor(col_str)
+                        text_color = c
+                        bg_col_val = (c & 0x00FFFFFF) | 0x20000000 
+                    except: pass
+                
+                bg.setColor(bg_col_val)
+                tag_frame.setBackground(bg)
+                
+                tv = TextView(context)
+                tv.setText(tag.get("text", ""))
+                tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, get_size(tag, "size", 12))
+                tv.setTypeface(AndroidUtilities.bold())
+                tv.setTextColor(text_color)
+                tv.setGravity(Gravity.CENTER)
+                tv.setPadding(AndroidUtilities.dp(4), AndroidUtilities.dp(6), AndroidUtilities.dp(4), AndroidUtilities.dp(6))
+                
+                tag_frame.addView(tv, LayoutHelper.createFrame(-1, -2))
+                
+                lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0)
+                lp.setMargins(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0)
+                tags_container.addView(tag_frame, lp)
+                
+                controller._register_view(tag.get("id"), tv)
+
+            add_view(tags_container, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 8))
+
+        # --- Subtext ---
+        if data.get("subtext"):
+            sub_tv = TextView(context)
+            sub_tv.setText(str(data["subtext"]))
+            sub_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, get_size(data, "sub_size", 13))
+            sub_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            add_view(sub_tv, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12))
+            controller._register_view("subtext", sub_tv)
+
+        # --- Custom View ---
+        custom_view_data = data.get("view")
+        if custom_view_data:
+            vid = custom_view_data.get("id")
+            if vid and vid in view_creators:
+                try:
+                    c_view = view_creators[vid](context)
+                    if c_view:
+                        if c_view.getParent(): c_view.getParent().removeView(c_view)
+                        c_view.setTransitionName("mandre_custom_view")
+                        height_dp = get_size(custom_view_data, "height", 0)
+                        height_px = AndroidUtilities.dp(height_dp) if height_dp > 0 else -2
+                        add_view(c_view, LayoutHelper.createLinear(-1, height_px, 0, 0, 0, 12))
+                        controller._register_view(vid, c_view)
+                except Exception as e:
+                    log(f"[MandreUI] View error: {e}")
+
+        # --- Content (Text + Align) ---
+        content_data = data.get("content", {})
+        content_text = content_data.get("text", "")
+        if content_text:
+            scroll = ScrollView(context)
+            scroll.setVerticalScrollBarEnabled(False)
+            content_tv = TextView(context)
+            content_tv.setText(content_text)
+            content_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, get_size(content_data, "size", 15))
+            content_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            content_tv.setTextIsSelectable(True)
+            content_tv.setLineSpacing(AndroidUtilities.dp(2), 1.1)
+            
+            align_map = {
+                "left": Gravity.LEFT,
+                "center": Gravity.CENTER,
+                "right": Gravity.RIGHT,
+                "start": Gravity.START,
+                "end": Gravity.END
+            }
+            gravity = align_map.get(content_data.get("align", "left").lower(), Gravity.LEFT)
+            content_tv.setGravity(gravity)
+            
+            scroll.addView(content_tv)
+            add_view(scroll, LayoutHelper.createLinear(-1, 0, 1.0))
+            controller._register_view(content_data.get("id", "content"), content_tv)
+
+        if data.get("actions"):
+            div = View(context)
+            div.setBackgroundColor(Theme.getColor(Theme.key_divider))
+            add_view(div, LayoutHelper.createLinear(-1, 1, 0, 16, 0, 12))
+
+        # --- Actions ---
+        if data.get("actions"):
+            actions_row = LinearLayout(context)
+            actions_row.setOrientation(LinearLayout.HORIZONTAL)
+            actions_row.setGravity(Gravity.CENTER_VERTICAL)
+            actions_row.setWeightSum(float(len(data["actions"])))
+            
+            for item in data["actions"]:
+                itype = item.get("type")
+                btn_frame = FrameLayout(context)
+                
+                apply_spring_press(btn_frame) # Spring эффект
+
+                btn_bg = GradientDrawable()
+                btn_bg.setCornerRadius(AndroidUtilities.dp(18))
+                
+                col_str = item.get("color")
+                bg_color = Theme.getColor(Theme.key_chat_inLoader) & 0x20FFFFFF | 0x10000000
+                if col_str:
+                    try: bg_color = (Color.parseColor(col_str) & 0x00FFFFFF) | 0x20000000
+                    except: pass
+                
+                btn_bg.setColor(bg_color)
+                btn_frame.setBackground(btn_bg)
+                
+                content_layout = LinearLayout(context)
+                content_layout.setOrientation(LinearLayout.HORIZONTAL)
+                content_layout.setGravity(Gravity.CENTER)
+                content_layout.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(10), AndroidUtilities.dp(12), AndroidUtilities.dp(10))
+                
+                if item.get("icon"):
+                    iv = ImageView(context)
+                    res_id = context.getResources().getIdentifier(item["icon"], "drawable", context.getPackageName())
+                    if res_id != 0:
+                        iv.setImageResource(res_id)
+                        iv.setColorFilter(Theme.getColor(Theme.key_dialogTextBlack))
+                        content_layout.addView(iv, LayoutHelper.createLinear(20, 20))
+                
+                if item.get("text"):
+                    tv = TextView(context)
+                    tv.setText(item["text"])
+                    tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, get_size(item, "size", 14))
+                    tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                    tv.setGravity(Gravity.CENTER)
+                    ml = 6 if item.get("icon") else 0
+                    content_layout.addView(tv, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, ml, 0, 0, 0))
+
+                btn_frame.addView(content_layout, LayoutHelper.createFrame(-2, -2, Gravity.CENTER))
+                
+                cid = item.get("id")
+                if itype == "button":
+                    if cid and cid in callbacks:
+                        btn_frame.setOnClickListener(OnClickListener(lambda v, f=callbacks[cid]: f(controller)))
+                    else:
+                        btn_frame.setOnClickListener(OnClickListener(lambda v: controller.dismiss()))
+                elif itype == "menu":
+                    menu_items = item.get("items", [])
+                    def show_popup(anchor, items=menu_items):
+                        MandreUI._show_popup_menu(anchor, items, callbacks, controller.sheet)
+                    btn_frame.setOnClickListener(OnClickListener(lambda v: show_popup(v)))
+
+                lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0)
+                lp.setMargins(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0)
+                actions_row.addView(btn_frame, lp)
+            
+            add_view(actions_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12))
+
+        # --- Close Button ---
+        close_btn = FrameLayout(context)
+        c_bg = GradientDrawable()
+        c_bg.setCornerRadius(AndroidUtilities.dp(10))
+        c_bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+        close_btn.setBackground(c_bg)
+        close_btn.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12))
+        
+        apply_spring_press(close_btn) # Spring эффект
+
+        c_text = TextView(context)
+        c_text.setText(data.get("close_text", "Закрыть"))
+        c_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, get_size(data, "close_size", 15))
+        c_text.setTypeface(AndroidUtilities.bold())
+        c_text.setTextColor(Color.WHITE)
+        c_text.setGravity(Gravity.CENTER)
+        close_btn.addView(c_text)
+        close_btn.setOnClickListener(OnClickListener(lambda v: controller.dismiss()))
+        add_view(close_btn, LayoutHelper.createLinear(-1, -2))
+
+        # === АНИМАЦИЯ ПОЯВЛЕНИЯ (Staggered Entry) ===
+        # Работает только если animate_entry=True (при первом открытии)
+        if animate_entry:
+            for i, v in enumerate(added_views):
+                v.setAlpha(0.0)
+                v.setTranslationY(float(AndroidUtilities.dp(50)))
+                
+                Mandre.Animation.animate(v)\
+                    .alpha(1.0)\
+                    .move_y(0)\
+                    .duration(400)\
+                    .delay(i * 40) \
+                    .ease("decelerate")\
+                    .start()
+
+    @staticmethod
+    def _parse_sheet_dsl(dsl: str) -> Dict:
+        try:
+            import re
+            # Корневой тег
+            root_match = re.search(r'<sheet\s*(.*?)>(.*)</sheet>', dsl, re.DOTALL)
+            if not root_match: return None
+            
+            attrs_str, body = root_match.groups()
+            result = MandreSettings._parse_html(f"<dummy {attrs_str} />")[0]
+            
+            # Tags
+            result["tags"] = []
+            for m in re.finditer(r'<tag\s*(.*?)/>', body):
+                result["tags"].append(MandreSettings._parse_html(f"<dummy {m.group(1)} />")[0])
+            
+            # Content (Text)
+            c_match = re.search(r'<content\s*(.*?)>(.*?)</content>', body, re.DOTALL)
+            if c_match:
+                c_attrs, c_text = c_match.groups()
+                content_info = MandreSettings._parse_html(f"<dummy {c_attrs} />")[0]
+                content_info["text"] = c_text.strip()
+                result["content"] = content_info
+            
+            # Custom View (<view>)
+            v_match = re.search(r'<view\s*(.*?)/>', body)
+            if v_match:
+                v_attrs = v_match.group(1)
+                result["view"] = MandreSettings._parse_html(f"<dummy {v_attrs} />")[0]
+
+            # Actions
+            result["actions"] = []
+            actions_body = body
+            a_block = re.search(r'<actions>(.*?)</actions>', body, re.DOTALL)
+            if a_block: actions_body = a_block.group(1)
+            
+            for m in re.finditer(r'<button\s*(.*?)/>', actions_body):
+                btn = MandreSettings._parse_html(f"<dummy {m.group(1)} />")[0]
+                btn["type"] = "button"
+                result["actions"].append(btn)
+                
+            menu_match = re.search(r'<menu\s*(.*?)>(.*?)</menu>', actions_body, re.DOTALL)
+            if menu_match:
+                menu_attrs, menu_body = menu_match.groups()
+                menu = MandreSettings._parse_html(f"<dummy {menu_attrs} />")[0]
+                menu["type"] = "menu"
+                menu["items"] = []
+                for im in re.finditer(r'<item\s*(.*?)/>', menu_body):
+                    it = MandreSettings._parse_html(f"<dummy {im.group(1)} />")[0]
+                    menu["items"].append(it)
+                result["actions"].append(menu)
+                
+            return result
+        except Exception as e:
+            log(f"[MandreUI] DSL Parse Error: {e}")
+            return None
+            
+    @staticmethod
+    def _show_popup_menu(anchor, items, callbacks, sheet):
+        # (код popup menu, оставь как был)
+        try:
+            context = anchor.getContext()
+            layout = ActionBarPopupWindow.ActionBarPopupWindowLayout(context)
+            layout.setBackgroundColor(Theme.getColor(Theme.key_actionBarDefaultSubmenuBackground))
+            layout.setFitItems(True)
+            
+            popup = ActionBarPopupWindow(layout, -2, -2)
+            
+            for item in items:
+                frame = FrameLayout(context)
+                frame.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_listSelector), 2))
+                frame.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(12), AndroidUtilities.dp(16), AndroidUtilities.dp(12))
+                
+                lin = LinearLayout(context)
+                lin.setOrientation(LinearLayout.HORIZONTAL)
+                lin.setGravity(Gravity.CENTER_VERTICAL)
+                
+                if item.get("icon"):
+                    iv = ImageView(context)
+                    res_id = context.getResources().getIdentifier(item["icon"], "drawable", context.getPackageName())
+                    iv.setImageResource(res_id)
+                    iv.setColorFilter(Theme.getColor(Theme.key_actionBarDefaultSubmenuItem))
+                    lin.addView(iv, LayoutHelper.createLinear(24, 24, 0, 0, 12, 0))
+                    
+                tv = TextView(context)
+                tv.setText(item.get("text", ""))
+                tv.setTextColor(Theme.getColor(Theme.key_actionBarDefaultSubmenuItem))
+                tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                lin.addView(tv)
+                
+                frame.addView(lin)
+                
+                cid = item.get("id")
+                def on_click(v, func=callbacks.get(cid)):
+                    popup.dismiss()
+                    if func: 
+                        # Меню не может вызывать update контроллера напрямую (пока), 
+                        # поэтому просто вызываем функцию без аргументов
+                        try: func() 
+                        except: pass
+                        
+                frame.setOnClickListener(OnClickListener(on_click))
+                layout.addView(frame, LayoutHelper.createLinear(-1, -2))
+            
+            popup.setOutsideTouchable(True)
+            popup.setFocusable(True)
+            popup.showAsDropDown(anchor, 0, -anchor.getHeight() - AndroidUtilities.dp(10))
+            popup.dimBehind()
+        except Exception as e:
+            log(f"[MandreUI] Popup error: {e}")
+
+class MandreSuggestions:
+    """
+    Модуль для создания кастомных меню автодополнения (как при вводе @ или /).
+    Использует HTML-like DSL.
+    """
+    
+    @staticmethod
+    def register(plugin_instance: BasePlugin, trigger: str, content: Any):
+        """
+        Регистрирует триггер для меню.
+        :param trigger: Текст, при вводе которого появится меню (например, "#myui", "//tools").
+        :param content: Строка с DSL или функция, возвращающая строку DSL.
+                        DSL формат: <item text="Title" subtext="Description" />
+        """
+        _SUGGESTIONS_REGISTRY[trigger.lower()] = content
+        MandreSuggestions._ensure_hook(plugin_instance)
+        log(f"[MandreSuggestions] Зарегистрирован триггер '{trigger}' для {plugin_instance.id}")
+
+    @staticmethod
+    def trigger_input(text: str):
+        """Программно вставляет текст в поле ввода, вызывая меню (если триггер совпадает)."""
+        run_on_ui_thread(lambda: MandreSuggestions._inject_text(text))
+
+    @staticmethod
+    def _inject_text(text: str):
+        try:
+            fragment = get_last_fragment()
+            if hasattr(fragment, "getChatActivityEnterView"):
+                enter_view = fragment.getChatActivityEnterView()
+                field = enter_view.getEditField() if enter_view else None
+                if field:
+                    field.setText(text)
+                    field.setSelection(len(text))
+        except Exception: pass
+
+    @staticmethod
+    def _parse_dsl(dsl_string: str) -> tuple:
+        """Парсит DSL и возвращает (titles, descriptions)."""
+        titles = []
+        descriptions = []
+        # Simple regex parsing for speed
+        # Matches <item ... /> or <cmd ... /> or <s ... />
+        # Attrs: text/t/value/command -> Title
+        #        subtext/d/desc/help -> Description
+        pattern = re.compile(r'<(?:\w+)\s+([^>]+?)\s*/?>')
+        attr_pattern = re.compile(r'([a-zA-Z0-9_]+)\s*=\s*["\']([^"\']+)["\']')
+        
+        for match in pattern.finditer(dsl_string):
+            attrs_str = match.group(1)
+            attrs = dict(attr_pattern.findall(attrs_str))
+            
+            # Resolve title
+            title = attrs.get("text") or attrs.get("t") or attrs.get("value") or attrs.get("command") or "Item"
+            
+            # Resolve description
+            desc = attrs.get("subtext") or attrs.get("d") or attrs.get("desc") or attrs.get("help") or "MandreLib"
+            
+            titles.append(title)
+            descriptions.append(desc)
+            
+        return titles, descriptions
+
+    class _Hook(MethodHook):
+        def before_hooked_method(self, param):
+            try:
+                # Аргументы: (CharSequence text, int position, ArrayList messages, boolean username, boolean hashtag)
+                if not param.args or param.args[0] is None: return
+                
+                text = str(param.args[0].toString())
+                if not text: return
+
+                # Ищем совпадение по триггеру
+                matched_trigger = None
+                content_source = None
+                
+                for trigger, content in _SUGGESTIONS_REGISTRY.items():
+                    if text.lower().startswith(trigger):
+                        matched_trigger = trigger
+                        content_source = content
+                        break
+                
+                if not matched_trigger: return
+
+                # Получаем DSL
+                dsl = content_source() if callable(content_source) else str(content_source)
+                titles_py, descs_py = MandreSuggestions._parse_dsl(dsl)
+                
+                if not titles_py: return
+
+                # Инъекция в адаптер
+                adapter = param.thisObject
+                
+                # Reflection magic (как в list_of_commands.py)
+                cls = adapter.getClass()
+                f_cmds = cls.getDeclaredField("searchResultCommands")
+                f_help = cls.getDeclaredField("searchResultCommandsHelp")
+                f_delegate = cls.getDeclaredField("delegate")
+                
+                f_cmds.setAccessible(True)
+                f_help.setAccessible(True)
+                f_delegate.setAccessible(True)
+                
+                # Конвертация в Java ArrayList
+                StringClass = find_class("java.lang.String")
+                from java.util import Arrays
+                
+                # Создаем Java массив строк
+                def to_jlist(pylist):
+                    arr = java.lang.reflect.Array.newInstance(StringClass, len(pylist))
+                    for i, v in enumerate(pylist):
+                        arr[i] = v
+                    return ArrayList(Arrays.asList(arr))
+
+                # Используем упрощенный метод, если jython позволяет, иначе через рефлексию выше
+                # Но надежнее так:
+                j_titles = ArrayList()
+                j_descs = ArrayList()
+                for t in titles_py: j_titles.add(str(t))
+                for d in descs_py: j_descs.add(str(d))
+
+                f_cmds.set(adapter, j_titles)
+                f_help.set(adapter, j_descs)
+                
+                # Обновляем UI
+                def ui_update():
+                    adapter.notifyDataSetChanged()
+                    delegate = f_delegate.get(adapter)
+                    if delegate:
+                        # needChangePanelVisibility(boolean show)
+                        delegate.needChangePanelVisibility(True)
+                
+                run_on_ui_thread(ui_update)
+                
+                # Блокируем оригинальный поиск Telegram
+                param.setResult(None)
+                
+            except Exception as e:
+                log(f"[MandreSuggestions] Hook error: {e}")
+
+    @staticmethod
+    def _ensure_hook(plugin_instance):
+        global _suggestions_hook_installed
+        if _suggestions_hook_installed: return
+        
+        try:
+            MentionsAdapter = find_class("org.telegram.ui.Adapters.MentionsAdapter")
+            CharSequence = find_class("java.lang.CharSequence")
+            Integer = find_class("java.lang.Integer")
+            ArrayList = find_class("java.util.ArrayList")
+            Boolean = find_class("java.lang.Boolean")
+            
+            # searchUsernameOrHashtag(CharSequence text, int position, ArrayList messages, boolean username, boolean hashtag)
+            method = MentionsAdapter.getClass().getDeclaredMethod(
+                "searchUsernameOrHashtag", 
+                CharSequence, Integer.TYPE, ArrayList, Boolean.TYPE, Boolean.TYPE
+            )
+            
+            plugin_instance.hook_method(method, MandreSuggestions._Hook())
+            _suggestions_hook_installed = True
+            log("[MandreSuggestions] Хук успешно установлен.")
+        except Exception as e:
+            log(f"[MandreSuggestions] Не удалось установить хук: {e}")
+
+class MandreMessages:
+    @staticmethod
+    def get_local(dialog_id: int, limit: int = 100) -> List[Any]:
+        """
+        Мгновенно получает сообщения из локальной базы данных (кэша).
+        Не делает запросов в сеть. Возвращает список объектов TLRPC.Message.
+        Usage: msgs = Mandre.Messages.get_local(dialog_id, 50)
+        """
+        messages = []
+        db = Mandre.sql_get_database()
+        if not db: return messages
+        
+        # Читаем сырой BLOB (data), ID сообщения (mid) и дату для точной сортировки
+        query = f"SELECT data, mid, date FROM messages_v2 WHERE uid = {int(dialog_id)} ORDER BY date DESC LIMIT {int(limit)}"
+        cursor = db.queryFinalized(query)
+        
+        try:
+            while cursor.next():
+                data = cursor.byteBufferValue(0) # NativeByteBuffer
+                if data:
+                    # Десериализация TL-объекта из байтов
+                    msg = TLRPC.Message.TLdeserialize(data, data.readInt32(False), False)
+                    if msg:
+                        # Восстанавливаем критичные поля из колонок БД (быстрее и надежнее)
+                        msg.id = cursor.intValue(1)
+                        msg.date = cursor.intValue(2)
+                        msg.dialog_id = int(dialog_id)
+                        messages.append(msg)
+                    data.reuse() # Обязательно освобождаем память NativeByteBuffer
+        except Exception as e:
+            log(f"[MandreMessages] SQL Error: {e}")
+        finally:
+            cursor.dispose() # Закрываем курсор
+            
+        return messages
+
+
+class _AsyncLoopManager:
+    """
+    Управляет отдельным потоком для AsyncIO Event Loop.
+    Это позволяет запускать асинхронный код, не блокируя UI Telegram.
+    """
+    def __init__(self):
+        self.loop = None
+        self.thread = None
+        self.ready_event = threading.Event()
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self._run_loop, daemon=True, name="MandreAsyncLoop")
+        self.thread.start()
+        # Ждем, пока цикл запустится
+        self.ready_event.wait()
+
+    def _run_loop(self):
+        # Создаем и запускаем новый цикл событий в этом потоке
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.ready_event.set()
+        try:
+            self.loop.run_forever()
+        except Exception as e:
+            log(f"[MandreAsync] Loop crashed: {e}")
+
+    def submit(self, coro):
+        """Отправляет корутину в вечный цикл."""
+        if not self.loop:
+            self.start()
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+_ASYNC_MANAGER = _AsyncLoopManager()
+
+class MandreAsync:
+    """
+    Асинхронный движок MandreLib.
+    Поддерживает: httpx, aiofiles, asyncio, dramatiq.
+    """
+    @staticmethod
+    def ensure_env():
+        """Проверяет и устанавливает httpx, aiofiles и dramatiq."""
+        try:
+            import httpx
+            import aiofiles
+            # import dramatiq # Опционально, можно не импортировать сразу
+            return True
+        except ImportError:
+            BulletinHelper.show_info("Установка Async/IO компонентов...")
+            _, _, site_dir, _ = _mandrelib_get_pip_dirs()
+            _mandrelib_ensure_site_on_path(site_dir)
+            
+            if not _mandrelib_bootstrap_pip():
+                BulletinHelper.show_error("Ошибка Pip Bootstrap")
+                return False
+            
+            success = True
+            for name, url in WHEELS_ASYNC_STACK:
+                try:
+                    __import__(name)
+                    continue
+                except ImportError:
+                    pass
+                
+                log(f"[MandreAsync] Installing {name}...")
+                code, out, err = MandrePip.install(url)
+                if code != 0:
+                    log(f"[MandreAsync] Failed to install {name}: {err}")
+                    success = False
+                    break
+            
+            if success:
+                import importlib
+                importlib.invalidate_caches()
+                BulletinHelper.show_success("Async компоненты установлены! Перезапустите плагины.")
+            else:
+                BulletinHelper.show_error("Ошибка установки компонентов")
+            return success
+
+    @staticmethod
+    def run(coro):
+        """
+        Запускает асинхронную функцию (корутину) в фоновом потоке.
+        Пример: Mandre.Async.run(my_async_func())
+        """
+        return _ASYNC_MANAGER.submit(coro)
+
+    @staticmethod
+    def get_httpx_client():
+        """Возвращает настроенный асинхронный клиент."""
+        try:
+            import httpx
+            return httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        except ImportError:
+            log("[MandreAsync] httpx not installed. Call ensure_env() first.")
+            return None
+
+    @staticmethod
+    def file_open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
+        """
+        Аналог open(), но асинхронный (контекстный менеджер).
+        Пример:
+        async with Mandre.Async.file_open('file.txt', 'w') as f:
+            await f.write("Hello")
+        """
+        try:
+            import aiofiles
+            return aiofiles.open(file, mode, buffering, encoding, errors, newline, closefd, opener)
+        except ImportError:
+            log("[MandreAsync] aiofiles not installed. Call ensure_env().")
+            raise ImportError("aiofiles not installed")
+
+class MandreDecorators:
+    """
+    Модуль декораторов для современного написания плагинов.
+    Поддерживает Smart Argument Parsing.
+    """
+    
+    @staticmethod
+    def command(name: str = None, aliases: List[str] = None, description: str = None):
+        """
+        Декоратор для регистрации команды.
+        Пример:
+        @Mandre.Command(aliases=["hi"])
+        def hello(self, name: str, count: int = 1): ...
+        """
+        def decorator(func):
+            setattr(func, "_mandre_handler_type", "command")
+            setattr(func, "_mandre_cmd_name", name)
+            setattr(func, "_mandre_cmd_aliases", aliases or [])
+            setattr(func, "_mandre_cmd_desc", description)
+            return func
+        return decorator
+
+    @staticmethod
+    def on_message(pattern: str = None, outgoing: bool = True, incoming: bool = False):
+        """
+        Декоратор для перехвата сообщений по Regex.
+        Пример:
+        @Mandre.OnMessage(pattern=r"hello", outgoing=True)
+        def handler(self, message): ...
+        """
+        def decorator(func):
+            setattr(func, "_mandre_handler_type", "regex")
+            setattr(func, "_mandre_regex_pattern", pattern)
+            setattr(func, "_mandre_regex_out", outgoing)
+            setattr(func, "_mandre_regex_in", incoming)
+            return func
+        return decorator
+
+# --- TEXT PARSING ENGINE (Based on Pyrogram) ---
+
+class _TextUtils:
+    @staticmethod
+    def add_surrogates(text):
+        # Telegram считает длину в UTF-16 (Java), Python в Unicode.
+        # Эмодзи в Python = 1 символ, в Java = 2 символа.
+        # Эта функция принудительно разбивает эмодзи на суррогатные пары для корректного подсчета смещения.
+        return re.sub(
+            r"[\U00010000-\U0010FFFF]",
+            lambda match: "".join(
+                chr(i) for i in struct.unpack("<HH", match.group().encode("utf-16le"))
+            ),
+            text
+        )
+
+    @staticmethod
+    def remove_surrogates(text):
+        return text.encode("utf-16", "surrogatepass").decode("utf-16")
+
+    @staticmethod
+    def replace_once(source, old, new, start):
+        return source[:start] + source[start:].replace(old, new, 1)
+
+class _MandreHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = ""
+        self.entities = []
+        self.tag_entities = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        entity = None
+        extra = {}
+
+        if tag in ["b", "strong"]:
+            entity = TLRPC.TL_messageEntityBold
+        elif tag in ["i", "em"]:
+            entity = TLRPC.TL_messageEntityItalic
+        elif tag == "u":
+            entity = TLRPC.TL_messageEntityUnderline
+        elif tag in ["s", "del", "strike"]:
+            entity = TLRPC.TL_messageEntityStrike
+        elif tag == "blockquote":
+            entity = TLRPC.TL_messageEntityBlockquote
+            if "expandable" in attrs:
+                # В текущей схеме TL это флаг collapsed
+                extra["collapsed"] = True 
+        elif tag == "code":
+            entity = TLRPC.TL_messageEntityCode
+        elif tag == "pre":
+            entity = TLRPC.TL_messageEntityPre
+            extra["language"] = attrs.get("language", "")
+        elif tag == "spoiler":
+            entity = TLRPC.TL_messageEntitySpoiler
+        elif tag == "a":
+            url = attrs.get("href", "")
+            if url.startswith("tg://user?id="):
+                entity = TLRPC.TL_inputMessageEntityMentionName
+                try:
+                    extra["user_id"] = TLRPC.TL_inputUser()
+                    extra["user_id"].user_id = int(url.split("=")[1])
+                    extra["user_id"].access_hash = 0 # Hash нужен реальный, но для парсинга сойдет
+                except:
+                    pass
+            else:
+                entity = TLRPC.TL_messageEntityTextUrl
+                extra["url"] = url
+        elif tag == "emoji":
+            entity = TLRPC.TL_messageEntityCustomEmoji
+            try:
+                extra["document_id"] = int(attrs.get("id", 0))
+            except:
+                pass
+        
+        if not entity:
+            return
+
+        if tag not in self.tag_entities:
+            self.tag_entities[tag] = []
+
+        # Создаем экземпляр TL класса
+        tl_obj = entity()
+        tl_obj.offset = len(self.text)
+        tl_obj.length = 0
+        
+        # Применяем доп поля
+        for k, v in extra.items():
+            setattr(tl_obj, k, v)
+            
+        self.tag_entities[tag].append(tl_obj)
+
+    def handle_data(self, data):
+        # Экранирование уже снято HTMLParser'ом
+        # Но для корректной длины в entities нам нужно учитывать суррогаты, если они есть в тексте
+        # data приходит уже с суррогатами из feed()
+        
+        for tag_list in self.tag_entities.values():
+            for entity in tag_list:
+                entity.length += len(data)
+        
+        self.text += data
+
+    def handle_endtag(self, tag):
+        try:
+            if tag in self.tag_entities and self.tag_entities[tag]:
+                self.entities.append(self.tag_entities[tag].pop())
+        except:
+            pass
+
+class MandreText:
+    """
+    Мощный парсер Markdown/HTML в TLRPC Entities.
+    Использует логику Pyrogram адаптированную под Java классы.
+    """
+    
+    # Markdown Definitions
+    BOLD_DELIM = "**"
+    ITALIC_DELIM = "__"
+    UNDERLINE_DELIM = "--"
+    STRIKE_DELIM = "~~"
+    SPOILER_DELIM = "||"
+    CODE_DELIM = "`"
+    PRE_DELIM = "```"
+    BLOCKQUOTE_DELIM = ">"
+    
+    MARKDOWN_RE = re.compile(r"({d})|(!?)\[(.+?)\]\((.+?)\)".format(
+        d="|".join([re.escape(i) for i in [PRE_DELIM, CODE_DELIM, STRIKE_DELIM, UNDERLINE_DELIM, ITALIC_DELIM, BOLD_DELIM, SPOILER_DELIM]])
+    ))
+    
+    @staticmethod
+    def parse(text: str, mode: str = "markdown") -> Dict[str, Any]:
+        """
+        Парсит текст и возвращает словарь {"message": str, "entities": ArrayList}.
+        mode: 'markdown' или 'html'
+        """
+        if mode == "markdown":
+            text = MandreText._parse_markdown_to_html(text)
+        
+        # Парсим HTML (который получился из MD или был передан)
+        parser = _MandreHTMLParser()
+        # Важно: добавляем суррогаты ДО скармливания парсеру, чтобы оффсеты считались как в Java
+        parser.feed(_TextUtils.add_surrogates(text))
+        parser.close()
+        
+        # Собираем Java ArrayList
+        j_entities = ArrayList()
+        # Сортируем по оффсету
+        sorted_entities = sorted(parser.entities, key=lambda e: e.offset)
+        
+        # Фильтруем нулевую длину и добавляем в список
+        for e in sorted_entities:
+            if e.length > 0:
+                j_entities.add(e)
+                
+        # Удаляем суррогаты из итогового текста, чтобы он был нормальным Python string
+        # (Telegram клиент сам добавит их при отправке или отрисовке)
+        final_text = _TextUtils.remove_surrogates(parser.text)
+        
+        return {"message": final_text, "entities": j_entities}
+
+    @staticmethod
+    def _parse_markdown_to_html(text: str) -> str:
+        # Предварительная обработка цитат (простая версия)
+        lines = text.splitlines()
+        new_lines = []
+        in_quote = False
+        for line in lines:
+            if line.startswith(">"):
+                clean_line = line[1:].strip()
+                if not in_quote:
+                    new_lines.append("<blockquote>" + clean_line)
+                    in_quote = True
+                else:
+                    new_lines.append(clean_line)
+            else:
+                if in_quote:
+                    new_lines[-1] += "</blockquote>"
+                    in_quote = False
+                new_lines.append(line)
+        if in_quote: new_lines[-1] += "</blockquote>"
+        text = "\n".join(new_lines)
+
+        # Основной парсинг маркеров
+        text = _TextUtils.add_surrogates(text) # Работаем в пространстве UTF-16 смещений
+        delims = set()
+        is_fixed_width = False
+        
+        # Паттерн для замены URL и EMOJI
+        URL_MARKUP = '<a href="{}">{}</a>'
+        EMOJI_MARKUP = '<emoji id="{}">{}</emoji>'
+        
+        # Вспомогательная функция для замены
+        def replace_at(s, old, new, idx):
+            return s[:idx] + s[idx:].replace(old, new, 1)
+
+        # Итерация по совпадениям
+        # (Упрощенная логика Pyrogram, так как полный перенос требует state machine)
+        # Мы используем замену "на лету", проходя по тексту
+        
+        # Вариант 2: Простой проход регулярками (менее надежно для вложенности, но работает для 90% кейсов)
+        # Используем HTML парсер для финальной сборки, поэтому тут просто конвертим MD -> HTML теги
+        
+        # Bold
+        text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        # Italic
+        text = re.sub(r"\_\_(.+?)\_\_", r"<i>\1</i>", text)
+        # Spoiler
+        text = re.sub(r"\|\|(.+?)\|\|", r"<spoiler>\1</spoiler>", text)
+        # Strike
+        text = re.sub(r"\~\~(.+?)\~\~", r"<s>\1</s>", text)
+        # Monospace (Pre)
+        text = re.sub(r"```([\w]*)\n([\s\S]+?)\n```", r'<pre language="\1">\2</pre>', text)
+        # Monospace (Code)
+        text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
+        # Links [text](url)
+        text = re.sub(r"\[(.+?)\]\((.+?)\)", r'<a href="\2">\1</a>', text)
+        # Custom Emoji [alt](tg://emoji?id=123)
+        text = re.sub(r"\[(.+?)\]\(tg://emoji\?id=(\d+)\)", r'<emoji id="\2">\1</emoji>', text)
+
+        return _TextUtils.remove_surrogates(text)
+
+# --- Глобальные переменные ---
+_LATEST_FRAME = None
+_FRAME_LOCK = threading.Lock()
+
+# Колбэк для Telegram
+class _ServerCallback(dynamic_proxy(Utilities.Callback)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def run(self, arg):
+        try:
+            self.fn(arg)
+        except:
+            pass
+
+# --- Глобальное состояние для стрима ---
+_LATEST_FRAME = None
+_FRAME_LOCK = threading.Lock()
+
+# Импорты для PixelCopy (добавьте это в секцию импортов или внутри класса, если там динамическая загрузка)
+try:
+    PixelCopy = find_class("android.view.PixelCopy")
+    HandlerThread = find_class("android.os.HandlerThread")
+except:
+    PixelCopy = None
+    HandlerThread = None
+
+class _InAppStreamManager:
+    def __init__(self):
+        self.running = False
+        self.width = 480  # Default
+        self.quality = 60 # Default
+        self.fps = 15     # Default
+        self.format = "JPEG" # JPEG or PNG
+        
+        self.thread = None
+        self._reusable_bitmap = None
+        self._handler_thread = None
+        self._pixel_copy_handler = None
+        
+        # Анти-спам логов
+        self._last_error_msg = ""
+        self._last_error_time = 0
+
+    def start(self):
+        if self.running: return
+        self.running = True
+        
+        # Инициализация потока для PixelCopy (Android 8+)
+        if Build.VERSION.SDK_INT >= 26 and PixelCopy:
+            try:
+                self._handler_thread = HandlerThread("PixelCopyHandler")
+                self._handler_thread.start()
+                self._pixel_copy_handler = Handler(self._handler_thread.getLooper())
+            except Exception as e:
+                log(f"[Stream] Failed to init PixelCopy handler: {e}")
+
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        log("[Stream] Started (Optimized)")
+
+    def stop(self):
+        self.running = False
+        if self._handler_thread:
+            try:
+                self._handler_thread.quitSafely()
+            except:
+                self._handler_thread.quit()
+            self._handler_thread = None
+            self._pixel_copy_handler = None
+        
+        # Очистка битмапа
+        if self._reusable_bitmap and not self._reusable_bitmap.isRecycled():
+            self._reusable_bitmap.recycle()
+        self._reusable_bitmap = None
+        log("[Stream] Stopped")
+
+    def update_config(self, cfg):
+        """Thread-safe config update"""
+        try:
+            if 'width' in cfg:
+                w = int(cfg['width'])
+                if w != self.width:
+                    self.width = w
+                    # Reset bitmap to force resize on next frame
+                    if self._reusable_bitmap:
+                        self._reusable_bitmap = None
+            
+            if 'quality' in cfg: self.quality = int(cfg['quality'])
+            if 'fps' in cfg: self.fps = max(1, int(cfg['fps']))
+            if 'format' in cfg: self.format = str(cfg['format']).upper()
+            
+            log(f"[Stream] Config updated: {self.width}px, {self.fps}fps, {self.format} {self.quality}%")
+        except Exception as e:
+            log(f"[Stream] Config error: {e}")
+
+    def get_config(self):
+        return {
+            "width": self.width,
+            "quality": self.quality,
+            "fps": self.fps,
+            "format": self.format
+        }
+
+    def _log_error_throttled(self, msg):
+        now = time.time()
+        if msg != self._last_error_msg or (now - self._last_error_time) > 5.0:
+            log(f"[Stream Error] {msg}")
+            self._last_error_msg = msg
+            self._last_error_time = now
+
+    def _loop(self):
+        while self.running:
+            t_start = time.time()
+            
+            try:
+                bmp = self._capture_ui_frame()
+                
+                if bmp:
+                    stream = ByteArrayOutputStream()
+                    
+                    # Choose format
+                    fmt = Bitmap.CompressFormat.JPEG
+                    if self.format == "PNG":
+                        fmt = Bitmap.CompressFormat.PNG
+                        # PNG ignores quality usually, but 100 is safe
+                    
+                    # Compress
+                    bmp.compress(fmt, self.quality, stream)
+                    
+                    java_bytes = stream.toByteArray()
+                    py_bytes = bytes(java_bytes)
+                    
+                    with _FRAME_LOCK:
+                        global _LATEST_FRAME
+                        _LATEST_FRAME = py_bytes
+                    
+                    stream.close()
+                    self._last_error_msg = "" 
+                
+            except Exception as e:
+                self._log_error_throttled(str(e))
+            
+            # Dynamic FPS Sleep
+            dt = time.time() - t_start
+            target_delay = 1.0 / self.fps
+            sleep_time = max(0, target_delay - dt)
+            time.sleep(sleep_time)
+
+    def _capture_ui_frame(self):
+        frag = get_last_fragment()
+        if not frag: return None
+        act = frag.getParentActivity()
+        if not act or act.isFinishing(): return None
+        
+        window = act.getWindow()
+        if not window: return None
+        
+        decor_view = window.getDecorView()
+        w = decor_view.getWidth()
+        h = decor_view.getHeight()
+        if w <= 0 or h <= 0: return None
+
+        # Scaling
+        scale = self.width / float(w)
+        dest_w = self.width
+        dest_h = int(h * scale)
+
+        # Prepare Bitmap (Reuse if possible)
+        if (self._reusable_bitmap is None or 
+            self._reusable_bitmap.isRecycled() or 
+            self._reusable_bitmap.getWidth() != dest_w or 
+            self._reusable_bitmap.getHeight() != dest_h):
+            
+            if self._reusable_bitmap and not self._reusable_bitmap.isRecycled():
+                self._reusable_bitmap.recycle()
+            
+            try:
+                self._reusable_bitmap = Bitmap.createBitmap(dest_w, dest_h, Bitmap.Config.ARGB_8888)
+            except OutOfMemoryError:
+                self._log_error_throttled("OOM creating bitmap")
+                return None
+
+        # METHOD A: PixelCopy
+        if Build.VERSION.SDK_INT >= 26 and PixelCopy and self._pixel_copy_handler:
+            result_signal = threading.Event()
+            
+            class OnCopyFinished(dynamic_proxy(PixelCopy.OnPixelCopyFinishedListener)):
+                def onPixelCopyFinished(self, result):
+                    result_signal.set()
+
+            try:
+                PixelCopy.request(window, self._reusable_bitmap, OnCopyFinished(), self._pixel_copy_handler)
+                if not result_signal.wait(0.2):
+                    self._log_error_throttled("PixelCopy timeout")
+                    return None
+                return self._reusable_bitmap
+            except Exception as e:
+                self._log_error_throttled(f"PixelCopy failed: {e}")
+        
+        # METHOD B: Canvas Fallback
+        ui_latch = threading.Event()
+        def ui_draw_task():
+            try:
+                canvas = Canvas(self._reusable_bitmap)
+                canvas.scale(scale, scale)
+                decor_view.draw(canvas)
+            except Exception as e:
+                pass
+            finally:
+                ui_latch.set()
+
+        run_on_ui_thread(ui_draw_task)
+        if ui_latch.wait(0.2):
+            return self._reusable_bitmap
+        
+        return None
+
+_STREAM_MANAGER = _InAppStreamManager()
+
+# Сервер
+class _MandreServerCore:
+    def __init__(self):
+        self.server = None
+        self.clients = set()
+        self.running = False
+        self.port = 5555
+
+    async def start(self):
+        if self.running: return
+        try:
+            self.server = await asyncio.start_server(self.handle_client, '0.0.0.0', self.port)
+            self.running = True
+            self._announce_ip()
+            async with self.server:
+                await self.server.serve_forever()
+        except Exception as e:
+            log(f"[Server] Start Error: {e}")
+            self.running = False
+
+    def _announce_ip(self):
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            run_on_ui_thread(lambda: BulletinHelper.show_success(f"API: http://{ip}:{self.port}"))
+        except: pass
+
+    def stop(self):
+        if self.server:
+            self.server.close()
+            self.running = False
+        if _STREAM_MANAGER.running:
+            run_on_ui_thread(_STREAM_MANAGER.stop)
+
+    async def handle_client(self, reader, writer):
+        try:
+            line = await reader.readline()
+            if not line: return
+            parts = line.decode().strip().split()
+            if len(parts) < 2: return
+            method, full_path = parts[0], parts[1]
+            
+            path_parts = full_path.split('?', 1)
+            path = path_parts[0]
+            query_string = path_parts[1] if len(path_parts) > 1 else ""
+            query_params = {}
+            if query_string:
+                for pair in query_string.split('&'):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        query_params[k] = v
+
+            content_length = 0
+            while True:
+                line = await reader.readline()
+                if not line or line == b'\r\n': break
+                s = line.decode().lower()
+                if s.startswith("content-length:"):
+                    content_length = int(s.split(":")[1].strip())
+
+            body_bytes = b""
+            if content_length > 0:
+                body_bytes = await reader.readexactly(content_length)
+
+            if method == 'OPTIONS':
+                await self.send_cors(writer)
+                return
+
+            # --- API ---
+
+            if path == '/api/stream':
+                await self.handle_mjpeg_stream(writer)
+                return
+            
+            elif path == '/api/stream/start' and method == 'POST':
+                _STREAM_MANAGER.start()
+                await self.resp_json(writer, {"status": "started"})
+
+            elif path == '/api/stream/stop' and method == 'POST':
+                _STREAM_MANAGER.stop()
+                await self.resp_json(writer, {"status": "stopped"})
+
+            # NEW: Settings Endpoints
+            elif path == '/api/stream/settings' and method == 'GET':
+                await self.resp_json(writer, _STREAM_MANAGER.get_config())
+
+            elif path == '/api/stream/settings' and method == 'POST':
+                try:
+                    data = json.loads(body_bytes.decode())
+                    _STREAM_MANAGER.update_config(data)
+                    await self.resp_json(writer, {"status": "updated"})
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/logs/stream':
+                await self.handle_sse(writer)
+                return
+
+            elif path == '/api/status':
+                await self.resp_json(writer, {
+                    "status": "running",
+                    "version": __version__,
+                    "device": MandreDevice.get_simple_info(),
+                    "streaming": _STREAM_MANAGER.running
+                })
+
+            elif path == '/api/plugins':
+                try:
+                    pc = PluginsController.getInstance()
+                    java_list = ArrayList(pc.plugins.values())
+                    py_plugins = list(java_list.toArray())
+                    plugins_json = []
+                    for p in py_plugins:
+                        try:
+                            meta = {
+                                "id": str(p.getId()),
+                                "name": str(p.getName()),
+                                "version": str(p.getVersion() or "0.0"),
+                                "enabled": bool(p.isEnabled()),
+                                "path": str(pc.getPluginPath(p.getId()))
+                            }
+                            plugins_json.append(meta)
+                        except: pass
+                    await self.resp_json(writer, {"plugins": plugins_json})
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/plugins/download' and method == 'GET':
+                try:
+                    pid = query_params.get("id")
+                    pc = PluginsController.getInstance()
+                    if not pid or not pc.plugins.containsKey(pid):
+                        await self.resp_error(writer, "Plugin not found")
+                        return
+                    fpath = pc.getPluginPath(pid)
+                    with open(fpath, 'rb') as f: content = f.read()
+                    fname = os.path.basename(fpath)
+                    h = (f"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"{fname}\"\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(content)}\r\n\r\n").encode()
+                    writer.write(h)
+                    writer.write(content)
+                    await writer.drain()
+                    writer.close()
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/plugins/delete' and method == 'POST':
+                try:
+                    data = json.loads(body_bytes.decode())
+                    pid = data.get("id")
+                    run_on_ui_thread(lambda: PluginsController.getInstance().deletePlugin(pid, _ServerCallback(lambda x: None)))
+                    await self.resp_json(writer, {"status": "deleted", "id": pid})
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/plugins/upload' and method == 'POST':
+                try:
+                    data = json.loads(body_bytes.decode())
+                    fname = data.get("filename", "upload.plugin")
+                    content = data.get("content")
+                    cache_dir = str(ApplicationLoader.applicationContext.getCacheDir())
+                    temp_file = os.path.join(cache_dir, fname)
+                    with open(temp_file, "w", encoding="utf-8") as f: f.write(content)
+                    
+                    def install():
+                        pc = PluginsController.getInstance()
+                        engine = pc.engines.get("python")
+                        cb = _ServerCallback(lambda e: BulletinHelper.show_error(f"Err: {e}") if e else BulletinHelper.show_success(f"Updated: {fname}"))
+                        engine.loadPluginFromFile(temp_file, None, cb)
+                    run_on_ui_thread(install)
+                    await self.resp_json(writer, {"status": "installed"})
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/plugins/hot-reload' and method == 'POST':
+                try:
+                    data = json.loads(body_bytes.decode())
+                    pid = data.get("id")
+                    content = data.get("content") # Исходный код плагина
+                    
+                    if not pid or not content:
+                        await self.resp_error(writer, "Missing id or content")
+                        return
+
+                    # Запускаем Hot Reload
+                    # Поскольку hot_reload работает с UI и внутренностями, запускаем в run_on_ui_thread 
+                    # или просто синхронно, но он сам внутри использует run_on_ui_thread для UI части.
+                    # Но доступ к engine лучше делать из основного потока или синхронизированно.
+                    
+                    # Создаем Future или Event для ожидания результата (упрощенно - просто запускаем)
+                    success = [False]
+                    done_event = threading.Event()
+
+                    def do_reload():
+                        success[0] = MandreReloader.hot_reload(pid, content)
+                        done_event.set()
+                    
+                    # Лучше выполнить это в очереди плагинов или UI, чтобы избежать гонок с Engine
+                    run_on_ui_thread(do_reload)
+                    
+                    # Ждем немного (макс 2 сек), чтобы вернуть статус
+                    done_event.wait(2.0)
+
+                    if success[0]:
+                        await self.resp_json(writer, {"status": "reloaded"})
+                    else:
+                        await self.resp_json(writer, {"status": "failed", "error": "Check logs"})
+                        
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/deeplink' and method == 'POST':
+                try:
+                    data = json.loads(body_bytes.decode())
+                    link = data.get("url")
+                    if link.startswith("t.me"): link = "https://" + link
+                    def open_intent():
+                        try:
+                            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+                            intent = Intent(Intent.ACTION_VIEW, Uri.parse(link))
+                            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            intent.setClass(ApplicationLoader.applicationContext, LaunchActivity)
+                            ApplicationLoader.applicationContext.startActivity(intent)
+                        except: pass
+                    run_on_ui_thread(open_intent)
+                    await self.resp_json(writer, {"status": "opened"})
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            elif path == '/api/chat/send' and method == 'POST':
+                try:
+                    data = json.loads(body_bytes.decode())
+                    text = data.get("text", "")
+                    res = {"s": 0, "e": ""}
+                    evt = threading.Event()
+                    def send():
+                        try:
+                            frag = get_last_fragment()
+                            if not frag or not hasattr(frag, "getDialogId"):
+                                res["s"]=400; res["e"]="No chat"
+                                return
+                            
+                            if text:
+                                p = SendMessagesHelper.SendMessageParams()
+                                p.peer = frag.getDialogId()
+                                p.message = text
+                                SendMessagesHelper.getInstance(frag.getCurrentAccount()).sendMessage(p)
+                                res["s"]=200
+                            else:
+                                res["s"]=400
+                        except Exception as ex:
+                            res["s"]=500; res["e"]=str(ex)
+                        finally:
+                            evt.set()
+                    
+                    run_on_ui_thread(send)
+                    evt.wait(5.0)
+                    
+                    if res["s"]==200:
+                        await self.resp_json(writer, {"status":"sent"})
+                    else:
+                        await self.resp_json(writer, {"error": res["e"]})
+                except Exception as e:
+                    await self.resp_error(writer, str(e))
+
+            else:
+                writer.write(b"HTTP/1.1 404 Not Found\r\n\r\n")
+                await writer.drain()
+                writer.close()
+
+        except Exception:
+            try:
+                writer.close()
+            except:
+                pass
+
+    # --- Helpers ---
+
+    async def handle_mjpeg_stream(self, writer):
+        if not _STREAM_MANAGER.running:
+            _STREAM_MANAGER.start()
+        
+        boundary = "mandreframe"
+        writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary={boundary}\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n".encode())
+        await writer.drain()
+        
+        try:
+            while True:
+                if not _STREAM_MANAGER.running:
+                    await asyncio.sleep(1)
+                    continue
+                
+                frame = None
+                with _FRAME_LOCK:
+                    if _LATEST_FRAME:
+                        frame = _LATEST_FRAME
+                
+                if frame:
+                    # MIME type depends on format
+                    mime = "image/png" if _STREAM_MANAGER.format == "PNG" else "image/jpeg"
+                    writer.write(f"--{boundary}\r\nContent-Type: {mime}\r\nContent-Length: {len(frame)}\r\n\r\n".encode())
+                    writer.write(frame)
+                    writer.write(b"\r\n")
+                    await writer.drain()
+                
+                await asyncio.sleep(1.0 / _STREAM_MANAGER.fps)
+        except:
+            pass
+        finally:
+            try: writer.close()
+            except: pass
+
+    async def handle_sse(self, writer):
+        writer.write(b"HTTP/1.1 200 OK\r\n")
+        writer.write(b"Content-Type: text/event-stream\r\n")
+        writer.write(b"Cache-Control: no-cache\r\n")
+        writer.write(b"Connection: keep-alive\r\n")
+        writer.write(b"Access-Control-Allow-Origin: *\r\n\r\n")
+        await writer.drain()
+        q = asyncio.Queue()
+        self.clients.add(q)
+        try:
+            while True:
+                msg = await q.get()
+                data = f"data: {json.dumps({'m': msg, 't': time.time()})}\n\n".encode('utf-8')
+                writer.write(data)
+                await writer.drain()
+        except: pass
+        finally:
+            self.clients.remove(q)
+            try: writer.close()
+            except: pass
+
+    async def send_cors(self, writer):
+        writer.write(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    async def resp_json(self, writer, data):
+        b = json.dumps(data).encode()
+        writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(b)}\r\n\r\n".encode() + b)
+        await writer.drain()
+        writer.close()
+
+    async def resp_error(self, writer, msg):
+        await self.resp_json(writer, {"error": str(msg)})
+
+    def broadcast(self, msg):
+        if not self.clients or not _ASYNC_MANAGER.loop: return
+        for q in list(self.clients):
+            try: _ASYNC_MANAGER.loop.call_soon_threadsafe(q.put_nowait, msg)
+            except: pass
+
+_MANDRE_SERVER = _MandreServerCore()
+
+class MandreReflect:
+    """
+    Утилита для рефлексии. Исправлена работа со статическими классами.
+    """
+    @staticmethod
+    def _to_java_class(target: Any) -> Any:
+        """
+        Преобразует объект или Python-обертку класса в java.lang.Class.
+        """
+        try:
+            # 1. Если это Python-обертка над Java классом (например, BuildVars)
+            if isinstance(target, type):
+                # В Chaquopy у оберток есть скрытое поле class_, содержащее java.lang.Class
+                if hasattr(target, 'class_'):
+                    return target.class_
+                # Фолбек: пытаемся найти класс по имени, если class_ нет
+                if hasattr(target, '__name__'):
+                    try:
+                        return find_class("java.lang.Class").forName(target.__name__)
+                    except: pass
+            
+            # 2. Если это уже java.lang.Class (например, int.class)
+            # (Проверяем через строковое имя класса, чтобы не импортировать лишнее)
+            if str(target.getClass().getName()) == "java.lang.Class":
+                return target
+
+            # 3. Если это обычный экземпляр объекта (например, UserConfig.getInstance(0))
+            if hasattr(target, "getClass"):
+                return target.getClass()
+                
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def get_field(target: Any, field_name: str) -> Any:
+        """Получает поле (в том числе приватное/статическое)."""
+        try:
+            # Получаем java.lang.Class для итерации
+            cls = MandreReflect._to_java_class(target)
+            if cls is None:
+                log(f"[MandreReflect] Не удалось получить класс для {target}")
+                return None
+
+            # Определяем, статический доступ или нет
+            # Если target это тип (класс), то instance = None
+            instance = None if isinstance(target, type) else target
+
+            while cls is not None:
+                try:
+                    f = cls.getDeclaredField(field_name)
+                    f.setAccessible(True)
+                    return f.get(instance)
+                except Exception:
+                    # Идем вверх по иерархии
+                    cls = cls.getSuperclass()
+            
+            log(f"[MandreReflect] Поле '{field_name}' не найдено.")
+            return None
+        except Exception as e:
+            log(f"[MandreReflect] Ошибка get_field '{field_name}': {e}")
+            return None
+
+    @staticmethod
+    def set_field(target: Any, field_name: str, value: Any) -> bool:
+        """Устанавливает поле."""
+        try:
+            cls = MandreReflect._to_java_class(target)
+            if cls is None: return False
+            
+            instance = None if isinstance(target, type) else target
+
+            while cls is not None:
+                try:
+                    f = cls.getDeclaredField(field_name)
+                    f.setAccessible(True)
+                    f.set(instance, value)
+                    return True
+                except Exception:
+                    cls = cls.getSuperclass()
+            return False
+        except Exception as e:
+            log(f"[MandreReflect] Ошибка set_field '{field_name}': {e}")
+            return False
+
+    @staticmethod
+    def invoke(target: Any, method_name: str, *args, arg_types: List[Any] = None) -> Any:
+        """Вызывает метод."""
+        try:
+            cls = MandreReflect._to_java_class(target)
+            if cls is None: return None
+            
+            instance = None if isinstance(target, type) else target
+
+            # Если типы не даны, ищем первый попавшийся метод с таким именем и кол-вом аргументов
+            if arg_types is None:
+                curr_cls = cls
+                while curr_cls is not None:
+                    try:
+                        for m in curr_cls.getDeclaredMethods():
+                            if m.getName() == method_name and len(m.getParameterTypes()) == len(args):
+                                m.setAccessible(True)
+                                return m.invoke(instance, *args)
+                    except: pass
+                    curr_cls = curr_cls.getSuperclass()
+                # Сбрасываем для точного поиска, если "умный" не сработал
+                cls = MandreReflect._to_java_class(target)
+
+            # Точный поиск
+            while cls is not None:
+                try:
+                    if arg_types is None: 
+                        # Если arg_types все еще None, значит автоматика не нашла. 
+                        # Тут мы скорее всего упадем, но попробуем без типов (редко работает в Java)
+                        log(f"[MandreReflect] Метод {method_name} не найден автопоиском, укажите arg_types.")
+                        return None
+                    
+                    m = cls.getDeclaredMethod(method_name, arg_types)
+                    m.setAccessible(True)
+                    return m.invoke(instance, *args)
+                except Exception:
+                    cls = cls.getSuperclass()
+            return None
+        except Exception as e:
+            log(f"[MandreReflect] Ошибка invoke '{method_name}': {e}")
+            return None
+
+class MandreSecurity:
+    """
+    Модуль безопасности: отправка файла боту @PluginSecurity_bot.
+    """
+    BOT_ID = 8136793598
+    
+    @staticmethod
+    def scan_file(file_path: str):
+        def task():
+            try:
+                if not os.path.exists(file_path):
+                    BulletinHelper.show_error("Файл не найден!")
+                    return
+
+                # 1. Получаем AccountInstance
+                from org.telegram.messenger import SendMessagesHelper, UserConfig
+                AccountInstanceClass = find_class("org.telegram.messenger.AccountInstance")
+                current_account = UserConfig.selectedAccount
+                account_instance = AccountInstanceClass.getInstance(current_account)
+
+                # 2. Отправка через prepareSendingDocument (18 аргументов)
+                # Сигнатура из твоего файла:
+                # (AccountInstance, String path, String originalPath, Uri, String name, String mime, long dialogId, ...)
+                SendMessagesHelper.prepareSendingDocument(
+                    account_instance,           # 1. AccountInstance
+                    file_path,                  # 2. path
+                    file_path,                  # 3. originalPath
+                    None,                       # 4. Uri
+                    None,                       # 5. name
+                    "application/octet-stream", # 6. mime
+                    MandreSecurity.BOT_ID,      # 7. dialog_id (long)
+                    None,                       # 8. replyToMsg
+                    None,                       # 9. replyToTopMsg
+                    None,                       # 10. StoryItem
+                    None,                       # 11. ReplyQuote
+                    None,                       # 12. MessageObject
+                    True,                       # 13. boolean z (grouping?)
+                    0,                          # 14. int i (schedule/ttl)
+                    None,                       # 15. InputContentInfoCompat
+                    None,                       # 16. quick_reply_shortcut
+                    0,                          # 17. quick_reply_shortcut_id
+                    False                       # 18. boolean z2
+                )
+
+                fragment = get_last_fragment()
+                if fragment:
+                    Bundle = find_class("android.os.Bundle")
+                    ChatActivity = find_class("org.telegram.ui.ChatActivity")
+                    if Bundle and ChatActivity:
+                        args = Bundle()
+                        args.putLong("user_id", MandreSecurity.BOT_ID)
+                        fragment.presentFragment(ChatActivity(args))
+                    
+                BulletinHelper.show_success("Файл отправлен на проверку!")
+                
+            except Exception as e:
+                log(f"[MandreSecurity] Ошибка: {e}")
+                BulletinHelper.show_error(f"Ошибка отправки: {e}")
+        
+        run_on_ui_thread(task)
+
+# --- Внутреннее состояние для STT ---
+class _STTState:
+    recognizer = None
+    listening = False
+    listener = None
+
+_STT_STATE = _STTState()
+
+class _MandreRecognitionListener(dynamic_proxy(RecognitionListener)):
+    def __init__(self, on_result, on_error, on_partial=None):
+        super().__init__()
+        self.on_result = on_result
+        self.on_error = on_error
+        self.on_partial = on_partial
+
+    def onReadyForSpeech(self, params):
+        pass
+
+    def onBeginningOfSpeech(self):
+        log("[MandreSTT] Начало речи detected")
+
+    def onRmsChanged(self, rmsdB):
+        pass
+
+    def onBufferReceived(self, buffer):
+        pass
+
+    def onEndOfSpeech(self):
+        log("[MandreSTT] Конец речи")
+
+    def onError(self, error):
+        _STT_STATE.listening = False
+        msgs = {
+            1: "Network Timeout",
+            2: "Network Error",
+            3: "Audio Error",
+            4: "Server Error",
+            5: "Client Error",
+            6: "Speech Timeout",
+            7: "No Match",
+            8: "Recognizer Busy",
+            9: "Insufficient Permissions",
+            10: "Too Many Requests",
+            11: "Server Disconnected",
+            12: "Language Not Supported"
+        }
+        msg = msgs.get(error, f"Unknown Error ({error})")
+        log(f"[MandreSTT] Ошибка распознавания: {msg}")
+        if self.on_error:
+            run_on_ui_thread(lambda: self.on_error(msg))
+
+    def onResults(self, results):
+        _STT_STATE.listening = False
+        matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+        if matches and matches.size() > 0:
+            text = str(matches.get(0))
+            log(f"[MandreSTT] Распознано: {text}")
+            if self.on_result:
+                run_on_ui_thread(lambda: self.on_result(text))
+        else:
+            if self.on_error:
+                run_on_ui_thread(lambda: self.on_error("No results found"))
+
+    def onPartialResults(self, partialResults):
+        if self.on_partial:
+            matches = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if matches and matches.size() > 0:
+                text = str(matches.get(0))
+                run_on_ui_thread(lambda: self.on_partial(text))
+
+    def onEvent(self, eventType, params):
+        pass
+
+class MandreSTT:
+    """
+    Модуль для распознавания речи (Speech-to-Text).
+    Требует разрешения RECORD_AUDIO (обычно есть у Telegram).
+    """
+    
+    @staticmethod
+    def is_available() -> bool:
+        """Проверяет наличие сервиса распознавания речи на устройстве."""
+        try:
+            ctx = ApplicationLoader.applicationContext
+            return SpeechRecognizer.isRecognitionAvailable(ctx)
+        except:
+            return False
+
+    @staticmethod
+    def listen(on_result: Callable[[str], None], 
+               on_error: Callable[[str], None] = None, 
+               lang: str = None, 
+               prompt: str = None,
+               partial_results: bool = False):
+        """
+        Запускает прослушивание.
+        :param on_result: Колбэк с итоговым текстом (str)
+        :param on_error: Колбэк с текстом ошибки (str)
+        :param lang: Код языка (например, "ru-RU", "en-US"). Если None - язык системы.
+        :param prompt: Текст подсказки (не везде отображается).
+        :param partial_results: Если True, будет вызывать on_result для частичных результатов (экспериментально).
+        """
+        
+        def runner():
+            try:
+                ctx = ApplicationLoader.applicationContext
+                if not SpeechRecognizer.isRecognitionAvailable(ctx):
+                    if on_error: on_error("STT Service not available on device")
+                    return
+
+                # Очистка предыдущего инстанса
+                if _STT_STATE.recognizer:
+                    try:
+                        _STT_STATE.recognizer.destroy()
+                    except: pass
+                    _STT_STATE.recognizer = None
+
+                _STT_STATE.recognizer = SpeechRecognizer.createSpeechRecognizer(ctx)
+                
+                # Настройка слушателя
+                # Если partial_results=True, используем on_result и для частичных, иначе None
+                partial_cb = on_result if partial_results else None 
+                _STT_STATE.listener = _MandreRecognitionListener(on_result, on_error, partial_cb)
+                _STT_STATE.recognizer.setRecognitionListener(_STT_STATE.listener)
+
+                # Настройка интента
+                intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, ctx.getPackageName())
+                
+                if lang:
+                    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+                else:
+                    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toString())
+
+                if prompt:
+                    intent.putExtra(RecognizerIntent.EXTRA_PROMPT, prompt)
+                
+                if partial_results:
+                    intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, True)
+
+                # Запуск
+                log(f"[MandreSTT] Запуск слушателя (lang={lang or 'default'})...")
+                _STT_STATE.recognizer.startListening(intent)
+                _STT_STATE.listening = True
+                
+            except Exception as e:
+                log(f"[MandreSTT] Start error: {traceback.format_exc()}")
+                if on_error: on_error(str(e))
+
+        run_on_ui_thread(runner)
+
+    @staticmethod
+    def stop():
+        """Останавливает прослушивание."""
+        def runner():
+            if _STT_STATE.recognizer:
+                try:
+                    _STT_STATE.recognizer.stopListening()
+                    log("[MandreSTT] Stopped listening.")
+                except Exception as e:
+                    log(f"[MandreSTT] Stop error: {e}")
+                _STT_STATE.listening = False
+        run_on_ui_thread(runner)
+        
+    @staticmethod
+    def destroy():
+        """Полностью уничтожает инстанс распознавателя."""
+        def runner():
+            if _STT_STATE.recognizer:
+                try:
+                    _STT_STATE.recognizer.destroy()
+                    _STT_STATE.recognizer = None
+                    log("[MandreSTT] Destroyed.")
+                except: pass
+                _STT_STATE.listening = False
+        run_on_ui_thread(runner)
+
+class MandreReloader:
+    """
+    Модуль для горячей перезагрузки (Hot Reload).
+    Исправлена ошибка NameError за счет объединения областей видимости.
+    """
+    @staticmethod
+    def hot_reload(plugin_id: str, source_code: str) -> bool:
+        try:
+            # 1. Получаем доступ к движку
+            pc = PluginsController.getInstance()
+            engine = pc.engines.get("python")
+            
+            if not engine or not hasattr(engine, "pluginInstances"):
+                log("[MandreReloader] Engine not found.")
+                return False
+
+            # Получаем живой экземпляр
+            plugin_instance = engine.pluginInstances.get(plugin_id)
+            
+            if not plugin_instance:
+                log(f"[MandreReloader] Плагин {plugin_id} не запущен.")
+                return False
+
+            # 2. Подготавливаем окружение
+            # ВАЖНО: Копируем текущие глобальные переменные (чтобы работали BasePlugin и т.д.)
+            # И используем этот же словарь как locals. Это решает проблему с видимостью
+            # переменных (Event, импорты) внутри классов плагина.
+            scope = globals().copy()
+            
+            # Очищаем __name__, чтобы скрипт выполнялся как __main__ или изолированный модуль
+            scope['__name__'] = f"__hot_reload_{plugin_id}__"
+            
+            # 3. Выполняем новый код
+            try:
+                # Передаем scope и как globals, и как locals
+                exec(source_code, scope, scope)
+            except Exception as e:
+                log(f"[MandreReloader] Ошибка компиляции ({plugin_id}): {e}")
+                # Выводим детальный трейс в лог для отладки синтаксиса
+                log(traceback.format_exc())
+                return False
+
+            # 4. Ищем новый класс плагина в scope
+            new_plugin_class = None
+            
+            # Сначала ищем класс, имя которого совпадает с именем класса живого инстанса
+            current_class_name = plugin_instance.__class__.__name__
+            if current_class_name in scope:
+                candidate = scope[current_class_name]
+                if isinstance(candidate, type) and issubclass(candidate, BasePlugin):
+                    new_plugin_class = candidate
+            
+            # Если не нашли по имени, ищем любой наследник BasePlugin (как раньше)
+            if not new_plugin_class:
+                for name, obj in scope.items():
+                    if isinstance(obj, type) and issubclass(obj, BasePlugin) and obj is not BasePlugin:
+                        # Исключаем сам импортированный BasePlugin, если он там есть
+                        if obj.__module__ == 'base_plugin': 
+                             continue
+                        new_plugin_class = obj
+                        log(f"[MandreReloader] Найден класс плагина: {name}")
+                        break
+            
+            if not new_plugin_class:
+                log("[MandreReloader] В новом коде не найден класс плагина.")
+                return False
+
+            # 5. HOT SWAP: Обновляем методы
+            import types
+            updated_count = 0
+            
+            for attr_name, attr_value in new_plugin_class.__dict__.items():
+                # Игнорируем магические методы, кроме init (хотя init менять бесполезно для уже созданного объекта)
+                if attr_name.startswith("__") and attr_name != "__init__":
+                    continue
+                
+                if isinstance(attr_value, types.FunctionType):
+                    # Привязываем метод к живому экземпляру
+                    bound_method = types.MethodType(attr_value, plugin_instance)
+                    setattr(plugin_instance, attr_name, bound_method)
+                    updated_count += 1
+            
+            log(f"[MandreReloader] Обновлено {updated_count} методов для {plugin_id}")
+
+            # 6. Обновляем UI
+            def refresh_task():
+                try:
+                    # Обновляем кэш настроек в Java-контроллере (вызовет новый create_settings)
+                    PluginsController.getInstance().loadPluginSettings(plugin_id)
+                    
+                    # Обновляем экран, если пользователь сейчас в настройках
+                    fragment = get_last_fragment()
+                    if fragment and "PluginSettingsActivity" in str(fragment.getClass().getName()):
+                         Mandre.apply_and_refresh_settings(plugin_instance)
+                    
+                    BulletinHelper.show_success(f"Hot Reload: {plugin_id} обновлен!")
+                except Exception as e:
+                    log(f"[MandreReloader] Ошибка UI: {e}")
+
+            run_on_ui_thread(refresh_task)
+            return True
+
+        except Exception as e:
+            log(f"[MandreReloader] Критическая ошибка: {traceback.format_exc()}")
+            return False
+
+# --- Animation Imports ---
+# Глобальные переменные для хранения классов
+_TransManager = None
+_TransSet = None
+_AutoTrans = None
+_ChangeBounds = None
+_Fade = None
+_Slide = None
+_ChangeTransform = None
+_SpringAnim = None
+_SpringForce = None
+_DynAnim = None
+
+# Стандартные андроидовские (всегда есть)
+try:
+    ViewPropertyAnimator = find_class("android.view.ViewPropertyAnimator")
+    ObjectAnimator = find_class("android.animation.ObjectAnimator")
+    AnimatorSet = find_class("android.animation.AnimatorSet")
+    DecelerateInterpolator = find_class("android.view.animation.DecelerateInterpolator")
+    OvershootInterpolator = find_class("android.view.animation.OvershootInterpolator")
+    BounceInterpolator = find_class("android.view.animation.BounceInterpolator")
+    LinearInterpolator = find_class("android.view.animation.LinearInterpolator")
+    LayoutTransition = find_class("android.animation.LayoutTransition")
+except: pass
+
+# Попытка загрузить AndroidX или Native Transitions
+# Попытка загрузить AndroidX или Native Transitions
+def _init_anim_classes():
+    global _TransManager, _TransSet, _AutoTrans, _ChangeBounds, _Fade, _Slide, _ChangeTransform
+    global _SpringAnim, _SpringForce, _DynAnim
+
+    # 1. Сначала пробуем Native Android Transitions (Встроены в Android, не вызывают ошибок в логах)
+    try:
+        _TransManager = find_class("android.transition.TransitionManager")
+        _TransSet = find_class("android.transition.TransitionSet")
+        _AutoTrans = find_class("android.transition.AutoTransition")
+        _ChangeBounds = find_class("android.transition.ChangeBounds")
+        _Fade = find_class("android.transition.Fade")
+        _Slide = find_class("android.transition.Slide")
+        _ChangeTransform = find_class("android.transition.ChangeTransform")
+        # Если нашли нативные, AndroidX искать не нужно
+        return
+    except Exception:
+        pass
+
+    # 2. Если нативные не найдены, пробуем AndroidX (Fallback)
+    try:
+        _TransManager = find_class("androidx.transition.TransitionManager")
+        _TransSet = find_class("androidx.transition.TransitionSet")
+        _AutoTrans = find_class("androidx.transition.AutoTransition")
+        _ChangeBounds = find_class("androidx.transition.ChangeBounds")
+        _Fade = find_class("androidx.transition.Fade")
+        _Slide = find_class("androidx.transition.Slide")
+        _ChangeTransform = find_class("androidx.transition.ChangeTransform")
+    except Exception:
+        # log(f"[MandreAnimation] No Transitions available: {e}")
+        pass
+
+    # 3. Пробуем Dynamic Animation (Springs)
+    try:
+        _SpringAnim = find_class("androidx.dynamicanimation.animation.SpringAnimation")
+        _SpringForce = find_class("androidx.dynamicanimation.animation.SpringForce")
+        _DynAnim = find_class("androidx.dynamicanimation.animation.DynamicAnimation")
+    except Exception:
+        pass
+
+# Инициализируем при загрузке
+_init_anim_classes()
+
+class MandreAnimation:
+    """
+    Мощный хелпер для анимаций с автоматическими фолбэками.
+    """
+
+    # --- 1. LAYOUT TRANSITIONS ---
+    @staticmethod
+    def magic_layout(view_group, duration: int = 300, type: str = "auto", ease: str = "standard"):
+        try:
+            if not view_group: return
+
+            # Если TransitionManager найден (AndroidX или Native)
+            if _TransManager and _AutoTrans:
+                transition = None
+                
+                if type == "auto": transition = _AutoTrans()
+                elif type == "bounds" and _ChangeBounds: transition = _ChangeBounds()
+                elif type == "fade" and _Fade: transition = _Fade()
+                elif type == "slide" and _Slide: transition = _Slide()
+                elif type == "transform" and _ChangeTransform: transition = _ChangeTransform()
+                elif type == "complex" and _TransSet:
+                    transition = _TransSet()
+                    if _ChangeBounds: transition.addTransition(_ChangeBounds())
+                    if _Fade: transition.addTransition(_Fade())
+                    if _ChangeTransform: transition.addTransition(_ChangeTransform())
+                
+                if not transition: transition = _AutoTrans()
+
+                transition.setDuration(int(duration))
+                
+                if ease == "bounce": transition.setInterpolator(BounceInterpolator())
+                elif ease == "overshoot": transition.setInterpolator(OvershootInterpolator())
+                else: transition.setInterpolator(DecelerateInterpolator())
+                
+                _TransManager.beginDelayedTransition(view_group, transition)
+            
+            # ФОЛБЭК: Если TransitionManager нет, пробуем LayoutTransition (старый способ)
+            else:
+                lt = LayoutTransition()
+                lt.setDuration(int(duration))
+                lt.enableTransitionType(LayoutTransition.CHANGING)
+                view_group.setLayoutTransition(lt)
+                
+        except Exception as e:
+            log(f"[MandreAnimation] Magic Layout Error: {e}")
+
+    # --- 2. PROPERTY ANIMATOR BUILDER ---
+    class _Builder:
+        def __init__(self, view):
+            self.view = view
+            self.animator = view.animate() if view else None
+
+        def alpha(self, val: float):
+            if self.animator: self.animator.alpha(float(val))
+            return self
+
+        def scale(self, val: float):
+            if self.animator: 
+                self.animator.scaleX(float(val))
+                self.animator.scaleY(float(val))
+            return self
+            
+        def scale_x(self, val: float):
+            if self.animator: self.animator.scaleX(float(val))
+            return self
+
+        def scale_y(self, val: float):
+            if self.animator: self.animator.scaleY(float(val))
+            return self
+
+        def move_y(self, val: float):
+            if self.animator: self.animator.translationY(float(val))
+            return self
+            
+        def move_x(self, val: float):
+            if self.animator: self.animator.translationX(float(val))
+            return self
+            
+        def rotate(self, val: float):
+            if self.animator: self.animator.rotation(float(val))
+            return self
+
+        def duration(self, ms: int):
+            if self.animator: self.animator.setDuration(int(ms))
+            return self
+
+        def delay(self, ms: int):
+            if self.animator: self.animator.setStartDelay(int(ms))
+            return self
+            
+        def ease(self, type: str):
+            if not self.animator: return self
+            if type == "overshoot": self.animator.setInterpolator(OvershootInterpolator())
+            elif type == "bounce": self.animator.setInterpolator(BounceInterpolator())
+            elif type == "linear": self.animator.setInterpolator(LinearInterpolator())
+            else: self.animator.setInterpolator(DecelerateInterpolator())
+            return self
+            
+        def on_end(self, callback):
+            if not self.animator: return self
+            try:
+                AnimatorListener = find_class("android.animation.Animator$AnimatorListener")
+                class _Listener(dynamic_proxy(AnimatorListener)):
+                    def onAnimationStart(self, a): pass
+                    def onAnimationCancel(self, a): pass
+                    def onAnimationRepeat(self, a): pass
+                    def onAnimationEnd(self, a):
+                        try: callback()
+                        except: pass
+                self.animator.setListener(_Listener())
+            except: pass
+            return self
+
+        def start(self):
+            if self.animator: self.animator.start()
+
+    @staticmethod
+    def animate(view) -> '_Builder':
+        return MandreAnimation._Builder(view)
+
+    # --- 3. PRESETS ---
+    @staticmethod
+    def shake(view, intensity=10):
+        if not view: return
+        try:
+            anim = ObjectAnimator.ofFloat(view, "translationX", [0.0, float(intensity), float(-intensity), float(intensity), float(-intensity), 0.0])
+            anim.setDuration(500)
+            anim.start()
+            Mandre.UI.ripple(0.0, vibrate=True)
+        except Exception as e: log(f"Shake err: {e}")
+
+    @staticmethod
+    def pulse(view, scale=1.2, duration=300):
+        if not view: return
+        try:
+            set_anim = AnimatorSet()
+            s = float(scale)
+            scale_up_x = ObjectAnimator.ofFloat(view, "scaleX", [1.0, s])
+            scale_up_y = ObjectAnimator.ofFloat(view, "scaleY", [1.0, s])
+            scale_down_x = ObjectAnimator.ofFloat(view, "scaleX", [s, 1.0])
+            scale_down_y = ObjectAnimator.ofFloat(view, "scaleY", [s, 1.0])
+            
+            # Исправление .with()
+            builder_up = set_anim.play(scale_up_x)
+            getattr(builder_up, "with")(scale_up_y)
+            
+            builder_down = set_anim.play(scale_down_x)
+            getattr(builder_down, "with")(scale_down_y).after(scale_up_x)
+            
+            set_anim.setDuration(int(duration // 2))
+            set_anim.start()
+        except Exception as e: log(f"Pulse err: {e}")
+
+# --- 4. PHYSICS (Springs with Fallback) ---
+    @staticmethod
+    def spring(view, property_name="scale", final_value=1.0, stiffness=1500.0, damping=0.5):
+        """
+        Анимация с физикой. Если androidx.dynamicanimation падает или недоступна, 
+        используется безопасный ObjectAnimator с Overshoot.
+        """
+        if not view: return
+        
+        # Маппинг имени свойства
+        prop_map = {
+            "scaleX": "scaleX", "scaleY": "scaleY",
+            "translationX": "translationX", "translationY": "translationY",
+            "alpha": "alpha", "rotation": "rotation"
+        }
+        
+        # Логика для combined свойств (scale)
+        if property_name == "scale":
+            MandreAnimation.spring(view, "scaleX", final_value, stiffness, damping)
+            MandreAnimation.spring(view, "scaleY", final_value, stiffness, damping)
+            return
+
+        real_prop_name = prop_map.get(property_name, property_name)
+
+        # ВАРИАНТ 1: Настоящая физика (если либа есть и работает)
+        if _SpringAnim and _SpringForce and _DynAnim:
+            try:
+                dyn_prop = None
+                if property_name == "scaleX": dyn_prop = _DynAnim.SCALE_X
+                elif property_name == "scaleY": dyn_prop = _DynAnim.SCALE_Y
+                elif property_name == "translationX": dyn_prop = _DynAnim.TRANSLATION_X
+                elif property_name == "translationY": dyn_prop = _DynAnim.TRANSLATION_Y
+                elif property_name == "alpha": dyn_prop = _DynAnim.ALPHA
+                elif property_name == "rotation": dyn_prop = _DynAnim.ROTATION
+                
+                if dyn_prop:
+                    # ВАЖНО: Устанавливаем startValue, если текущее значение некорректно
+                    # (например, scale=0 может вызвать ошибку в некоторых версиях)
+                    current_val = 0.0
+                    if property_name == "scaleX": current_val = view.getScaleX()
+                    elif property_name == "scaleY": current_val = view.getScaleY()
+                    
+                    if current_val == 0.0 and (property_name == "scaleX" or property_name == "scaleY"):
+                         # Spring не любит начинать с 0, ставим 0.01
+                         if property_name == "scaleX": view.setScaleX(0.01)
+                         if property_name == "scaleY": view.setScaleY(0.01)
+
+                    anim = _SpringAnim(view, dyn_prop, float(final_value))
+                    force = _SpringForce()
+                    force.setStiffness(float(stiffness))
+                    force.setDampingRatio(float(damping))
+                    anim.setSpring(force)
+                    
+                    # Безопасный запуск
+                    try:
+                        anim.start()
+                        return # Успех
+                    except Exception as e:
+                        # Если Spring упал при старте (как в логе), идем к фолбэку
+                        # log(f"[MandreAnimation] Spring crashed: {e}. Using fallback.")
+                        pass
+            except Exception as e:
+                # log(f"[MandreAnimation] Spring setup error: {e}")
+                pass
+
+        # ВАРИАНТ 2: Фолбэк (обычная анимация с отскоком)
+        try:
+            # Создаем эффект "пружины" через интерполятор Overshoot
+            anim = ObjectAnimator.ofFloat(view, real_prop_name, [float(final_value)])
+            anim.setDuration(400) # Чуть быстрее для отзывчивости
+            # Если damping низкий (сильно прыгает), увеличиваем tension у Overshoot
+            tension = 2.0 if damping < 0.6 else 1.0
+            anim.setInterpolator(OvershootInterpolator(float(tension)))
+            anim.start()
+        except Exception as e:
+            log(f"[MandreAnimation] Fallback error: {e}")
+
+# --- SENSORS MODULE (UPDATED) ---
+try:
+    SensorManager = find_class("android.hardware.SensorManager")
+    Sensor = find_class("android.hardware.Sensor")
+    SensorEvent = find_class("android.hardware.SensorEvent")
+    SensorEventListener = find_class("android.hardware.SensorEventListener")
+except:
+    pass
+
+class _MandreSensorListener(dynamic_proxy(SensorEventListener)):
+    def __init__(self, callback, parser_func):
+        super().__init__()
+        self.cb = callback
+        self.parser = parser_func
+
+    def onSensorChanged(self, event):
+        try:
+            values = [float(v) for v in event.values]
+            result = self.parser(values)
+            if result is not None:
+                run_on_ui_thread(lambda: self.cb(result))
+        except Exception as e:
+            pass # Suppress logs for speed
+
+    def onAccuracyChanged(self, sensor, accuracy):
+        pass
+
+class MandreSensors:
+    _active_listeners = {} 
+    _manager = None
+    _config_cache = {}
+    
+    # --- Константы (Android Sensor API) ---
+    TYPE_ACCELEROMETER = 1
+    TYPE_MAGNETIC_FIELD = 2
+    TYPE_GYROSCOPE = 4
+    TYPE_LIGHT = 5
+    TYPE_PROXIMITY = 8
+    TYPE_GRAVITY = 9
+    TYPE_LINEAR_ACCELERATION = 10
+    TYPE_ROTATION_VECTOR = 11
+    TYPE_STEP_COUNTER = 19
+    
+    @staticmethod
+    def _get_man():
+        if not MandreSensors._manager:
+            ctx = ApplicationLoader.applicationContext
+            MandreSensors._manager = ctx.getSystemService("sensor")
+        return MandreSensors._manager
+
+    @staticmethod
+    def _get_config_id(default_type: int) -> int:
+        if not MandreSensors._config_cache:
+            MandreSensors._config_cache = MandreData.read_persistent_json("mandre_lib", "sensors_config.json", {})
+        
+        str_key = str(default_type)
+        if str_key in MandreSensors._config_cache:
+            override_id = int(MandreSensors._config_cache[str_key])
+            if override_id > 0: return override_id
+        return default_type
+
+    @staticmethod
+    def set_override(default_type: int, new_real_id: int):
+        config = MandreData.read_persistent_json("mandre_lib", "sensors_config.json", {})
+        config[str(default_type)] = int(new_real_id)
+        MandreData.write_persistent_json("mandre_lib", "sensors_config.json", config)
+        MandreSensors._config_cache = config
+
+    @staticmethod
+    def stop(sensor_type: int):
+        if sensor_type in MandreSensors._active_listeners:
+            listener = MandreSensors._active_listeners.pop(sensor_type)
+            try: MandreSensors._get_man().unregisterListener(listener)
+            except: pass
+
+    @staticmethod
+    def stop_all():
+        keys = list(MandreSensors._active_listeners.keys())
+        for k in keys: MandreSensors.stop(k)
+
+    @staticmethod
+    def _register(sensor_type_key, callback, parser, delay=3):
+        real_id = MandreSensors._get_config_id(sensor_type_key)
+        man = MandreSensors._get_man()
+        
+        # Пытаемся найти по ID, если не вышло - по дефолтному типу
+        sensor = man.getDefaultSensor(real_id)
+        if not sensor and real_id != sensor_type_key:
+             sensor = man.getDefaultSensor(sensor_type_key)
+
+        if not sensor:
+            log(f"[MandreSensors] Sensor {real_id} not found.")
+            return False
+            
+        MandreSensors.stop(sensor_type_key)
+        listener = _MandreSensorListener(callback, parser)
+        man.registerListener(listener, sensor, delay)
+        MandreSensors._active_listeners[sensor_type_key] = listener
+        return True
+
+    @staticmethod
+    def get_all_sensors_info() -> List[Dict]:
+        try:
+            res = []
+            lst = MandreSensors._get_man().getSensorList(-1)
+            for i in range(lst.size()):
+                s = lst.get(i)
+                res.append({
+                    "name": str(s.getName()),
+                    "vendor": str(s.getVendor()),
+                    "id": int(s.getType()),
+                    "type": int(s.getType()) # Дублируем для удобства
+                })
+            return res
+        except: return []
+
+    # --- API Wrapper ---
+    @staticmethod
+    def listen_light(callback):
+        MandreSensors._register(MandreSensors.TYPE_LIGHT, callback, lambda v: v[0])
+
+    @staticmethod
+    def listen_proximity(callback):
+        def parse(vals): return {"cm": vals[0], "is_near": vals[0] < 5.0}
+        MandreSensors._register(MandreSensors.TYPE_PROXIMITY, callback, parse)
+
+    @staticmethod
+    def listen_accelerometer(callback):
+        def parse(vals): return {"x": vals[0], "y": vals[1], "z": vals[2]}
+        MandreSensors._register(MandreSensors.TYPE_ACCELEROMETER, callback, parse, delay=2)
+        
+    @staticmethod
+    def listen_gyroscope(callback):
+        def parse(vals): return {"x": vals[0], "y": vals[1], "z": vals[2]}
+        MandreSensors._register(MandreSensors.TYPE_GYROSCOPE, callback, parse, delay=2)
+
+    @staticmethod
+    def on_shake(callback, threshold=15.0, cooldown_ms=1000):
+        class S: last = 0
+        st = S()
+        def parse(v):
+            g = (v[0]**2 + v[1]**2 + v[2]**2)**0.5
+            if g > threshold:
+                n = time.time()*1000
+                if n - st.last > cooldown_ms:
+                    st.last = n
+                    return True
+            return None
+        MandreSensors._register(MandreSensors.TYPE_ACCELEROMETER, lambda _: callback(), parse, delay=1)
+
+# --- Graphics Module ---
+try:
+    QRCodeWriter = find_class("com.google.zxing.qrcode.QRCodeWriter")
+    EncodeHintType = find_class("com.google.zxing.EncodeHintType")
+    
+    try:
+        ErrorCorrectionLevel = find_class("com.google.zxing.qrcode.decoder.ErrorCorrectionLevel")
+    except:
+        ErrorCorrectionLevel = None
+
+    Bitmap = find_class("android.graphics.Bitmap")
+    CompressFormat = find_class("android.graphics.Bitmap$CompressFormat")
+    Config = find_class("android.graphics.Bitmap$Config")
+    Color = find_class("android.graphics.Color")
+    HashMap = find_class("java.util.HashMap")
+    
+    from java import jint
+    
+    ZXING_AVAILABLE = True
+except Exception:
+    ZXING_AVAILABLE = False
+    QRCodeWriter = None
+    try: from java import jint
+    except: jint = int
+
+class MandreGraphics:
+    @staticmethod
+    def generate_qr(content: str, size: int = 512, color: int = 0xFF000000, bg_color: int = 0xFFFFFFFF) -> str:
+        """
+        Генерирует QR-код используя встроенный QRCodeWriter.
+        """
+        if not ZXING_AVAILABLE or not QRCodeWriter:
+            log("[MandreGraphics] QRCodeWriter не найден.")
+            return None
+
+        if not content: return None
+
+        try:
+            # 1. Создаем Bitmap
+            bitmap = Bitmap.createBitmap(size, size, Config.ARGB_8888)
+            
+            # 2. Заливаем фон
+            # ВАЖНО: Всегда приводим цвет к jint, даже если это Color.WHITE
+            # Color.WHITE это статический инт, но Python видит его значение как большое число
+            if bg_color == 0xFFFFFFFF:
+                val = Color.WHITE
+            else:
+                val = int(bg_color)
+                # Превращаем беззнаковый 32-битный int в знаковый Java int
+                if val > 0x7FFFFFFF: val -= 0x100000000
+            
+            # Явно кастуем в jint перед вызовом, чтобы Chaquopy выбрал eraseColor(int)
+            bitmap.eraseColor(jint(val))
+            
+            # 3. Настройки
+            hints = HashMap()
+            if EncodeHintType and ErrorCorrectionLevel:
+                # Устанавливаем средний уровень коррекции
+                hints.put(EncodeHintType.ERROR_CORRECTION, ErrorCorrectionLevel.M)
+            
+            # 4. Инициализация Writer
+            writer = QRCodeWriter()
+            
+            # 5. Рисуем
+            result_bitmap = writer.encode(content, size, size, hints, bitmap)
+            
+            if result_bitmap:
+                bitmap = result_bitmap
+            
+            # 6. Сохраняем
+            cache_dir = ApplicationLoader.applicationContext.getCacheDir()
+            ts = int(time.time() * 1000)
+            file_name = f"qr_{ts}.png"
+            file_path = os.path.join(str(cache_dir), file_name)
+            
+            out_stream = FileOutputStream(file_path)
+            bitmap.compress(CompressFormat.PNG, 100, out_stream)
+            out_stream.close()
+            
+            if bitmap != result_bitmap and result_bitmap:
+                 result_bitmap.recycle()
+            bitmap.recycle()
+            
+            return file_path
+
+        except Exception as e:
+            log(f"[MandreGraphics] QR Gen Error: {e}")
+            log(traceback.format_exc())
+            return None
+
+# --- СИСТЕМА MANDRE PACKAGE (Вставлять ПЕРЕД MandreLibPlugin) ---
+
+class MandreMeta:
+    def __init__(self, content: str):
+        self.raw = content
+        self.data = {}
+        self._parse()
+
+    def _parse(self):
+        import re
+        pattern = re.compile(r'(\w+)\s*=\s*(?:"""(.*?)"""|"(.*?)")', re.DOTALL)
+        matches = pattern.findall(self.raw)
+        for key, val_multi, val_single in matches:
+            val = val_multi if val_multi else val_single
+            self.data[key.strip()] = val.strip()
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+class MandrePackageLoader:
+    def __init__(self, plugin_instance, pid: str, main_file: str):
+        self.plugin = plugin_instance
+        self.pid = pid
+        self.main_file = main_file
+        self.pkg_dir = os.path.join(MandrePackage.PACKAGES_DIR, pid)
+        self.loaded_modules = [] 
+        self._main_module = None
+
+    def load(self):
+        if not os.path.exists(self.pkg_dir):
+            self.plugin.log(f"[MandrePkg] Path not found: {self.pkg_dir}")
+            return
+
+        # 1. Добавляем путь в sys.path для импортов
+        if self.pkg_dir not in sys.path:
+            sys.path.insert(0, self.pkg_dir)
+
+        # 2. Грузим DEX рекурсивно
+        dex_count = 0
+        for root, dirs, files in os.walk(self.pkg_dir):
+            for f in files:
+                if f.endswith(".dex"):
+                    if self._load_dex(os.path.join(root, f)): dex_count += 1
+        
+        # 3. Грузим Python
+        if self.main_file.endswith(".py"):
+            main_path = os.path.join(self.pkg_dir, self.main_file)
+            if os.path.exists(main_path):
+                self._load_python_entry(main_path)
+            else:
+                self.plugin.log(f"[MandrePkg] Main file missing: {self.main_file}")
+
+    def _load_dex(self, path):
+        try:
+            from dalvik.system import InMemoryDexClassLoader
+            from java.nio import ByteBuffer
+            with open(path, "rb") as f: dex_bytes = f.read()
+            parent = ApplicationLoader.applicationContext.getClassLoader()
+            _ = InMemoryDexClassLoader(ByteBuffer.wrap(dex_bytes), parent)
+            return True
+        except: return False
+
+    def _load_python_entry(self, path):
+        try:
+            mod_name = f"mandre_pkg.{self.pid}.main"
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = module
+                self.loaded_modules.append(mod_name)
+                spec.loader.exec_module(module)
+                self._main_module = module
+                if hasattr(module, "on_load"):
+                    module.on_load(self.plugin)
+                    self.plugin.log(f"[MandrePkg] {self.pid} loaded.")
+        except Exception as e:
+            self.plugin.log(f"[MandrePkg] Py Error: {traceback.format_exc()}")
+
+    def unload(self):
+        if self.pkg_dir in sys.path: sys.path.remove(self.pkg_dir)
+        if self._main_module and hasattr(self._main_module, "on_unload"):
+            try: self._main_module.on_unload(self.plugin)
+            except: pass
+        for m in self.loaded_modules:
+            if m in sys.modules: del sys.modules[m]
+
+class MandrePackage:
+    PACKAGES_DIR = os.path.join(str(ApplicationLoader.getFilesDirFixed()), "plugins", "mandre_packages")
+
+    @staticmethod
+    def install(path: str, listener=None) -> tuple:
+        """Возвращает (success, error_msg, meta_object)"""
+        try:
+            # 1. Читаем мету
+            temp_meta = None
+            has_main_py = False
+            try:
+                with zipfile.ZipFile(path, 'r') as zf:
+                    names = zf.namelist()
+                    if "meta.mandre" not in names:
+                        return False, "Нет meta.mandre", None
+                    if "main.py" in names:
+                        has_main_py = True
+                    
+                    with zf.open("meta.mandre") as f:
+                        temp_meta = MandreMeta(f.read().decode('utf-8'))
+            except: return False, "Ошибка чтения ZIP", None
+
+            pid = temp_meta.get("id")
+            if not pid: return False, "Нет ID в meta", None
+
+            # 2. Распаковка
+            target_dir = os.path.join(MandrePackage.PACKAGES_DIR, pid)
+            if os.path.exists(target_dir): shutil.rmtree(target_dir)
+            os.makedirs(target_dir)
+
+            if listener: listener(f"Распаковка {pid}...")
+            with zipfile.ZipFile(path, 'r') as zf: zf.extractall(target_dir)
+
+            # 3. АВТО-ГЕНЕРАЦИЯ MAIN.PY (Если это DEX-плагин)
+            if not has_main_py:
+                main_class = temp_meta.get("main_class")
+                if main_class:
+                    if listener: listener("Генерация Java-моста...")
+                    MandrePackage._generate_auto_main(target_dir, main_class)
+                else:
+                    return False, "Нет main.py и не указан main_class!", None
+
+            # 4. Зависимости
+            req_path = os.path.join(target_dir, "requirements.txt")
+            if os.path.exists(req_path):
+                if listener: listener("Установка библиотек...")
+                try:
+                    with open(req_path, 'r', encoding='utf-8') as f:
+                        reqs = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                        if reqs: MandreInstall(reqs)
+                except Exception as e:
+                    log(f"[MandrePkg] Pip Warn: {e}")
+
+            # 5. Генерация враппера
+            if listener: listener("Регистрация...")
+            MandrePackage._create_wrapper(pid, temp_meta)
+
+            return True, "OK", temp_meta
+
+        except Exception as e:
+            return False, str(e), None
+
+    @staticmethod
+    def _generate_auto_main(target_dir, main_class):
+        """Создает универсальный main.py для Java плагинов (Injection Version)"""
+        content = f'''
+# Auto-generated bridge for Injected Java Plugin
+from base_plugin import BasePlugin
+from ui.settings import Text
+from ui.bulletin import BulletinHelper
+from mandre_lib import Mandre
+from hook_utils import find_class
+
+# Класс, который мы ищем (теперь он виден глобально!)
+TARGET_CLASS = "{main_class}"
+_instance_box = []
+
+def on_load(plugin: BasePlugin):
+    global _instance_box
+    plugin.log(f"Starting Java plugin: {{TARGET_CLASS}}")
+    
+    try:
+        # 1. Находим класс стандартным способом (работает благодаря инъекции)
+        try:
+            cls = find_class(TARGET_CLASS)
+        except:
+            # Фолбек на ручной поиск, если кэш Chaquopy тупит
+            JClass = find_class("java.lang.Class")
+            cls = JClass.forName(TARGET_CLASS)
+            
+        if not cls: raise Exception("Class not found via injection")
+
+        # 2. Инициализация (getInstance или конструктор)
+        inst = _get_instance(cls, plugin)
+        if not inst: raise Exception("Instance init failed")
+        
+        _instance_box = [inst]
+
+        # 3. Запуск
+        try:
+            Mandre.Reflect.invoke(_instance_box[0], "start", arg_types=[])
+            plugin.log("Java start() executed")
+        except:
+            plugin.log("No start() method, skipping")
+
+    except Exception as e:
+        import traceback
+        plugin.log(f"Bridge Error: {{e}}\\n{{traceback.format_exc()}}")
+        BulletinHelper.show_error(f"Start Error: {{e}}")
+
+def _get_instance(cls, plugin):
+    # getInstance
+    try:
+        inst = Mandre.Reflect.invoke(cls, "getInstance", arg_types=[])
+        if inst: return inst
+    except: pass
+    
+    # Constructor (взлом приватного)
+    try:
+        ctor = cls.getDeclaredConstructor()
+        ctor.setAccessible(True)
+        return ctor.newInstance()
+    except Exception as e:
+        plugin.log(f"Constructor Error: {{e}}")
+    return None
+
+def on_unload(plugin):
+    global _instance_box
+    if _instance_box:
+        try:
+            Mandre.Reflect.invoke(_instance_box[0], "onUnload", arg_types=[])
+        except: pass
+    _instance_box = []
+
+def create_settings():
+    return [Text("Настройки", icon="msg_settings", on_click=open_settings)]
+
+def open_settings():
+    if _instance_box:
+        try:
+            Mandre.Reflect.invoke(_instance_box[0], "showSettings", arg_types=[])
+        except Exception as e:
+            BulletinHelper.show_error(f"Settings Error: {{e}}")
+'''
+        with open(os.path.join(target_dir, "main.py"), "w", encoding="utf-8") as f:
+            f.write(content)
+
+    @staticmethod
+    def _create_wrapper(pid: str, meta: MandreMeta):
+        wrap_path = os.path.join(str(ApplicationLoader.getFilesDirFixed()), "plugins", f"{pid}.py")
+        esc = lambda s: s.replace('"""', "\\\"\\\"\\\"") if s else ""
+        
+        code = f'''# Generated by MandreLib
+__id__ = "{meta.get("id")}"
+__name__ = "{esc(meta.get("name"))}"
+__version__ = "{meta.get("version")}"
+__author__ = """{esc(meta.get("author"))}"""
+__description__ = """{esc(meta.get("description"))}"""
+__min_version__ = "{meta.get("min_version", "1.0")}"
+__icon__ = "{meta.get("icon", "msg_settings")}"
+
+from base_plugin import BasePlugin
+try:
+    from mandre_lib import Mandre
+except ImportError:
+    Mandre = None
+
+class MandreWrapper_{pid}(BasePlugin):
+    def on_plugin_load(self):
+        if not Mandre: return
+        self._loader = Mandre.PackageLoader(self, "{pid}", "{meta.get("main_file", "main.py")}")
+        self._loader.load()
+
+    def on_plugin_unload(self):
+        if hasattr(self, "_loader"):
+            self._loader.unload()
+
+    def create_settings(self):
+        # ПРОКСИРОВАНИЕ НАСТРОЕК
+        # Если загрузчик отработал и в main.py есть функция create_settings — вызываем её
+        if hasattr(self, "_loader") and self._loader._main_module:
+            if hasattr(self._loader._main_module, "create_settings"):
+                try:
+                    return self._loader._main_module.create_settings()
+                except Exception as e:
+                    from ui.settings import Text
+                    return [Text(f"Ошибка настроек: {{e}}", color="#ff0000")]
+        return None
+'''
+        with open(wrap_path, "w", encoding="utf-8") as f: f.write(code)
+
+class MandrePackageLoader:
+    def __init__(self, plugin_instance, pid: str, main_file: str):
+        self.plugin = plugin_instance
+        self.pid = pid
+        self.main_file = main_file
+        self.pkg_dir = os.path.join(MandrePackage.PACKAGES_DIR, pid)
+        self.loaded_modules = []
+        self._main_module = None
+
+    def load(self):
+        if not os.path.exists(self.pkg_dir):
+            self.plugin.log(f"[MandrePkg] Папка не найдена: {self.pkg_dir}")
+            return
+        
+        # 1. Добавляем путь для Python
+        if self.pkg_dir not in sys.path:
+            sys.path.insert(0, self.pkg_dir)
+
+        # 2. Инъекция DEX в систему
+        # Мы ищем все .dex файлы и "вливаем" их в приложение
+        dex_files = []
+        for root, dirs, files in os.walk(self.pkg_dir):
+            for f in files:
+                if f.endswith(".dex"):
+                    dex_files.append(os.path.join(root, f))
+        
+        if dex_files:
+            self._inject_dex_files(dex_files)
+        
+        # 3. Запуск Python
+        if self.main_file.endswith(".py"):
+            main_path = os.path.join(self.pkg_dir, self.main_file)
+            if os.path.exists(main_path):
+                self._load_python_entry(main_path)
+
+    def _inject_dex_files(self, paths):
+        """Внедряет DEX файлы в основной ClassLoader приложения"""
+        try:
+            # Импорты
+            BaseDexClassLoader = find_class("dalvik.system.BaseDexClassLoader")
+            PathClassLoader = find_class("dalvik.system.PathClassLoader")
+            Array = find_class("java.lang.reflect.Array")
+            
+            # 1. Получаем системный лоадер (в который будем внедрять)
+            app_loader = ApplicationLoader.applicationContext.getClassLoader()
+            
+            # 2. Получаем pathList системного лоадера
+            # pathList - это приватное поле в BaseDexClassLoader
+            f_pathList = MandreReflect.get_field(BaseDexClassLoader, "pathList") # Это объект, не класс
+            # А нам нужен Field объект, чтобы сделать get()
+            # Используем хак через to_java_class из твоего MandreReflect, 
+            # но проще сделать вручную тут, чтобы наверняка.
+            
+            # Получаем класс BaseDexClassLoader через рефлексию
+            BDCL_Class = Mandre.Reflect._to_java_class(BaseDexClassLoader)
+            f_pathList_field = BDCL_Class.getDeclaredField("pathList")
+            f_pathList_field.setAccessible(True)
+            system_path_list = f_pathList_field.get(app_loader)
+            
+            # 3. Создаем временный лоадер для наших DEX файлов
+            # path_str = список путей через двоеточие
+            path_str = ":".join(paths)
+            # optimizedDirectory = null (используем дефолтную)
+            temp_loader = PathClassLoader(path_str, None, app_loader)
+            
+            # 4. Достаем dexElements из обоих лоадеров
+            # DexPathList класс
+            DPL_Class = system_path_list.getClass()
+            f_dexElements_field = DPL_Class.getDeclaredField("dexElements")
+            f_dexElements_field.setAccessible(True)
+            
+            system_elements = f_dexElements_field.get(system_path_list)
+            
+            # Достаем pathList у временного лоадера
+            temp_path_list = f_pathList_field.get(temp_loader)
+            new_elements = f_dexElements_field.get(temp_path_list)
+            
+            # 5. Объединяем массивы (System + New)
+            # Тип элементов (Element)
+            ElementClass = system_elements.getClass().getComponentType()
+            
+            sys_len = Array.getLength(system_elements)
+            new_len = Array.getLength(new_elements)
+            
+            # Создаем новый массив
+            combined_elements = Array.newInstance(ElementClass, sys_len + new_len)
+            
+            # Копируем: Сначала НОВЫЕ (чтобы они перекрывали старые или находились первыми), потом системные
+            # Или наоборот? Обычно добавляют в начало для патчинга.
+            from java.lang import System as JSystem
+            JSystem.arraycopy(new_elements, 0, combined_elements, 0, new_len)
+            JSystem.arraycopy(system_elements, 0, combined_elements, new_len, sys_len)
+            
+            # 6. Подменяем поле в системном лоадере
+            f_dexElements_field.set(system_path_list, combined_elements)
+            
+            self.plugin.log(f"[MandrePkg] Injected {new_len} DEX elements into system.")
+            
+        except Exception as e:
+            import traceback
+            self.plugin.log(f"[MandrePkg] Injection Failed: {e}\n{traceback.format_exc()}")
+
+    def get_class(self, class_name):
+        """Ищет класс в загруженных DEX файлах"""
+        for loader in self.dex_loaders:
+            try:
+                return loader.loadClass(class_name)
+            except:
+                continue
+        return None
+
+    def _load_python_entry(self, path):
+        try:
+            mod_name = f"mandre_pkg.{self.pid}.main"
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = module
+                self.loaded_modules.append(mod_name)
+                spec.loader.exec_module(module)
+                self._main_module = module
+                if hasattr(module, "on_load"):
+                    module.on_load(self.plugin)
+        except Exception as e:
+            self.plugin.log(f"[MandrePkg] Py Error: {traceback.format_exc()}")
+
+    def unload(self):
+        if self.pkg_dir in sys.path: sys.path.remove(self.pkg_dir)
+        if self._main_module and hasattr(self._main_module, "on_unload"):
+            try: self._main_module.on_unload(self.plugin)
+            except: pass
+        for m in self.loaded_modules:
+            if m in sys.modules: del sys.modules[m]
+        self.dex_loaders.clear()
+
+# --- ГЛОБАЛЬНЫЕ КЛАССЫ ХУКОВ (Чтобы не было NameError) ---
+
+class _PkgValidateHook(MethodHook):
+    def after_hooked_method(self, param):
+        try:
+            path = str(param.args[0])
+            if path.endswith(".mandre") or path.endswith(".zip"):
+                import zipfile
+                is_pkg = False
+                try:
+                    with zipfile.ZipFile(path, 'r') as zf:
+                        if "meta.mandre" in zf.namelist():
+                            with zf.open("meta.mandre") as f:
+                                meta = MandreMeta(f.read().decode('utf-8'))
+                            is_pkg = True
+                except: pass
+
+                if is_pkg:
+                    PluginCls = find_class("com.exteragram.messenger.plugins.Plugin")
+                    p = PluginCls(meta.get("id"), meta.get("name"))
+                    p.setDescription(f"📦 [Mandre Package]\n{meta.get('description', '')}")
+                    p.setAuthor(meta.get("author", ""))
+                    p.setVersion(meta.get("version", "1.0"))
+                    
+                    ResultCls = find_class("com.exteragram.messenger.plugins.PluginsController$PluginValidationResult")
+                    param.setResult(ResultCls(p, None))
+        except: pass
+
+class _PkgLoadHook(MethodHook):
+    def before_hooked_method(self, param):
+        path = str(param.args[0])
+        cb = param.args[2]
+        
+        if path.endswith(".mandre"):
+            param.setResult(None)
+            def runner():
+                def listener(msg): run_on_ui_thread(lambda: BulletinHelper.show_info(msg))
+                try:
+                    # 1. Установка
+                    success, msg, meta = MandrePackage.install(path, listener)
+                    
+                    if success and meta:
+                        # 2. Инъекция в движок (через рефлексию)
+                        run_on_ui_thread(lambda: self._trigger_engine_load(meta))
+                        
+                        if cb: run_on_ui_thread(lambda: cb.run(None))
+                    else:
+                        run_on_ui_thread(lambda err=msg: BulletinHelper.show_error(f"Err: {err}"))
+                        if cb: run_on_ui_thread(lambda: cb.run("Install Failed"))
+                except Exception as e:
+                    if cb: run_on_ui_thread(lambda: cb.run(str(e)))
+            threading.Thread(target=runner).start()
+
+    def _trigger_engine_load(self, meta):
+        try:
+            pid = meta.get("id")
+            wrapper_path = os.path.join(str(ApplicationLoader.getFilesDirFixed()), "plugins", f"{pid}.py")
+            
+            # 1. Получаем контроллер через Reflect
+            PCWrapper = find_class("com.exteragram.messenger.plugins.PluginsController")
+            PCCls = Mandre.Reflect._to_java_class(PCWrapper)
+            # getInstance() статический
+            PC = PCCls.getDeclaredMethod("getInstance").invoke(None)
+            
+            # 2. Получаем движок
+            engine = PC.engines.get("python")
+            
+            # 3. Получаем класс движка
+            EngineWrapper = find_class("com.exteragram.messenger.plugins.PythonPluginsEngine")
+            EngineCls = Mandre.Reflect._to_java_class(EngineWrapper)
+            
+            # 4. Вызываем loadPlugin через рефлексию
+            JString = find_class("java.lang.String")
+            JStringCls = Mandre.Reflect._to_java_class(JString)
+            
+            load_method = EngineCls.getDeclaredMethod("loadPlugin", JStringCls, JStringCls)
+            load_method.setAccessible(True)
+            load_method.invoke(engine, pid, wrapper_path)
+            
+            # 5. Обновляем UI (ИСПРАВЛЕНО: через рефлексию)
+            # notifyPluginsChanged - package-private метод, нужен setAccessible
+            notify_method = PCCls.getDeclaredMethod("notifyPluginsChanged")
+            notify_method.setAccessible(True)
+            notify_method.invoke(PC)
+            
+            BulletinHelper.show_success(f"Плагин '{meta.get('name')}' загружен!")
+            
+        except Exception as e:
+            import traceback
+            log(f"Engine Load Error: {e}\n{traceback.format_exc()}")
+            BulletinHelper.show_error(f"Load Error: {e}")
+            
+class _PkgIsPluginHook(MethodHook):
+    """Говорит движку, что .mandre это тоже плагин"""
+    def after_hooked_method(self, param):
+        try:
+            f = param.args[0]
+            if f and str(f.getName()).endswith(".mandre"):
+                param.setResult(True)
+        except: pass
+
+class _OpenMandreHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            f = param.args[0]
+            if not f: return
+            path = str(f.getAbsolutePath())
+            if path.endswith(".mandre"):
+                param.setResult(True)
+                run_on_ui_thread(lambda: self._trigger_install(path))
+        except: pass
+
+    def _trigger_install(self, path):
+        try:
+            PC = find_class("com.exteragram.messenger.plugins.PluginsController").getInstance()
+            frag = get_last_fragment()
+            if frag:
+                # Ищем метод showInstallDialog(BaseFragment, String, boolean)
+                for m in PC.getClass().getDeclaredMethods():
+                    if m.getName() == "showInstallDialog":
+                        pt = m.getParameterTypes()
+                        if len(pt) == 3 and pt[1].getName() == "java.lang.String":
+                            m.invoke(PC, frag, path, False)
+                            return
+        except Exception as e:
+            BulletinHelper.show_error(f"Error: {e}")
+
+class Mandre:
+    UI = MandreUI
+    TTS = MandreTTS
+    STT = MandreSTT
+    Data = MandreData
+    Text = MandreText
+    Auth = MandreAuth
+    Share = MandreShare
+    Device = MandreDevice
+    Async = MandreAsync
+    Reflect = MandreReflect
+    Package = MandrePackage
+    PackageLoader = MandrePackageLoader
+    Sensors = MandreSensors
+    Graphics = MandreGraphics
+    Command = MandreDecorators.command # Алиас для удобства @Mandre.Command
+    Settings = MandreSettings
+    Reloader = MandreReloader
+    Animation = MandreAnimation
+    OnMessage = MandreDecorators.on_message # Алиас для удобства @Mandre.OnMessage
+    Messages = MandreMessages
+    Decorators = MandreDecorators
+    Suggestions = MandreSuggestions
+    SheetController = MandreSheetContrl 
+    Notification = MandreNotification
+    Dex = MandreDex
+    Send = MandreSend
+    # Pip = MandrePip # DEPRECATED. Use MandreInstall instead.
+
+    _DB_CACHE_STORAGE = None
+    _DB_CACHE_DB = None
+    _DECORATED_PLUGINS = {}
+
+    class NativeSettings:
+        @staticmethod
+        def render(plugin: BasePlugin, spec: Any):
+            # Поддержка старого формата (List)
+            if isinstance(spec, list):
+                return MandreSettings.render(plugin, spec)
+            
+            # Поддержка нового формата (String DSL) через DEX
+            if isinstance(spec, str):
+                return MandreDex.render(plugin, spec)
+            
+            return []
+
+    class Server:
+        """
+        Управление локальным сервером разработки.
+        """
+        @staticmethod
+        def start():
+            """Запускает сервер на порту 5555"""
+            Mandre.Async.run(_MANDRE_SERVER.start())
+            # Получаем IP
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+                s.close()
+                BulletinHelper.show_success(f"Server: http://{ip}:5555")
+            except:
+                BulletinHelper.show_success("Server started on port 5555")
+
+        @staticmethod
+        def stop():
+            _MANDRE_SERVER.stop()
+            BulletinHelper.show_info("Server stopped")
+
+    @staticmethod
+    def initialise(plugin_instance: BasePlugin):
+        """
+        Магический метод. Сканирует плагин на наличие декораторов, 
+        регистрирует хуки и активирует Smart Parsing.
+        Нужно вызывать один раз в on_plugin_load.
+        """
+        try:
+            plugin_id = plugin_instance.id
+            handlers = []
+            
+            # 1. Сканируем методы класса через inspect
+            for name, method in inspect.getmembers(plugin_instance, predicate=inspect.ismethod):
+                handler_type = getattr(method, "_mandre_handler_type", None)
+                
+                if handler_type == "command":
+                    cmd_name = getattr(method, "_mandre_cmd_name") or name
+                    aliases = getattr(method, "_mandre_cmd_aliases", [])
+                    handlers.append({
+                        "type": "command",
+                        "name": cmd_name.lower(),
+                        "aliases": [a.lower() for a in aliases],
+                        "method": method
+                    })
+                    
+                elif handler_type == "regex":
+                    handlers.append({
+                        "type": "regex",
+                        "pattern": getattr(method, "_mandre_regex_pattern"),
+                        "out": getattr(method, "_mandre_regex_out"),
+                        "in": getattr(method, "_mandre_regex_in"),
+                        "method": method
+                    })
+
+            if handlers:
+                Mandre._DECORATED_PLUGINS[plugin_id] = handlers
+                
+                # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+                
+                # 1. Сохраняем ссылку на оригинальный метод (если он был переопределен юзером)
+                # Важно: берем метод класса, чтобы получить unbound function, или bound method экземпляра
+                original_hook = getattr(plugin_instance, "on_send_message_hook", None)
+                
+                # 2. Создаем обертку
+                def dispatch_wrapper(account, params):
+                    # Сначала декораторы
+                    res = Mandre._dispatch_smart_handlers(plugin_instance, params)
+                    if res: return res
+                    
+                    # Если декораторы не сработали, вызываем оригинальный код
+                    # Проверяем, чтобы это не была та же самая функция (рекурсия)
+                    if original_hook and original_hook.__name__ != "dispatch_wrapper":
+                        try: 
+                            return original_hook(account, params)
+                        except: 
+                            return HookResult()
+                    return HookResult()
+                
+                # 3. СНАЧАЛА Подменяем метод у экземпляра плагина
+                plugin_instance.on_send_message_hook = dispatch_wrapper
+                
+                # 4. И ТОЛЬКО ПОТОМ регистрируем хук в системе
+                # Теперь система увидит наш dispatch_wrapper
+                plugin_instance.add_on_send_message_hook(priority=100)
+                
+                log(f"[MandreLib] Initialised {len(handlers)} smart handlers for {plugin_id}")
+        
+        except Exception as e:
+            log(f"[MandreLib] Init error for {plugin_instance.id}: {traceback.format_exc()}")
+
+    @staticmethod
+    def _dispatch_smart_handlers(plugin, params) -> Optional[HookResult]:
+        try:
+            # ИСПРАВЛЕНИЕ: params это Java объект, берем атрибут напрямую
+            msg = getattr(params, "message", None)
+            
+            # Если сообщения нет или это не строка (например, файл без подписи), выходим
+            if not msg or not isinstance(msg, str): return None
+            
+            handlers = Mandre._DECORATED_PLUGINS.get(plugin.id, [])
+            
+            if _mandrelib_instance:
+                prefix = _mandrelib_instance.get_setting("command_prefix", ".")
+            else:
+                prefix = "."
+            
+            for h in handlers:
+                # --- ЛОГИКА КОМАНД ---
+                if h["type"] == "command":
+                    if not msg.startswith(prefix): continue
+                    
+                    parts = msg[len(prefix):].split(' ', 1)
+                    cmd_trigger = parts[0].lower()
+                    args_str = parts[1] if len(parts) > 1 else ""
+                    
+                    if cmd_trigger == h["name"] or cmd_trigger in h["aliases"]:
+                        return Mandre._execute_smart_command(h["method"], args_str, params)
+
+                # --- ЛОГИКА REGEX ---
+                elif h["type"] == "regex":
+                    if not h["out"]: continue
+                    
+                    pattern = h["pattern"]
+                    if pattern and re.search(pattern, msg):
+                        try:
+                            res = h["method"](params)
+                            if res is False: return HookResult(strategy=HookStrategy.CANCEL)
+                            if res: return res
+                        except Exception as e:
+                            log(f"[MandreLib] Regex handler error: {e}")
+
+            return None
+        except Exception as e:
+            log(f"[MandreLib] Dispatch error: {e}")
+            return None
+
+    @staticmethod
+    def _execute_smart_command(method, args_str: str, params) -> HookResult:
+        """
+        SMART ARGUMENT PARSER
+        Анализирует сигнатуру функции и преобразует строку аргументов в типы Python.
+        """
+        try:
+            sig = inspect.signature(method)
+            bound_args = {}
+            
+            # Используем shlex для умного разбиения кавычек: .cmd "hello world" 123
+            try:
+                split_args = shlex.split(args_str)
+            except:
+                split_args = args_str.split()
+
+            iterator = iter(split_args)
+            
+            for name, param in sig.parameters.items():
+                # 1. Пропускаем 'self' (уже привязан)
+                if name == "self": continue
+                
+                # 2. Специальный аргумент 'message' или 'msg' или 'params' -> передаем сырой объект
+                if name in ("message", "msg", "params", "ctx"):
+                    bound_args[name] = params
+                    continue
+
+                # 3. Если аргументов не осталось
+                try:
+                    val_str = next(iterator)
+                except StopIteration:
+                    if param.default != inspect.Parameter.empty:
+                        bound_args[name] = param.default
+                        continue
+                    else:
+                        # Аргумент обязателен, но его нет -> Ошибка или Help
+                        Mandre.Notification.show_simple("Ошибка", f"Не хватает аргумента: {name}")
+                        return HookResult(strategy=HookStrategy.CANCEL)
+
+                # 4. CASTING TYPES
+                annotation = param.annotation
+                if annotation != inspect.Parameter.empty:
+                    try:
+                        if annotation == int:
+                            bound_args[name] = int(val_str)
+                        elif annotation == float:
+                            bound_args[name] = float(val_str)
+                        elif annotation == bool:
+                            # Умный булеан: 'true', '1', 'on' -> True
+                            bound_args[name] = val_str.lower() in ("true", "1", "yes", "on", "t")
+                        else:
+                            bound_args[name] = val_str
+                    except ValueError:
+                        Mandre.Notification.show_simple("Ошибка типа", f"Аргумент '{name}' должен быть {annotation.__name__}")
+                        return HookResult(strategy=HookStrategy.CANCEL)
+                else:
+                    # Без аннотации - просто строка
+                    bound_args[name] = val_str
+
+            # Вызов метода
+            res = method(**bound_args)
+            
+            # Обработка результата
+            if isinstance(res, HookResult): return res
+            if isinstance(res, str):
+                # Умная обработка Markdown
+                # Если строка содержит спецсимволы, пробуем распарсить
+                if any(c in res for c in "*_`[<"):
+                    try:
+                        parsed = Mandre.Text.parse(res, mode="markdown")
+                        params.message = parsed["message"]
+                        params.entities = parsed["entities"]
+                    except Exception as e:
+                        log(f"[MandreLib] Markdown auto-parse error: {e}")
+                        params.message = res
+                else:
+                    params.message = res
+                    
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        except Exception as e:
+            log(f"[MandreLib SmartArgs] Error: {traceback.format_exc()}")
+            Mandre.Notification.show_simple("System Error", str(e))
+            return HookResult(strategy=HookStrategy.CANCEL)
+    
+    @staticmethod
+    def add_tg_alias(path: str, callback: Callable[[Intent], None]):
+        if not isinstance(path, str) or not path: log("[MandreLib] Ошибка: путь для tg:// алиаса должен быть непустой строкой."); return
+        _TG_ALIAS_MAP[path.rstrip('/')] = callback
+        log(f"[MandreLib] Зарегистрирован tg:// алиас: {path}")
+    
+    @staticmethod
+    def remove_tg_alias(path: str):
+        if _TG_ALIAS_MAP.pop(path.rstrip('/'), None): log(f"[MandreLib] Удален tg:// алиас: {path}")
+
+    @staticmethod
+    def register_settings_alias(plugin_instance: BasePlugin):
+        plugin_id = plugin_instance.id
+        if not plugin_id: log("[MandreLib] Ошибка: у плагина нет ID."); return
+        def open_settings_callback(intent: Intent):
+            try:
+                controller = PluginsController.getInstance()
+                plugin = controller.plugins.get(plugin_id)
+                fragment = get_last_fragment()
+                if fragment and plugin: fragment.presentFragment(PluginSettingsActivity(plugin))
+                else: BulletinHelper.show_error("Не удалось открыть настройки.")
+            except Exception as e: log(f"[MandreLib] Ошибка при открытии настроек для {plugin_id}: {e}")
+        Mandre.add_tg_alias(plugin_id, open_settings_callback)
+        log(f"[MandreLib] Автоматически зарегистрирован алиас настроек: tg://{plugin_id}")
+
+    @staticmethod
+    def remove_settings_alias(plugin_instance: BasePlugin):
+        if plugin_instance.id: Mandre.remove_tg_alias(plugin_instance.id); log(f"[MandreLib] Алиас настроек для {plugin_instance.id} удален.")
+            
+    @staticmethod
+    def apply_and_refresh_settings(plugin_instance):
+        def refresher():
+            try:
+                # Импортируем R под другим именем, чтобы не было конфликтов
+                from android_utils import R as RunnableArg 
+
+                fragment = get_last_fragment()
+                listView = None
+                
+                if fragment:
+                    cls_name = str(fragment.getClass().getName())
+                    if "PluginSettingsActivity" in cls_name:
+                        listView = get_private_field(fragment, "listView")
+
+                if not listView:
+                    PluginsController.getInstance().loadPluginSettings(plugin_instance.id)
+                    return
+
+                # 1. FADE OUT (Быстро скрываем)
+                # Важно: duration поменьше, чтобы отзывчивость была высокой
+                listView.animate()\
+                    .alpha(0.0)\
+                    .scaleX(0.95)\
+                    .scaleY(0.95)\
+                    .setDuration(100)\
+                    .setInterpolator(DecelerateInterpolator())\
+                    .withEndAction(RunnableArg(lambda: _on_fade_out_complete(listView, plugin_instance.id)))\
+                    .start()
+
+            except Exception as e:
+                log(f"[MandreLib] Anim error: {e}")
+                PluginsController.getInstance().loadPluginSettings(plugin_instance.id)
+
+        def _on_fade_out_complete(listView, pid):
+            try:
+                # 2. ПОДМЕНА ДАННЫХ
+                # Список сейчас полностью прозрачен (alpha=0)
+                PluginsController.getInstance().loadPluginSettings(pid)
+                
+                # 3. ПАУЗА ДЛЯ ЛЕЙАУТА (FIX ГЛИТЧА)
+                # Мы не запускаем анимацию появления мгновенно.
+                # Даем списку 40мс, чтобы он успел отрисовать новые элементы "за кадром".
+                # Если этого не сделать, анимация начнется со старым кадром.
+                
+                def start_fade_in():
+                    try:
+                        # Подготовка к появлению
+                        listView.setAlpha(0.0) # Гарантируем прозрачность
+                        listView.setScaleX(0.97)
+                        listView.setScaleY(0.97)
+                        listView.setTranslationY(float(AndroidUtilities.dp(10)))
+                        
+                        # 4. FADE IN (Появление)
+                        listView.animate()\
+                            .alpha(1.0)\
+                            .scaleX(1.0)\
+                            .scaleY(1.0)\
+                            .translationY(0.0)\
+                            .setDuration(200)\
+                            .setInterpolator(DecelerateInterpolator())\
+                            .start()
+                    except: pass
+
+                # Используем встроенную функцию отложенного запуска
+                run_on_ui_thread(start_fade_in, delay=150)
+
+            except Exception as e:
+                log(f"[MandreLib] Anim swap error: {e}")
+
+        run_on_ui_thread(refresher)
+        
+    @staticmethod
+    def schedule_task(plugin_instance: BasePlugin, task_name: str, interval_seconds: int, callback: Callable):
+        global _SCHEDULER_RUNNABLE
+        if not callable(callback): log("[MandreLib] Ошибка: колбэк для задачи не является функцией."); return
+        task_key = f"{plugin_instance.id}_{task_name}"
+        with _TASK_LOCK:
+            _TASKS[task_key] = {"cb": callback, "interval": max(1, int(interval_seconds)), "next_ts": time.time() + interval_seconds}
+            log(f"[MandreLib] Задача '{task_key}' запланирована с интервалом {interval_seconds}с")
+            if _SCHEDULER_RUNNABLE is None:
+                _SCHEDULER_RUNNABLE = _SchedulerRunnable()
+                _SCHEDULER_HANDLER.postDelayed(_SCHEDULER_RUNNABLE, 1000)
+                log("[MandreLib] Планировщик запущен.")
+        
+    @staticmethod
+    def cancel_task(plugin_instance: BasePlugin, task_name: str):
+        global _SCHEDULER_RUNNABLE
+        task_key = f"{plugin_instance.id}_{task_name}"
+        with _TASK_LOCK:
+            if _TASKS.pop(task_key, None):
+                log(f"[MandreLib] Задача '{task_key}' отменена.")
+            if not _TASKS and _SCHEDULER_RUNNABLE is not None:
+                _SCHEDULER_HANDLER.removeCallbacks(_SCHEDULER_RUNNABLE)
+                _SCHEDULER_RUNNABLE = None
+                log("[MandreLib] Планировщик остановлен (нет задач).")
+
+    @staticmethod
+    def use_persistent_storage(plugin: BasePlugin):
+        plugin_id = plugin.id
+        if plugin_id in _PERSISTENT_PLUGINS or "_validation_test_" in plugin_id:
+            return
+
+        try:
+            original_set_setting = plugin.set_setting
+            def patched_set_setting(key, value):
+                original_set_setting(key, value)
+                if plugin_id not in _RESTORING_PLUGINS:
+                    config = MandreData.read_persistent_json(plugin_id, "config.json", {})
+                    config[key] = value
+                    MandreData.write_persistent_json(plugin_id, "config.json", config)
+            plugin.set_setting = patched_set_setting
+            _PERSISTENT_PLUGINS.add(plugin_id)
+            try:
+                _RESTORING_PLUGINS.add(plugin_id)
+                config = MandreData.read_persistent_json(plugin_id, "config.json", None)
+                if config is not None:
+                    log(f"[MandreLib] Восстановление настроек для {plugin_id} из персистентного хранилища.")
+                    for key, value in config.items():
+                        original_set_setting(key, value)
+            finally:
+                _RESTORING_PLUGINS.discard(plugin_id)
+            log(f"[MandreLib] Персистентное хранилище настроек включено для {plugin_id}")
+        except Exception:
+            log(f"[MandreLib] Не удалось включить персистентное хранилище для {plugin_id}: {traceback.format_exc()}")
+            
+    @staticmethod
+    def sql_get_database():
+        try:
+            storage = get_messages_storage()
+            # Return cached DB if storage unchanged
+            if getattr(Mandre, "_DB_CACHE_STORAGE", None) is storage and getattr(Mandre, "_DB_CACHE_DB", None):
+                return Mandre._DB_CACHE_DB
+            db = get_private_field(storage, "database")
+            Mandre._DB_CACHE_STORAGE = storage
+            Mandre._DB_CACHE_DB = db
+            return db
+        except Exception:
+            return None
+
+    @staticmethod
+    def sql_init_kv(plugin_id: str, table_name: str = "mandre_kv"):
+        try:
+            db = Mandre.sql_get_database()
+            if not db:
+                return
+            db.executeFast(f"CREATE TABLE IF NOT EXISTS {table_name} (plugin TEXT, k TEXT, v TEXT, PRIMARY KEY(plugin,k))").stepThis()
+        except Exception:
+            pass
+
+    @staticmethod
+    def sql_kv_set(plugin_id: str, key: str, value: Any, table_name: str = "mandre_kv"):
+        try:
+            db = Mandre.sql_get_database()
+            if not db:
+                return
+            stmt = db.executeFast(f"REPLACE INTO {table_name} (plugin,k,v) VALUES (?,?,?)")
+            try:
+                stmt.bindString(1, str(plugin_id))
+                stmt.bindString(2, str(key))
+                stmt.bindString(3, str(value))
+                stmt.stepThis()
+            finally:
+                try:
+                    stmt.dispose()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def sql_kv_get(plugin_id: str, key: str, table_name: str = "mandre_kv") -> Optional[str]:
+        try:
+            db = Mandre.sql_get_database()
+            if not db:
+                return None
+            cursor = db.queryFinalized(f"SELECT v FROM {table_name} WHERE plugin = '{plugin_id}' AND k = '{key}' LIMIT 1")
+            try:
+                if cursor.next():
+                    try:
+                        return cursor.stringValue(0)
+                    except Exception:
+                        try:
+                            return str(cursor.intValue(0))
+                        except Exception:
+                            return None
+            finally:
+                try:
+                    cursor.dispose()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def sql_kv_get_int(plugin_id: str, key: str, default: int = 0, table_name: str = "mandre_kv") -> int:
+        v = Mandre.sql_kv_get(plugin_id, key, table_name)
+        try:
+            if v is None:
+                return default
+            if isinstance(v, int):
+                return int(v)
+            s = str(v).strip()
+            if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+                return int(s)
+        except Exception:
+            pass
+        return default
+
+    @staticmethod
+    def sql_kv_delete_prefix(plugin_id: str, prefix: str, table_name: str = "mandre_kv"):
+        try:
+            db = Mandre.sql_get_database()
+            if not db:
+                return
+            stmt = db.executeFast(f"DELETE FROM {table_name} WHERE plugin = ? AND k LIKE ?")
+            try:
+                stmt.bindString(1, str(plugin_id))
+                stmt.bindString(2, f"{prefix}%")
+                stmt.stepThis()
+            finally:
+                try:
+                    stmt.dispose()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def auto_translate_inline_strings(plugin_instance: BasePlugin, strings: List[str]):
+        try:
+            plugin_id = plugin_instance.id
+            user_lang = LocaleController.getInstance().getCurrentLocaleInfo().getLangCode().split('-')[0]
+            
+            # 1. Проверка TARGETlang в плагине
+            target_lang_override = getattr(plugin_instance, "TARGETlang", None)
+            if target_lang_override:
+                target_lang_override = str(target_lang_override).strip().lower()
+                # Если язык плагина совпадает с языком пользователя - перевод не нужен.
+                if target_lang_override == user_lang:
+                    return
+
+            cache_key = f"{plugin_id}_{user_lang}"
+            
+            # Загрузка кэша с диска, если в памяти пусто
+            if cache_key not in _LOCALIZATION_CACHE:
+                disk_cache = MandreData.read_persistent_json(plugin_id, f"locales/{user_lang}.json", {})
+                if disk_cache:
+                    _LOCALIZATION_CACHE[cache_key] = disk_cache
+
+            cache = _LOCALIZATION_CACHE.get(cache_key, {})
+            if cache_key not in _LOCALIZATION_CACHE:
+                _LOCALIZATION_CACHE[cache_key] = cache
+
+            # Уникализируем и отфильтруем уже переведенные
+            to_translate: List[str] = []
+            seen = set()
+            for s in strings:
+                if not isinstance(s, str):
+                    continue
+                key = s.strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                if not cache.get(key):
+                    to_translate.append(key)
+
+            if not to_translate:
+                return
+
+            # Вызов AI. Если TARGETlang не задан, AI определит исходный язык сам.
+            translated_values_str = Mandre._call_pollinations_api_for_json(to_translate, user_lang)
+            if not translated_values_str:
+                log(f"[MandreLib AutoLoc] Не удалось получить inline переводы для {plugin_id} на {user_lang}")
+                return
+
+            translated_values = json.loads(translated_values_str)
+            if len(translated_values) != len(to_translate):
+                log(f"[MandreLib AutoLoc] Несоответствие количества inline переводов: {len(translated_values)} != {len(to_translate)}")
+                return
+
+            for original, translated in zip(to_translate, translated_values):
+                cache[original] = translated
+
+            # Сохраняем в persistent JSON
+            try:
+                base_dir = MandreData._get_base_data_dir().getAbsolutePath()
+                locale_dir_path = os.path.join(base_dir, plugin_id, "locales")
+                os.makedirs(locale_dir_path, exist_ok=True)
+            except Exception:
+                pass
+            
+            existing = MandreData.read_persistent_json(plugin_id, f"locales/{user_lang}.json")
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(cache)
+            MandreData.write_persistent_json(plugin_id, f"locales/{user_lang}.json", existing)
+            log(f"[MandreLib AutoLoc] Inline переводов добавлено для {plugin_id} на {user_lang}: {len(to_translate)}")
+            
+            # САМОЕ ГЛАВНОЕ: Перезагружаем настройки, чтобы перевод применился сразу
+            run_on_ui_thread(lambda: Mandre.apply_and_refresh_settings(plugin_instance))
+
+        except Exception:
+            log(f"[MandreLib AutoLoc] Ошибка в auto_translate_inline_strings: {traceback.format_exc()}")
+
+    @staticmethod
+    def register_synthetic_channel(channel_id: int, title: str, megagroup: bool = False, broadcast: bool = True):
+        try:
+            mc = get_messages_controller()
+            chat = mc.getChat(channel_id)
+            if chat:
+                if title and getattr(chat, 'title', None) != title:
+                    chat.title = title
+                    mc.putChat(chat, True)
+                return chat
+            channel = TLRPC.TL_channel()
+            channel.id = int(channel_id)
+            channel.title = title
+            channel.megagroup = bool(megagroup)
+            channel.broadcast = bool(broadcast)
+            channel.creator = False
+            channel.left = False
+            channel.verified = False
+            channel.scam = False
+            channel.restricted = False
+            mc.putChat(channel, True)
+            return channel
+        except Exception as e:
+            log(f"[MandreLib] register_synthetic_channel error: {e}")
+            return None
+            
+    @staticmethod
+    def register_command(plugin_instance: BasePlugin, command_name: str, callback: Callable):
+        if not callable(callback):
+            log(f"[MandreLib] Ошибка регистрации команды '{command_name}': колбэк не является функцией.")
+            return
+        with _COMMAND_LOCK:
+            _COMMANDS[command_name.lower()] = {
+                "callback": callback,
+                "plugin_instance": plugin_instance
+            }
+            log(f"[MandreLib] Команда '{command_name}' от плагина '{plugin_instance.id}' зарегистрирована.")
+            
+    @staticmethod
+    def handle_outgoing_command(params: Any) -> Optional[HookResult]:
+        global _mandrelib_instance
+        if not _mandrelib_instance: return None
+
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str): return None
+        
+        prefix = _mandrelib_instance.get_setting("command_prefix", ".")
+        if not msg.startswith(prefix): return None
+        
+        parts = msg[len(prefix):].split(' ', 1)
+        cmd_name = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        
+        with _COMMAND_LOCK:
+            command_entry = _COMMANDS.get(cmd_name)
+            
+        if not command_entry: return None
+        
+        try:
+            callback = command_entry["callback"]
+            plugin_instance = command_entry["plugin_instance"]
+            result = callback(plugin_instance, args, params)
+            
+            if isinstance(result, HookResult):
+                return result
+            if isinstance(result, str):
+                params.message = result
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception:
+            log(f"[MandreLib] Ошибка выполнения команды '{cmd_name}': {traceback.format_exc()}")
+            BulletinHelper.show_error(f"Ошибка в команде .{cmd_name}")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+    @staticmethod
+    def t(plugin_instance: BasePlugin, key: str, **kwargs) -> str:
+        plugin_id = plugin_instance.id
+        user_lang = LocaleController.getInstance().getCurrentLocaleInfo().getLangCode().split('-')[0]
+        
+        # Проверяем кэш в памяти (он заполняется через auto_translate или загрузку с диска)
+        cache_key = f"{plugin_id}_{user_lang}"
+        
+        if cache_key not in _LOCALIZATION_CACHE:
+             # Пытаемся лениво загрузить с диска, если еще не загружено
+            disk_cache = MandreData.read_persistent_json(plugin_id, f"locales/{user_lang}.json", {})
+            if disk_cache:
+                _LOCALIZATION_CACHE[cache_key] = disk_cache
+        
+        if cache_key in _LOCALIZATION_CACHE:
+            translated_text = _LOCALIZATION_CACHE[cache_key].get(key)
+            if translated_text:
+                return translated_text.format(**kwargs) if kwargs else translated_text
+
+        # Если перевода нет, возвращаем оригинал
+        return key.format(**kwargs) if kwargs else key
+    
+    @staticmethod
+    def _call_pollinations_api_for_json(values: List[str], target_lang: str) -> Optional[str]:
+        try:
+            lang_name = Locale(target_lang).getDisplayLanguage(Locale("en"))
+            json_to_translate = json.dumps(values, ensure_ascii=False)
+            
+            prompt = (
+                f"You are a translation assistant. Translate the following JSON array of strings into {lang_name}. "
+                f"Detect the source language automatically. "
+                f"Your response must be ONLY a valid JSON array containing the translated strings in the exact same order. "
+                f"Do not add any explanations, markdown, or other text outside of the JSON array. "
+                f"Original JSON array:\n\n{json_to_translate}"
+            )
+            
+            url = "https://text.pollinations.ai/openai"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "model": "openai-fast",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            }
+
+            response = requests.post(url, headers=headers, json=payload, timeout=90)
+            response.raise_for_status()
+            
+            result = response.json()
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            match = re.search(r'\[\s*".*?"\s*(?:,\s*".*?"\s*)*\]', content, re.DOTALL)
+            if match:
+                return match.group(0)
+
+            log("[MandreLib AutoLoc] Не удалось извлечь JSON массив из ответа API.")
+            return None
+        except Exception as e:
+            log(f"[MandreLib AutoLoc] Ошибка API Pollinations: {e}")
+            return None
+
+class _ActivityResultHook(MethodHook):
+    def __init__(self, plugin_instance):
+        self.plugin = plugin_instance
+    def before_hooked_method(self, param):
+        if param.args[0] == FILE_PICK_REQUEST_CODE:
+            param.setResult(None)
+            if param.args[1] == Activity.RESULT_OK and param.args[2] is not None:
+                uri = param.args[2].getData()
+                if uri:
+                    run_on_queue(lambda: self.plugin._process_imported_file(uri, self.plugin._import_target_plugin_id))
+            if self.plugin._activity_hook:
+                self.plugin.unhook_method(self.plugin._activity_hook)
+                self.plugin._activity_hook = None
+
+class _AppLogHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            msg = str(param.args[0])
+            # level = param.args[2] # 0=D, 1=I, 2=W, 3=E
+            
+            # Отправляем на сервер
+            # Добавим подсветку для важных тегов
+            if "[MandreLib]" in msg: msg = f"🔥 {msg}"
+            elif "[MandreAsync]" in msg: msg = f"⚡ {msg}"
+            elif "Command" in msg and "plugin" in msg: msg = f"🎮 {msg}"
+            
+            # Можно добавить префикс уровня лога, если хочешь
+            # levels = {0: "D", 1: "I", 2: "W", 3: "E"}
+            # lvl = levels.get(int(param.args[2]), "?")
+            # msg = f"[{lvl}] {msg}"
+
+            _MANDRE_SERVER.broadcast(msg)
+        except:
+            pass
+
+class MandreLibPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._activity_hook = None
+        self._import_target_plugin_id = None
+
+    
+        
+    def on_plugin_load(self):
+        global _mandrelib_instance
+        _mandrelib_instance = self
+        self.log(f"Библиотека '{self.name} v{self.version}' загружена.")
+        _ensure_tg_hook(self)
+        run_on_ui_thread(self._hook_install_sheet, 1000)
+
+
+
+        try:
+            PluginSettingsActivity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if hasattr(PluginSettingsActivity, "class_"):
+                TargetClass = PluginSettingsActivity.class_
+            else:
+                TargetClass = jclass("java.lang.Class").forName("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            
+            ArrayList = jclass("java.util.ArrayList")
+            UniversalAdapter = jclass("org.telegram.ui.Components.UniversalAdapter")
+            method = TargetClass.getDeclaredMethod("fillItems", ArrayList, UniversalAdapter)
+            method.setAccessible(True)
+            self.hook_method(method, SettingsFillItemsHook())
+        except Exception as e:
+            self.log(f"Hook FAILED: {e}")
+
+        MandreDex.ensure_loaded(self)
+       # --- АВТОМАТИЧЕСКАЯ УСТАНОВКА ЗАВИСИМОСТЕЙ ---
+        # Запускаем в отдельном потоке, чтобы не тормозить UI Telegram при запуске
+        def bootstrap_async_deps():
+            try:
+                # Проверяем наличие aiofiles. Если нет - качаем всё.
+                try:
+                    import aiofiles
+                except ImportError:
+                    self.log("[MandreLib] Установка Async зависимостей (первый запуск)...")
+                    if MandreAsync.ensure_env():
+                        self.log("[MandreLib] Зависимости установлены.")
+            except Exception as e:
+                self.log(f"[MandreLib] Ошибка Bootstrap: {e}")
+
+        threading.Thread(target=bootstrap_async_deps, daemon=True).start()
+        # -----------------------------------------------
+
+        # --- НОВЫЙ ХУК ЛОГОВ ---
+        try:
+            AppUtils = find_class("com.exteragram.messenger.utils.AppUtils")
+            if AppUtils:
+                String = find_class("java.lang.String")
+                Throwable = find_class("java.lang.Throwable")
+                Integer = find_class("java.lang.Integer")
+                
+                method = AppUtils.getClass().getDeclaredMethod(
+                    "logInternal", String, Throwable, Integer.TYPE
+                )
+                method.setAccessible(True)
+                self.hook_method(method, _AppLogHook())
+                self.log("[MandreLib] Системный хук логов активирован.")
+        except Exception as e:
+            self.log(f"[MandreLib] Ошибка хука логов: {e}")
+        # -----------------------
+
+        # 2. Хуки инсталлятора
+        try:
+            EngineWrapper = find_class("com.exteragram.messenger.plugins.PythonPluginsEngine")
+            EngineClass = Mandre.Reflect._to_java_class(EngineWrapper)
+            String = find_class("java.lang.String")
+            PluginCls = find_class("com.exteragram.messenger.plugins.Plugin")
+            CallbackCls = find_class("org.telegram.messenger.Utilities$Callback")
+            JavaFile = find_class("java.io.File")
+            
+            val_method = EngineClass.getDeclaredMethod("validatePluginFromFile", String)
+            self.hook_method(val_method, _PkgValidateHook()) 
+            
+            load_method = EngineClass.getDeclaredMethod("loadPluginFromFile", String, PluginCls, CallbackCls)
+            self.hook_method(load_method, _PkgLoadHook())
+            
+            # Хук isPlugin, чтобы контроллер не отсеивал файл .mandre до валидации
+            is_plugin_method = EngineClass.getDeclaredMethod("isPlugin", JavaFile)
+            self.hook_method(is_plugin_method, _PkgIsPluginHook())
+            
+            self.log("Pkg Installer: Active")
+        except Exception as e:
+            self.log(f"Install Hook Error: {e}")
+
+        # 3. Хук открытия файла
+        try:
+            AndroidUtilsWrapper = find_class("org.telegram.messenger.AndroidUtilities")
+            AndroidUtils = Mandre.Reflect._to_java_class(AndroidUtilsWrapper)
+            JavaFile = find_class("java.io.File")
+            
+            hooked = 0
+            for m in AndroidUtils.getDeclaredMethods():
+                if m.getName() == "openForView":
+                    pt = m.getParameterTypes()
+                    if len(pt) > 0 and pt[0].getName() == "java.io.File":
+                        self.hook_method(m, _OpenMandreHook())
+                        hooked += 1
+            if hooked > 0: self.log("Open Hook: Active")
+        except Exception as e:
+            self.log(f"Open Hook Error: {e}")
+
+    def on_plugin_unload(self):
+        global _mandrelib_instance
+        _internal_shutdown_tts()
+        _mandrelib_instance = None
+        self.log(f"Библиотека выгружена.")
+        Mandre.Sensors.stop_all()
+        
+    def on_plugin_unload(self):
+        global _mandrelib_instance
+        _internal_shutdown_tts() # Остановка TTS
+        _mandrelib_instance = None
+        self.log(f"Библиотека '{self.name} v{self.version}' выгружена.")
+        Mandre.Sensors.stop_all()
+
+    def _hook_install_sheet(self):
+        try:
+            self.log("[MandreLib Hook] Поиск класса InstallPluginBottomSheet...")
+            try:
+                JavaClass = find_class("java.lang.Class")
+                SheetClassJava = JavaClass.forName("com.exteragram.messenger.plugins.ui.components.InstallPluginBottomSheet")
+            except Exception:
+                SheetClassWrapper = find_class("com.exteragram.messenger.plugins.ui.components.InstallPluginBottomSheet")
+                if SheetClassWrapper:
+                    SheetClassJava = SheetClassWrapper.class_
+                else:
+                    return
+
+            if not SheetClassJava: return
+
+            target_ctor = None
+            constructors = SheetClassJava.getDeclaredConstructors()
+            
+            for ctor in constructors:
+                params = ctor.getParameterTypes()
+                if len(params) == 3:
+                    p0 = params[0].getName()
+                    p2 = params[2].getName()
+                    if "BaseFragment" in p0 and "PluginInstallParams" in p2:
+                        target_ctor = ctor
+                        break
+            
+            if target_ctor:
+                target_ctor.setAccessible(True)
+                self._sheet_hook_ref = self.hook_method(target_ctor, self._InstallSheetHook())
+                self.log("[MandreLib Hook] ✅ Хук установлен!")
+
+        except Exception as e:
+            self.log(f"[MandreLib Hook] Ошибка: {traceback.format_exc()}")
+
+    class _InstallSheetHook(MethodHook):
+        def after_hooked_method(self, param):
+            def to_java_int(val):
+                """Приводит Python int к Java int (32-bit signed)"""
+                val = int(val)
+                if val > 0x7FFFFFFF:
+                    val -= 0x100000000
+                return val
+
+            def darken_color(color, factor=0.85):
+                """Затемняет цвет и возвращает Java int"""
+                if color < 0: color += 0x100000000
+                a = (color >> 24) & 0xFF
+                r = int(((color >> 16) & 0xFF) * factor)
+                g = int(((color >> 8) & 0xFF) * factor)
+                b = int((color & 0xFF) * factor)
+                val = (a << 24) | (r << 16) | (g << 8) | b
+                return to_java_int(val)
+
+            def modify_ui():
+                try:
+                    sheet = param.thisObject
+                    install_params = param.args[2] 
+                    
+                    if not sheet or not install_params: return
+
+                    is_trusted = False
+                    try:
+                        trusted_field = install_params.getClass().getDeclaredField("trusted")
+                        trusted_field.setAccessible(True)
+                        is_trusted = trusted_field.getBoolean(install_params)
+                    except: is_trusted = False
+
+                    if is_trusted: return
+
+                    # --- ПОИСК VIEW ---
+                    custom_view = None
+                    try:
+                        curr_cls = sheet.getClass()
+                        while curr_cls is not None:
+                            try:
+                                f = curr_cls.getDeclaredField("customView")
+                                f.setAccessible(True)
+                                custom_view = f.get(sheet)
+                                if custom_view: break
+                            except: pass
+                            curr_cls = curr_cls.getSuperclass()
+                    except: pass
+
+                    if not custom_view:
+                        try:
+                            f = sheet.getClass().getSuperclass().getDeclaredField("containerView")
+                            f.setAccessible(True)
+                            custom_view = f.get(sheet)
+                        except: pass
+
+                    if not custom_view: return
+
+                    # --- ИМПОРТЫ ---
+                    ButtonWithCounterView = find_class("org.telegram.ui.Stories.recorder.ButtonWithCounterView")
+                    ViewGroup = find_class("android.view.ViewGroup")
+                    LinearLayout = find_class("android.widget.LinearLayout")
+                    Theme = find_class("org.telegram.ui.ActionBar.Theme")
+                    AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
+                    
+                    install_btn = None
+                    parent_layout = None
+                    warning_badge = None
+
+                    def scan_view(view):
+                        nonlocal install_btn, parent_layout, warning_badge
+                        if not view: return
+                        
+                        if isinstance(view, ButtonWithCounterView):
+                            install_btn = view
+                            parent_layout = view.getParent()
+                        
+                        if isinstance(view, LinearLayout):
+                            if view.getChildCount() == 2:
+                                if parent_layout and view.getParent() == parent_layout and view != install_btn:
+                                    warning_badge = view
+
+                        if isinstance(view, ViewGroup):
+                            count = view.getChildCount()
+                            for i in range(count):
+                                scan_view(view.getChildAt(i))
+
+                    scan_view(custom_view)
+
+                    if not install_btn or not parent_layout: return
+
+                    # --- 1. ПЛАШКА "НЕИЗВЕСТНЫЙ ИСТОЧНИК" ---
+                    if warning_badge:
+                        warn_bg = Theme.createSimpleSelectorRoundRectDrawable(
+                            AndroidUtilities.dp(20), 
+                            to_java_int(0x30FF0000), 
+                            to_java_int(0x30FF0000)
+                        )
+                        warning_badge.setBackground(warn_bg)
+
+                    # --- 2. КНОПКА "УСТАНОВИТЬ" (ОБЫЧНАЯ) ---
+                    normal_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+                    normal_pressed = darken_color(normal_color, 0.9)
+                    
+                    install_btn.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
+                        AndroidUtilities.dp(8), 
+                        normal_color, 
+                        normal_pressed
+                    ))
+                    
+                    try: install_btn.setText("Всё равно установить", False)
+                    except: pass
+
+                    # --- 3. КНОПКА "ПРОВЕРИТЬ" (ТЕМНАЯ) ---
+                    context = sheet.getContext()
+                    resources_provider = None
+                    try:
+                        curr_cls = sheet.getClass()
+                        while curr_cls is not None:
+                            try:
+                                m = curr_cls.getDeclaredMethod("getResourceProvider")
+                                m.setAccessible(True)
+                                resources_provider = m.invoke(sheet)
+                                if resources_provider: break
+                            except: pass
+                            curr_cls = curr_cls.getSuperclass()
+                    except: pass
+
+                    scan_btn = ButtonWithCounterView(context, True, resources_provider)
+                    scan_btn.setText("Проверить (@PluginSecurity_bot)", False)
+                    
+                    base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+                    darker_color = darken_color(base_color, 0.75) # Сильно темнее
+                    darker_pressed = darken_color(base_color, 0.65)
+
+                    scan_bg = Theme.createSimpleSelectorRoundRectDrawable(
+                        AndroidUtilities.dp(8), 
+                        darker_color, 
+                        darker_pressed
+                    )
+                    scan_btn.setBackground(scan_bg)
+
+                    # Путь к файлу
+                    file_path = None
+                    try:
+                        path_field = install_params.getClass().getDeclaredField("filePath")
+                        path_field.setAccessible(True)
+                        file_path = path_field.get(install_params)
+                    except: pass
+                    
+                    class ScanClickListener(dynamic_proxy(View.OnClickListener)):
+                        def onClick(self, v):
+                            sheet.dismiss()
+                            if file_path:
+                                MandreSecurity.scan_file(str(file_path))
+                            else:
+                                BulletinHelper.show_error("Путь не найден")
+
+                    scan_btn.setOnClickListener(ScanClickListener())
+
+                    # --- 4. ВСТАВКА И ОТСТУПЫ ---
+                    idx = -1
+                    child_count = parent_layout.getChildCount()
+                    for i in range(child_count):
+                        if parent_layout.getChildAt(i) == install_btn:
+                            idx = i
+                            break
+                    
+                    if idx != -1:
+                        # 4.1. Исправляем отступ кнопки УСТАНОВКИ (чтобы не липла к описанию)
+                        try:
+                            # Получаем текущие параметры, чтобы не сбить ширину/высоту
+                            install_lp = install_btn.getLayoutParams()
+                            if isinstance(install_lp, LinearLayout.LayoutParams):
+                                # Стандартный отступ сверху (например, 16dp от текста)
+                                # Если там был 0, ставим нормальный
+                                install_lp.topMargin = AndroidUtilities.dp(16)
+                                # Убираем нижний отступ, так как отступ будет у кнопки проверки
+                                install_lp.bottomMargin = 0 
+                                install_btn.setLayoutParams(install_lp)
+                        except: pass
+
+                        # 4.2. Настраиваем кнопку ПРОВЕРКИ
+                        # Копируем параметры у install_btn, чтобы ширина/высота совпадали
+                        scan_lp = LinearLayout.LayoutParams(install_btn.getLayoutParams())
+                        
+                        # Отступ СВЕРХУ от кнопки установки (8dp - стандарт для кнопок)
+                        scan_lp.topMargin = AndroidUtilities.dp(8)
+                        # Отступ СНИЗУ (для конца контейнера)
+                        scan_lp.bottomMargin = AndroidUtilities.dp(8)
+
+                        # 4.3. Вставляем ПОСЛЕ кнопки установки (индекс + 1)
+                        # Так логичнее: Сначала главное действие, потом проверка
+                        parent_layout.addView(scan_btn, idx + 1, scan_lp)
+
+                except Exception as e:
+                    log(f"[MandreLib Hook] UI Error: {traceback.format_exc()}")
+
+            run_on_ui_thread(modify_ui)
+
+    def _create_data_management_fragment(self):
+        items = [Header(text="Управление данными плагинов")]
+        plugins_with_data = MandreData.list_persistent_plugins()
+        if not plugins_with_data:
+            items.append(Text(text="Нет сохраненных данных.", icon="msg_info_solar"))
+            return items
+        items.append(Text(text="Здесь хранятся данные и конфиги, которые не удаляются вместе с плагинами."))
+        items.append(Divider())
+        for plugin_id in plugins_with_data:
+            items.append(Text(
+                text=plugin_id,
+                icon="files_folder_solar",
+                create_sub_fragment=lambda p_id=plugin_id: self._create_plugin_data_fragment(p_id)
+            ))
+        return items
+
+    def _create_plugin_data_fragment(self, plugin_id: str):
+        files = MandreData.list_files_for_plugin(plugin_id)
+        items = [Header(f"Данные для: {plugin_id}")]
+        for filename in files:
+            items.append(Text(text=filename, icon="msg_filehq_solar"))
+        items.extend([
+            Divider(),
+            Text(
+                text="Экспорт данных",
+                icon="msg_upload_solar",
+                accent=True,
+                on_click=lambda _, p_id=plugin_id: self._handle_export_data(p_id)
+            ),
+            Text(
+                text="Импорт данных",
+                icon="msg_download_solar",
+                accent=True,
+                on_click=lambda _, p_id=plugin_id: self._handle_import_data(p_id)
+            ),
+            Text(
+                text=f"Удалить все данные для {plugin_id}",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda _, p_id=plugin_id: MandreUI.show(
+                    title="Подтверждение",
+                    message=f"Вы уверены, что хотите удалить ВСЕ данные для плагина '{p_id}'? Это действие необратимо.",
+                    items=["Да, удалить"],
+                    on_select=lambda i, t: self._confirm_delete_data(p_id)
+                )
+            )
+        ])
+        return items
+        
+    def _confirm_delete_data(self, plugin_id: str):
+        if MandreData.delete_persistent_plugin_data(plugin_id):
+            BulletinHelper.show_success(f"Данные для {plugin_id} удалены.")
+            Mandre.apply_and_refresh_settings(self) 
+        else:
+            BulletinHelper.show_error(f"Не удалось удалить данные.")
+            
+    def _handle_export_data(self, plugin_id: str):
+        def _export_task():
+            try:
+                source_dir = File(MandreData._get_base_data_dir(), plugin_id)
+                if not source_dir.exists() or not source_dir.isDirectory() or not source_dir.listFiles():
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Нет данных для экспорта."))
+                    return
+
+                downloads_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if not downloads_dir.exists(): downloads_dir.mkdirs()
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                zip_filename = f"mandrelib_data_{plugin_id}_{timestamp}.zip"
+                zip_path = os.path.join(downloads_dir.getAbsolutePath(), zip_filename)
+
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for filename in MandreData.list_files_for_plugin(plugin_id):
+                        file_path = MandreData.get_persistent_path(plugin_id, filename)
+                        zipf.write(file_path, arcname=filename)
+                
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Данные экспортированы в Downloads/{zip_filename}"))
+            except Exception as e:
+                log(f"[MandreLib] Ошибка экспорта: {traceback.format_exc()}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка экспорта: {e}"))
+        
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Экспорт данных..."))
+        run_on_queue(_export_task)
+
+    def _handle_import_data(self, plugin_id: str):
+        try:
+            self._import_target_plugin_id = plugin_id
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if not activity: BulletinHelper.show_error("Не удалось получить текущий экран."); return
+
+            if self._activity_hook: self.unhook_method(self._activity_hook)
+            
+            method = activity.getClass().getDeclaredMethod("onActivityResult", JInteger.TYPE, JInteger.TYPE, Intent)
+            self._activity_hook = self.hook_method(method, _ActivityResultHook(self))
+            
+            intent = Intent(Intent.ACTION_GET_CONTENT)
+            intent.setType("application/zip")
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            
+            activity.startActivityForResult(Intent.createChooser(intent, "Выберите архив с данными"), FILE_PICK_REQUEST_CODE)
+        except Exception as e:
+            log(f"[MandreLib] Не удалось запустить выбор файла: {e}")
+            BulletinHelper.show_error("Ошибка при открытии выбора файла.")
+
+    def _process_imported_file(self, uri: Uri, plugin_id: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Импорт данных..."))
+        in_stream, out_stream = None, None
+        try:
+            context = ApplicationLoader.applicationContext
+            resolver = context.getContentResolver()
+            temp_dir = context.getCacheDir()
+            temp_file = File(temp_dir, f"import_{plugin_id}.zip")
+            
+            in_stream, out_stream = resolver.openInputStream(uri), FileOutputStream(temp_file)
+            buffer = bytearray(4096)
+            bytes_read = in_stream.read(buffer)
+            while bytes_read != -1:
+                out_stream.write(buffer, 0, bytes_read)
+                bytes_read = in_stream.read(buffer)
+            
+            MandreData.delete_persistent_plugin_data(plugin_id)
+            target_dir = File(MandreData._get_base_data_dir(), plugin_id)
+            if not target_dir.exists(): target_dir.mkdirs()
+            
+            with zipfile.ZipFile(temp_file.getAbsolutePath(), 'r') as zipf:
+                zipf.extractall(target_dir.getAbsolutePath())
+            
+            temp_file.delete()
+            
+            run_on_ui_thread(lambda: (
+                BulletinHelper.show_success(f"Данные для {plugin_id} импортированы!"),
+                BulletinHelper.show_info("Перезапустите плагин для применения изменений.")
+            ))
+            Mandre.apply_and_refresh_settings(self)
+        except Exception as e:
+            error_message = f"Ошибка импорта: {e}"
+            log(f"[MandreLib] {traceback.format_exc()}")
+            run_on_ui_thread(lambda err=error_message: BulletinHelper.show_error(err))
+        finally:
+            try:
+                if in_stream: in_stream.close()
+                if out_stream: out_stream.close()
+            except Exception as e_close:
+                log(f"[MandreLib] Ошибка закрытия потока: {e_close}")
+            
+    def create_settings(self):
+        # ВНИМАНИЕ: Text не поддерживает subtext, используем только поддерживаемые поля.
+        return [
+            Header(text="Библиотека MandreLib"),
+            Text(text="Надёжный фреймворк для ваших плагинов.", icon="msg_info_solar"),
+            
+            Divider(text="Команды и Локализация"),
+            Input(
+                key="command_prefix",
+                text="Префикс команд",
+                subtext="Символ для активации команд в плагинах.",
+                default=".",
+                icon="msg_edit_solar"
+            ),
+            Input(
+                key="pollinations_api_key",
+                text="API Key (Pollinations.AI)",
+                subtext="Для авто-перевода. Необязательно.",
+                default="",
+                icon="ai_chat_solar"
+            ),
+            Text(
+                text="Управление данными плагинов",
+                icon="menu_storage_path_solar",
+                create_sub_fragment=self._create_data_management_fragment
+            )
+        ]
+
