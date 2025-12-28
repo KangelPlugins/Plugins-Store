@@ -1,0 +1,510 @@
+__id__ = "heroku_host_ultimate"
+__name__ = "Heroku Host (heroku)"
+__version__ = "1.0" # Bumped version FIX: Перенос во внутреннюю память (лечит PermissionError) и фикс логов установки.
+__author__ = "@swagnonher & @codrago (автор хероку)"
+__description__ = """хостинг Heroku Userbot прямо плагином!
+"""
+__min_version__ = "1.7"
+__icon__ = "msg_folders"
+
+import os
+import sys
+import shutil
+import zipfile
+import threading
+import asyncio
+import time
+import requests
+import traceback
+import html
+import logging
+import builtins
+import signal
+import json
+import socket
+import queue
+import gc
+
+# !!! ДОБАВЛЕН ИМПОРТ ApplicationLoader !!!
+from org.telegram.messenger import ApplicationLoader 
+from android.os import Environment, Build
+from android.content import Intent, Context
+from android.net import Uri
+
+from base_plugin import BasePlugin
+from mandre_lib import Mandre, MandreInstall, MandrePip, MandreUI
+from client_utils import get_last_fragment 
+from android_utils import run_on_ui_thread
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+# UI Imports
+try:
+    from android.widget import EditText, LinearLayout
+    from android.text import InputType
+    from android.content import ClipboardManager
+    from android.content import ClipData
+except ImportError:
+    from hook_utils import find_class
+    EditText = find_class("android.widget.EditText")
+    LinearLayout = find_class("android.widget.LinearLayout")
+    InputType = find_class("android.text.InputType")
+    ClipboardManager = find_class("android.content.ClipboardManager")
+    ClipData = find_class("android.content.ClipData")
+
+# --- КОНФИГУРАЦИЯ ---
+HEROKU_ZIP_URL = "https://github.com/coidarashka/MandreLib-Modules/raw/refs/heads/main/Heroku-master.zip"
+
+WHEELS = [
+    "https://coidarashka.github.io/MandreLesta/heroku-tl-new/heroku_tl_new-1.7.2-py3-none-any.whl"
+]
+
+class SoftRestartException(Exception): pass
+
+# --- ВИРТУАЛЬНАЯ КОНСОЛЬ ---
+class VirtualConsole:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.buffer = []
+        self.max_lines = 100
+        self.input_queue = queue.Queue()
+        self.waiting_input = False
+        self.last_prompt = ""
+
+    def write(self, text):
+        if not text: return
+        
+        # Фильтр системного мусора
+        if any(x in text for x in ["DEBUG", "Keepalive", "Receiving items", "connection attempts"]):
+            return
+
+        # Фильтр внутренних логов
+        if "SSH" not in text and "[HEROKU LOG]" not in text:
+            lines = text.splitlines()
+            for line in lines:
+                clean = line.strip()
+                if clean: self.plugin.log(f"[BOT] {clean}")
+        
+        self.buffer.append(text)
+        if len(self.buffer) > self.max_lines:
+            self.buffer.pop(0)
+
+    def flush(self): pass
+
+    def read_input(self, prompt=""):
+        self.waiting_input = True
+        self.last_prompt = str(prompt).strip()
+        
+        run_on_ui_thread(lambda: BulletinHelper.show_info(f"Ввод: {self.last_prompt}"))
+        self.plugin.update_ui_state()
+        
+        try:
+            result = self.input_queue.get(block=True)
+            self.waiting_input = False
+            self.plugin.update_ui_state()
+            return result
+        except: return ""
+
+    def send_input(self, text):
+        self.input_queue.put(text)
+
+# --- ЛОГИРОВАНИЕ ---
+class BridgeHandler(logging.Handler):
+    def __init__(self, p, log_file_path=None):
+        super().__init__()
+        self.p = p
+        self.log_file_path = log_file_path
+        
+    def emit(self, r): 
+        try:
+            msg = self.format(r)
+            if r.levelno >= logging.INFO: 
+                 self.p.log(f"[HEROKU] {msg}")
+        except: pass
+
+    # Фикс ошибки multiple values
+    def dumps(self, lvl=None, client_id=None, *args, **kwargs):
+        try:
+            if self.log_file_path and os.path.exists(self.log_file_path):
+                with open(self.log_file_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            return "Log file not found."
+        except Exception as e:
+            return f"Log read error: {e}"
+
+class HerokuFileHandler(logging.FileHandler):
+    def dumps(self, lvl=None, client_id=None, *args, **kwargs):
+        try:
+            self.flush()
+            with open(self.baseFilename, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            return f"Log read error: {e}"
+
+# --- ПЛАГИН ---
+class HerokuHost(BasePlugin):
+    TARGETlang = "ru"
+    
+    def on_plugin_load(self):
+        Mandre.use_persistent_storage(self)
+        if hasattr(Mandre, "Dex"): Mandre.Dex.ensure_loaded(self)
+        
+        # !!! FIX: ИСПОЛЬЗУЕМ ВНУТРЕННЮЮ ПАМЯТЬ !!!
+        # Внешняя память (Documents) вызывает Permission denied при импорте кода на Android 10+
+        self.root = str(ApplicationLoader.getFilesDirFixed())
+        self.work_dir = os.path.join(self.root, "MandreHost_Heroku")
+        
+        self.is_running = False
+        self.is_web_active = False 
+        self.is_bot_active = False 
+        
+        self.console = VirtualConsole(self)
+        self.stop_flag = False
+        self.bot_thread = None
+        self.web_port = None
+        self.current_bot_instance = None # Ссылка на бота для проверки
+
+        if self.get_setting("autostart", False) and os.path.exists(os.path.join(self.work_dir, "heroku", "__main__.py")):
+            self.run_bot()
+
+    def on_plugin_unload(self):
+        self.stop_bot()
+
+    def update_ui_state(self):
+        run_on_ui_thread(lambda: Mandre.apply_and_refresh_settings(self))
+
+    def create_settings(self):
+        auto = self.get_setting("autostart", False)
+        
+        # --- СТАТУС БАР ---
+        if self.is_running:
+            action_btn = '<button text="🛑 Остановить сервер" icon="msg_delete" red="true" on_click="stop_bot" />'
+            
+            if self.is_bot_active:
+                status_icon = "msg_check"
+                status_color = "#55FF55" # Зеленый
+                status_text = f"Работает (Connected)"
+                if self.is_web_active:
+                    status_text += f"\nWeb: :{self.web_port}"
+            elif self.is_web_active:
+                status_icon = "msg_round_video"
+                status_color = "#FFAA00" # Оранжевый
+                status_text = "Веб-сервер активен (Подключение лет 10 +-)"
+            else:
+                status_icon = "msg_clock"
+                status_color = "#FF5555" # Красный
+                status_text = "Запуск ядра..."
+
+            if self.is_web_active and self.web_port:
+                web_btn = '<button text="🌐 Открыть Web-панель" icon="msg_open" accent="true" on_click="open_web" />'
+            else:
+                web_btn = '<text text="⏳ Ожидание веб-интерфейса..." align="center" size="13" color="#808080" />'
+
+        else:
+            status_icon = "msg_info"
+            status_color = "#FF5555"
+            status_text = "Сервер выключен"
+            action_btn = '<button text="🚀 Запустить" icon="msg_played_solar" accent="true" on_click="run_bot" />'
+            web_btn = ""
+
+        # --- ВВОД (КОНСОЛЬ) ---
+        input_section = ""
+        if self.is_running and self.console.waiting_input:
+            input_section = f"""
+            <header text="⚠️ ВВОД ДАННЫХ" color="#FFAA00" />
+            <text text="{html.escape(self.console.last_prompt)}" />
+            <button text="⌨️ Ответить" icon="msg_message" on_click="show_input_dialog" />
+            <divider />
+            """
+
+        markup = f"""
+            <header text="Heroku Host Ultimate" align="center" />
+            <text text="Статус:" subtext="{status_text}" icon="{status_icon}" icon_color="{status_color}" />
+            {input_section}
+            {web_btn}
+            {action_btn}
+            <shadow />
+            <header text="Инструменты" align="center" />
+            <checkbox key="autostart" text="Автозапуск" default="{'true' if auto else 'false'}" icon="media_photo_flash_auto2_solar" />
+            <button text="Логи консоли" icon="msg_log" on_click="show_console" />
+            <button text="Сброс сессии (Fix Login)" icon="msg_delete" on_click="reset_session" />
+            <button text="Переустановить" icon="msg_download" on_click="install" />
+            <text text="" subtext="Release v{self.version}" align="center" />
+        """
+        return Mandre.Settings.render(self, markup)
+
+    def _check_health(self):
+        """Проверка здоровья: Пинг сокета и опрос объекта"""
+        if not self.is_running: return
+
+        # 1. Проверка подключения к Telegram (Напрямую у объекта)
+        if self.current_bot_instance:
+            try:
+                # Telethon метод: is_connected()
+                is_connected = self.current_bot_instance.is_connected()
+                if is_connected != self.is_bot_active:
+                    self.is_bot_active = is_connected
+                    self.update_ui_state()
+            except: pass
+
+        # 2. Проверка Веб-порта (Socket Connect)
+        if self.web_port:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.1)
+                    # 0 = успех, значит порт слушается
+                    if s.connect_ex(('127.0.0.1', self.web_port)) == 0:
+                        if not self.is_web_active:
+                            self.is_web_active = True
+                            self.update_ui_state()
+            except: pass
+
+    def open_web(self):
+        if self.web_port and self.is_web_active:
+            try: get_last_fragment().getParentActivity().startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(f"http://127.0.0.1:{self.web_port}")))
+            except: pass
+
+    def show_console(self):
+        log_text = "".join(self.console.buffer[-60:]) 
+        MandreUI.show("Консоль", ["Копировать", "Закрыть"], 
+                      lambda i,t: self.copy_logs() if i==0 else None, 
+                      message=log_text if log_text else "Пусто")
+
+    def copy_logs(self):
+        try:
+            log_file = os.path.join(self.work_dir, "heroku.log")
+            content = ""
+            if os.path.exists(log_file):
+                with open(log_file, "r", encoding="utf-8") as f: content = f.read()
+            else:
+                content = "".join(self.console.buffer)
+            
+            ctx = get_last_fragment().getParentActivity()
+            cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            cm.setPrimaryClip(ClipData.newPlainText("Logs", content))
+            BulletinHelper.show_success("Скопировано")
+        except Exception as e:
+            BulletinHelper.show_error(f"Ошибка: {e}")
+
+    def show_input_dialog(self):
+        frag = get_last_fragment()
+        act = frag.getParentActivity()
+        l = LinearLayout(act); l.setOrientation(1); l.setPadding(50,50,50,50)
+        e = EditText(act); l.addView(e)
+        def send(d,w): self.console.send_input(str(e.getText()).strip())
+        b = AlertDialogBuilder(act); b.set_title(self.console.last_prompt); b.set_view(l); b.set_positive_button("Отправить", send); b.show()
+
+    def reset_session(self):
+        if self.is_running: return BulletinHelper.show_error("Сначала остановите!")
+        try:
+            count = 0
+            for f in os.listdir(self.work_dir):
+                if "session" in f or "json" in f: os.remove(os.path.join(self.work_dir, f)); count += 1
+            BulletinHelper.show_success(f"Сброшено: {count}")
+        except: pass
+
+    def install(self):
+        if self.is_running: return BulletinHelper.show_error("Остановите!")
+        def task():
+            try:
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Установка..."))
+                for w in WHEELS: MandreInstall(w)
+                if not os.path.exists(self.work_dir): os.makedirs(self.work_dir)
+                
+                # Чистим старое (кроме конфигов)
+                for item in os.listdir(self.work_dir):
+                    if "session" in item or "json" in item or "log" in item: continue
+                    try: shutil.rmtree(os.path.join(self.work_dir, item))
+                    except: os.remove(os.path.join(self.work_dir, item))
+                
+                r = requests.get(HEROKU_ZIP_URL)
+                z = os.path.join(self.work_dir, "h.zip")
+                with open(z, 'wb') as f: f.write(r.content)
+                with zipfile.ZipFile(z, 'r') as zf: zf.extractall(self.work_dir)
+                os.remove(z)
+                
+                ext = next((d for d in os.listdir(self.work_dir) if "Heroku" in d), None)
+                if ext:
+                    src = os.path.join(self.work_dir, ext)
+                    for i in os.listdir(src): shutil.move(os.path.join(src, i), self.work_dir)
+                    os.rmdir(src)
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Готово!"))
+            except Exception as e:
+                # !!! FIX: СОХРАНЯЕМ E, ЛОГИРУЕМ И ВЫВОДИМ !!!
+                err_msg = str(e)
+                self.log(f"INSTALL ERROR: {traceback.format_exc()}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Err: {err_msg}"))
+        threading.Thread(target=task).start()
+
+    def run_bot(self):
+        if self.is_running: return
+        if not os.path.exists(os.path.join(self.work_dir, "heroku")): return BulletinHelper.show_error("Нажмите 'Установить'!")
+        
+        self.stop_flag = False
+        self.is_running = True
+        self.is_web_active = False 
+        self.is_bot_active = False 
+        self.current_bot_instance = None
+        
+        self.bot_thread = threading.Thread(target=self._worker, daemon=True)
+        self.bot_thread.start()
+        self.update_ui_state()
+
+    def stop_bot(self):
+        if not self.is_running: return
+        self.stop_flag = True
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Остановка..."))
+        time.sleep(0.5)
+        self.is_running = False
+        self.is_web_active = False
+        self.is_bot_active = False
+        self.current_bot_instance = None
+        self.web_port = None
+        self.update_ui_state()
+
+    def _worker(self):
+        self.web_port = self._get_free_port()
+        self.log(f"Порт: {self.web_port}")
+        
+        os.environ["GIT_PYTHON_REFRESH"] = "quiet"
+        os.environ["HEROKU_DO_NOT_RESTART"] = "1"
+        sys.dont_write_bytecode = True
+        
+        sys.argv = [os.path.join(self.work_dir, "heroku", "__main__.py"), "--port", str(self.web_port)]
+
+        old_stdout = sys.stdout; old_stderr = sys.stderr; old_input = builtins.input
+        sys.stdout = self.console; sys.stderr = self.console
+        
+        def mocked_input(prompt=""):
+            prompt = str(prompt)
+            print(f"INPUT REQUESTED: {prompt}")
+            if "qr code" in prompt.lower(): return "n"
+            return self.console.read_input(prompt)
+            
+        builtins.input = mocked_input
+
+        site = MandrePip.site_dir()
+        if site not in sys.path: sys.path.insert(0, site)
+        if self.work_dir not in sys.path: sys.path.insert(0, self.work_dir)
+        os.chdir(self.work_dir)
+
+        while not self.stop_flag:
+            try:
+                gc.collect()
+                # Чистка модулей для рестарта
+                to_del = [m for m in sys.modules if m.startswith("heroku") or m.startswith("herokutl") or m == "telethon"]
+                for m in to_del: del sys.modules[m]
+
+                import herokutl
+                original_init = herokutl.TelegramClient.__init__
+                def safe_init(self_client, *args, **kwargs):
+                    kwargs['device_model'] = "Google Pixel 8 Pro"
+                    kwargs['system_version'] = "Android 14"
+                    kwargs['app_version'] = "10.1.1"
+                    kwargs['lang_code'] = "en"; kwargs['system_lang_code'] = "en-US"
+                    kwargs['connection_retries'] = 10
+                    kwargs['retry_delay'] = 2
+                    kwargs['request_retries'] = 5
+                    kwargs['flood_sleep_threshold'] = 60
+                    kwargs['use_ipv6'] = False
+                    kwargs['catch_up'] = False
+                    original_init(self_client, *args, **kwargs)
+                herokutl.TelegramClient.__init__ = safe_init
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.add_signal_handler = lambda *a, **k: None
+
+                import git
+                class FakeRepo:
+                    def __init__(self, *args, **kwargs): pass
+                    @property
+                    def head(self):
+                        class H: 
+                            @property
+                            def commit(self):
+                                class C: hexsha = "local_build_hash"
+                                return C()
+                        return H()
+                    @property
+                    def active_branch(self):
+                        class B: name = "master"
+                        return B()
+                    def git(self): pass
+                git.Repo = FakeRepo
+
+                import heroku.main
+                import heroku._internal
+                import heroku.utils
+                import heroku.version
+                import heroku.log 
+
+                heroku.log.init()
+                root_logger = logging.getLogger()
+                log_file = os.path.join(self.work_dir, "heroku.log")
+                
+                for h in root_logger.handlers[:]:
+                    if isinstance(h, BridgeHandler):
+                        root_logger.removeHandler(h)
+                
+                file_handler = HerokuFileHandler(log_file, mode='a', encoding='utf-8')
+                file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+                root_logger.addHandler(file_handler)
+                root_logger.addHandler(BridgeHandler(self, log_file_path=log_file))
+
+                def mock_restart():
+                    self.log(">>> SOFT RESTART <<<")
+                    raise SoftRestartException()
+                
+                heroku._internal.restart = mock_restart
+                heroku.utils.get_git_hash = lambda: "stable"
+                async def mock_badge(*args, **kwargs): return
+                heroku.main.Heroku._badge = mock_badge 
+                async def mock_check_branch(*args, **kwargs): return
+                heroku.version.check_branch = mock_check_branch
+
+                self.log("Инициализация...")
+                
+                bot = heroku.main.Heroku()
+                bot.loop = loop
+                heroku.main.heroku = bot
+                
+                # Сохраняем ссылку для проверки статуса
+                self.current_bot_instance = bot
+                
+                task = loop.create_task(bot._main())
+                
+                while not self.stop_flag:
+                    self._check_health()
+                    loop.run_until_complete(asyncio.sleep(2))
+                    if task.done():
+                        exc = task.exception()
+                        if exc: raise exc
+                        break 
+            
+            except SoftRestartException:
+                self.log("Рестарт ядра...")
+                self.current_bot_instance = None
+                self.is_bot_active = False
+                self.update_ui_state()
+                time.sleep(1)
+                continue 
+
+            except Exception as e:
+                self.log(f"CRASH: {traceback.format_exc()}")
+                break
+
+        self.log("Остановлено.")
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        builtins.input = old_input
+        self.is_running = False
+        self.is_web_active = False
+        self.is_bot_active = False
+        self.current_bot_instance = None
+        self.update_ui_state()
+
+    def _get_free_port(self):
+        with socket.socket() as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
