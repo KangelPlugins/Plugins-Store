@@ -1,0 +1,1091 @@
+from android.widget import TextView, LinearLayout, ImageView, FrameLayout, Toast, SeekBar
+from android.view import View, ViewGroup, Gravity
+from android.graphics import Color, PorterDuffColorFilter, Typeface, PorterDuff
+from android.content import Intent
+from android.net import Uri
+from androidx.core.content import FileProvider
+from android.graphics.drawable import GradientDrawable, ColorDrawable, LayerDrawable, ClipDrawable
+from android.os import Build
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment
+from ui.settings import Header, Input, Divider, Switch, Selector, Text, EditText
+from com.exteragram.messenger.plugins import PluginsController
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from org.telegram.messenger import MediaController, AndroidUtilities, R, LocaleController, SharedConfig, BuildVars, FileLoader, UserConfig, ApplicationLoader, SendMessagesHelper
+from org.telegram.ui.Components import BackupImageView, RLottieImageView, PlayPauseDrawable
+from org.telegram.ui.ActionBar import ActionBarMenuItem, ActionBar
+from org.telegram.tgnet import TLRPC
+from android.text import TextUtils
+from ui.bulletin import BulletinHelper
+import time
+import threading
+from java import dynamic_proxy
+
+__id__ = "fullscreen_music_player"
+__name__ = "Music Player"
+__description__ = "Full screen music player"
+__author__ = "@hoprik"
+__version__ = "1.0"
+__icon__ = "rottenprince_by_FStikBot/0"
+__min_version__ = "11.12.0"
+
+CONF_W = "notch_width"
+CONF_H = "notch_height"
+CONF_T = "notch_top"
+
+
+# ============ Colors ============
+COLORS = {
+    "background": "#08090a",
+    "background_overlay": "#CC08090a",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#AAAAAA",
+    "accent": "#fff300",
+    "icon": "#FFFFFF",
+    "icon_disabled": "#80FFFFFF",
+    "thumb": "#FFFFFF"
+}
+
+# ============ Dimensions (in dp) ============
+DIMENSIONS = {
+    "cover_size": 250,
+    "button_size": 50,
+    "small_button_size": 30,
+    "margin_small": 10,
+    "margin_medium": 16,
+    "margin_large": 20,
+    "padding_small": 8,
+    "padding_medium": 20,
+    "thumb_size": 16,
+    "round_radius": 8,
+    "animation_size": 40,
+    "status_bar_offset": 20,
+    "icon_size": 14
+}
+
+# ============ Localization ============
+class LocalizationManager:
+    def __init__(self):
+        self.current_language = LocaleController.getInstance().getCurrentLocale().getLanguage()
+        if '_' in self.current_language:
+            self.current_language = self.current_language.split('_')[0]
+        if self.current_language not in self.strings:
+            self.current_language = "en"
+        
+    def get_string(self, string_key):
+        return self.strings[self.current_language].get(
+            string_key, 
+            self.strings["en"].get(string_key, string_key)
+        )
+    
+    strings = {
+        "ru": {
+            "player": "Плеер",
+            "no_music": "Включите музыку",
+            "music_saved": "Музыка была скачана",
+            "music_shared": "Вы поделились музыкой",
+            "music_forwarded": "Вы сохранили музыку",
+            "fullscreen_player": "Полноэкранный плеер",
+            "saved": "Сохранено",
+            "error": "Ошибка",
+            "error_sharing": "Ошибка при попытке поделиться",
+            "error_saving": "Ошибка при сохранении",
+            "error_forwarding": "Ошибка при пересылке",
+            "settings_name": "Настройки плеера",
+            "settings_elements": "Настройка элементов",
+            "settings_color": "Настройки цвета",
+            "settings_enable_feature_shuffle": "Repeat и shuffle трэков",
+            "settings_enable_feature_download": "Скачивание трэков",
+            "settings_enable_feature_share": "Поделится трэком",
+            "settings_enable_feature_save": "Сохранение трэка"
+        },
+        "en": {
+            "player": "Player",
+            "no_music": "Turn on music",
+            "music_saved": "Music has been downloaded",
+            "music_shared": "You have shared the music",
+            "music_forwarded": "You have saved the music",
+            "fullscreen_player": "Fullscreen player",
+            "saved": "Saved",
+            "error": "Error",
+            "error_sharing": "Error while sharing",
+            "error_saving": "Error while saving",
+            "error_forwarding": "Error while forwarding",
+            "settings_name": "Player Settings",
+            "settings_elements": "Elements Settings",
+            "settings_color": "Color Settings",
+            "settings_enable_feature_shuffle": "Repeat and shuffle tracks",
+            "settings_enable_feature_download": "Download tracks",
+            "settings_enable_feature_share": "Share track",
+            "settings_enable_feature_save": "Save track to favorites"
+        }
+    }
+
+localizer = LocalizationManager()
+
+
+class PlayerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.update_thread = None
+        self.chat_settings_item = None
+        self.profile_settings_item = None
+        self.ui_components = {}
+        self.music_data = {}
+        self.is_seeking = False
+        self.action_bar = None
+        self.stop_thread = False
+
+    def on_plugin_load(self):
+        self.add_settings_menu_items()
+
+    def create_settings(self):
+        return [
+            Header(localizer.get_string("settings_elements")),
+            Switch(
+                key="enable_feature_shuffle",
+                text=localizer.get_string("settings_enable_feature_shuffle"),
+                default=True,
+                icon="msg_settings",
+                link_alias="enable_feature_shuffle_switch"
+            ),
+            Switch(
+                key="enable_feature_download",
+                text=localizer.get_string("settings_enable_feature_download"),
+                default=True,
+                icon="msg_settings",
+                link_alias="enable_feature_download_switch"
+            ),
+            Switch(
+                key="enable_feature_share",
+                text=localizer.get_string("settings_enable_feature_share"),
+                default=True,
+                icon="msg_settings",
+                link_alias="enable_feature_share_switch"
+            ),
+            Switch(
+                key="enable_feature_save",
+                text=localizer.get_string("settings_enable_feature_save"),
+                default=True,
+                icon="msg_settings",
+                link_alias="enable_feature_save_switch"
+            )
+        ]
+
+
+    def on_plugin_unload(self):
+        self.stop_update_thread()
+        self.remove_settings_menu_items()
+
+    def add_settings_menu_items(self):
+        try:
+            if not self.chat_settings_item:
+                self.chat_settings_item = self.add_menu_item(
+                    MenuItemData(
+                        menu_type=MenuItemType.CHAT_ACTION_MENU,
+                        text=localizer.get_string("player"),
+                        icon="msg_settings_14",
+                        priority=1,
+                        on_click=lambda ctx: run_on_ui_thread(
+                            lambda: self.open_player_ui()
+                        )
+                    )
+                )
+            if not self.profile_settings_item:
+                self.profile_settings_item = self.add_menu_item(
+                    MenuItemData(
+                        menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                        text=localizer.get_string("player"),
+                        icon="msg_settings_14",
+                        priority=1,
+                        on_click=lambda ctx: run_on_ui_thread(
+                            lambda: self.open_player_ui()
+                        )
+                    )
+                )
+        except Exception as e:
+            self.log_error("Failed to add settings menu items", e)
+
+    def remove_settings_menu_items(self):
+        try:
+            if self.chat_settings_item:
+                self.remove_menu_item(self.chat_settings_item)
+                self.chat_settings_item = None
+            if self.profile_settings_item:
+                self.remove_menu_item(self.profile_settings_item)
+                self.profile_settings_item = None
+        except Exception as e:
+            self.log_error("Failed to remove settings menu items", e)
+
+
+    def log_error(self, message, error):
+        log(f"[{__id__}] {message}: {error}")
+
+    def find_suitable_container(self, view, depth=0):
+        if depth > 10:
+            return None
+        
+        if "Layout" in view.getClass().getSimpleName():
+            return view
+        
+        for i in range(view.getChildCount()):
+            child = view.getChildAt(i)
+            result = self.find_suitable_container(child, depth + 1)
+            if result:
+                return result
+        
+        return None
+
+    def get_artwork_thumb_image_location(self, message_object):
+        try:
+            document = message_object.getDocument()
+            if not document:
+                return None
+            
+            if hasattr(document, 'thumbs') and document.thumbs:
+                if document.thumbs.size() > 0:
+                    thumb = document.thumbs.get(document.thumbs.size() - 1)
+                    from org.telegram.messenger import ImageLocation
+                    return ImageLocation.getForDocument(thumb, document)
+        except Exception as e:
+            self.log_error("Error getting thumb image location", e)
+        return None
+
+    def update_album_cover(self, message_object, image_view):
+        try:
+            audio_info = MediaController.getInstance().getAudioInfo()
+            
+            if audio_info and audio_info.getCover():
+                image_view.setImageBitmap(audio_info.getCover())
+                self.ui_components["background_image"].setAspectFit(False)
+                return
+            
+            artwork_url = message_object.getArtworkUrl(False)
+            thumb_image_location = self.get_artwork_thumb_image_location(message_object)
+            
+            from org.telegram.messenger import ImageLocation
+            
+            if not TextUtils.isEmpty(artwork_url):
+                image_view.setImage(
+                    ImageLocation.getForPath(artwork_url), 
+                    None, 
+                    thumb_image_location, 
+                    None, 
+                    None, 
+                    0, 
+                    1, 
+                    message_object
+                )
+                self.ui_components["background_image"].setAspectFit(False)
+            elif thumb_image_location:
+                image_view.setImage(
+                    None, 
+                    None, 
+                    thumb_image_location, 
+                    None, 
+                    None, 
+                    0, 
+                    1, 
+                    message_object
+                )
+                self.ui_components["background_image"].setAspectFit(False)
+            else:
+                image_view.setRoundRadius(AndroidUtilities.dp(DIMENSIONS["round_radius"]))
+                image_view.setImageResource(R.drawable.nocover)
+                self.ui_components["background_image"].setAspectFit(True)
+            
+            image_view.invalidate()
+                
+        except Exception as e:
+            self.log_error("Error updating cover", e)
+
+    def is_music_message(self, message_object):
+        try:
+            document = message_object.getDocument()
+            if not document:
+                return False
+            return not document.attributes.get(0).voice and not document.attributes.get(0).round_message
+        except Exception as e:
+            return False
+
+    def create_update_thread(self):
+        self.stop_thread = False
+        self.update_thread = threading.Thread(target=self.update_ui_loop)
+        self.update_thread.start()
+
+    def update_ui_loop(self):
+        while not self.stop_thread:
+            time.sleep(0.1)
+            music_info = self.get_music_info()
+            should_update, title, author, duration, progress, current_time_str, total_time_str, message_obj = music_info
+            
+            if not message_obj:
+                continue
+
+            run_on_ui_thread(lambda: self.update_player_ui(
+                should_update, title, author, duration, progress, current_time_str, total_time_str, message_obj
+            ))
+
+    def update_player_ui(self, should_update, title, author, duration, progress, current_time_str, total_time_str, message_obj):
+        try:
+            if not MediaController.getInstance().isMessagePaused():
+                if should_update:
+                    self.ui_components["title_view"].setText(title)
+                    self.ui_components["artist_view"].setText(author)
+                    self.update_album_cover(message_obj, self.ui_components["album_cover"])
+                    self.update_album_cover(message_obj, self.ui_components["background_image"])
+                    if self.action_bar:
+                        self.action_bar.setTitle(f"{title} — {author}")
+
+                seek_bar = self.ui_components.get("seek_bar")
+                if seek_bar and not self.is_seeking:
+                    if progress > 0:
+                        current_progress = int((duration / float(progress)) * 100)
+                        seek_bar.setProgress(current_progress)
+                    else:
+                        seek_bar.setProgress(0)
+
+                self.ui_components["remaining_time"].setText(total_time_str)
+                self.ui_components["current_time"].setText(current_time_str)
+        except Exception as e:
+            self.log_error("UI update error", e)
+            self.stop_update_thread()
+
+    def stop_update_thread(self):
+        self.stop_thread = True
+        if self.update_thread and self.update_thread.is_alive():
+            self.update_thread.join(timeout=2.0)
+        self.update_thread = None
+
+    def get_music_info(self):
+        message_object = MediaController.getInstance().getPlayingMessageObject()
+        if not message_object:
+            return False, "", "", 0, 0, "", "", message_object
+        
+        duration = 0
+        if not MediaController.getInstance().isPlayingMessage(message_object):
+            document = message_object.getDocument()
+            if document and document.attributes:
+                for i in range(document.attributes.size()):
+                    attribute = document.attributes.get(i)
+                    if attribute.getClass().getSimpleName() == "TL_documentAttributeAudio":
+                        duration = int(attribute.duration)
+                        break
+        else:
+            duration = message_object.audioProgressSec
+        
+        should_update = False
+        
+        current_title = message_object.getMusicTitle()
+        current_author = message_object.getMusicAuthor()
+        current_duration = duration
+        audio_progress = message_object.audioPlayerDuration
+
+        time_string = AndroidUtilities.formatLongDuration(duration)
+        audio_progress_string = AndroidUtilities.formatLongDuration(audio_progress)
+
+        if (not "name" in self.music_data or self.music_data["name"] != current_title) or \
+           (not "author" in self.music_data or self.music_data["author"] != current_author):
+            self.music_data["name"] = message_object.getMusicTitle()
+            self.music_data["author"] = message_object.getMusicAuthor()
+            should_update = True
+
+        return should_update, current_title, current_author, current_duration, audio_progress, time_string, audio_progress_string, message_object
+
+    def update_repeat_buttons(self):
+        repeat_button = self.ui_components.get("repeat_button")
+        shuffle_button = self.ui_components.get("shuffle_button")
+        
+        if repeat_button:
+            if SharedConfig.repeatMode == 2: 
+                repeat_button.setAlpha(1.0)
+            else:
+                repeat_button.setAlpha(0.5)
+        
+        if shuffle_button:
+            if SharedConfig.shuffleMusic:
+                shuffle_button.setAlpha(1.0)
+            else:
+                shuffle_button.setAlpha(0.5)
+
+    def save_to_music(self, message_object, current_fragment):
+        try:
+            if not current_fragment: 
+                return
+            parent_activity = current_fragment.getParentActivity()
+            if not parent_activity: 
+                return
+            
+            file_name = FileLoader.getDocumentFileName(message_object.getDocument())
+            if not file_name or file_name.strip() == "":
+                file_name = message_object.getFileName()
+            
+            path = message_object.messageOwner.attachPath
+            if path and len(path) > 0:
+                from java.io import File
+                temp_file = File(path)
+                if not temp_file.exists(): 
+                    path = None
+            
+            if not path or len(path) == 0:
+                current_account = UserConfig.selectedAccount
+                path = FileLoader.getInstance(current_account).getPathToMessage(message_object.messageOwner).toString()
+            
+            MediaController.saveFile(path, parent_activity, 3, file_name, 
+                                    message_object.getDocument().mime_type if message_object.getDocument() else "")
+        except Exception as e:
+            self.log_error("Error in save_to_music", e)
+
+    def share_music(self, message_object, current_fragment):
+        try:
+            if not current_fragment:
+                return
+            
+            parent_activity = current_fragment.getParentActivity()
+            if not parent_activity:
+                return
+            
+            file_obj = None
+            
+            if message_object.messageOwner.attachPath and message_object.messageOwner.attachPath.strip() != "":
+                file_obj = File(message_object.messageOwner.attachPath)
+                if not file_obj.exists():
+                    file_obj = None
+            
+            if file_obj is None:
+                current_account = UserConfig.selectedAccount
+                file_obj = FileLoader.getInstance(current_account).getPathToMessage(
+                    message_object.messageOwner
+                )
+            
+            if file_obj.exists():
+                intent = Intent(Intent.ACTION_SEND)
+                intent.setType(message_object.getMimeType())
+                
+                if Build.VERSION.SDK_INT >= 24:
+                    try:
+                        intent.putExtra(
+                            Intent.EXTRA_STREAM,
+                            FileProvider.getUriForFile(
+                                ApplicationLoader.applicationContext,
+                                ApplicationLoader.getApplicationId() + ".provider",
+                                file_obj
+                            )
+                        )
+                        intent.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    except Exception as e:
+                        log(f"Error using FileProvider: {e}")
+                        intent.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(file_obj))
+                else:
+                    intent.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(file_obj))
+                
+                parent_activity.startActivityForResult(
+                    Intent.createChooser(intent, LocaleController.getString(R.string.ShareFile)),
+                    500
+                )
+            else:
+                builder = AlertDialog.Builder(parent_activity)
+                builder.setTitle(LocaleController.getString(R.string.AppName))
+                builder.setPositiveButton(LocaleController.getString(R.string.OK), None)
+                builder.setMessage(LocaleController.getString(R.string.PleaseDownload))
+                builder.show()
+                
+        except Exception as e:
+            log(f"Error in _share: {e}")
+
+    def forward_to_saved(self, message_object, current_fragment):
+        try:
+            if not current_fragment: 
+                return
+            current_account = UserConfig.selectedAccount
+            
+            if message_object.getId() < 0:
+                forward_messages = None
+                if not isinstance(message_object.getDocument(), TLRPC.TL_document): 
+                    return
+                document = message_object.getDocument()
+            else:
+                forward_messages = [message_object]
+                document = None
+            
+            if forward_messages:
+                SendMessagesHelper.getInstance(current_account).sendMessage(
+                    forward_messages, UserConfig.getInstance(current_account).getClientUserId(), 
+                    False, False, True, 0, 0
+                )
+            else:
+                SendMessagesHelper.getInstance(current_account).sendMessage(
+                    SendMessagesHelper.SendMessageParams.of(
+                        document, None, message_object.messageOwner.attachPath, 
+                        UserConfig.getInstance(current_account).getClientUserId(), 
+                        None, None, None, None, None, None, True, 0, 0, 0, None, None, False, False
+                    )
+                )
+            
+            from ui.bulletin import BulletinFactory
+            BulletinFactory.of(current_fragment).createSimpleBulletin(
+                R.raw.forward, localizer.get_string("saved")
+            ).show()
+        except Exception as e:
+            self.log_error("Error in forward_to_saved", e)
+
+    def render_fullscreen_player(self, container, current_fragment):
+        context = container.getContext()
+
+        self.create_action_bar(current_fragment, context)
+    
+        root_container = FrameLayout(context)
+        root_container.setLayoutParams(FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+    
+        background_image = BackupImageView(context)
+        background_image.setAspectFit(False)
+
+        background_params = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        self.ui_components["background_image"] = background_image
+        background_image.setLayoutParams(background_params)
+        
+        overlay_drawable = GradientDrawable()
+        overlay_drawable.setColor(Color.parseColor(COLORS["background_overlay"]))
+        
+        overlay_container = FrameLayout(context)
+        overlay_container.setBackground(overlay_drawable)
+
+        overlay_params = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        overlay_container.setLayoutParams(overlay_params)
+  
+        main_layout = LinearLayout(context)
+        main_layout.setOrientation(LinearLayout.VERTICAL)
+        main_layout.setGravity(Gravity.CENTER_HORIZONTAL)
+        main_layout.setPadding(
+            AndroidUtilities.dp(DIMENSIONS["padding_medium"]), 
+            AndroidUtilities.dp(AndroidUtilities.statusBarHeight + DIMENSIONS["status_bar_offset"]), 
+            AndroidUtilities.dp(DIMENSIONS["padding_medium"]), 
+            AndroidUtilities.dp(DIMENSIONS["padding_medium"])
+        )
+        self.ui_components["main_layout"] = main_layout
+
+        main_layout_params = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        main_layout.setLayoutParams(main_layout_params)
+
+        music_info = self.get_music_info()
+        should_update, current_title, current_author, current_duration, audio_progress, time_string, audio_progress_string, message_object = music_info
+        
+        if not message_object or not self.is_music_message(message_object):
+            self.action_bar.setTitle(localizer.get_string("fullscreen_player"))
+            error_view = TextView(context)
+            error_view.setTextColor(Color.parseColor(COLORS["text_primary"]))
+            error_view.setTextSize(32)
+            error_view.setTypeface(None, Typeface.BOLD)
+            error_view.setText(localizer.get_string("no_music"))
+            error_view.setGravity(Gravity.CENTER_HORIZONTAL)
+            main_layout.addView(error_view)
+            root_container.addView(self.action_bar)
+            root_container.addView(main_layout)
+            container.addView(root_container)
+            return
+
+        self.action_bar.setTitle(f"{current_title} — {current_author}")
+        
+        root_container.addView(background_image)
+        root_container.addView(overlay_container)
+        root_container.addView(self.action_bar)
+        
+        album_cover = BackupImageView(context)
+        album_cover.setAspectFit(False)
+        album_cover.setRoundRadius(AndroidUtilities.dp(DIMENSIONS["round_radius"]))
+        
+        cover_params = LinearLayout.LayoutParams(
+            AndroidUtilities.dp(DIMENSIONS["cover_size"]),
+            AndroidUtilities.dp(DIMENSIONS["cover_size"]),
+        )
+        cover_params.gravity = Gravity.CENTER_HORIZONTAL
+        cover_params.setMargins(0, 0, 0, AndroidUtilities.dp(DIMENSIONS["margin_large"]))
+        album_cover.setLayoutParams(cover_params)
+        self.ui_components["album_cover"] = album_cover
+        
+        title_view = TextView(context)
+        title_view.setTextColor(Color.parseColor(COLORS["text_primary"]))
+        title_view.setTextSize(18)
+        title_view.setSingleLine(True)
+        title_view.setTypeface(None, Typeface.BOLD)
+        title_view.setEllipsize(TextUtils.TruncateAt.END)
+        title_view.setText(current_title)
+        
+        title_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        title_params.setMargins(
+            AndroidUtilities.dp(DIMENSIONS["margin_medium"]), 0, 
+            AndroidUtilities.dp(DIMENSIONS["margin_medium"]), 
+            AndroidUtilities.dp(DIMENSIONS["padding_small"])
+        )
+        title_view.setLayoutParams(title_params)
+        self.ui_components["title_view"] = title_view
+        
+        artist_view = TextView(context)
+        artist_view.setTextColor(Color.parseColor(COLORS["text_secondary"]))
+        artist_view.setTextSize(14)
+        artist_view.setSingleLine(True)
+        artist_view.setEllipsize(TextUtils.TruncateAt.END)
+        artist_view.setText(current_author)
+        
+        artist_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        artist_params.setMargins(
+            AndroidUtilities.dp(DIMENSIONS["margin_medium"]), 0, 
+            AndroidUtilities.dp(DIMENSIONS["margin_medium"]), 
+            AndroidUtilities.dp(DIMENSIONS["margin_large"])
+        )
+        artist_view.setLayoutParams(artist_params)
+        self.ui_components["artist_view"] = artist_view
+        
+        progress_container = LinearLayout(context)
+        progress_container.setOrientation(LinearLayout.VERTICAL)
+        progress_container.setGravity(Gravity.CENTER_HORIZONTAL)
+        
+        progress_container_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        progress_container_params.setMargins(
+            AndroidUtilities.dp(DIMENSIONS["margin_medium"]), 
+            AndroidUtilities.dp(DIMENSIONS["margin_large"]), 
+            AndroidUtilities.dp(DIMENSIONS["margin_medium"]), 
+            AndroidUtilities.dp(DIMENSIONS["margin_large"])
+        )
+        progress_container.setLayoutParams(progress_container_params)
+        
+        seek_bar = SeekBar(context)
+        seek_bar.setMax(100)
+
+        thumb_drawable = GradientDrawable()
+        thumb_drawable.setShape(GradientDrawable.OVAL)
+        thumb_drawable.setSize(
+            AndroidUtilities.dp(DIMENSIONS["thumb_size"]), 
+            AndroidUtilities.dp(DIMENSIONS["thumb_size"])
+        )
+        thumb_drawable.setColor(Color.parseColor(COLORS["thumb"]))
+        seek_bar.setThumb(thumb_drawable)
+        
+        seek_bar.getProgressDrawable().setColorFilter(
+            PorterDuffColorFilter(Color.parseColor(COLORS["accent"]), PorterDuff.Mode.SRC_IN)
+        )
+
+        seek_bar_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+
+        seek_bar.setPadding(0, 0, 0, 0)
+        seek_bar.setThumbOffset(AndroidUtilities.dp(0))
+        seek_bar_params.setMargins(0, 0, 0, AndroidUtilities.dp(DIMENSIONS["padding_small"]))
+        seek_bar.setLayoutParams(seek_bar_params)
+
+        class SeekBarListener(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
+            def __init__(self, plugin_instance):
+                super().__init__()
+                self.plugin = plugin_instance
+
+            def onProgressChanged(self, seekBar, progress, fromUser):
+                if fromUser:
+                    msg_obj = MediaController.getInstance().getPlayingMessageObject()
+                    if msg_obj:
+                        total_duration = msg_obj.audioPlayerDuration
+                        current_seconds = int((float(progress) / float(seekBar.getMax())) * total_duration)
+                        time_str = AndroidUtilities.formatLongDuration(current_seconds)
+
+                        time_view = self.plugin.ui_components.get("current_time")
+                        if time_view:
+                            time_view.setText(time_str)
+
+            def onStartTrackingTouch(self, seekBar):
+                self.plugin.is_seeking = True
+
+            def onStopTrackingTouch(self, seekBar):
+                self.plugin.is_seeking = False
+                ratio = float(seekBar.getProgress()) / float(seekBar.getMax())
+                msg_obj = MediaController.getInstance().getPlayingMessageObject()
+                if msg_obj:
+                    MediaController.getInstance().seekToProgress(msg_obj, ratio)
+
+        seek_bar.setOnSeekBarChangeListener(SeekBarListener(self))
+
+        if audio_progress > 0:
+            current_progress = int((current_duration / float(audio_progress)) * 100)
+            seek_bar.setProgress(current_progress)
+        else:
+            seek_bar.setProgress(0)
+
+        self.ui_components["seek_bar"] = seek_bar
+
+        progress_container.addView(seek_bar)
+        
+        time_container = LinearLayout(context)
+        time_container.setOrientation(LinearLayout.HORIZONTAL)
+        time_container.setLayoutParams(LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        current_time = TextView(context)
+        current_time.setTextColor(Color.parseColor(COLORS["text_primary"]))
+        current_time.setTextSize(12)
+        current_time.setText(time_string)
+        
+        current_time_params = LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1
+        )
+        current_time.setLayoutParams(current_time_params)
+        self.ui_components["current_time"] = current_time
+        
+        remaining_time = TextView(context)
+        remaining_time.setTextColor(Color.parseColor(COLORS["text_secondary"]))
+        remaining_time.setTextSize(12)
+        remaining_time.setText(audio_progress_string)
+        remaining_time.setGravity(Gravity.RIGHT)
+        
+        remaining_time_params = LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1
+        )
+        remaining_time.setLayoutParams(remaining_time_params)
+        self.ui_components["remaining_time"] = remaining_time
+        
+        time_container.addView(current_time)
+        time_container.addView(remaining_time)
+        
+        progress_container.addView(time_container)
+
+        controller_layout = LinearLayout(context)
+        controller_layout.setOrientation(LinearLayout.HORIZONTAL)
+        controller_layout.setGravity(Gravity.CENTER_HORIZONTAL)
+        controller_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        controller_layout.setLayoutParams(controller_params)
+
+        icon_color = Color.parseColor(COLORS["icon"])
+        icon_color_opacity = Color.parseColor(COLORS["icon_disabled"])
+
+        button_params = LinearLayout.LayoutParams(
+            AndroidUtilities.dp(DIMENSIONS["button_size"]), 
+            AndroidUtilities.dp(DIMENSIONS["button_size"])
+        )
+        button_params.setMargins(
+            AndroidUtilities.dp(DIMENSIONS["margin_small"]), 0, 
+            AndroidUtilities.dp(DIMENSIONS["margin_small"]), 0
+        )
+
+        if self.get_setting("enable_feature_shuffle", True):
+            repeat_button = ImageView(context)
+            repeat_button.setScaleType(ImageView.ScaleType.FIT_CENTER) 
+            repeat_button.setImageResource(R.drawable.player_new_repeatall)
+            repeat_button.setColorFilter(icon_color_opacity)
+            repeat_button.setLayoutParams(button_params)
+            repeat_button.setAlpha(0.5)
+            
+            class RepeatButtonClickListener(dynamic_proxy(View.OnClickListener)):
+                def onClick(self, v):
+                    if SharedConfig.repeatMode == 2:
+                        SharedConfig.setRepeatMode(0)
+                    else:
+                        SharedConfig.setRepeatMode(2)
+                    self.plugin.update_repeat_buttons()
+            
+            repeat_listener = RepeatButtonClickListener()
+            repeat_listener.plugin = self
+            repeat_button.setOnClickListener(repeat_listener)
+            self.ui_components["repeat_button"] = repeat_button
+            controller_layout.addView(repeat_button)
+
+        prev_button = RLottieImageView(context)
+        prev_button.setScaleType(ImageView.ScaleType.CENTER)
+        prev_button.setAnimation(R.raw.player_prev, 
+                                DIMENSIONS["animation_size"], 
+                                DIMENSIONS["animation_size"])
+        prev_button.setLayerColor("Triangle 3.**", icon_color)
+        prev_button.setLayerColor("Triangle 4.**", icon_color)
+        prev_button.setLayerColor("Rectangle 4.**", icon_color)
+
+        class PrevClickListener(dynamic_proxy(View.OnClickListener)):
+            def __init__(self, plugin_instance):
+                super().__init__()
+                self.plugin = plugin_instance
+
+            def onClick(self, v):
+                MediaController.getInstance().playPreviousMessage()
+                v.setProgress(0.0)
+                v.playAnimation()
+                music_info = self.plugin.get_music_info()
+                should_update, title, author, duration, progress, t_str, p_str, msg_obj = music_info
+                self.plugin.update_player_ui(should_update, title, author, duration, progress, t_str, p_str, msg_obj)
+                play_pause_drawable.setPause(not MediaController.getInstance().isMessagePaused(), False)
+
+        prev_click_listener = PrevClickListener(self)
+        prev_button.setOnClickListener(prev_click_listener)
+        prev_button.setLayoutParams(button_params)
+        self.ui_components["prev_button"] = prev_button
+        controller_layout.addView(prev_button)
+
+        class PlayClickListener(dynamic_proxy(View.OnClickListener)):
+            def onClick(self, v):
+                if MediaController.getInstance().isDownloadingCurrentMessage(): 
+                    return
+                if MediaController.getInstance().isMessagePaused(): 
+                    MediaController.getInstance().playMessage(MediaController.getInstance().getPlayingMessageObject())
+                else:
+                    MediaController.getInstance().pauseMessage(MediaController.getInstance().getPlayingMessageObject())
+                play_pause_drawable.setPause(not MediaController.getInstance().isMessagePaused(), False)
+        
+
+        play_pause_drawable = PlayPauseDrawable(DIMENSIONS["button_size"])
+        play_pause_drawable.setPause(not MediaController.getInstance().isMessagePaused(), False)
+        play_button = ImageView(context)
+        play_button.setScaleType(ImageView.ScaleType.CENTER)
+        play_button.setImageDrawable(play_pause_drawable)
+        play_button.setColorFilter(icon_color)
+        
+        play_click_listener = PlayClickListener()
+        play_click_listener.play_pause_drawable = play_pause_drawable
+        play_button.setOnClickListener(play_click_listener)
+        controller_layout.addView(play_button)
+
+        next_button = RLottieImageView(context)
+        next_button.setScaleType(ImageView.ScaleType.CENTER)
+        next_button.setAnimation(R.raw.player_prev, 
+                                DIMENSIONS["animation_size"], 
+                                DIMENSIONS["animation_size"])
+        next_button.setLayerColor("Triangle 3.**", icon_color)
+        next_button.setLayerColor("Triangle 4.**", icon_color)
+        next_button.setLayerColor("Rectangle 4.**", icon_color)
+
+        class NextClickListener(dynamic_proxy(View.OnClickListener)):
+            def __init__(self, plugin_instance):
+                super().__init__()
+                self.plugin = plugin_instance
+
+            def onClick(self, v):
+                MediaController.getInstance().playNextMessage()
+                self.prev_button.setProgress(0.0)
+                self.prev_button.playAnimation()
+                music_info = self.plugin.get_music_info()
+                should_update, title, author, duration, progress, t_str, p_str, msg_obj = music_info
+                self.plugin.update_player_ui(should_update, title, author, duration, progress, t_str, p_str, msg_obj)
+                play_pause_drawable.setPause(not MediaController.getInstance().isMessagePaused(), False)
+
+        next_click_listener = NextClickListener(self)
+        next_click_listener.prev_button = prev_button
+        next_click_listener.play_pause_drawable = play_pause_drawable
+        next_button.setOnClickListener(next_click_listener)
+        next_button.setRotation(180)
+        next_button.setLayoutParams(button_params)
+        self.ui_components["next_button"] = next_button
+        controller_layout.addView(next_button)
+
+        if self.get_setting("enable_feature_shuffle", True):
+            shuffle_button = ImageView(context)
+            shuffle_button.setScaleType(ImageView.ScaleType.FIT_CENTER) 
+            shuffle_button.setImageResource(R.drawable.player_new_shuffle)
+            shuffle_button.setColorFilter(icon_color_opacity)
+            shuffle_button.setLayoutParams(button_params)
+            shuffle_button.setAlpha(0.5)
+
+            class ShuffleButtonClickListener(dynamic_proxy(View.OnClickListener)):
+                def __init__(self, plugin_instance):
+                    super().__init__()
+                    self.plugin = plugin_instance
+
+                def onClick(self, v):
+                    if SharedConfig.shuffleMusic:
+                        MediaController.getInstance().setPlaybackOrderType(0)
+                    else:
+                        MediaController.getInstance().setPlaybackOrderType(2)
+                    self.plugin.update_repeat_buttons()
+            
+            shuffle_click_listener = ShuffleButtonClickListener(self)
+            shuffle_button.setOnClickListener(shuffle_click_listener)
+            controller_layout.addView(shuffle_button)
+
+            self.ui_components["shuffle_button"] = shuffle_button
+
+        space = View(context)
+        space_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            0,
+            1.0
+        )
+        space.setLayoutParams(space_params)
+        
+        secondary_controller_layout = LinearLayout(context)
+        secondary_controller_layout.setOrientation(LinearLayout.HORIZONTAL)
+        secondary_controller_layout.setGravity(Gravity.CENTER_HORIZONTAL | Gravity.CENTER_VERTICAL)
+
+        secondary_controller_params = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        secondary_controller_layout.setLayoutParams(secondary_controller_params)
+
+        small_button_params = LinearLayout.LayoutParams(
+            AndroidUtilities.dp(DIMENSIONS["small_button_size"]),
+            AndroidUtilities.dp(DIMENSIONS["small_button_size"])
+        )
+        small_button_params.setMargins(
+            AndroidUtilities.dp(DIMENSIONS["margin_small"]), 0, 
+            AndroidUtilities.dp(DIMENSIONS["margin_small"]), 0
+        )
+        small_button_params.gravity = Gravity.CENTER
+
+        if self.get_setting("enable_feature_download", True):
+            download_button = ImageView(context)
+            download_button.setScaleType(ImageView.ScaleType.FIT_CENTER) 
+            download_button.setImageResource(R.drawable.msg_download)
+            download_button.setColorFilter(icon_color)
+            download_button.setLayoutParams(small_button_params)
+
+            class DownloadButtonClickListener(dynamic_proxy(View.OnClickListener)):
+                def __init__(self, plugin_instance, msg_obj, fragment):
+                    super().__init__()
+                    self.plugin = plugin_instance
+                    self.msg_obj = msg_obj
+                    self.fragment = fragment
+
+                def onClick(self, v):
+                    self.plugin.save_to_music(self.msg_obj, self.fragment)
+                    Toast.makeText(v.getContext(), 
+                                localizer.get_string("music_saved"), 
+                                Toast.LENGTH_SHORT).show()
+
+            download_click_listener = DownloadButtonClickListener(self, message_object, current_fragment)
+            download_button.setOnClickListener(download_click_listener)
+            secondary_controller_layout.addView(download_button)
+
+        if self.get_setting("enable_feature_share", True):
+            share_button = ImageView(context)
+            share_button.setScaleType(ImageView.ScaleType.FIT_CENTER) 
+            share_button.setImageResource(R.drawable.msg_shareout)
+            share_button.setColorFilter(icon_color)
+            share_button.setLayoutParams(small_button_params)
+            
+            class ShareButtonClickListener(dynamic_proxy(View.OnClickListener)):
+                def __init__(self, plugin_instance, msg_obj, fragment):
+                    super().__init__()
+                    self.plugin = plugin_instance
+                    self.msg_obj = msg_obj
+                    self.fragment = fragment
+
+                def onClick(self, v):
+                    self.plugin.share_music(self.msg_obj, self.fragment)
+                    Toast.makeText(v.getContext(), 
+                                localizer.get_string("music_shared"), 
+                                Toast.LENGTH_SHORT).show()
+
+            share_click_listener = ShareButtonClickListener(self, message_object, current_fragment)
+            share_button.setOnClickListener(share_click_listener)
+            secondary_controller_layout.addView(share_button)
+        if self.get_setting("enable_feature_save", True):
+            favorite_button = ImageView(context)
+            favorite_button.setScaleType(ImageView.ScaleType.FIT_CENTER) 
+            favorite_button.setImageResource(R.drawable.msg_saved)
+            favorite_button.setColorFilter(icon_color)
+            favorite_button.setLayoutParams(small_button_params)
+
+            class FavoriteButtonClickListener(dynamic_proxy(View.OnClickListener)):
+                def __init__(self, plugin_instance, fragment):
+                    super().__init__()
+                    self.plugin = plugin_instance
+                    self.fragment = fragment
+
+                def onClick(self, v):
+                    message_object = MediaController.getInstance().getPlayingMessageObject()
+                    if message_object:
+                        self.plugin.forward_to_saved(message_object, self.fragment)
+
+            favorite_click_listener = FavoriteButtonClickListener(self, current_fragment)
+            favorite_button.setOnClickListener(favorite_click_listener)
+
+            secondary_controller_layout.addView(favorite_button)
+        
+        if self.get_setting("enable_feature_shuffle", True):
+            self.update_repeat_buttons()
+        self.update_album_cover(message_object, album_cover)
+        self.update_album_cover(message_object, background_image)
+   
+        main_layout.addView(album_cover)
+        main_layout.addView(title_view)
+        main_layout.addView(artist_view)
+        main_layout.addView(progress_container)
+        main_layout.addView(controller_layout)
+        main_layout.addView(space)
+        main_layout.addView(secondary_controller_layout)
+
+        root_container.addView(main_layout)
+
+        self.create_update_thread()
+        container.addView(root_container)
+        
+        main_layout.requestLayout()
+        root_container.requestLayout()
+        container.requestLayout()
+
+    def create_action_bar(self, current_fragment, context):
+        self.action_bar = current_fragment.createActionBar(context)
+        self.action_bar.setBackButtonImage(R.drawable.ic_ab_back)
+        
+        class BackClickListener(dynamic_proxy(View.OnClickListener)):
+            def __init__(self, fragment):
+                super().__init__()
+                self.fragment = fragment
+            
+            def onClick(self, v):
+                self.fragment.finishFragment()
+
+        back_button = self.action_bar.getBackButton()
+        if back_button:
+            back_button.setOnClickListener(BackClickListener(current_fragment))
+        
+        return self.action_bar
+
+    def setup_player_ui(self):
+        try:
+            activity = get_last_fragment()
+            activity.presentFragment(
+                PluginSettingsActivity(
+                    PluginsController.getInstance().plugins.get(self.id)
+                )
+            )
+            
+            current_fragment = get_last_fragment()
+            view = current_fragment.getLayoutContainer()
+            
+            container = self.find_suitable_container(view)
+            if container:
+                container.removeAllViews()
+                container.invalidate()
+                self.stop_update_thread()
+                self.render_fullscreen_player(container, current_fragment)
+        except Exception as e:
+            self.log_error("Error in setup_player_ui", e)
+
+    def open_player_ui(self): 
+        self.setup_player_ui()
