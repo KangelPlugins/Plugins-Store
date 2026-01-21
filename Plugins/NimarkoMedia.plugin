@@ -1,0 +1,570 @@
+__id__ = "NimarkoMedia"
+__name__ = "📥 Nimarko Downloader"
+__description__ = " Download from **TikTok**, **YouTube**, **SoundCloud**\n\nJust send a link and get the media!"
+__author__ = "@NimarkoProject"
+__version__ = "1.2.0"
+__icon__ = "exteraPlugins/0"
+__min_version__ = "11.12.0"
+
+import requests
+import re
+import time
+import os
+import concurrent.futures
+from typing import Any, Optional, Dict, List, Tuple
+from java.util import HashMap, Locale
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from android_utils import run_on_ui_thread
+from client_utils import (
+    run_on_queue, get_last_fragment, send_message, get_user_config,
+    _generate_photo_sizes
+)
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Divider, Selector
+from file_utils import get_cache_dir, ensure_dir_exists
+from org.telegram.messenger import Utilities
+from org.telegram.tgnet import TLRPC
+
+
+class Strings:
+    _ru = {
+        'downloading': '⏳ Загрузка...',
+        'downloading_photos': 'Загрузка фото {current}/{total}...',
+        'photos_sent': '✅ {count} фото отправлено!',
+        'error': '❌ {msg}',
+        'no_media_url': 'Нет ссылки на медиа',
+        'sent': '✅ Отправлено!',
+        'sent_from_cache': '⚡ Отправлено из кеша!',
+        'download_media': '📥 Скачать медиа',
+        'video': '🎬 Видео',
+        'audio': '🎵 Аудио',
+        'cancel': 'Отмена',
+        'opt_header': 'Опции',
+        'auto_download': 'Авто-загрузка',
+        'yt_format': 'Формат YouTube',
+        'yt_ask': 'Спрашивать формат YouTube',
+        'show_progress': 'Показывать прогресс',
+        'auto_update': 'Автообновление плагина',
+        'update_success': '✅ NimarkoMedia обновлен.\nПерезапустите тг для применения',
+        'file_too_large': '❌ Файл слишком большой: {size}MB',
+        'file_too_large_generic': '❌ Файл слишком большой.',
+    }
+    _en = {
+        'downloading': '⏳ Downloading...',
+        'downloading_photos': 'Downloading photos {current}/{total}...',
+        'photos_sent': '✅ {count} photos sent!',
+        'error': '❌ {msg}',
+        'no_media_url': 'No media URL',
+        'sent': '✅ Sent!',
+        'sent_from_cache': '⚡ Sent from cache!',
+        'download_media': '📥 Download Media',
+        'video': '🎬 Video',
+        'audio': '🎵 Audio',
+        'cancel': 'Cancel',
+        'opt_header': 'Options',
+        'auto_download': 'Auto-download',
+        'yt_format': 'YouTube format',
+        'yt_ask': 'Ask YouTube format',
+        'show_progress': 'Show progress',
+        'auto_update': 'Auto-update plugin',
+        'update_success': '✅ NimarkoMedia updated.\nRestart to apply',
+        'file_too_large': '❌ File too large: {size})',
+        'file_too_large_generic': '❌ File too large',
+    }
+
+    @classmethod
+    def _is_russian(cls) -> bool:
+        try:
+            return Locale.getDefault().getLanguage() == 'ru'
+        except:
+            return False
+
+    @classmethod
+    def get(cls, key: str, **kwargs) -> str:
+        strings = cls._ru if cls._is_russian() else cls._en
+        text = strings.get(key, cls._en.get(key, key))
+        return text.format(**kwargs) if kwargs else text
+
+
+API_URL = "https://67.ettacent.dev"
+ALBUM_CHUNK_SIZE = 10
+DOWNLOAD_TIMEOUT = 60
+API_TIMEOUT = 180
+MAX_WORKERS = 5
+
+PATTERNS = {
+    'tiktok': re.compile(r'https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+', re.IGNORECASE),
+    'youtube': re.compile(r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w-]+', re.IGNORECASE),
+    'soundcloud': re.compile(r'https?://(?:www\.|on\.|m\.)?soundcloud\.com/\S+', re.IGNORECASE),
+}
+
+YOUTUBE_SHORTS_PATTERN = re.compile(r'youtube\.com/shorts/', re.IGNORECASE)
+
+
+class MediaDownloaderPlugin(BasePlugin):
+    def init(self):
+        super().init()
+        self._dialog = None
+        self._cache_dir = None
+
+    def _parse_version(self, v: str):
+        return tuple(map(int, v.split('.')))
+
+    def _parse_file_size_from_error(self, error_msg: str) -> Optional[int]:
+        match = re.search(r'(\d+)\s*MB', error_msg, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _is_file_too_large_error(self, error_msg: str) -> bool:
+        keywords = ['too large', 'max 18mb', 'filesize', 'file size']
+        error_lower = error_msg.lower()
+        return any(kw in error_lower for kw in keywords)
+
+    def _format_size_error(self, error_msg: str) -> str:
+        size = self._parse_file_size_from_error(error_msg)
+        if size:
+            return Strings.get('file_too_large', size=size)
+        return Strings.get('file_too_large_generic')
+
+    def check_for_update(self):
+        if not self.get_setting("auto_update", True):
+            return
+
+        VERSION_URL = f"{API_URL}/api/plugin-version"
+        DOWNLOAD_URL = "https://ettacent.dev/files/NimarkoMedia.plugin"
+
+        try:
+            response = requests.get(VERSION_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            latest_version = data.get("version", "").strip()
+
+            if not latest_version:
+                return
+
+            if self._parse_version(latest_version) <= self._parse_version(__version__):
+                return
+
+            new_code_response = requests.get(DOWNLOAD_URL, timeout=30)
+            new_code_response.raise_for_status()
+            new_code = new_code_response.text
+
+            plugin_path = __file__
+            backup_path = plugin_path + ".backup"
+            temp_path = plugin_path + ".new"
+
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+
+            os.rename(plugin_path, backup_path)
+
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(new_code)
+
+            os.rename(temp_path, plugin_path)
+
+            run_on_ui_thread(lambda: BulletinHelper.show_success(
+                Strings.get('update_success')
+            ))
+
+        except Exception:
+            pass
+
+    def on_plugin_load(self):
+        self._cache_dir = os.path.join(get_cache_dir(), "media_dl")
+        ensure_dir_exists(self._cache_dir)
+        self.add_on_send_message_hook(priority=100)
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text=Strings.get('download_media'),
+            on_click=self._on_menu_click,
+            icon="msg_download"
+        ))
+        run_on_queue(self.check_for_update)
+
+    def on_plugin_unload(self):
+        self._cleanup_cache()
+
+    def create_settings(self) -> List:
+        return [
+            Header(text=Strings.get('opt_header')),
+            Switch(key="auto", text=Strings.get('auto_download'), default=True, icon="msg_download"),
+            Selector(
+                key="yt_fmt",
+                text=Strings.get('yt_format'),
+                default=0,
+                items=[Strings.get('video'), Strings.get('audio')],
+                icon="msg_played"
+            ),
+            Switch(key="yt_ask", text=Strings.get('yt_ask'), default=True, icon="msg_ask"),
+            Switch(key="progress", text=Strings.get('show_progress'), default=False, icon="msg_timer"),
+            Switch(key="auto_update", text=Strings.get('auto_update'), default=True, icon="msg_update"),
+        ]
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not self.get_setting("auto", True):
+            return HookResult()
+        msg = getattr(params, 'message', None)
+        if not isinstance(msg, str):
+            return HookResult()
+        text = msg.strip()
+        if not text.startswith('http') or '\n' in text or ' ' in text:
+            return HookResult()
+        match = self._find_url(text)
+        if not match:
+            return HookResult()
+        peer = getattr(params, 'peer', None)
+        if not peer:
+            return HookResult()
+        reply_to = getattr(params, 'replyToMsg', None)
+        platform, url = match
+        is_shorts = YOUTUBE_SHORTS_PATTERN.search(url) is not None
+        if platform == 'youtube' and self.get_setting("yt_ask", True):
+            run_on_ui_thread(lambda: self._show_youtube_dialog(url, peer, is_shorts, reply_to))
+        else:
+            media_type = self._get_media_type(platform)
+            run_on_queue(lambda: self._process_download(url, platform, peer, media_type, is_shorts, reply_to))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _on_menu_click(self, ctx: Dict):
+        msg = ctx.get("message")
+        if not msg or not msg.messageText:
+            return
+        match = self._find_url(str(msg.messageText))
+        if not match:
+            BulletinHelper.show_error(Strings.get('no_media_url'))
+            return
+        dialog_id = ctx.get("dialog_id")
+        if not dialog_id:
+            return
+        platform, url = match
+        is_shorts = YOUTUBE_SHORTS_PATTERN.search(url) is not None
+        if platform == 'youtube':
+            self._show_youtube_dialog(url, dialog_id, is_shorts, msg)
+        else:
+            media_type = self._get_media_type(platform)
+            run_on_queue(lambda: self._process_download(url, platform, dialog_id, media_type, is_shorts, msg))
+
+    def _find_url(self, text: str) -> Optional[Tuple[str, str]]:
+        for platform, pattern in PATTERNS.items():
+            match = pattern.search(text)
+            if match:
+                return platform, match.group(0)
+        return None
+
+    def _get_media_type(self, platform: str) -> str:
+        if platform == 'soundcloud':
+            return 'audio'
+        if platform == 'youtube' and self.get_setting("yt_fmt", 0) == 1:
+            return 'audio'
+        return 'video'
+
+    def _process_download(self, url: str, platform: str, peer: Any, media_type: str, is_shorts: bool = False, reply_to: Any = None):
+        # Показываем прогресс
+        if self.get_setting("progress", False):
+            run_on_ui_thread(lambda: self._show_progress(platform))
+        else:
+            run_on_ui_thread(lambda: BulletinHelper.show_info(Strings.get('downloading')))
+        
+        try:
+            response = requests.post(
+                f"{API_URL}/api/download",
+                json={'url': url, 'type': media_type},
+                timeout=API_TIMEOUT
+            )
+            data = response.json()
+            
+            # Сначала ВСЕГДА скрываем прогресс
+            run_on_ui_thread(lambda: self._hide_progress())
+            
+            if not data.get('success'):
+                error_msg = data.get('error', 'Unknown error')
+                # Форматируем ошибку о размере файла
+                if self._is_file_too_large_error(error_msg):
+                    formatted_error = self._format_size_error(error_msg)
+                else:
+                    formatted_error = Strings.get('error', msg=error_msg)
+                # Показываем ошибку напрямую (без _show_error, чтобы избежать двойного ❌)
+                run_on_ui_thread(lambda e=formatted_error: BulletinHelper.show_error(e))
+                return
+            
+            self._handle_result(data, peer, platform, is_shorts, reply_to)
+            
+        except requests.exceptions.Timeout:
+            run_on_ui_thread(lambda: self._hide_progress())
+            timeout_error = Strings.get('error', msg='Request timeout')
+            run_on_ui_thread(lambda: BulletinHelper.show_error(timeout_error))
+        except requests.exceptions.ConnectionError:
+            run_on_ui_thread(lambda: self._hide_progress())
+            conn_error = Strings.get('error', msg='Connection error')
+            run_on_ui_thread(lambda: BulletinHelper.show_error(conn_error))
+        except Exception as e:
+            run_on_ui_thread(lambda: self._hide_progress())
+            err_str = str(e)
+            generic_error = Strings.get('error', msg=err_str)
+            run_on_ui_thread(lambda e=generic_error: BulletinHelper.show_error(e))
+
+    def _handle_result(self, data: Dict, peer: Any, platform: str, is_shorts: bool = False, reply_to: Any = None):
+        from_cache = data.get('fromCache', False)
+        content_type = data.get('type', 'video')
+        if content_type == 'album':
+            self._send_album(peer, data.get('images', []), data.get('originalUrl', ''), from_cache, reply_to)
+        elif content_type == 'video':
+            self._send_video(peer, data, platform, is_shorts, from_cache, reply_to)
+        elif content_type == 'audio':
+            self._send_audio(peer, data, platform, from_cache, reply_to)
+
+    def _send_video(self, peer: Any, data: Dict, platform: str, is_shorts: bool = False, from_cache: bool = False, reply_to: Any = None):
+        def send():
+            try:
+                title = data.get('title', '')
+                file_url = data.get('fileUrl', '')
+                original_url = data.get('originalUrl', '')
+
+                text, entities = self._build_media_message(
+                    title=title if not is_shorts else '',
+                    file_url=file_url,
+                    original_url=original_url,
+                    is_audio=False
+                )
+
+                self._send_message_with_entities(peer, text, entities, reply_to=reply_to)
+                BulletinHelper.show_success(Strings.get('sent_from_cache') if from_cache else Strings.get('sent'))
+
+            except Exception as e:
+                err = str(e)
+                BulletinHelper.show_error(Strings.get('error', msg=err))
+        run_on_ui_thread(send)
+
+    def _send_audio(self, peer: Any, data: Dict, platform: str, from_cache: bool = False, reply_to: Any = None):
+        def send():
+            try:
+                artist = data.get('artist', '')
+                title = data.get('title', '')
+                caption = f"{artist} - {title}" if artist and title else title
+                file_url = data.get('fileUrl', '')
+                original_url = data.get('originalUrl', '')
+
+                text, entities = self._build_media_message(
+                    title=caption,
+                    file_url=file_url,
+                    original_url=original_url,
+                    is_audio=True
+                )
+
+                self._send_message_with_entities(peer, text, entities, reply_to=reply_to)
+                BulletinHelper.show_success(Strings.get('sent_from_cache') if from_cache else Strings.get('sent'))
+
+            except Exception as e:
+                err = str(e)
+                BulletinHelper.show_error(Strings.get('error', msg=err))
+        run_on_ui_thread(send)
+
+    def _send_album(self, peer: Any, images: List[str], original_url: str, from_cache: bool = False, reply_to: Any = None):
+        def process():
+            paths = []
+            try:
+                total = len(images)
+                if self.get_setting("progress", False):
+                    run_on_ui_thread(lambda: self._update_progress(
+                        Strings.get('downloading_photos', current=0, total=total)
+                    ))
+                paths = self._download_images_parallel(images, total)
+                run_on_ui_thread(lambda: self._hide_progress())
+                if not paths:
+                    raise Exception("No photos downloaded")
+                run_on_ui_thread(lambda: self._send_album_grouped(peer, paths, original_url, from_cache, reply_to))
+            except Exception as e:
+                err = str(e)
+                run_on_ui_thread(lambda: self._hide_progress())
+                error_msg = Strings.get('error', msg=err)
+                run_on_ui_thread(lambda m=error_msg: BulletinHelper.show_error(m))
+                self._cleanup_files(paths)
+        run_on_queue(process)
+
+    def _send_album_grouped(self, peer: Any, paths: List[str], original_url: str, from_cache: bool = False, reply_to: Any = None):
+        def send():
+            try:
+                chunks = [paths[i:i + ALBUM_CHUNK_SIZE] for i in range(0, len(paths), ALBUM_CHUNK_SIZE)]
+                for idx, chunk in enumerate(chunks):
+                    self._send_photo_group(peer, chunk, reply_to if idx == 0 else None)
+                    if len(chunks) > 1:
+                        time.sleep(0.1)
+                text, entities = self._build_link_only_message(original_url)
+                self._send_message_with_entities(peer, text, entities, disable_preview=True)
+                msg = Strings.get('sent_from_cache') if from_cache else Strings.get('photos_sent', count=len(paths))
+                run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
+            except Exception as e:
+                err = str(e)
+                error_msg = Strings.get('error', msg=err)
+                run_on_ui_thread(lambda m=error_msg: BulletinHelper.show_error(m))
+            finally:
+                self._cleanup_files(paths)
+        run_on_queue(send)
+
+    def _send_photo_group(self, peer: Any, paths: List[str], reply_to: Any = None):
+        grouped_id = Utilities.random.nextLong()
+        total = len(paths)
+        for idx, path in enumerate(paths):
+            photo = _generate_photo_sizes(path, False)
+            if not photo:
+                continue
+            params_map = HashMap()
+            params_map.put("groupId", str(grouped_id))
+            if idx == total - 1:
+                params_map.put("final", "1")
+            msg_params = {
+                'peer': peer,
+                'photo': photo,
+                'path': path,
+                'params': params_map,
+                'searchLinks': False
+            }
+            if idx == 0 and reply_to:
+                msg_params['replyToMsg'] = reply_to
+            send_message(msg_params)
+
+    def _create_text_url_entity(self, offset: int, length: int, url: str):
+        entity = TLRPC.TL_messageEntityTextUrl()
+        entity.offset = offset
+        entity.length = length
+        entity.url = url
+        return entity
+
+    def _build_media_message(self, title: str, file_url: str, original_url: str, is_audio: bool = False) -> Tuple[str, List]:
+        entities = []
+        download_text = "Download"
+        source_text = "Source"
+
+        if title and not is_audio:
+            text = f"📥 {download_text} • 🔗 {source_text}\n\n🎬 {title}"
+        else:
+            text = f"📥 {download_text} • 🔗 {source_text}"
+
+        prefix_download = "📥 "
+        download_offset = len(prefix_download.encode('utf-16-le')) // 2
+
+        prefix_source = f"📥 {download_text} • 🔗 "
+        source_offset = len(prefix_source.encode('utf-16-le')) // 2
+
+        if file_url:
+            entities.append(self._create_text_url_entity(download_offset, len(download_text), file_url))
+        if original_url:
+            entities.append(self._create_text_url_entity(source_offset, len(source_text), original_url))
+
+        return text, entities
+
+    def _build_link_only_message(self, url: str) -> Tuple[str, List]:
+        text = "🔗 Link"
+        entities = []
+
+        if url:
+            offset = len("🔗 ".encode('utf-16-le')) // 2
+            entities.append(self._create_text_url_entity(offset, 4, url))
+
+        return text, entities
+
+    def _send_message_with_entities(self, peer: Any, text: str, entities: List, disable_preview: bool = False, reply_to: Any = None):
+        try:
+            msg_params = {
+                'peer': peer,
+                'message': text,
+                'entities': entities if entities else None,
+                'searchLinks': not disable_preview
+            }
+            if reply_to:
+                msg_params['replyToMsg'] = reply_to
+            send_message(msg_params)
+        except Exception:
+            send_message({'peer': peer, 'message': text, 'searchLinks': False})
+
+    def _download_images_parallel(self, urls: List[str], total: int) -> List[str]:
+        completed = [0]
+        def download_one(args: Tuple[int, str]) -> Optional[str]:
+            idx, url = args
+            file_path = self._download_file(url, f"photo_{idx}.jpg")
+            completed[0] += 1
+            if self.get_setting("progress", False):
+                run_on_ui_thread(lambda c=completed[0]: self._update_progress(
+                    Strings.get('downloading_photos', current=c, total=total)
+                ))
+            return file_path
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            results = list(executor.map(download_one, enumerate(urls)))
+        return [p for p in results if p]
+
+    def _download_file(self, url: str, filename: str) -> Optional[str]:
+        try:
+            file_path = os.path.join(self._cache_dir, f"{int(time.time() * 1000)}_{filename}")
+            with requests.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True) as r:
+                r.raise_for_status()
+                with open(file_path, 'wb') as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+            return file_path
+        except Exception:
+            return None
+
+    def _cleanup_files(self, paths: List[str]):
+        for file_path in paths:
+            try:
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+            except:
+                pass
+
+    def _cleanup_cache(self):
+        if not self._cache_dir:
+            return
+        try:
+            for f in os.listdir(self._cache_dir):
+                os.remove(os.path.join(self._cache_dir, f))
+        except:
+            pass
+
+    def _show_progress(self, platform: str):
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+        activity = fragment.getParentActivity()
+        if not activity:
+            return
+        self._dialog = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        self._dialog.set_title(f"📥 {platform}...")
+        self._dialog.set_cancelable(False)
+        self._dialog.show()
+
+    def _update_progress(self, message: str):
+        if self._dialog:
+            try:
+                self._dialog.set_message(message)
+            except:
+                pass
+
+    def _hide_progress(self):
+        if self._dialog:
+            try:
+                self._dialog.dismiss()
+            except:
+                pass
+        self._dialog = None
+
+    def _show_youtube_dialog(self, url: str, peer: Any, is_shorts: bool = False, reply_to: Any = None):
+        fragment = get_last_fragment()
+        if not fragment or not fragment.getParentActivity():
+            media_type = 'audio' if self.get_setting("yt_fmt", 0) == 1 else 'video'
+            run_on_queue(lambda: self._process_download(url, 'youtube', peer, media_type, is_shorts, reply_to))
+            return
+
+        def on_select(dialog, which):
+            dialog.dismiss()
+            media_type = 'audio' if which == 1 else 'video'
+            run_on_queue(lambda: self._process_download(url, 'youtube', peer, media_type, is_shorts, reply_to))
+
+        builder = AlertDialogBuilder(fragment.getParentActivity())
+        builder.set_title("▶️ YouTube")
+        builder.set_items([Strings.get('video'), Strings.get('audio')], on_select)
+        builder.set_negative_button(Strings.get('cancel'), lambda d, w: d.dismiss())
+        builder.show()
