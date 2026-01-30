@@ -2,7 +2,7 @@ __id__ = "NimarkoMedia"
 __name__ = "📥 Nimarko Downloader"
 __description__ = " Download from **TikTok**, **YouTube**, **SoundCloud**\n\nJust send a link and get the media!"
 __author__ = "@NimarkoProject"
-__version__ = "1.5.2"
+__version__ = "1.7.0"
 __icon__ = "exteraPlugins/0"
 __min_version__ = "11.12.0"
 
@@ -10,10 +10,17 @@ import requests
 import re
 import time
 import os
+import ssl
+import json
+import certifi
+import threading
 import concurrent.futures
 from typing import Any, Optional, Dict, List, Tuple
+from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 from java.util import HashMap, Locale
-from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
 from android_utils import run_on_ui_thread
 from client_utils import (
     run_on_queue, get_last_fragment, send_message, get_user_config,
@@ -23,8 +30,280 @@ from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Switch, Divider, Selector
 from file_utils import get_cache_dir, ensure_dir_exists
-from org.telegram.messenger import Utilities
+from hook_utils import find_class
+from org.telegram.messenger import Utilities, UserConfig
 from org.telegram.tgnet import TLRPC
+
+BADGES_API_URL = "https://badges.ettacent.dev/api/v1"
+BADGES_REFRESH_SEC = 60
+BADGES_QUICK_CHECK_SEC = 15
+
+
+def safe_int(v, default=0):
+    try:
+        s = str(v).strip()
+        if not s:
+            return default
+        return int(s)
+    except:
+        return default
+
+
+class SecurityError(Exception):
+    pass
+
+
+class SSLAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        self._ssl_context = create_urllib3_context()
+        self._ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        self._ssl_context.verify_mode = ssl.CERT_REQUIRED
+        self._ssl_context.check_hostname = True
+        self._ssl_context.load_verify_locations(certifi.where())
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class SecureRequests:
+    _ALLOWED_DOMAINS = frozenset({
+        "67.ettacent.dev",
+        "ettacent.dev",
+        "update.ettacent.dev",
+        "badges.ettacent.dev"
+    })
+
+    @classmethod
+    def _validate_url(cls, url: str, check_domain: bool = True) -> bool:
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme != "https":
+                raise SecurityError()
+            if check_domain and parsed.hostname not in cls._ALLOWED_DOMAINS:
+                raise SecurityError()
+            return True
+        except SecurityError:
+            raise
+        except Exception:
+            raise SecurityError()
+
+    @classmethod
+    def _get_session(cls) -> requests.Session:
+        session = requests.Session()
+        adapter = SSLAdapter()
+        session.mount("https://", adapter)
+        return session
+
+    @classmethod
+    def get(cls, url: str, check_domain: bool = True, **kwargs) -> requests.Response:
+        cls._validate_url(url, check_domain)
+        kwargs["verify"] = certifi.where()
+        with cls._get_session() as session:
+            return session.get(url, **kwargs)
+
+    @classmethod
+    def post(cls, url: str, **kwargs) -> requests.Response:
+        cls._validate_url(url, check_domain=True)
+        kwargs["verify"] = certifi.where()
+        with cls._get_session() as session:
+            return session.post(url, **kwargs)
+
+
+class GlobalBadgeCache:
+    CACHE_FILE = "badges_global_cache.json"
+    LOCK_FILE = "badges_cache.lock"
+
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+        self.cache_path = os.path.join(cache_dir, self.CACHE_FILE)
+        self.lock_path = os.path.join(cache_dir, self.LOCK_FILE)
+        self._memory_cache: Dict[int, dict] = {}
+        self._etag: str = ""
+        self._timestamp: float = 0
+        self._lock = threading.Lock()
+
+    def _acquire_file_lock(self, timeout: float = 5.0) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                if os.path.exists(self.lock_path):
+                    lock_age = time.time() - os.path.getmtime(self.lock_path)
+                    if lock_age > 30:
+                        os.remove(self.lock_path)
+                    else:
+                        time.sleep(0.1)
+                        continue
+                with open(self.lock_path, 'w') as f:
+                    f.write(str(os.getpid()))
+                return True
+            except:
+                time.sleep(0.1)
+        return False
+
+    def _release_file_lock(self):
+        try:
+            if os.path.exists(self.lock_path):
+                os.remove(self.lock_path)
+        except:
+            pass
+
+    def load_from_file(self) -> bool:
+        try:
+            if not os.path.exists(self.cache_path):
+                return False
+            with open(self.cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            with self._lock:
+                self._memory_cache = {int(k): v for k, v in data.get('badges', {}).items()}
+                self._etag = data.get('etag', '')
+                self._timestamp = data.get('timestamp', 0)
+            return True
+        except:
+            return False
+
+    def save_to_file(self):
+        try:
+            if not self._acquire_file_lock():
+                return
+            try:
+                with self._lock:
+                    data = {
+                        'badges': {str(k): v for k, v in self._memory_cache.items()},
+                        'etag': self._etag,
+                        'timestamp': self._timestamp,
+                        'saved_at': time.time()
+                    }
+                temp_path = self.cache_path + '.tmp'
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(temp_path, self.cache_path)
+            finally:
+                self._release_file_lock()
+        except:
+            pass
+
+    def needs_refresh(self) -> bool:
+        return time.time() - self._timestamp > BADGES_REFRESH_SEC
+
+    def needs_quick_check(self) -> bool:
+        return time.time() - self._timestamp > BADGES_QUICK_CHECK_SEC
+
+    def update(self, badges: Dict[int, dict], etag: str):
+        with self._lock:
+            self._memory_cache = badges
+            self._etag = etag
+            self._timestamp = time.time()
+        self.save_to_file()
+
+    def get_badges(self) -> Dict[int, dict]:
+        with self._lock:
+            return self._memory_cache.copy()
+
+    def get_etag(self) -> str:
+        return self._etag
+
+    def get_timestamp(self) -> float:
+        return self._timestamp
+
+
+class BadgeHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+
+    def _has_active_streak(self, user_id: int) -> bool:
+        try:
+            shared_path = os.path.join(get_cache_dir(), "ettacent_shared", "active_streaks.json")
+            if not os.path.exists(shared_path):
+                return False
+            
+            with open(shared_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            if time.time() - data.get('updated_at', 0) > 3600:
+                return False
+            
+            active_streaks = data.get('active_streaks', {})
+            streak_info = active_streaks.get(str(user_id))
+            
+            if streak_info:
+                return streak_info.get('is_active', False) or streak_info.get('can_restore', False)
+            
+            return False
+        except:
+            return False
+
+    def after_hooked_method(self, param):
+        try:
+            badges = self.p.get_badges()
+            if not badges:
+                return
+            
+            tl_object = param.args[0]
+            obj_id = safe_int(getattr(tl_object, "id", 0), 0)
+            if obj_id == 0:
+                return
+            
+            if self._has_active_streak(obj_id):
+                return
+            
+            badge_data = badges.get(obj_id)
+            if badge_data is None and obj_id > 0:
+                badge_data = badges.get(-obj_id)
+            if badge_data is None and obj_id > 0:
+                channel_id = -1000000000000 - obj_id
+                badge_data = badges.get(channel_id)
+            
+            if not isinstance(badge_data, dict):
+                return
+            
+            emoji_doc_id = safe_int(badge_data.get("emoji_doc_id", 0), 0)
+            if emoji_doc_id <= 0:
+                return
+            
+            text = str(badge_data.get("text", "") or "")
+            badge = self.p.BadgeDTO(int(emoji_doc_id), str(text))
+            param.setResult(badge)
+        except:
+            pass
+
+class BulletinFactoryHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+    
+    def before_hooked_method(self, param):
+        try:
+            if len(param.args) >= 4 and param.args[3] is not None:
+                badges = self.p.get_badges()
+                if not badges:
+                    return
+                
+                doc = param.args[0]
+                if doc is None:
+                    return
+                
+                doc_id = 0
+                try:
+                    if hasattr(doc, 'id'):
+                        doc_id = int(doc.id)
+                except:
+                    pass
+                
+                if doc_id <= 0:
+                    return
+                
+                is_our_badge = False
+                for user_id, badge_data in badges.items():
+                    emoji_doc_id = safe_int(badge_data.get("emoji_doc_id", 0), 0)
+                    if emoji_doc_id == doc_id:
+                        is_our_badge = True
+                        break
+                
+                if is_our_badge:
+                    param.args[3] = None
+        except:
+            pass
 
 
 class Strings:
@@ -33,6 +312,7 @@ class Strings:
         'downloading_photos': 'Загрузка фото {current}/{total}...',
         'photos_sent': '✅ {count} фото отправлено!',
         'error': '❌ {msg}',
+        'ssl_error': '❌ Ошибка безопасности',
         'no_media_url': 'Нет ссылки на медиа',
         'sent': '✅ Отправлено!',
         'sent_from_cache': '⚡ Отправлено из кеша!',
@@ -45,8 +325,7 @@ class Strings:
         'yt_format': 'Формат YouTube',
         'yt_ask': 'Спрашивать формат YouTube',
         'show_progress': 'Показывать прогресс',
-        'auto_update': 'Автообновление плагина',
-        'update_success': '✅ NimarkoMedia обновлен.\nПерезапустите тг для применения',
+        'update_success': '✅ NimarkoMedia обновлён!\nПерезапустите клиент!',
         'file_too_large': '❌ Файл слишком большой: {size}MB',
         'file_too_large_generic': '❌ Файл слишком большой.',
     }
@@ -55,6 +334,7 @@ class Strings:
         'downloading_photos': 'Downloading photos {current}/{total}...',
         'photos_sent': '✅ {count} photos sent!',
         'error': '❌ {msg}',
+        'ssl_error': '❌ Security error',
         'no_media_url': 'No media URL',
         'sent': '✅ Sent!',
         'sent_from_cache': '⚡ Sent from cache!',
@@ -67,8 +347,7 @@ class Strings:
         'yt_format': 'YouTube format',
         'yt_ask': 'Ask YouTube format',
         'show_progress': 'Show progress',
-        'auto_update': 'Auto-update plugin',
-        'update_success': '✅ NimarkoMedia updated.\nRestart to apply',
+        'update_success': '✅ NimarkoMedia updated!\nRestart the client!',
         'file_too_large': '❌ File too large: {size})',
         'file_too_large_generic': '❌ File too large',
     }
@@ -103,10 +382,114 @@ YOUTUBE_SHORTS_PATTERN = re.compile(r'youtube\.com/shorts/', re.IGNORECASE)
 
 
 class MediaDownloaderPlugin(BasePlugin):
-    def init(self):
-        super().init()
+    def __init__(self):
+        super().__init__()
         self._dialog = None
         self._cache_dir = None
+        self._global_cache: Optional[GlobalBadgeCache] = None
+        self._badges_stop_event = threading.Event()
+        self.BadgeDTO = None
+        self.badge_hook_ref = None
+
+    def get_badges(self) -> Dict[int, dict]:
+        if self._global_cache:
+            return self._global_cache.get_badges()
+        return {}
+
+    def _fetch_badges(self, force: bool = False):
+        try:
+            if not self._global_cache:
+                return
+            if not force:
+                self._global_cache.load_from_file()
+                if not self._global_cache.needs_refresh():
+                    return
+            headers = {}
+            current_etag = self._global_cache.get_etag()
+            if current_etag:
+                headers['If-None-Match'] = current_etag
+            response = SecureRequests.get(
+                f"{BADGES_API_URL}/badges",
+                headers=headers,
+                timeout=10
+            )
+            if response.status_code == 304:
+                self._global_cache.update(self._global_cache.get_badges(), current_etag)
+                return
+            if response.status_code == 200:
+                data = response.json()
+                new_etag = response.headers.get('ETag', '')
+                badges_raw = data.get("badges", {})
+                if isinstance(badges_raw, dict):
+                    new_badges = {}
+                    for k, v in badges_raw.items():
+                        entity_id = safe_int(k, 0)
+                        if entity_id != 0 and isinstance(v, dict):
+                            new_badges[entity_id] = v
+                    self._global_cache.update(new_badges, new_etag)
+        except:
+            pass
+
+    def _quick_check_updates(self) -> bool:
+        try:
+            if not self._global_cache:
+                return False
+            timestamp = int(self._global_cache.get_timestamp())
+            response = SecureRequests.get(
+                f"{BADGES_API_URL}/badges/check?since={timestamp}",
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('has_updates', False)
+            return False
+        except:
+            return False
+
+    def _badges_loop(self):
+        while not self._badges_stop_event.is_set():
+            try:
+                if self._global_cache:
+                    self._global_cache.load_from_file()
+                if self._global_cache and self._global_cache.needs_refresh():
+                    if self._quick_check_updates():
+                        self._fetch_badges(force=True)
+                    else:
+                        self._global_cache.update(
+                            self._global_cache.get_badges(),
+                            self._global_cache.get_etag()
+                        )
+            except:
+                pass
+            self._badges_stop_event.wait(BADGES_QUICK_CHECK_SEC)
+
+    def _init_badges_system(self):
+        global_cache_dir = os.path.join(get_cache_dir(), "ettacent_shared")
+        ensure_dir_exists(global_cache_dir)
+        self._global_cache = GlobalBadgeCache(global_cache_dir)
+        if self._global_cache.load_from_file():
+            pass
+        self.BadgeDTO = find_class("com.exteragram.messenger.api.dto.BadgeDTO")
+        BadgesController = find_class("com.exteragram.messenger.badges.BadgesController")
+        TLObject = find_class("org.telegram.tgnet.TLObject")
+        
+        try:
+            BulletinFactory = find_class("org.telegram.ui.Components.BulletinFactory")
+            if BulletinFactory:
+                self.hook_all_methods(BulletinFactory, "createEmojiBulletin", BulletinFactoryHook(self))
+        except:
+            pass
+        
+        if self.BadgeDTO and BadgesController and TLObject:
+            try:
+                method = BadgesController.getClass().getDeclaredMethod("getBadge", TLObject)
+                method.setAccessible(True)
+                self.badge_hook_ref = self.hook_method(method, BadgeHook(self))
+            except:
+                pass
+        self._badges_stop_event.clear()
+        threading.Thread(target=self._badges_loop, daemon=True).start()
+        threading.Thread(target=lambda: (time.sleep(0.5), self._fetch_badges()), daemon=True).start()
 
     def _parse_version(self, v: str):
         return tuple(map(int, v.split('.')))
@@ -129,52 +512,25 @@ class MediaDownloaderPlugin(BasePlugin):
         return Strings.get('file_too_large_generic')
 
     def check_for_update(self):
-        if not self.get_setting("auto_update", True):
-            return
-
-        VERSION_URL = f"{API_URL}/api/plugin-version"
-        DOWNLOAD_URL = "https://ettacent.dev/files/NimarkoMedia.plugin"
-
         try:
-            response = requests.get(VERSION_URL, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            latest_version = data.get("version", "").strip()
-
-            if not latest_version:
+            r = SecureRequests.get("https://update.ettacent.dev/api/plugin-version?id=NimarkoMedia", timeout=10)
+            latest = r.json().get("version", "")
+            if not latest or self._parse_version(latest) <= self._parse_version(__version__):
                 return
-
-            if self._parse_version(latest_version) <= self._parse_version(__version__):
-                return
-
-            new_code_response = requests.get(DOWNLOAD_URL, timeout=30)
-            new_code_response.raise_for_status()
-            new_code = new_code_response.text
-
-            plugin_path = __file__
-            backup_path = plugin_path + ".backup"
-            temp_path = plugin_path + ".new"
-
-            if os.path.exists(backup_path):
-                os.remove(backup_path)
-
-            os.rename(plugin_path, backup_path)
-
-            with open(temp_path, "w", encoding="utf-8") as f:
-                f.write(new_code)
-
-            os.rename(temp_path, plugin_path)
-
-            run_on_ui_thread(lambda: BulletinHelper.show_success(
-                Strings.get('update_success')
-            ))
-
-        except Exception:
+            code = SecureRequests.get("https://ettacent.dev/plugins/NimarkoMedia.plugin", timeout=30).text
+            p = __file__
+            if os.path.exists(p + ".backup"):
+                os.remove(p + ".backup")
+            os.rename(p, p + ".backup")
+            open(p, "w", encoding="utf-8").write(code)
+            run_on_ui_thread(lambda: BulletinHelper.show_success(Strings.get('update_success')))
+        except:
             pass
 
     def on_plugin_load(self):
         self._cache_dir = os.path.join(get_cache_dir(), "media_dl")
         ensure_dir_exists(self._cache_dir)
+        self._init_badges_system()
         self.add_on_send_message_hook(priority=100)
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
@@ -185,6 +541,12 @@ class MediaDownloaderPlugin(BasePlugin):
         run_on_queue(self.check_for_update)
 
     def on_plugin_unload(self):
+        self._badges_stop_event.set()
+        if self.badge_hook_ref:
+            try:
+                self.unhook_method(self.badge_hook_ref)
+            except:
+                pass
         self._cleanup_cache()
 
     def create_settings(self) -> List:
@@ -200,7 +562,6 @@ class MediaDownloaderPlugin(BasePlugin):
             ),
             Switch(key="yt_ask", text=Strings.get('yt_ask'), default=True, icon="msg_ask"),
             Switch(key="progress", text=Strings.get('show_progress'), default=False, icon="msg_timer"),
-            Switch(key="auto_update", text=Strings.get('auto_update'), default=True, icon="msg_update"),
         ]
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
@@ -218,13 +579,10 @@ class MediaDownloaderPlugin(BasePlugin):
         peer = getattr(params, 'peer', None)
         if not peer:
             return HookResult()
-        
         reply_to = getattr(params, 'replyToMsg', None)
         reply_to_top = getattr(params, 'replyToTopMsg', None)
-        
         platform, url = match
         is_shorts = YOUTUBE_SHORTS_PATTERN.search(url) is not None
-        
         if platform == 'youtube' and self.get_setting("yt_ask", True):
             run_on_ui_thread(lambda: self._show_youtube_dialog(url, peer, is_shorts, reply_to, reply_to_top))
         else:
@@ -243,17 +601,14 @@ class MediaDownloaderPlugin(BasePlugin):
         dialog_id = ctx.get("dialog_id")
         if not dialog_id:
             return
-        
         topic_id = ctx.get("topic_id")
         reply_to_top = None
-        
         if topic_id:
             try:
                 reply_to_top = TLRPC.TL_message()
                 reply_to_top.id = topic_id
             except:
                 pass
-        
         platform, url = match
         is_shorts = YOUTUBE_SHORTS_PATTERN.search(url) is not None
         if platform == 'youtube':
@@ -281,17 +636,14 @@ class MediaDownloaderPlugin(BasePlugin):
             run_on_ui_thread(lambda: self._show_progress(platform))
         else:
             run_on_ui_thread(lambda: BulletinHelper.show_info(Strings.get('downloading')))
-        
         try:
-            response = requests.post(
+            response = SecureRequests.post(
                 f"{API_URL}/api/download",
                 json={'url': url, 'type': media_type},
                 timeout=API_TIMEOUT
             )
             data = response.json()
-            
             run_on_ui_thread(lambda: self._hide_progress())
-            
             if not data.get('success'):
                 error_msg = data.get('error', 'Unknown error')
                 if self._is_file_too_large_error(error_msg):
@@ -300,9 +652,10 @@ class MediaDownloaderPlugin(BasePlugin):
                     formatted_error = Strings.get('error', msg=error_msg)
                 run_on_ui_thread(lambda e=formatted_error: BulletinHelper.show_error(e))
                 return
-            
             self._handle_result(data, peer, platform, is_shorts, reply_to, reply_to_top)
-            
+        except (SecurityError, ssl.SSLError):
+            run_on_ui_thread(lambda: self._hide_progress())
+            run_on_ui_thread(lambda: BulletinHelper.show_error(Strings.get('ssl_error')))
         except requests.exceptions.Timeout:
             run_on_ui_thread(lambda: self._hide_progress())
             timeout_error = Strings.get('error', msg='Request timeout')
@@ -333,17 +686,14 @@ class MediaDownloaderPlugin(BasePlugin):
                 title = data.get('title', '')
                 file_url = data.get('fileUrl', '')
                 original_url = data.get('originalUrl', '')
-
                 text, entities = self._build_media_message(
                     title=title if not is_shorts else '',
                     file_url=file_url,
                     original_url=original_url,
                     is_audio=False
                 )
-
                 self._send_message_with_entities(peer, text, entities, reply_to=reply_to, reply_to_top=reply_to_top)
                 BulletinHelper.show_success(Strings.get('sent_from_cache') if from_cache else Strings.get('sent'))
-
             except Exception as e:
                 err = str(e)
                 BulletinHelper.show_error(Strings.get('error', msg=err))
@@ -357,17 +707,14 @@ class MediaDownloaderPlugin(BasePlugin):
                 caption = f"{artist} - {title}" if artist and title else title
                 file_url = data.get('fileUrl', '')
                 original_url = data.get('originalUrl', '')
-
                 text, entities = self._build_media_message(
                     title=caption,
                     file_url=file_url,
                     original_url=original_url,
                     is_audio=True
                 )
-
                 self._send_message_with_entities(peer, text, entities, reply_to=reply_to, reply_to_top=reply_to_top)
                 BulletinHelper.show_success(Strings.get('sent_from_cache') if from_cache else Strings.get('sent'))
-
             except Exception as e:
                 err = str(e)
                 BulletinHelper.show_error(Strings.get('error', msg=err))
@@ -387,6 +734,10 @@ class MediaDownloaderPlugin(BasePlugin):
                 if not paths:
                     raise Exception("No photos downloaded")
                 run_on_ui_thread(lambda: self._send_album_grouped(peer, paths, original_url, from_cache, reply_to, reply_to_top))
+            except (SecurityError, ssl.SSLError):
+                run_on_ui_thread(lambda: self._hide_progress())
+                run_on_ui_thread(lambda: BulletinHelper.show_error(Strings.get('ssl_error')))
+                self._cleanup_files(paths)
             except Exception as e:
                 err = str(e)
                 run_on_ui_thread(lambda: self._hide_progress())
@@ -400,22 +751,19 @@ class MediaDownloaderPlugin(BasePlugin):
             try:
                 chunks = [paths[i:i + ALBUM_CHUNK_SIZE] for i in range(0, len(paths), ALBUM_CHUNK_SIZE)]
                 total_chunks = len(chunks)
-                
                 caption_text, caption_entities = self._build_link_only_message(original_url)
-                
                 for idx, chunk in enumerate(chunks):
                     is_last_chunk = (idx == total_chunks - 1)
                     self._send_photo_group(
-                        peer, 
-                        chunk, 
-                        reply_to if idx == 0 else None, 
+                        peer,
+                        chunk,
+                        reply_to if idx == 0 else None,
                         reply_to_top,
                         caption=caption_text if is_last_chunk else None,
                         caption_entities=caption_entities if is_last_chunk else None
                     )
                     if total_chunks > 1 and not is_last_chunk:
                         time.sleep(0.1)
-                
                 msg = Strings.get('sent_from_cache') if from_cache else Strings.get('photos_sent', count=len(paths))
                 run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
             except Exception as e:
@@ -429,20 +777,14 @@ class MediaDownloaderPlugin(BasePlugin):
     def _send_photo_group(self, peer: Any, paths: List[str], reply_to: Any = None, reply_to_top: Any = None, caption: str = None, caption_entities: List = None):
         grouped_id = Utilities.random.nextLong()
         total = len(paths)
-        
         for idx, path in enumerate(paths):
             photo = _generate_photo_sizes(path, False)
             if not photo:
                 continue
-            
             is_final = (idx == total - 1)
-            
-            params_map = {
-                "groupId": str(grouped_id)
-            }
+            params_map = {"groupId": str(grouped_id)}
             if is_final:
                 params_map["final"] = "1"
-            
             msg_params = {
                 'peer': peer,
                 'photo': photo,
@@ -450,17 +792,14 @@ class MediaDownloaderPlugin(BasePlugin):
                 'params': params_map,
                 'searchLinks': False
             }
-            
             if idx == 0 and reply_to:
                 msg_params['replyToMsg'] = reply_to
             if reply_to_top:
                 msg_params['replyToTopMsg'] = reply_to_top
-            
             if is_final and caption:
                 msg_params['caption'] = caption
                 if caption_entities:
                     msg_params['entities'] = caption_entities
-            
             try:
                 send_message(msg_params)
             except Exception:
@@ -485,33 +824,26 @@ class MediaDownloaderPlugin(BasePlugin):
         entities = []
         download_text = "Download"
         source_text = "Source"
-
         if title and not is_audio:
             text = f"📥 {download_text} • 🔗 {source_text}\n\n🎬 {title}"
         else:
             text = f"📥 {download_text} • 🔗 {source_text}"
-
         prefix_download = "📥 "
         download_offset = len(prefix_download.encode('utf-16-le')) // 2
-
         prefix_source = f"📥 {download_text} • 🔗 "
         source_offset = len(prefix_source.encode('utf-16-le')) // 2
-
         if file_url:
             entities.append(self._create_text_url_entity(download_offset, len(download_text), file_url))
         if original_url:
             entities.append(self._create_text_url_entity(source_offset, len(source_text), original_url))
-
         return text, entities
 
     def _build_link_only_message(self, url: str) -> Tuple[str, List]:
         text = "🔗 Source"
         entities = []
-
         if url:
             offset = len("🔗 ".encode('utf-16-le')) // 2
             entities.append(self._create_text_url_entity(offset, 6, url))
-
         return text, entities
 
     def _send_message_with_entities(self, peer: Any, text: str, entities: List, disable_preview: bool = False, reply_to: Any = None, reply_to_top: Any = None):
@@ -551,12 +883,14 @@ class MediaDownloaderPlugin(BasePlugin):
     def _download_file(self, url: str, filename: str) -> Optional[str]:
         try:
             file_path = os.path.join(self._cache_dir, f"{int(time.time() * 1000)}_{filename}")
-            with requests.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True) as r:
+            with SecureRequests.get(url, check_domain=False, timeout=DOWNLOAD_TIMEOUT, stream=True) as r:
                 r.raise_for_status()
                 with open(file_path, 'wb') as f:
                     for chunk in r.iter_content(8192):
                         f.write(chunk)
             return file_path
+        except (SecurityError, ssl.SSLError):
+            raise
         except Exception:
             return None
 
@@ -621,3 +955,6 @@ class MediaDownloaderPlugin(BasePlugin):
         builder.set_items([Strings.get('video'), Strings.get('audio')], on_select)
         builder.set_negative_button(Strings.get('cancel'), lambda d, w: d.dismiss())
         builder.show()
+
+
+__plugin__ = MediaDownloaderPlugin
