@@ -1,0 +1,1449 @@
+"""
+ _____                                                             _____ 
+( ___ )-----------------------------------------------------------( ___ )
+ |   |                                                             |   | 
+ |   | _ _ _ _ ___ _  _    _    ____ _  _ ____    ___  _   _       |   | 
+ |   | | | | |  |  |__|    |    |  | |  | |___    |__]  \_/        |   | 
+ |   | |_|_| |  |  |  |    |___ |__|  \/  |___    |__]   |         |   | 
+ |   |                                                             |   | 
+ |   | _  _ _ _  _ ____ _ _    _  _ ____ ___ ____ _  _ ____ _  _ _ |   | 
+ |   | |\/| | |__| |__| | |    |_/  |  |  |  |  | |  | [__  |_/  | |   | 
+ |   | |  | | |  | |  | | |___ | \_ |__|  |  |__|  \/  ___] | \_ | |   | 
+ |___|                                                             |___| 
+(_____)-----------------------------------------------------------(_____)
+
+Копирование кода без указания авторства является публичным неуважением к работе @mihailkotovski
+"""
+
+__id__ = "inlinetools"
+__name__ = "Inline Tools"
+__description__ = "Локальная админ-панель с inline-кнопками"
+__author__ = "@mihailkotovski & @mishabotov"
+__version__ = "1.0.0"
+__icon__ = "DateRegBot_by_MoiStikiBot/19"
+
+import random
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from android_utils import run_on_ui_thread, R as Runnable
+from client_utils import (
+    RequestCallback,
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    run_on_queue,
+    send_request,
+)
+from hook_utils import find_class
+from markdown_utils import parse_markdown
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Divider, Switch
+
+from java.util import ArrayList
+from java import jclass
+from java.lang import Class as JClass, Float as JFloat
+
+from org.telegram.messenger import AndroidUtilities, ChatObject, MessageObject, UserObject
+from org.telegram.tgnet import TLRPC
+
+
+_CALLBACK_PREFIX = "exadm:"
+
+_PAGE_MAIN = "main"
+_PAGE_BAN = "ban"
+_PAGE_MUTE = "mute"
+
+
+@dataclass
+class _PanelContext:
+    dialog_id: int
+    user_ids: List[int]
+    page: str
+    created_at: float
+
+
+class _InlineButtonHook(MethodHook):
+    def __init__(self, plugin: "InlineToolsPlugin", is_long: bool = False):
+        self._plugin = plugin
+        self._is_long = is_long
+
+    def before_hooked_method(self, param):
+        try:
+            cell = param.args[0] if param.args and len(param.args) > 0 else None
+            btn = param.args[1] if param.args and len(param.args) > 1 else None
+            self._plugin._handle_inline_button_click(cell, btn, param, is_long=self._is_long)
+        except Exception as e:
+            try:
+                self._plugin.log(f"[inlinetools] inline hook error: {e}")
+            except Exception:
+                pass
+
+
+class _UserAvatarLongPressHook(MethodHook):
+    def __init__(self, plugin: "InlineToolsPlugin"):
+        self._plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self._plugin._handle_user_avatar_long_press(param)
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        return
+
+
+class _ChatMessageCellTouchHook(MethodHook):
+    def __init__(self, plugin: "InlineToolsPlugin"):
+        self._plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            motion_event = param.args[0] if param.args and len(param.args) > 0 else None
+            if motion_event is None:
+                return
+            self._plugin._record_touch(param.thisObject, motion_event)
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        return
+
+
+class InlineToolsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._unhooks: List[Any] = []
+        self._panels: Dict[str, _PanelContext] = {}
+        self._touch_unhook: Optional[Any] = None
+        self._last_touch: Optional[Tuple[float, float, float, float]] = None
+        self._last_touch_cell: Optional[Any] = None
+        self._launch_activity_jclass = None
+        self._make_ripple_static = None
+        self._make_ripple_method = None
+
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook(priority=50)
+        self._init_ripple()
+        self._install_touch_hook()
+        self._install_inline_button_hooks()
+
+    def on_plugin_unload(self):
+        for unhook in list(self._unhooks):
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks.clear()
+        if self._touch_unhook:
+            try:
+                self.unhook_method(self._touch_unhook)
+            except Exception:
+                pass
+        self._touch_unhook = None
+        self._panels.clear()
+
+    def create_settings(self):
+        enabled_val = self.get_setting("effects_enabled", True)
+        if isinstance(enabled_val, bool):
+            enabled = enabled_val
+        else:
+            enabled = str(enabled_val).strip().lower() in ("1", "true", "yes", "on")
+        return [
+            Header(text="Inline Tools"),
+            Switch(
+                key="effects_enabled",
+                text="Эффекты",
+                default=enabled,
+                icon="msg_settings",
+            ),
+            Switch(
+                key="avatar_context_menu",
+                text="Кнопка в меню аватара",
+                default=True,
+                icon="msg_folders",
+            ),
+            Divider(text="Если выключить — переключения будут без анимации и без ripple-эффекта."),
+        ]
+
+    def _effects_enabled(self) -> bool:
+        val = self.get_setting("effects_enabled", True)
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+    def _avatar_context_menu_enabled(self) -> bool:
+        val = self.get_setting("avatar_context_menu", True)
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+    def _init_ripple(self):
+        try:
+            self._launch_activity_jclass = JClass.forName("org.telegram.ui.LaunchActivity")
+            try:
+                self._make_ripple_static = getattr(self._launch_activity_jclass, "makeRipple")
+            except Exception:
+                self._make_ripple_static = None
+        except Exception:
+            self._launch_activity_jclass = None
+            self._make_ripple_static = None
+            self._make_ripple_method = None
+
+    def _invoke_ripple(self, x: float, y: float, intensity: float):
+        try:
+            if self._launch_activity_jclass is None:
+                self._init_ripple()
+
+            try:
+                if getattr(self, "_make_ripple_static", None):
+                    self._make_ripple_static(float(x), float(y), float(intensity))
+                    return
+            except Exception:
+                pass
+
+            if self._launch_activity_jclass is None:
+                return
+
+            if not self._make_ripple_method:
+                method = None
+                try:
+                    method = self._launch_activity_jclass.getDeclaredMethod("makeRipple", JFloat.TYPE, JFloat.TYPE, JFloat.TYPE)
+                except Exception:
+                    try:
+                        methods = self._launch_activity_jclass.getDeclaredMethods()
+                        for m in methods:
+                            try:
+                                if m.getName() != "makeRipple":
+                                    continue
+                                if len(m.getParameterTypes()) == 3:
+                                    method = m
+                                    break
+                            except Exception:
+                                method = m
+                                break
+                    except Exception:
+                        method = None
+                if method:
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    self._make_ripple_method = method
+
+            if self._make_ripple_method:
+                self._make_ripple_method.invoke(None, JFloat(x), JFloat(y), JFloat(intensity))
+        except Exception:
+            pass
+
+    def _install_touch_hook(self):
+        try:
+            cell_cls = find_class("org.telegram.ui.Cells.ChatMessageCell")
+            if cell_cls is None:
+                return
+
+            motion_event_cls = None
+            try:
+                motion_event_cls = JClass.forName("android.view.MotionEvent")
+            except Exception:
+                motion_event_cls = None
+
+            method = None
+            try:
+                if motion_event_cls is not None:
+                    method = cell_cls.getClass().getDeclaredMethod("onTouchEvent", motion_event_cls)
+            except Exception:
+                method = None
+
+            if method is None:
+                try:
+                    for m in cell_cls.getClass().getDeclaredMethods():
+                        try:
+                            if m.getName() == "onTouchEvent" and len(m.getParameterTypes()) == 1:
+                                method = m
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    method = None
+
+            if method is None:
+                return
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+
+            self._touch_unhook = self.hook_method(method, _ChatMessageCellTouchHook(self), priority=0)
+        except Exception:
+            self._touch_unhook = None
+
+    def _record_touch(self, cell, motion_event):
+        try:
+            if not self._effects_enabled():
+                return
+            action = int(motion_event.getActionMasked())
+            if action != 0:
+                return
+            try:
+                rx = float(motion_event.getRawX())
+                ry = float(motion_event.getRawY())
+            except Exception:
+                rx = float(motion_event.getX())
+                ry = float(motion_event.getY())
+            try:
+                pressure = float(motion_event.getPressure())
+            except Exception:
+                pressure = 0.55
+            self._last_touch = (rx, ry, pressure, float(time.time()))
+            self._last_touch_cell = cell
+        except Exception:
+            pass
+
+    def _get_view_center(self, view) -> Optional[Tuple[float, float]]:
+        if view is None:
+            return None
+        try:
+            coords = view.getLocationOnScreen()
+            w = float(view.getWidth() or view.getMeasuredWidth() or 0)
+            h = float(view.getHeight() or view.getMeasuredHeight() or 0)
+            if not coords or len(coords) < 2:
+                return None
+            x = float(coords[0]) + (w / 2.0 if w > 0 else 0.0)
+            y = float(coords[1]) + (h / 2.0 if h > 0 else 0.0)
+            return (x, y)
+        except Exception:
+            return None
+
+    def _maybe_ripple_on_inline_click(self, cell):
+        try:
+            if not self._effects_enabled():
+                return
+            now = float(time.time())
+            x = None
+            y = None
+            pressure = 0.55
+            if self._last_touch and (self._last_touch_cell is cell) and (now - self._last_touch[3] <= 1.0):
+                x, y, pressure, _ts = self._last_touch
+            else:
+                center = self._get_view_center(cell)
+                if not center:
+                    return
+                x, y = center
+            try:
+                p = float(pressure)
+                if p < 0.2:
+                    p = 0.2
+                if p > 1.0:
+                    p = 1.0
+            except Exception:
+                p = 0.55
+            self._invoke_ripple(float(x), float(y), float(p))
+        except Exception:
+            pass
+
+
+    def on_send_message_hook(self, account, params):
+        try:
+            raw = getattr(params, "message", None)
+            if not isinstance(raw, str):
+                return HookResult()
+
+            text = raw.strip()
+            if not text:
+                return HookResult()
+
+            low = text.lower()
+            if not (low == ".admin" or low.startswith(".admin ")):
+                return HookResult()
+
+            dialog_id = getattr(params, "peer", None)
+            if not isinstance(dialog_id, int):
+                BulletinHelper.show_error("Не удалось определить чат.")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            user_ids = self._extract_target_user_ids(params, text)
+            if not user_ids:
+                run_on_ui_thread(self._show_usage_dialog)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            run_on_ui_thread(lambda: self._show_ban_panel(dialog_id, user_ids))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        except Exception as e:
+            try:
+                    self.log(f"[inlinetools] on_send_message_hook error: {e}")
+            except Exception:
+                pass
+            return HookResult()
+
+    def _show_usage_dialog(self):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity():
+                BulletinHelper.show_error("Использование: ответь на сообщение и напиши .admin")
+                return
+
+            ctx = frag.getParentActivity()
+            msg = (
+                "Как использовать:\n\n"
+                "• Ответь на сообщение пользователя и напиши .admin\n"
+                "• Или укажи ID: .admin 123456\n\n"
+                "Далее выбирай нужное действие и срок в меню."
+            )
+
+            builder = AlertDialogBuilder(ctx, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            builder.set_title("Inline Tools")
+            builder.set_message(msg)
+            builder.set_positive_button("OK", lambda d, _w: d.dismiss())
+            builder.set_cancelable(True)
+            builder.set_canceled_on_touch_outside(True)
+            builder.show()
+        except Exception:
+            try:
+                BulletinHelper.show_error("Использование: ответь на сообщение пользователя и напиши .admin")
+            except Exception:
+                pass
+
+
+    def _show_ban_panel(self, dialog_id: int, user_ids: List[int]):
+        chat_activity = self._get_current_chat_activity(dialog_id)
+        if chat_activity is None:
+            BulletinHelper.show_error("Открой нужный чат и попробуй снова.")
+            return
+
+        topic_id = 0
+        try:
+            topic_id = self._safe_int32(chat_activity.getTopicId() or 0, default=0)
+        except Exception:
+            topic_id = 0
+
+        token = self._new_token()
+        self._panels[token] = _PanelContext(
+            dialog_id=dialog_id,
+            user_ids=list(user_ids),
+            page=_PAGE_MAIN,
+            created_at=time.time(),
+        )
+
+        panel_text = self._format_panel_text(dialog_id, user_ids, page=_PAGE_MAIN)
+        markup = self._build_markup(token, page=_PAGE_MAIN)
+
+        msg_obj = self._build_local_message(dialog_id, topic_id, panel_text, markup)
+        if msg_obj is None:
+            BulletinHelper.show_error("Не удалось создать локальное сообщение.")
+            self._panels.pop(token, None)
+            return
+
+        if not self._insert_local_message(chat_activity, msg_obj):
+            BulletinHelper.show_error("Не удалось вставить локальное сообщение в чат.")
+            self._panels.pop(token, None)
+
+    def _format_panel_text(self, dialog_id: int, user_ids: List[int], *, page: str) -> str:
+        mc = get_messages_controller()
+        lines = ["**Админ-панель**", ""]
+        lines.append(f"**Чат:** `{dialog_id}`")
+        if page == _PAGE_MAIN:
+            section = "Главное меню"
+        elif page == _PAGE_BAN:
+            section = "Бан: выбрать срок"
+        elif page == _PAGE_MUTE:
+            section = "Мут: выбрать срок"
+        else:
+            section = page
+        lines.append(f"**Раздел:** {section}")
+        lines.append("**Цели:**")
+        for uid in user_ids:
+            name = str(uid)
+            try:
+                user = mc.getUser(uid)
+                if user is not None:
+                    name = UserObject.getUserName(user)
+            except Exception:
+                pass
+            lines.append(f"• {name} (`{uid}`)")
+        lines.append("")
+        lines.append("_Нажатия обрабатываются локально (сообщение не отправляется в чат)_")
+        return "\n".join(lines)
+
+    def _build_markup(self, token: str, *, page: str):
+        def cb(action: str, arg: Optional[str] = None) -> bytes:
+            tail = action if arg is None else f"{action}:{arg}"
+            return f"{_CALLBACK_PREFIX}{token}:{tail}".encode("utf-8")
+
+        markup = TLRPC.TL_replyInlineMarkup()
+
+        if page == _PAGE_MAIN:
+            row1 = TLRPC.TL_keyboardButtonRow()
+            row1.buttons.add(self._kb_cb("Мут", cb("nav", _PAGE_MUTE)))
+            row1.buttons.add(self._kb_cb("Бан", cb("nav", _PAGE_BAN)))
+            markup.rows.add(row1)
+
+            row2 = TLRPC.TL_keyboardButtonRow()
+            row2.buttons.add(self._kb_cb("Кик", cb("kick")))
+            row2.buttons.add(self._kb_cb("Разбан", cb("unban")))
+            markup.rows.add(row2)
+
+            row3 = TLRPC.TL_keyboardButtonRow()
+            row3.buttons.add(self._kb_cb("Размут", cb("unmute")))
+            row3.buttons.add(self._kb_cb("Закрыть", cb("close")))
+            markup.rows.add(row3)
+            return markup
+
+        if page == _PAGE_BAN:
+            row1 = TLRPC.TL_keyboardButtonRow()
+            row1.buttons.add(self._kb_cb("Навсегда", cb("ban", "0")))
+            row1.buttons.add(self._kb_cb("1ч", cb("ban", str(60 * 60))))
+            row1.buttons.add(self._kb_cb("1д", cb("ban", str(24 * 60 * 60))))
+            markup.rows.add(row1)
+
+            row2 = TLRPC.TL_keyboardButtonRow()
+            row2.buttons.add(self._kb_cb("7д", cb("ban", str(7 * 24 * 60 * 60))))
+            row2.buttons.add(self._kb_cb("30д", cb("ban", str(30 * 24 * 60 * 60))))
+            row2.buttons.add(self._kb_cb("Назад", cb("nav", _PAGE_MAIN)))
+            markup.rows.add(row2)
+            return markup
+
+        if page == _PAGE_MUTE:
+            row1 = TLRPC.TL_keyboardButtonRow()
+            row1.buttons.add(self._kb_cb("5м", cb("mute", str(5 * 60))))
+            row1.buttons.add(self._kb_cb("1ч", cb("mute", str(60 * 60))))
+            row1.buttons.add(self._kb_cb("1д", cb("mute", str(24 * 60 * 60))))
+            markup.rows.add(row1)
+
+            row2 = TLRPC.TL_keyboardButtonRow()
+            row2.buttons.add(self._kb_cb("7д", cb("mute", str(7 * 24 * 60 * 60))))
+            row2.buttons.add(self._kb_cb("Назад", cb("nav", _PAGE_MAIN)))
+            row2.buttons.add(self._kb_cb("Закрыть", cb("close")))
+            markup.rows.add(row2)
+            return markup
+
+        row = TLRPC.TL_keyboardButtonRow()
+        row.buttons.add(self._kb_cb("Назад", cb("nav", _PAGE_MAIN)))
+        markup.rows.add(row)
+        return markup
+
+    def _kb_cb(self, text: str, data: bytes):
+        b = TLRPC.TL_keyboardButtonCallback()
+        b.text = text
+        b.data = data
+        b.requires_password = False
+        return b
+
+    def _build_local_message(self, dialog_id: int, topic_id: int, text: str, markup):
+        try:
+            mc = get_messages_controller()
+            uc = get_user_config()
+            account = int(getattr(uc, "selectedAccount", 0))
+            my_id = int(uc.getClientUserId())
+
+            msg = TLRPC.TL_message()
+            msg.id = -random.randint(1, 2_000_000_000)
+            msg.date = self._safe_int32(int(time.time()), default=0)
+            parsed = parse_markdown(text)
+            msg.message = parsed.text
+            if parsed.entities:
+                entities = ArrayList()
+                for ent in parsed.entities:
+                    entities.add(ent.to_tlrpc_object())
+                msg.entities = entities
+                msg.flags |= 128
+
+            msg.peer_id = mc.getPeer(dialog_id)
+
+            from_peer = TLRPC.TL_peerUser()
+            from_peer.user_id = my_id
+            msg.from_id = from_peer
+
+            msg.out = True
+            msg.flags |= 2
+            msg.flags |= 256
+
+            if topic_id:
+                reply = TLRPC.TL_messageReplyHeader()
+                reply.reply_to_top_id = self._safe_int32(topic_id, default=0)
+                msg.reply_to = reply
+                msg.flags |= 8
+
+            if markup is not None:
+                msg.reply_markup = markup
+                msg.flags |= 64
+
+            msg_obj = MessageObject(account, msg, False, False)
+            return msg_obj
+        except Exception as e:
+            try:
+                self.log(f"[inlinetools] build_local_message error: {e}")
+            except Exception:
+                pass
+            return None
+
+    def _update_local_panel_message(self, cell, msg_obj, *, token: str, page: str):
+        try:
+            ctx = self._panels.get(token)
+            if ctx is None:
+                return
+
+            ctx.page = page
+
+            try:
+                mo = getattr(msg_obj, "messageOwner", None)
+                if mo is None:
+                    return
+
+                text = self._format_panel_text(ctx.dialog_id, ctx.user_ids, page=page)
+                parsed = parse_markdown(text)
+
+                mo.message = parsed.text
+                if parsed.entities:
+                    entities = ArrayList()
+                    for ent in parsed.entities:
+                        entities.add(ent.to_tlrpc_object())
+                    mo.entities = entities
+                    try:
+                        mo.flags |= 128
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        mo.entities = None
+                        mo.flags &= ~128
+                    except Exception:
+                        pass
+
+                markup = self._build_markup(token, page=page)
+                mo.reply_markup = markup
+                try:
+                    mo.flags |= 64
+                except Exception:
+                    pass
+
+                try:
+                    uc = get_user_config()
+                    account = int(getattr(uc, "selectedAccount", 0))
+                    refreshed = MessageObject(account, mo, False, False)
+                    if hasattr(refreshed, "messageText"):
+                        msg_obj.messageText = refreshed.messageText
+                    if hasattr(refreshed, "messageTextShort"):
+                        msg_obj.messageTextShort = refreshed.messageTextShort
+                    if hasattr(refreshed, "messageTextForReply"):
+                        msg_obj.messageTextForReply = refreshed.messageTextForReply
+                    if hasattr(refreshed, "type"):
+                        msg_obj.type = refreshed.type
+                except Exception as e:
+                    try:
+                        self.log(f"[inlinetools] MessageObject refresh failed: {e}")
+                    except Exception:
+                        pass
+
+                try:
+                    if hasattr(msg_obj, "measureInlineBotButtons"):
+                        msg_obj.measureInlineBotButtons()
+                except Exception as e:
+                    try:
+                        self.log(f"[inlinetools] measureInlineBotButtons failed: {e}")
+                    except Exception:
+                        pass
+
+                try:
+                    msg_obj.forceUpdate = True
+                except Exception:
+                    pass
+                try:
+                    if hasattr(msg_obj, "resetLayout"):
+                        msg_obj.resetLayout()
+                except Exception:
+                    pass
+
+                if cell is None:
+                    return
+
+                def _apply_update():
+                    cell.setMessageObject(
+                        msg_obj,
+                        cell.getCurrentMessagesGroup(),
+                        cell.isPinnedBottom(),
+                        cell.isPinnedTop(),
+                        cell.isFirstInChat(),
+                    )
+                    try:
+                        cell.requestLayout()
+                    except Exception:
+                        pass
+                    try:
+                        cell.invalidate()
+                    except Exception:
+                        pass
+
+                self._animate_panel_switch(cell, _apply_update)
+            except Exception as e:
+                try:
+                    self.log(f"[inlinetools] update panel failed: {e}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _animate_panel_switch(self, cell, apply_update):
+        try:
+            if not self._effects_enabled():
+                try:
+                    a = cell.animate() if hasattr(cell, "animate") else None
+                    if a is not None:
+                        a.cancel()
+                except Exception:
+                    pass
+                try:
+                    cell.setAlpha(1.0)
+                except Exception:
+                    pass
+                try:
+                    cell.setScaleX(1.0)
+                    cell.setScaleY(1.0)
+                except Exception:
+                    pass
+                try:
+                    cell.setTranslationY(0.0)
+                except Exception:
+                    pass
+                apply_update()
+                return
+
+            interp = None
+            try:
+                interp = jclass("android.view.animation.DecelerateInterpolator")(1.5)
+            except Exception:
+                interp = None
+            try:
+                dy = float(AndroidUtilities.dp(6))
+            except Exception:
+                dy = 0.0
+
+            animator = cell.animate() if hasattr(cell, "animate") else None
+            if animator is None:
+                apply_update()
+                return
+
+            try:
+                animator.cancel()
+            except Exception:
+                pass
+
+            def _after_fade_out():
+                try:
+                    apply_update()
+                finally:
+                    try:
+                        try:
+                            cell.setAlpha(0.0)
+                        except Exception:
+                            pass
+                        try:
+                            cell.setScaleX(0.94)
+                            cell.setScaleY(0.94)
+                        except Exception:
+                            pass
+                        try:
+                            cell.setTranslationY(dy)
+                        except Exception:
+                            pass
+
+                        a = cell.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).translationY(0.0).setDuration(280)
+                        try:
+                            if interp is not None:
+                                a.setInterpolator(interp)
+                        except Exception:
+                            pass
+                        a.start()
+                    except Exception:
+                        pass
+
+            try:
+                cell.setAlpha(1.0)
+            except Exception:
+                pass
+            try:
+                cell.setScaleX(1.0)
+                cell.setScaleY(1.0)
+            except Exception:
+                pass
+            try:
+                cell.setTranslationY(0.0)
+            except Exception:
+                pass
+
+            try:
+                a = animator.alpha(0.0).scaleX(0.94).scaleY(0.94).translationY(dy).setDuration(200)
+                try:
+                    if interp is not None:
+                        a.setInterpolator(interp)
+                except Exception:
+                    pass
+                a.withEndAction(Runnable(_after_fade_out)).start()
+            except Exception:
+                _after_fade_out()
+        except Exception:
+            try:
+                apply_update()
+            except Exception:
+                pass
+
+    def _insert_local_message(self, chat_activity, msg_obj) -> bool:
+        try:
+            method = chat_activity.getClass().getDeclaredMethod("processNewMessages", ArrayList)
+            method.setAccessible(True)
+            arr = ArrayList()
+            arr.add(msg_obj)
+            method.invoke(chat_activity, arr)
+            return True
+        except Exception as e:
+            try:
+                self.log(f"[inlinetools] insert_local_message error: {e}")
+            except Exception:
+                pass
+            return False
+
+    def _remove_local_message(self, chat_activity, msg_obj) -> bool:
+        try:
+            method = chat_activity.getClass().getDeclaredMethod("removeMessageObject", MessageObject)
+            method.setAccessible(True)
+            method.invoke(chat_activity, msg_obj)
+            return True
+        except Exception:
+            return False
+
+    def _get_current_chat_activity(self, dialog_id: int):
+        frag = get_last_fragment()
+        if frag is None:
+            return None
+        try:
+            if hasattr(frag, "getDialogId") and int(frag.getDialogId()) != int(dialog_id):
+                return None
+        except Exception:
+            return None
+        try:
+            chat_activity_cls = find_class("org.telegram.ui.ChatActivity")
+            if chat_activity_cls is None:
+                return frag
+            return frag if isinstance(frag, chat_activity_cls) else None
+        except Exception:
+            return frag
+
+
+    def _install_inline_button_hooks(self):
+        try:
+            delegate_cls = find_class("org.telegram.ui.ChatActivity$ChatMessageCellDelegate")
+            if delegate_cls is None:
+                self.log("[inlinetools] ChatMessageCellDelegate not found; inline buttons disabled")
+                return
+
+            methods = {}
+            try:
+                try:
+                    declared = delegate_cls.getClass().getDeclaredMethods()
+                except Exception:
+                    declared = delegate_cls.getDeclaredMethods()
+                methods = {repr(m): m for m in declared}
+            except Exception as e:
+                self.log(f"[inlinetools] failed to enumerate delegate methods: {e}")
+                return
+
+            press = (
+                methods.get(
+                    "<java.lang.reflect.Method 'public void org.telegram.ui.ChatActivity$ChatMessageCellDelegate."
+                    "didPressBotButton(org.telegram.ui.Cells.ChatMessageCell,org.telegram.tgnet.TLRPC$KeyboardButton)'>"
+                )
+                or next((m for s, m in methods.items() if "didPressBotButton" in s), None)
+            )
+            long_press = (
+                methods.get(
+                    "<java.lang.reflect.Method 'public void org.telegram.ui.ChatActivity$ChatMessageCellDelegate."
+                    "didLongPressBotButton(org.telegram.ui.Cells.ChatMessageCell,org.telegram.tgnet.TLRPC$KeyboardButton)'>"
+                )
+                or next((m for s, m in methods.items() if "didLongPressBotButton" in s), None)
+            )
+
+            if not press:
+                self.log("[inlinetools] didPressBotButton method not found; inline buttons disabled")
+                return
+
+            try:
+                unhook = self.hook_method(press, _InlineButtonHook(self, is_long=False), priority=2147483647)
+                if unhook:
+                    self._unhooks.append(unhook)
+            except Exception as e:
+                self.log(f"[inlinetools] hook didPressBotButton failed: {e}")
+
+            if long_press:
+                try:
+                    unhook2 = self.hook_method(long_press, _InlineButtonHook(self, is_long=True), priority=2147483647)
+                    if unhook2:
+                        self._unhooks.append(unhook2)
+                except Exception as e:
+                    self.log(f"[inlinetools] hook didLongPressBotButton failed: {e}")
+            else:
+                self.log("[inlinetools] didLongPressBotButton not found (ok)")
+
+            long_press_avatar = next((m for s, m in methods.items() if "didLongPressUserAvatar" in s), None)
+            if long_press_avatar:
+                try:
+                    unhook3 = self.hook_method(long_press_avatar, _UserAvatarLongPressHook(self), priority=2147483647)
+                    if unhook3:
+                        self._unhooks.append(unhook3)
+                except Exception as e:
+                    self.log(f"[inlinetools] hook didLongPressUserAvatar failed: {e}")
+            else:
+                self.log("[inlinetools] didLongPressUserAvatar not found (ok)")
+
+            self.log("[inlinetools] inline buttons hooks installed")
+
+        except Exception as e:
+            try:
+                self.log(f"[inlinetools] install hooks error: {e}")
+            except Exception:
+                pass
+
+    def _handle_user_avatar_long_press(self, hook_param):
+        try:
+            if not self._avatar_context_menu_enabled():
+                return
+
+            delegate = getattr(hook_param, "thisObject", None)
+            cell = hook_param.args[0] if hook_param.args and len(hook_param.args) > 0 else None
+            user = hook_param.args[1] if hook_param.args and len(hook_param.args) > 1 else None
+            if cell is None or user is None:
+                return
+
+            outer = None
+            try:
+                outer = getattr(delegate, "this$0", None) if delegate is not None else None
+            except Exception:
+                outer = None
+
+            if outer is None:
+                try:
+                    msg_obj = cell.getMessageObject() if hasattr(cell, "getMessageObject") else None
+                    if msg_obj is not None:
+                        outer = self._get_current_chat_activity(int(msg_obj.getDialogId()))
+                except Exception:
+                    outer = None
+
+            try:
+                ab = getattr(outer, "actionBar", None) if outer is not None else None
+                if ab is not None and hasattr(ab, "isActionModeShowed") and bool(ab.isActionModeShowed()):
+                    return
+            except Exception:
+                pass
+
+            hook_param.setResult(True)
+            run_on_ui_thread(lambda: self._show_user_avatar_context_menu(delegate, outer, cell, user))
+        except Exception:
+            pass
+
+    def _show_user_avatar_context_menu(self, delegate, chat_activity, cell, user):
+        try:
+            from org.telegram.ui.Components import ItemOptions
+
+            fragment = chat_activity or self._get_current_chat_activity(
+                int(cell.getMessageObject().getDialogId()) if cell and cell.getMessageObject() else 0
+            )
+            if fragment is None:
+                return
+
+            opts = ItemOptions.makeOptions(fragment, cell)
+
+            def _open_inline_menu():
+                try:
+                    msg_obj = cell.getMessageObject() if cell else None
+                    if msg_obj is None:
+                        return
+                    dialog_id = int(msg_obj.getDialogId())
+                    uid = int(getattr(user, "id", 0) or 0)
+                    if uid == 0:
+                        return
+                    self._show_ban_panel(dialog_id, [uid])
+                except Exception:
+                    pass
+
+            opts.add("Инлайн-меню", Runnable(_open_inline_menu))
+
+            def _invoke_delegate(method_name: str, *args):
+                try:
+                    if delegate is None:
+                        return
+                    m = None
+                    try:
+                        for cand in delegate.getClass().getDeclaredMethods():
+                            try:
+                                if cand.getName() == method_name and len(cand.getParameterTypes()) == len(args):
+                                    m = cand
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        m = None
+                    if m is None:
+                        return
+                    try:
+                        m.setAccessible(True)
+                    except Exception:
+                        pass
+                    try:
+                        m.invoke(delegate, *args)
+                    except Exception:
+                        try:
+                            m.invoke(delegate, args)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            opts.add("Открыть профиль", Runnable(lambda: _invoke_delegate("openProfile", user)))
+            opts.add("Написать", Runnable(lambda: _invoke_delegate("openDialog", cell, user)))
+            try:
+                current_chat = getattr(fragment, "currentChat", None)
+                if current_chat is not None:
+                    opts.add("Упомянуть", Runnable(lambda: _invoke_delegate("appendMention", user)))
+
+                    def _invoke_fragment(method_name: str, *args):
+                        try:
+                            m = None
+                            try:
+                                for cand in fragment.getClass().getDeclaredMethods():
+                                    try:
+                                        if cand.getName() == method_name and len(cand.getParameterTypes()) == len(args):
+                                            m = cand
+                                            break
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                m = None
+                            if m is None:
+                                return
+                            try:
+                                m.setAccessible(True)
+                            except Exception:
+                                pass
+                            try:
+                                m.invoke(fragment, *args)
+                            except Exception:
+                                try:
+                                    m.invoke(fragment, args)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                    opts.add("Поиск сообщений", Runnable(lambda: _invoke_fragment("openSearchWithUser", user)))
+            except Exception:
+                pass
+
+            try:
+                opts.setDrawScrim(False)
+            except Exception:
+                pass
+            try:
+                Gravity = jclass("android.view.Gravity")
+                opts.setGravity(int(getattr(Gravity, "LEFT", 3)))
+            except Exception:
+                pass
+            try:
+                opts.forceBottom(True)
+            except Exception:
+                pass
+            try:
+                opts.translate(0, -float(AndroidUtilities.dp(48)))
+            except Exception:
+                pass
+
+            opts.show()
+        except Exception as e:
+            try:
+                self.log(f"[inlinetools] avatar context menu error: {e}")
+            except Exception:
+                pass
+
+    def _handle_inline_button_click(self, cell, btn, hook_param, *, is_long: bool):
+        try:
+            if btn is None:
+                return
+
+            if not hasattr(btn, "data"):
+                return
+
+            data_raw = getattr(btn, "data", None)
+            if data_raw is None:
+                return
+
+            data = bytes(data_raw).decode("utf-8", errors="ignore")
+            if not data.startswith(_CALLBACK_PREFIX):
+                return
+
+            self._maybe_ripple_on_inline_click(cell)
+            hook_param.setResult(None)
+            self._dispatch_panel_action(cell, data)
+        except Exception as e:
+            try:
+                self.log(f"[inlinetools] handle_inline_button_click error: {e}")
+            except Exception:
+                pass
+
+    def _dispatch_panel_action(self, cell, data: str):
+        parts = data.split(":")
+        if len(parts) < 3:
+            return
+
+        token = parts[1]
+        action = parts[2]
+        arg = parts[3] if len(parts) > 3 else None
+
+        ctx = self._panels.get(token)
+        if ctx is None:
+            BulletinHelper.show_error("Контекст панели не найден (перезагрузи плагин).")
+            return
+
+        if action == "nav":
+            page = (arg or "").strip().lower()
+            if page not in (_PAGE_MAIN, _PAGE_BAN, _PAGE_MUTE):
+                page = _PAGE_MAIN
+            msg_obj = cell.getMessageObject() if cell else None
+            if msg_obj is None:
+                return
+            run_on_ui_thread(lambda: self._update_local_panel_message(cell, msg_obj, token=token, page=page))
+            return
+
+        if action == "close":
+            self._panels.pop(token, None)
+            self._close_panel(cell)
+            return
+
+        if action == "ban":
+            seconds = 0
+            try:
+                seconds = int(arg or "0")
+            except Exception:
+                seconds = 0
+            until_date = 0 if seconds <= 0 else int(time.time()) + seconds
+            run_on_queue(lambda: self._ban_users(ctx.dialog_id, ctx.user_ids, until_date))
+            return
+
+        if action == "mute":
+            seconds = 0
+            try:
+                seconds = int(arg or "0")
+            except Exception:
+                seconds = 0
+            until_date = 0 if seconds <= 0 else int(time.time()) + seconds
+            run_on_queue(lambda: self._mute_users(ctx.dialog_id, ctx.user_ids, until_date))
+            return
+
+        if action == "unban":
+            run_on_queue(lambda: self._unban_users(ctx.dialog_id, ctx.user_ids))
+            return
+
+        if action == "unmute":
+            run_on_queue(lambda: self._unmute_users(ctx.dialog_id, ctx.user_ids))
+            return
+
+        if action == "kick":
+            run_on_queue(lambda: self._kick_users(ctx.dialog_id, ctx.user_ids))
+            return
+
+    def _close_panel(self, cell):
+        try:
+            msg_obj = cell.getMessageObject() if cell else None
+            if msg_obj is None:
+                return
+            chat_activity = self._get_current_chat_activity(int(msg_obj.getDialogId()))
+            if chat_activity is None:
+                return
+            self._remove_local_message(chat_activity, msg_obj)
+        except Exception:
+            pass
+
+
+    def _ban_users(self, dialog_id: int, user_ids: List[int], until_date: int):
+        self._edit_banned_rights(dialog_id, user_ids, until_date=until_date, ban=True)
+
+    def _unban_users(self, dialog_id: int, user_ids: List[int]):
+        self._edit_banned_rights(dialog_id, user_ids, until_date=0, ban=False)
+
+    def _mute_users(self, dialog_id: int, user_ids: List[int], until_date: int):
+        self._edit_muted_rights(dialog_id, user_ids, until_date=until_date, mute=True)
+
+    def _unmute_users(self, dialog_id: int, user_ids: List[int]):
+        self._edit_muted_rights(dialog_id, user_ids, until_date=0, mute=False)
+
+    def _kick_users(self, dialog_id: int, user_ids: List[int]):
+        mc = get_messages_controller()
+        chat_id = int(-dialog_id) if dialog_id < 0 else 0
+        chat = mc.getChat(chat_id) if chat_id else None
+        if not chat_id or chat is None:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Команда доступна только в группах/каналах."))
+            return
+
+        if ChatObject.isChannel(chat):
+            self._kick_users_channel(chat_id, user_ids)
+        else:
+            self._kick_users_basic_group(chat_id, user_ids)
+
+    def _kick_users_basic_group(self, chat_id: int, user_ids: List[int]):
+        self._run_requests_grouped(
+            user_ids,
+            start_text=f"Кик: {len(user_ids)}",
+            success_text="Кик выполнен.",
+            error_prefix="Кик: ошибка",
+            build_request=lambda uid: self._req_delete_chat_user(chat_id, uid),
+        )
+
+    def _kick_users_channel(self, chat_id: int, user_ids: List[int]):
+        mc = get_messages_controller()
+
+        lock = threading.Lock()
+        state = {"pending": len(user_ids), "ok": 0, "errors": []}
+
+        def finish_one(ok: bool, err: Optional[str] = None):
+            with lock:
+                if ok:
+                    state["ok"] += 1
+                elif err:
+                    state["errors"].append(err)
+                state["pending"] -= 1
+                done = state["pending"] <= 0
+
+            if done:
+                if state["errors"]:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Кик: {state['ok']}/{len(user_ids)} ок\n" + "\n".join(state["errors"][:3])))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(f"Кик: {state['ok']}/{len(user_ids)} ок"))
+
+        for uid in user_ids:
+            ban_req = self._req_edit_banned(chat_id, uid, until_date=int(time.time()) + 60, ban=True)
+
+            def ban_cb(response, error, _uid=uid):
+                if error:
+                    finish_one(False, f"{_uid}: {getattr(error, 'text', 'error')}")
+                    return
+
+                unban_req = self._req_edit_banned(chat_id, _uid, until_date=0, ban=False)
+
+                def unban_cb(response2, error2, __uid=_uid):
+                    if error2:
+                        finish_one(False, f"{__uid}: {getattr(error2, 'text', 'unban error')}")
+                    else:
+                        finish_one(True, None)
+
+                send_request(unban_req, RequestCallback(unban_cb))
+
+            send_request(ban_req, RequestCallback(ban_cb))
+
+    def _edit_banned_rights(self, dialog_id: int, user_ids: List[int], *, until_date: int, ban: bool):
+        mc = get_messages_controller()
+        chat_id = int(-dialog_id) if dialog_id < 0 else 0
+        chat = mc.getChat(chat_id) if chat_id else None
+        if not chat_id or chat is None:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Команда доступна только в группах/каналах."))
+            return
+
+        if ChatObject.isChannel(chat):
+            self._run_requests_grouped(
+                user_ids,
+                start_text=("Бан" if ban else "Разбан") + f": {len(user_ids)}",
+                success_text=("Бан выполнен." if ban else "Разбан выполнен."),
+                error_prefix=("Бан: ошибка" if ban else "Разбан: ошибка"),
+                build_request=lambda uid: self._req_edit_banned(chat_id, uid, until_date=until_date, ban=ban),
+            )
+        else:
+            if ban:
+                self._kick_users_basic_group(chat_id, user_ids)
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Разбан недоступен в обычных группах (только супер-группы/каналы)."))
+
+    def _edit_muted_rights(self, dialog_id: int, user_ids: List[int], *, until_date: int, mute: bool):
+        mc = get_messages_controller()
+        chat_id = int(-dialog_id) if dialog_id < 0 else 0
+        chat = mc.getChat(chat_id) if chat_id else None
+        if not chat_id or chat is None:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Команда доступна только в группах/каналах."))
+            return
+
+        if not ChatObject.isChannel(chat):
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Мут доступен только в супер-группах/каналах."))
+            return
+
+        self._run_requests_grouped(
+            user_ids,
+            start_text=("Мут" if mute else "Размут") + f": {len(user_ids)}",
+            success_text=("Мут выполнен." if mute else "Размут выполнен."),
+            error_prefix=("Мут: ошибка" if mute else "Размут: ошибка"),
+            build_request=lambda uid: self._req_mute(chat_id, uid, until_date=until_date, mute=mute),
+        )
+
+    def _run_requests_grouped(
+        self,
+        user_ids: List[int],
+        *,
+        start_text: str,
+        success_text: str,
+        error_prefix: str,
+        build_request,
+    ):
+        if not user_ids:
+            return
+
+        lock = threading.Lock()
+        state = {"pending": len(user_ids), "ok": 0, "errors": []}
+
+        def finish_one(ok: bool, err: Optional[str] = None):
+            with lock:
+                if ok:
+                    state["ok"] += 1
+                elif err:
+                    state["errors"].append(err)
+                state["pending"] -= 1
+                done = state["pending"] <= 0
+
+            if done:
+                if state["errors"]:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"{error_prefix}: {state['ok']}/{len(user_ids)} ок\n" + "\n".join(state["errors"][:3])))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(success_text))
+
+        for uid in user_ids:
+            try:
+                req = build_request(uid)
+            except Exception as e:
+                finish_one(False, f"{uid}: {e}")
+                continue
+
+            def cb(response, error, _uid=uid):
+                if error:
+                    finish_one(False, f"{_uid}: {getattr(error, 'text', 'error')}")
+                else:
+                    finish_one(True, None)
+
+            send_request(req, RequestCallback(cb))
+
+    def _req_edit_banned(self, chat_id: int, user_id: int, *, until_date: int, ban: bool):
+        mc = get_messages_controller()
+        req = TLRPC.TL_channels_editBanned()
+        req.channel = mc.getInputChannel(chat_id)
+        req.participant = mc.getInputPeer(user_id)
+
+        rights = TLRPC.TL_chatBannedRights()
+        if ban:
+            for attr in dir(rights):
+                try:
+                    if isinstance(getattr(rights, attr), bool):
+                        setattr(rights, attr, True)
+                except Exception:
+                    pass
+        rights.until_date = int(until_date or 0)
+        req.banned_rights = rights
+        return req
+
+    def _req_mute(self, chat_id: int, user_id: int, *, until_date: int, mute: bool):
+        mc = get_messages_controller()
+        req = TLRPC.TL_channels_editBanned()
+        req.channel = mc.getInputChannel(chat_id)
+        req.participant = mc.getInputPeer(user_id)
+
+        rights = TLRPC.TL_chatBannedRights()
+        if mute:
+            for name in (
+                "send_messages",
+                "send_media",
+                "send_stickers",
+                "send_gifs",
+                "send_games",
+                "send_inline",
+                "embed_links",
+                "send_polls",
+                "send_photos",
+                "send_videos",
+                "send_roundvideos",
+                "send_audios",
+                "send_voices",
+                "send_docs",
+                "send_plain",
+            ):
+                if hasattr(rights, name):
+                    try:
+                        setattr(rights, name, True)
+                    except Exception:
+                        pass
+            rights.until_date = int(until_date or 0)
+        else:
+            rights.until_date = 0
+
+        req.banned_rights = rights
+        return req
+
+    def _req_delete_chat_user(self, chat_id: int, user_id: int):
+        mc = get_messages_controller()
+        req = TLRPC.TL_messages_deleteChatUser()
+        req.chat_id = int(chat_id)
+        req.user_id = mc.getInputUser(int(user_id))
+        return req
+
+
+    def _extract_target_user_ids(self, params, text: str) -> List[int]:
+        ids: List[int] = []
+
+        reply = getattr(params, "replyToMsg", None)
+        if reply is not None:
+            uid = self._get_user_id_from_reply(reply)
+            if uid:
+                ids.append(uid)
+
+        parts = text.split()
+        for tok in parts[1:]:
+            tok = tok.strip()
+            if not tok:
+                continue
+            if tok.isdigit():
+                try:
+                    ids.append(int(tok))
+                except Exception:
+                    pass
+
+        out: List[int] = []
+        seen = set()
+        for uid in ids:
+            if uid and uid not in seen:
+                out.append(uid)
+                seen.add(uid)
+        return out
+
+    def _get_user_id_from_reply(self, reply_msg) -> Optional[int]:
+        try:
+            if hasattr(reply_msg, "messageOwner") and reply_msg.messageOwner:
+                mo = reply_msg.messageOwner
+                if hasattr(mo, "from_id") and mo.from_id and hasattr(mo.from_id, "user_id"):
+                    return int(mo.from_id.user_id)
+            if hasattr(reply_msg, "replyMessageObject") and reply_msg.replyMessageObject:
+                mo = reply_msg.replyMessageObject.messageOwner
+                if hasattr(mo, "from_id") and mo.from_id and hasattr(mo.from_id, "user_id"):
+                    return int(mo.from_id.user_id)
+        except Exception:
+            return None
+        return None
+
+    def _new_token(self) -> str:
+        alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+        return "".join(random.choice(alphabet) for _ in range(8))
+
+    def _safe_int32(self, value: Any, *, default: int = 0) -> int:
+        try:
+            x = int(value)
+            if x > 2_147_483_647 or x < -2_147_483_648:
+                return int(default)
+            return x
+        except Exception:
+            return int(default)
