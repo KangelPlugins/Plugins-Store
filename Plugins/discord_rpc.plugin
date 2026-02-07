@@ -1,0 +1,414 @@
+"""
+использовать на свой страх и риск. telegram может вам выдать flood wait
+за частую смену описания (чего не должно произойти, т.к. я сделал лимит)
+
+api который используется - open source
+
+если вы не хотите зависеть от чужого api,
+то вы имеете полное право развернуть его на своём сервере
+
+https://github.com/Phineas/lanyard?tab=readme-ov-file#self-host-with-docker
+"""
+
+import requests
+import traceback
+import time
+import json
+import os
+
+from android.content import Intent
+from android.net import Uri
+from org.telegram.tgnet import TLRPC
+
+from base_plugin import BasePlugin
+from client_utils import (
+    send_request, 
+    run_on_queue, 
+    RequestCallback, 
+    PLUGINS_QUEUE, 
+    GLOBAL_QUEUE,
+    get_user_config,
+    get_last_fragment
+)
+from android_utils import log, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from file_utils import get_files_dir, read_file, write_file
+from ui.settings import Header, Input, Switch, EditText, Divider, Text
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+__id__ = "discord_rpc"
+__name__ = "Discord RPC"
+__description__ = "Реализует поддержку Discord Rich Presence, и автоматически обновляет ваше описание, показывая, во что вы играете или слушаете (Использовать на свой страх и риск)"
+__author__ = "@kexol / @kexolPlugins"
+__version__ = "1.0"
+__icon__ = "UtyaDuck/16"
+__min_version__ = "11.12.0"
+
+LANYARD_API = "https://api.lanyard.rest/v1/users/{}"
+LANYARD_INVITE = "https://discord.gg/lanyard"
+HELP_LINK = "https://support.discord.com/hc/articles/206346498"
+
+DEFAULT_GAME_TMPL = "{bio} | 🎮 {game} {details}"
+DEFAULT_MUSIC_TMPL = "{bio} | 🎵 {music} - {artist}"
+
+MAX_UPDATES_PER_HOUR = 10
+MIN_LOOP_DELAY = 300
+HOURLY_WINDOW = 3600
+MIN_INTERVAL_BETWEEN_UPDATES = 10
+HISTORY_FILE_NAME = "discord_rpc_history.json"
+
+STRINGS = {
+    "en": {
+        "setup_header": "Rich Presence Setup",
+        "enable_sync": "Enable Sync",
+        "discord_id": "Discord User ID",
+        "discord_id_sub": "ID",
+        "how_to_get_id": "How to get your user ID?",
+        "tmpl_header": "Templates Configuration",
+        "game_tmpl": "Game Template",
+        "game_info": "This template is used when you are playing a game.",
+        "music_tmpl": "Music Template",
+        "music_info": "This template is used when you are listening to Spotify.",
+        "vars_desc": "Variables Reference:\n\n{game} - Activity/Game name\n{details} - Activity description\n{state} - Activity status\n{music} - Song title\n{artist} - Artist name\n{bio} - Your static bio content",
+        "static_header": "Static Bio",
+        "static_hint": "Your default bio (when disabled)",
+        "reverted": "Bio reverted to static.",
+        "dialog_title": "Rich Presence",
+        "dialog_text": "To let us detect your RPC, you need to join the Lanyard Discord server (https://discord.gg/lanyard)",
+        "btn_go": "Go",
+        "btn_cancel": "Cancel",
+        "error_spam": "Too fast! Please wait {seconds}s.",
+        "error_limit": "Hourly limit reached! Bio not updated."
+    },
+    "ru": {
+        "setup_header": "Настройка Rich Presence",
+        "enable_sync": "Включить синхронизацию",
+        "discord_id": "Discord User ID",
+        "discord_id_sub": "ID",
+        "how_to_get_id": "Как получить свой user id?",
+        "tmpl_header": "Настройка шаблонов",
+        "game_tmpl": "Шаблон для Игр",
+        "game_info": "Этот шаблон используется, когда Discord показывает игровую активность.",
+        "music_tmpl": "Шаблон для Музыки",
+        "music_info": "Этот шаблон используется, когда вы слушаете Spotify.",
+        "vars_desc": "Список переменных:\n\n{game} - Название игры\n{details} - Описание\n{state} - Статус\n{music} - Трек\n{artist} - Артист\n{bio} - Текст статичного био",
+        "static_header": "Статичное Био",
+        "static_hint": "Обычное био (когда выключено)",
+        "reverted": "Био возвращено к стандартному.",
+        "dialog_title": "Rich Presence",
+        "dialog_text": "Для того чтобы мы смогли определить ваш RPC, вам нужно зайти в Discord сервер Lanyard (https://discord.gg/lanyard)",
+        "btn_go": "Перейти",
+        "btn_cancel": "Отмена",
+        "error_spam": "Слишком быстро! Подождите {seconds} сек.",
+        "error_limit": "Часовой лимит исчерпан! Био не обновлено."
+    }
+}
+
+class SafeDict(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+def get_current_lang():
+    try:
+        LocaleController = find_class("org.telegram.messenger.LocaleController")
+        if LocaleController:
+            instance = LocaleController.getInstance()
+            if instance:
+                locale = get_private_field(instance, "currentLocale")
+                if locale:
+                    return locale.getLanguage()
+    except Exception as e:
+        log(f"[DiscordRPC] lang error: {e}")
+    return "en"
+
+def tr(key):
+    lang = get_current_lang()
+    if lang not in STRINGS: lang = "en"
+    return STRINGS[lang].get(key, STRINGS["en"].get(key, key))
+
+def open_url(url):
+    try:
+        frag = get_last_fragment()
+        if frag and frag.getParentActivity():
+            act = frag.getParentActivity()
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            if "t.me" in url or "telegram.me" in url:
+                intent.setPackage(act.getPackageName())
+            act.startActivity(intent)
+    except Exception as e:
+        log(f"[DiscordRPC] open url error: {e}")
+
+class DiscordRPC(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.active = False
+        self.last_bio = ""
+        self.alerted_error = False
+        self.UpdateProfileClass = None
+        self.update_history = [] 
+    
+    def _get_history_file_path(self):
+        return os.path.join(get_files_dir(), HISTORY_FILE_NAME)
+
+    def _load_history(self):
+        try:
+            path = self._get_history_file_path()
+            content = read_file(path)
+            if content:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
+    def _save_history(self, history):
+        try:
+            path = self._get_history_file_path()
+            write_file(path, json.dumps(history))
+        except Exception as e:
+            log(f"[DiscordRPC] Save error: {e}")
+
+    def on_plugin_load(self):
+        self.active = True
+        self.update_history = self._load_history()
+        run_on_queue(self._background_init, PLUGINS_QUEUE)
+
+    def on_plugin_unload(self):
+        self.active = False
+        run_on_queue(self._revert_bio, GLOBAL_QUEUE)
+
+    def _background_init(self):
+        try:
+            self.UpdateProfileClass = find_class("org.telegram.tgnet.tl.TL_account$updateProfile")
+            if self.UpdateProfileClass is None:
+                self.UpdateProfileClass = find_class("org.telegram.tgnet.TLRPC$TL_account_updateProfile")
+
+            if self.UpdateProfileClass is None:
+                self.active = False
+                return
+            
+            self._fetch_initial_state()
+            
+            delay = self._calculate_loop_delay()
+            self._schedule_next_update(max(delay, 2000))
+
+        except Exception as e:
+            log(f"[DiscordRPC] Error: {e}")
+
+    def _calculate_loop_delay(self):
+        now = time.time()
+        recent_updates = [t for t in self.update_history if now - t < HOURLY_WINDOW]
+        count = len(recent_updates)
+        
+        if count >= MAX_UPDATES_PER_HOUR:
+            oldest = recent_updates[0]
+            wait = (oldest + HOURLY_WINDOW) - now
+            return int((max(wait, 10) + 10) * 1000)
+        
+        multiplier = 1
+        if count > 3: multiplier = 1 + (count - 3)
+        
+        return int(MIN_LOOP_DELAY * multiplier * 1000)
+
+    def _check_safety_and_cleanup_history(self):
+        now = time.time()
+        
+        if self.update_history:
+            last_time = self.update_history[-1]
+            diff = now - last_time
+            if diff < MIN_INTERVAL_BETWEEN_UPDATES:
+                wait_time = int(MIN_INTERVAL_BETWEEN_UPDATES - diff) + 1
+                run_on_ui_thread(lambda: BulletinHelper.show_error(tr("error_spam").format(seconds=wait_time)))
+                log(f"[DiscordRPC] Spam protection: {diff:.1f}s < {MIN_INTERVAL_BETWEEN_UPDATES}s")
+                return False
+        
+        self.update_history = [t for t in self.update_history if now - t < HOURLY_WINDOW]
+        self._save_history(self.update_history)
+        
+        if len(self.update_history) >= MAX_UPDATES_PER_HOUR:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(tr("error_limit")))
+            log(f"[DiscordRPC] Hourly limit reached: {len(self.update_history)}")
+            return False
+            
+        return True
+
+    def _schedule_next_update(self, delay=None):
+        if not self.active: return
+        if delay is None: delay = self._calculate_loop_delay()
+        run_on_queue(self._process_cycle, GLOBAL_QUEUE, delay)
+
+    def _process_cycle(self):
+        if not self.active: return
+
+        try:
+            discord_id = self.get_setting("discord_id", "")
+            enabled = self.get_setting("enable_sync", False)
+
+            if enabled and discord_id:
+                self._process_update(discord_id)
+            else:
+                self.last_bio = ""
+                self.alerted_error = False
+                
+        except Exception as e:
+            log(f"[DiscordRPC] Error: {e}")
+        
+        self._schedule_next_update()
+
+    def _revert_bio(self):
+        static_bio = self.get_setting("default_bio", "")
+        if self.last_bio != static_bio:
+            self._update_telegram_bio(static_bio)
+            self.last_bio = static_bio 
+
+    def _process_update(self, discord_id):
+        try:
+            response = requests.get(LANYARD_API.format(discord_id), timeout=10)
+            data = response.json()
+
+            if not data.get("success"):
+                err_code = data.get("error", {}).get("code")
+                if err_code == "user_not_monitored" and not self.alerted_error:
+                    self._show_lanyard_join_dialog()
+                    self.alerted_error = True
+                return
+
+            self.alerted_error = False
+            
+            new_bio = self._generate_bio_text(data.get("data", {}))
+            
+            if new_bio is not None and new_bio != self.last_bio:
+                if self._update_telegram_bio(new_bio):
+                    self.last_bio = new_bio
+
+        except Exception as e:
+            log(f"[DiscordRPC] Error processing data: {e}")
+    
+    def _show_lanyard_join_dialog(self):
+        def _show():
+            try:
+                frag = get_last_fragment()
+                if not frag or not frag.getParentActivity(): return
+                builder = AlertDialogBuilder(frag.getParentActivity())
+                builder.set_message(tr("dialog_text"))
+                builder.set_positive_button(tr("btn_go"), lambda d, w: open_url(LANYARD_INVITE))
+                builder.set_negative_button(tr("btn_cancel"), lambda d, w: None)
+                builder.show()
+            except Exception as e: log(str(e))
+        run_on_ui_thread(_show)
+
+    def _generate_bio_text(self, data):
+        static_bio = self.get_setting("default_bio", "")
+        context = {"bio": static_bio, "game": "", "details": "", "state": "", "music": "", "artist": ""}
+        template = ""
+        is_activity_found = False
+
+        if data.get("listening_to_spotify") and data.get("spotify"):
+            spotify = data["spotify"]
+            context["music"] = spotify.get("song", "Unknown")
+            context["artist"] = spotify.get("artist", "Unknown")
+            template = self.get_setting("music_template", DEFAULT_MUSIC_TMPL)
+            is_activity_found = True
+        elif data.get("activities"):
+            for activity in data["activities"]:
+                if activity.get("type") != 4:
+                    context["game"] = activity.get("name", "")
+                    context["details"] = activity.get("details", "")
+                    context["state"] = activity.get("state", "")
+                    template = self.get_setting("game_template", DEFAULT_GAME_TMPL)
+                    is_activity_found = True
+                    break
+        
+        if not is_activity_found: return static_bio
+        
+        for key, value in context.items(): context[key] = str(value) if value is not None else ""
+        
+        try:
+            safe_context = SafeDict(context)
+            bio_text = template.format_map(safe_context)
+            bio_text = " ".join(bio_text.split())
+        except Exception: return static_bio
+        
+        limit = 70
+        try:
+            if get_user_config().getCurrentUser().premium: limit = 140
+        except: pass
+        
+        if len(bio_text) > limit: bio_text = bio_text[:(limit - 3)] + "..."
+        return bio_text
+
+    def _update_telegram_bio(self, text):
+        if not self.UpdateProfileClass: return False
+        
+        if not self._check_safety_and_cleanup_history():
+            return False
+
+        try:
+            log(f"[DiscordRPC] Updating bio to: {text}")
+            req = self.UpdateProfileClass()
+            req.about = text
+            req.flags = 4
+            
+            def on_complete(resp, err):
+                if not err:
+                    self.update_history.append(time.time())
+                    self._save_history(self.update_history)
+                else:
+                    log(f"[DiscordRPC] API Error: {err.text}")
+
+            send_request(req, RequestCallback(on_complete))
+            return True
+        except Exception as e:
+            log(f"[DiscordRPC] Failed to send update: {e}")
+            return False
+
+    def _fetch_initial_state(self):
+        try:
+            req = TLRPC.TL_users_getFullUser()
+            req.id = TLRPC.TL_inputUserSelf()
+
+            def _on_response(resp, err):
+                if err: return
+                if resp and hasattr(resp, "full_user"):
+                    current_bio = resp.full_user.about
+                    if current_bio:
+                        self.last_bio = current_bio
+                        if not self.get_setting("default_bio", ""):
+                            self.set_setting("default_bio", current_bio, reload_settings=False)
+            
+            send_request(req, RequestCallback(_on_response))
+        except Exception: pass
+
+    def _on_sync_toggle(self, value):
+        self.set_setting("enable_sync", value)
+        if not value:
+            run_on_queue(self._revert_bio, GLOBAL_QUEUE)
+            
+            run_on_ui_thread(lambda: BulletinHelper.show_info(tr("reverted")))
+            self.alerted_error = False
+        else:
+            self.last_bio = ""
+            self._schedule_next_update(delay=1000)
+
+    def create_settings(self):
+        try:
+            current_id = self.get_setting("discord_id", "")
+            return [
+                Header(tr("setup_header")),
+                Switch(key="enable_sync", text=tr("enable_sync"), default=False, on_change=self._on_sync_toggle),
+                Input(key="discord_id", text=tr("discord_id"), subtext=tr("discord_id_sub"), default=current_id, icon="msg_contact"),
+                Text(text=tr("how_to_get_id"), icon="msg_help", on_click=lambda v: open_url(HELP_LINK)),
+                Header(tr("tmpl_header")),
+                EditText(key="game_template", hint=tr("game_tmpl"), default=DEFAULT_GAME_TMPL, max_length=140, multiline=True),
+                Divider(text=tr("game_info")),
+                EditText(key="music_template", hint=tr("music_tmpl"), default=DEFAULT_MUSIC_TMPL, max_length=140, multiline=True),
+                Divider(text=tr("music_info")),
+                Divider(text=tr("vars_desc")),
+                Divider(),
+                Header(tr("static_header")),
+                EditText(key="default_bio", hint=tr("static_hint"), default="", max_length=140)
+            ]
+        except Exception:
+            return []

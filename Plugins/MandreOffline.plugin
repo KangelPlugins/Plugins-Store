@@ -1,0 +1,149 @@
+__id__ = "MandreOffline"
+__name__ = "MandreOffline"
+__description__ = "Переход в офлайн по кнопку в древере"
+__author__ = "@swagnonher"
+__version__ = "1.0"
+__icon__ = "msg_delete"
+__dependencies__ = ["mandre_lib"]
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from ui.bulletin import BulletinHelper
+from hook_utils import find_class
+from org.telegram.messenger import UserConfig
+
+try:
+    from mandre_lib import Mandre
+except ImportError:
+    Mandre = None
+
+class OfflineModePlugin(BasePlugin):
+    def on_plugin_load(self):
+        if not Mandre:
+            self.log("Ошибка: MandreLib не загружен!")
+            return
+
+        self.cm_class = None
+        self.app_loader_class = None
+
+        try:
+            CMWrapper = find_class("org.telegram.tgnet.ConnectionsManager")
+            AppLoaderWrapper = find_class("org.telegram.messenger.ApplicationLoader")
+            
+            self.cm_class = Mandre.Reflect._to_java_class(CMWrapper)
+            self.app_loader_class = Mandre.Reflect._to_java_class(AppLoaderWrapper)
+            
+            from java.lang import Integer, Boolean, Long
+
+            if self.app_loader_class:
+                is_online_method = self.app_loader_class.getDeclaredMethod("isNetworkOnline")
+                self.hook_method(is_online_method, ForceFalseHook(self))
+
+            if self.cm_class:
+                set_net_method = self.cm_class.getDeclaredMethod(
+                    "native_setNetworkAvailable",
+                    Integer.TYPE, Boolean.TYPE, Integer.TYPE, Boolean.TYPE
+                )
+                self.hook_method(set_net_method, NativeNetStatusHook(self))
+
+                resume_method = self.cm_class.getDeclaredMethod(
+                    "native_resumeNetwork",
+                    Integer.TYPE, Boolean.TYPE
+                )
+                self.hook_method(resume_method, BlockResumeHook(self))
+
+                send_req_method = self.cm_class.getDeclaredMethod(
+                    "native_sendRequest",
+                    Integer.TYPE, Long.TYPE, Integer.TYPE, Integer.TYPE, 
+                    Integer.TYPE, Boolean.TYPE, Integer.TYPE
+                )
+                self.hook_method(send_req_method, BlockRequestHook(self))
+
+                self.log("All hooks installed successfully.")
+            
+        except Exception as e:
+            self.log(f"Error installing hooks: {e}")
+
+        self._update_menu_item()
+
+    def on_plugin_unload(self):
+        self.remove_menu_item("toggle_offline_mode")
+        self.set_setting("offline_active", False) 
+        self._force_network_resume()
+
+    def _update_menu_item(self):
+        self.remove_menu_item("toggle_offline_mode")
+        is_active = self.get_setting("offline_active", False)
+        
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text=f"Offline: {'ON' if is_active else 'OFF'}",
+            icon="msg_delete" if is_active else "msg_check",
+            on_click=self._toggle_mode,
+            item_id="toggle_offline_mode"
+        ))
+
+    def _toggle_mode(self, ctx):
+        new_state = not self.get_setting("offline_active", False)
+        self.set_setting("offline_active", new_state)
+        self._update_menu_item()
+        
+        if new_state:
+            self._force_network_pause()
+            status = "ВКЛЮЧЕН (Сеть убита)"
+        else:
+            self._force_network_resume()
+            status = "ВЫКЛЮЧЕН (Сеть восстановлена)"
+
+        BulletinHelper.show_success(f"Offline Mode {status}")
+
+    def _force_network_pause(self):
+        try:
+            CM = find_class("org.telegram.tgnet.ConnectionsManager")
+            account = UserConfig.selectedAccount
+            cm_instance = CM.getInstance(account)
+            cm_instance.checkConnection() 
+            CM.native_pauseNetwork(account)
+            
+        except Exception as e:
+            self.log(f"Error pausing network: {e}")
+
+    def _force_network_resume(self):
+        try:
+            CM = find_class("org.telegram.tgnet.ConnectionsManager")
+            account = UserConfig.selectedAccount
+            cm_instance = CM.getInstance(account)
+            CM.native_resumeNetwork(account, False)
+            cm_instance.checkConnection()
+            
+        except Exception as e:
+            self.log(f"Error resuming network: {e}")
+
+class ForceFalseHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+    def before_hooked_method(self, param):
+        if self.plugin.get_setting("offline_active", False):
+            param.setResult(False)
+
+class NativeNetStatusHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+    def before_hooked_method(self, param):
+        if self.plugin.get_setting("offline_active", False):
+            args = param.args
+            if len(args) >= 2:
+                args[1] = False
+
+class BlockResumeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+    def before_hooked_method(self, param):
+        if self.plugin.get_setting("offline_active", False):
+            param.setResult(None)
+
+class BlockRequestHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+    def before_hooked_method(self, param):
+        if self.plugin.get_setting("offline_active", False):
+            param.setResult(None)

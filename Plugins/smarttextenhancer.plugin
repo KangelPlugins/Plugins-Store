@@ -1,0 +1,619 @@
+import requests
+import threading
+import json
+import traceback
+from typing import Any, Optional, Callable
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, get_last_fragment, send_message
+from ui.settings import Header, Switch, Divider, Input, Selector, Text
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from org.telegram.messenger import ApplicationLoader
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from com.exteragram.messenger.plugins import PluginsController
+
+__id__ = "smart_text_enhancer"
+__name__ = "SmartTextEnhancer"
+__description__ = "Умное улучшение текста с помощью ИИ\n\nКоманды:\n   .emojify - добавить эмодзи\n   .rewrite - переписать текст\n   .fix - исправить ошибки\n\nАвтор: Oniel"
+__author__ = "@i_am_oniel"
+__version__ = "1.0.2"
+__icon__ = "msg_photo_text_regular"
+__min_version__ = "11.12.0"
+
+API_ENDPOINTS = {
+    "emojify": "https://keyboard.yandex.net/gpt/emoji",
+    "rewrite": "https://keyboard.yandex.net/gpt/rewrite",
+    "fix": "https://keyboard.yandex.net/gpt/fix"
+}
+
+API_HEADERS = {
+    "Content-Type": "application/json; charset=utf-8",
+    "User-Agent": "okhttp/4.12.0",
+    "Connection": "Keep-Alive",
+    "Accept-Encoding": "gzip"
+}
+
+DEFAULT_COMMANDS = {
+    "emojify": [".emojify", ".emoji"],
+    "rewrite": [".rewrite", ".rw"],
+    "fix": [".fix", ".correct"]
+}
+
+QUICK_MACROS = {
+    "😀": "emojify",
+    "✏️": "rewrite",
+    "✅": "fix"
+}
+
+DEFAULT_AUTO_COMMANDS = {
+    "emojify": ["эмодзи", "смайлы", "emoji"],
+    "rewrite": ["переписать", "улучшить", "rewrite"],
+    "fix": ["исправить", "ошибки", "fix"]
+}
+
+
+class SmartTextEnhancerPlugin(BasePlugin):
+    
+    def __init__(self):
+        super().__init__()
+        self.progress_dialog: Optional[AlertDialogBuilder] = None
+        self.processing_requests = set()
+        self.settings_menu_item = None
+        self.sent_messages = set()
+        
+    def on_plugin_load(self):
+        self.add_on_send_message_hook(priority=50)
+        self._create_settings_menu_item()
+        log("[SmartTextEnhancer] Плагин загружен успешно")
+        
+    def create_settings(self):
+        auto_enabled = self.get_setting("auto_mode_enabled", False)
+        auto_type = self.get_setting("auto_mode_type", 0)
+        
+        return [
+            Header(text="Автоматический режим"),
+            
+            Switch(
+                key="auto_mode_enabled",
+                text="Включить автообработку",
+                default=False,
+                subtext="Автоматически обрабатывать сообщения по командам",
+                icon="msg_online"
+            ),
+            
+            Selector(
+                key="auto_mode_type",
+                text="Тип автообработки",
+                default=0,
+                items=["Эмодзи", "Переписать", "Исправить", "Несколько"],
+                icon="msg_palette"
+            ) if auto_enabled else None,
+            
+            Switch(
+                key="auto_enable_emojify",
+                text="Добавлять эмодзи",
+                default=True,
+                subtext="Включить обработку эмодзи при множественном режиме"
+            ) if auto_enabled and auto_type == 3 else None,
+            
+            Switch(
+                key="auto_enable_rewrite",
+                text="Переписывать текст",
+                default=True,
+                subtext="Включить переписывание при множественном режиме"
+            ) if auto_enabled and auto_type == 3 else None,
+            
+            Switch(
+                key="auto_enable_fix",
+                text="Исправлять ошибки",
+                default=True,
+                subtext="Включить исправление при множественном режиме"
+            ) if auto_enabled and auto_type == 3 else None,
+            
+            Divider() if auto_enabled else None,
+            
+            Header(text="Команды"),
+
+            Input(
+                key="custom_emojify_commands",
+                text="Команды для эмодзи",
+                default="",
+                subtext=self._get_commands_description("emojify")
+            ),
+            
+            Input(
+                key="custom_rewrite_commands",
+                text="Команды для переписывания",
+                default="",
+                subtext=self._get_commands_description("rewrite")
+            ),
+            
+            Input(
+                key="custom_fix_commands",
+                text="Команды для исправления",
+                default="",
+                subtext=self._get_commands_description("fix")
+            ),
+            
+            Divider(),
+            
+            Header(text="Дополнительные настройки"),
+            
+            Switch(
+                key="enable_reply_processing",
+                text="Обработка ответов",
+                default=True,
+                subtext="Обрабатывать текст из сообщения, на которое отвечаете",
+                icon="msg_reply"
+            ),
+            
+            Selector(
+                key="request_timeout",
+                text="Таймаут запроса",
+                default=1,
+                items=["5 сек", "10 сек", "15 сек", "30 сек"],
+                icon="msg_timer"
+            ),
+            
+            Switch(
+                key="show_loading_indicator",
+                text="Отображать индикацию загрузки",
+                default=True,
+                subtext="Показывать диалог прогресса и уведомления",
+                icon="msg_loading"
+            ),
+            
+            Divider(),
+            
+            Header(text="Справка и тестирование"),
+            
+            Text(
+                text="Справка по использованию",
+                icon="msg_info",
+                on_click=lambda view: self._show_help_dialog()
+            ),
+            
+            Text(
+                text="Тест API",
+                icon="msg_download",
+                on_click=lambda view: self._test_api()
+            )
+        ]
+    
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, 'message') or not isinstance(params.message, str):
+            return HookResult()
+            
+        message = params.message.strip()
+        
+        message_hash = hash(message)
+        if message_hash in self.sent_messages:
+            self.sent_messages.discard(message_hash)
+            return HookResult()
+        
+        if self.get_setting("enable_macros", True):
+            for macro, action_type in QUICK_MACROS.items():
+                if message == macro:
+                    return self._handle_macro_command(action_type, params)
+        
+        for action_type, commands in DEFAULT_COMMANDS.items():
+            for command in commands:
+                if message.startswith(command):
+                    return self._handle_text_command(action_type, command, message, params)
+        
+        if self.get_setting("auto_mode_enabled", False):
+            return self._handle_auto_mode(message, params)
+            
+        return HookResult()
+    
+    def _handle_macro_command(self, action_type: str, params: Any) -> HookResult:
+        if not self.get_setting("enable_reply_processing", True) or not params.replyToMsg:
+            if self.get_setting("show_loading_indicator", True):
+                BulletinHelper.show_error("Для макросов нужно ответить на сообщение с текстом")
+            return HookResult(strategy=HookStrategy.CANCEL)
+            
+        reply_text = self._extract_text_from_message(params.replyToMsg)
+        if not reply_text:
+            if self.get_setting("show_loading_indicator", True):
+                BulletinHelper.show_error("В сообщении нет текста для обработки")
+            return HookResult(strategy=HookStrategy.CANCEL)
+            
+        self._process_text_async(action_type, reply_text, params)
+        return HookResult(strategy=HookStrategy.CANCEL)
+    
+    def _handle_text_command(self, action_type: str, command: str, message: str, params: Any) -> HookResult:
+        text_to_process = message[len(command):].strip()
+        
+        if not text_to_process:
+            if self.get_setting("enable_reply_processing", True) and params.replyToMsg:
+                text_to_process = self._extract_text_from_message(params.replyToMsg)
+            
+            if not text_to_process:
+                params.message = f"Использование: {command} <текст>\nИли ответьте на сообщение с текстом"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+        
+        self._process_text_async(action_type, text_to_process, params)
+        return HookResult(strategy=HookStrategy.CANCEL)
+    
+    def _handle_auto_mode(self, message: str, params: Any) -> HookResult:
+        auto_type = self.get_setting("auto_mode_type", 0)
+        
+        if auto_type == 3:
+            enabled_types = []
+            if self.get_setting("auto_enable_fix", True):
+                enabled_types.append("fix")
+            if self.get_setting("auto_enable_rewrite", True):
+                enabled_types.append("rewrite")
+            if self.get_setting("auto_enable_emojify", True):
+                enabled_types.append("emojify")
+            
+            if enabled_types:
+                self._process_multiple_types_sequential(enabled_types, message, params)
+        else:
+            action_types = ["emojify", "rewrite", "fix"]
+            if auto_type < len(action_types):
+                action_type = action_types[auto_type]
+                self._process_text_async(action_type, message, params)
+        
+        return HookResult(strategy=HookStrategy.CANCEL)
+    
+    def _process_multiple_types_sequential(self, action_types: list, text: str, params: Any):
+        if self.get_setting("show_loading_indicator", True):
+            self._show_progress_dialog("Последовательная обработка...")
+        
+        run_on_queue(lambda: self._process_sequential_request(action_types, text, params))
+    
+    def _process_sequential_request(self, action_types: list, text: str, params: Any):
+        request_id = id(threading.current_thread())
+        self.processing_requests.add(request_id)
+        
+        try:
+            current_text = text
+            timeout_index = self.get_setting("request_timeout", 1)
+            timeout_values = [5, 10, 15, 30]
+            timeout = timeout_values[timeout_index] if timeout_index < len(timeout_values) else 10
+            
+            for action_type in action_types:
+                try:
+                    url = API_ENDPOINTS.get(action_type)
+                    if not url:
+                        continue
+                    
+                    payload = {"text": current_text}
+                    response = requests.post(
+                        url,
+                        headers=API_HEADERS,
+                        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                        timeout=timeout
+                    )
+                    
+                    if response.status_code == 200:
+                        result_data = response.json()
+                        processed_text = result_data.get('response', '')
+                        if processed_text:
+                            current_text = processed_text
+                        
+                except Exception as e:
+                    log(f"[SmartTextEnhancer] Ошибка обработки {action_type}: {e}")
+                    continue
+            
+            if current_text != text:
+                self.sent_messages.add(hash(current_text))
+                
+                message_params = {
+                    "message": current_text,
+                    "peer": params.peer,
+                    "replyToMsg": params.replyToMsg,
+                    "replyToTopMsg": params.replyToTopMsg
+                }
+                
+                run_on_ui_thread(lambda: send_message(message_params))
+                
+                if self.get_setting("show_loading_indicator", True):
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Последовательная обработка завершена"))
+            else:
+                if self.get_setting("show_loading_indicator", True):
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось обработать текст"))
+                
+        except Exception as e:
+            self._handle_error("Ошибка последовательной обработки", e)
+        finally:
+            self.processing_requests.discard(request_id)
+            if self.get_setting("show_loading_indicator", True):
+                run_on_ui_thread(self._dismiss_progress_dialog)
+    
+    def _extract_text_from_message(self, message_obj) -> Optional[str]:
+        try:
+            if hasattr(message_obj, 'message') and message_obj.message:
+                return str(message_obj.message).strip()
+            return None
+        except Exception as e:
+            log(f"[SmartTextEnhancer] Ошибка извлечения текста: {e}")
+            return None
+    
+    def _process_text_async(self, action_type: str, text: str, params: Any, is_auto_multiple: bool = False):
+        if not text or len(text.strip()) == 0:
+            if self.get_setting("show_loading_indicator", True):
+                BulletinHelper.show_error("Пустой текст для обработки")
+            return
+            
+        if self.get_setting("show_loading_indicator", True):
+            action_names = {"emojify": "эмодзи", "rewrite": "переписывание", "fix": "исправление"}
+            action_name = action_names.get(action_type, action_type)
+            self._show_progress_dialog(f"Обработка: {action_name}...")
+        
+        run_on_queue(lambda: self._process_text_request(action_type, text, params, is_auto_multiple))
+    
+    def _process_text_request(self, action_type: str, text: str, params: Any, is_auto_multiple: bool = False):
+        request_id = id(threading.current_thread())
+        self.processing_requests.add(request_id)
+        
+        try:
+            url = API_ENDPOINTS.get(action_type)
+            if not url:
+                raise ValueError(f"Неизвестный тип обработки: {action_type}")
+            
+            payload = {"text": text}
+            timeout_index = self.get_setting("request_timeout", 1)
+            timeout_values = [5, 10, 15, 30]
+            timeout = timeout_values[timeout_index] if timeout_index < len(timeout_values) else 10
+            
+            response = requests.post(
+                url,
+                headers=API_HEADERS,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                result_data = response.json()
+                processed_text = result_data.get('response', '')
+                
+                if processed_text:
+                    self._send_processed_result(action_type, text, processed_text, params, is_auto_multiple)
+                else:
+                    self._handle_error("API вернул пустой результат", None)
+            else:
+                self._handle_error(f"Ошибка API: {response.status_code}", None)
+                
+        except requests.exceptions.Timeout:
+            self._handle_error("Превышено время ожидания ответа", None)
+        except requests.exceptions.ConnectionError:
+            self._handle_error("Ошибка подключения к серверу", None)
+        except Exception as e:
+            self._handle_error("Неожиданная ошибка", e)
+        finally:
+            self.processing_requests.discard(request_id)
+            if self.get_setting("show_loading_indicator", True):
+                run_on_ui_thread(self._dismiss_progress_dialog)
+    
+    def _send_processed_result(self, action_type: str, original_text: str, processed_text: str, params: Any, is_auto_multiple: bool = False):
+        try:
+            self.sent_messages.add(hash(processed_text))
+            
+            message_params = {
+                "message": processed_text,
+                "peer": params.peer,
+                "replyToMsg": params.replyToMsg,
+                "replyToTopMsg": params.replyToTopMsg
+            }
+            
+            run_on_ui_thread(lambda: send_message(message_params))
+            
+            if self.get_setting("show_loading_indicator", True):
+                action_names = {"emojify": "эмодзи", "rewrite": "переписывание", "fix": "исправление"}
+                action_name = action_names.get(action_type, action_type)
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Выполнено: {action_name}"))
+            
+        except Exception as e:
+            log(f"[SmartTextEnhancer] Ошибка отправки результата: {e}")
+            if self.get_setting("show_loading_indicator", True):
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка отправки результата"))
+    
+    def _handle_error(self, message: str, exception: Optional[Exception]):
+        log(f"[SmartTextEnhancer] {message}")
+        if exception:
+            log(f"[SmartTextEnhancer] Детали ошибки: {str(exception)}")
+            log(f"[SmartTextEnhancer] Traceback: {traceback.format_exc()}")
+        
+        if self.get_setting("show_loading_indicator", True):
+            run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+    
+    def _show_progress_dialog(self, title: str):
+        def show_dialog():
+            try:
+                fragment = get_last_fragment()
+                if not fragment:
+                    return
+                    
+                activity = fragment.getParentActivity()
+                if not activity:
+                    activity = ApplicationLoader.applicationContext
+                
+                self.progress_dialog = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+                self.progress_dialog.set_title(title)
+                self.progress_dialog.set_message("Пожалуйста, подождите...")
+                self.progress_dialog.set_cancelable(False)
+                self.progress_dialog.show()
+                
+            except Exception as e:
+                log(f"[SmartTextEnhancer] Ошибка показа диалога: {e}")
+        
+        run_on_ui_thread(show_dialog)
+    
+    def _dismiss_progress_dialog(self):
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.dismiss()
+            except Exception as e:
+                log(f"[SmartTextEnhancer] Ошибка скрытия диалога: {e}")
+            finally:
+                self.progress_dialog = None
+    
+    def _show_help_dialog(self):
+        help_text = """🤖 SmartTextEnhancer - Справка
+
+📝 Команды:
+• .emojify <текст> - добавить эмодзи
+• .rewrite <текст> - переписать текст
+• .fix <текст> - исправить ошибки
+
+🎯 Встроенные макросы (ответ на сообщение):
+• 😀 - добавить эмодзи
+• ✏️ - переписать текст
+• ✅ - исправить ошибки
+
+⚙️ Автоматический режим:
+Обрабатывает все сообщения выбранным типом обработки.
+
+💡 Советы:
+• Можно отвечать на сообщения
+• Настройте таймауты для медленного интернета
+• Используйте множественную обработку для комплексного улучшения"""
+
+        def show_dialog():
+            try:
+                fragment = get_last_fragment()
+                if not fragment:
+                    return
+                    
+                activity = fragment.getParentActivity()
+                if not activity:
+                    return
+                
+                dialog = AlertDialogBuilder(activity)
+                dialog.set_title("📖 Справка SmartTextEnhancer")
+                dialog.set_message(help_text)
+                dialog.set_positive_button("Понятно", lambda d, w: d.dismiss())
+                dialog.show()
+                
+            except Exception as e:
+                log(f"[SmartTextEnhancer] Ошибка показа справки: {e}")
+        
+        run_on_ui_thread(show_dialog)
+    
+    def _test_api(self):
+        test_text = "Привет мир"
+        
+        def test_request():
+            try:
+                self._show_progress_dialog("Тестирование API...")
+                
+                results = []
+                for action_type, url in API_ENDPOINTS.items():
+                    try:
+                        response = requests.post(
+                            url,
+                            headers=API_HEADERS,
+                            data=json.dumps({"text": test_text}, ensure_ascii=False).encode('utf-8'),
+                            timeout=10
+                        )
+                        
+                        if response.status_code == 200:
+                            results.append(f"✅ {action_type}: OK")
+                        else:
+                            results.append(f"❌ {action_type}: {response.status_code}")
+                            
+                    except Exception as e:
+                        results.append(f"❌ {action_type}: {str(e)}")
+                
+                result_text = "🧪 Результаты тестирования API:\n\n" + "\n".join(results)
+                
+                def show_results():
+                    self._dismiss_progress_dialog()
+                    fragment = get_last_fragment()
+                    if fragment and fragment.getParentActivity():
+                        dialog = AlertDialogBuilder(fragment.getParentActivity())
+                        dialog.set_title("Тест API")
+                        dialog.set_message(result_text)
+                        dialog.set_positive_button("OK", lambda d, w: d.dismiss())
+                        dialog.show()
+                
+                run_on_ui_thread(show_results)
+                
+            except Exception as e:
+                run_on_ui_thread(self._dismiss_progress_dialog)
+                self._handle_error("Ошибка тестирования API", e)
+        
+        run_on_queue(test_request)
+    
+    def _create_settings_menu_item(self):
+        if self.settings_menu_item is not None:
+            return
+            
+        menu_item = MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text="SmartTextEnhancer",
+            icon="msg_photo_text_regular",
+            priority=15,
+            on_click=lambda context: self._open_plugin_settings()
+        )
+        self.settings_menu_item = self.add_menu_item(menu_item)
+    
+    def _open_plugin_settings(self):
+        try:
+            java_plugin = PluginsController.getInstance().plugins.get(self.id)
+            if java_plugin:
+                run_on_ui_thread(lambda: get_last_fragment().presentFragment(PluginSettingsActivity(java_plugin)))
+        except Exception as e:
+            log(f"[SmartTextEnhancer] Ошибка открытия настроек: {e}")
+    
+    def _get_custom_commands(self):
+        try:
+            custom_emojify = self.get_setting("custom_emojify_commands", "").strip()
+            custom_rewrite = self.get_setting("custom_rewrite_commands", "").strip()
+            custom_fix = self.get_setting("custom_fix_commands", "").strip()
+            
+            commands = {}
+            if custom_emojify:
+                commands["emojify"] = [cmd.strip().lower() for cmd in custom_emojify.split(",") if cmd.strip()]
+            if custom_rewrite:
+                commands["rewrite"] = [cmd.strip().lower() for cmd in custom_rewrite.split(",") if cmd.strip()]
+            if custom_fix:
+                commands["fix"] = [cmd.strip().lower() for cmd in custom_fix.split(",") if cmd.strip()]
+            
+            return commands
+        except Exception as e:
+            log(f"[SmartTextEnhancer] Ошибка получения команд: {e}")
+            return {}
+    
+    def _get_commands_description(self, action_type: str) -> str:
+        try:
+            default_commands = DEFAULT_AUTO_COMMANDS.get(action_type, [])
+            
+            custom_commands = []
+            if action_type == "emojify":
+                custom_text = self.get_setting("custom_emojify_commands", "").strip()
+            elif action_type == "rewrite":
+                custom_text = self.get_setting("custom_rewrite_commands", "").strip()
+            elif action_type == "fix":
+                custom_text = self.get_setting("custom_fix_commands", "").strip()
+            else:
+                custom_text = ""
+            
+            if custom_text:
+                custom_commands = [cmd.strip() for cmd in custom_text.split(",") if cmd.strip()]
+            
+            all_commands = default_commands + custom_commands
+            if all_commands:
+                commands_text = ", ".join(all_commands)
+                return f"Активные команды: {commands_text}"
+            else:
+                default_text = ", ".join(default_commands)
+                return f"Встроенные команды: {default_text}. Добавьте свои через запятую"
+                
+        except Exception as e:
+            log(f"[SmartTextEnhancer] Ошибка формирования описания команд: {e}")
+            return "Добавьте команды через запятую"
+    
+    
+    def on_plugin_unload(self):
+        self.processing_requests.clear()
+        self.sent_messages.clear()
+        
+        if self.progress_dialog:
+            run_on_ui_thread(self._dismiss_progress_dialog)
+        
+        log("[SmartTextEnhancer] Плагин выгружен")
