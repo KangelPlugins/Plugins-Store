@@ -1,24 +1,54 @@
 from base_plugin import BasePlugin, HookResult, HookStrategy
-from ui.settings import Header, Divider, Text, Switch
+from ui.settings import Header, Divider, Text, Switch, Input
 from markdown_utils import parse_markdown
-from client_utils import log
-import sys, traceback
+from client_utils import log as _android_log, get_messages_controller, get_file_loader, get_last_fragment, get_messages_storage, run_on_queue, send_request
+from android_utils import run_on_ui_thread
+from org.telegram.messenger import AndroidUtilities
+import sys
+import traceback
 import re
 import random
+import threading
+import time
+import json
+import os
+import inspect
+import logging
+from typing import List, Optional, Any, Callable, Dict, Union
+from dataclasses import dataclass, field
 
 try:
     from java.util import ArrayList
     from org.telegram.tgnet import TLRPC
+    from org.telegram.ui import ChatActivity
+    from org.telegram.messenger import FileLoader, R, Utilities
+    from com.exteragram.messenger.plugins import PluginsController, Plugin
 except ImportError:
     ArrayList = list
 
 __name__ = "Dont65 Lib"
-__description__ = "📚 Ядро для плагинов @dont65. Управление Markdown и общий .help"
+__description__ = "📚 Ядро для плагинов @dont65. Управление Markdown, автообновление, логирование и общий .help"
 __icon__ = "random69_by_TgEmojiBot/123"
-__version__ = "1.2.0"  # Увеличил версию
+__version__ = "2.0.0"
 __id__ = "dont65_lib"
 __author__ = "@dont65"
 
+# ----------------------------------------------------------------------
+#  КОНСТАНТЫ (вынесены в начало, чтобы не зависеть от загрузки плагина)
+# ----------------------------------------------------------------------
+AUTOUPDATE_CHANNEL_ID = 3624287619          # @dontplugin
+AUTOUPDATE_MSG_ID = 10                      # ⚠️ ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ID ПОСТА С БИБЛИОТЕКОЙ!
+PLUGINS_DIR = PluginsController.getInstance().pluginsDir.getAbsolutePath() if 'PluginsController' in dir() else "."
+CACHE_DIR = os.path.join(PLUGINS_DIR, "dont65_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Глобальные переменные (инициализируются при загрузке плагина)
+_setting_getter: Optional[Callable] = None
+_autoupdater: Optional["AutoUpdater"] = None
+
+# ----------------------------------------------------------------------
+#  ОСНОВНОЙ ПЛАГИН – ПЕРВЫЙ КЛАСС!
+# ----------------------------------------------------------------------
 class Dont65Lib(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -37,6 +67,7 @@ class Dont65Lib(BasePlugin):
                     ("`.lower`", "сделать текст строчным"),
                     ("`.tglink`", "создать ссылку на пользователя"),
                     ("`.time`", "узнать точное время"),
+                    ("`.date`", "текущая дата и время (локальное)"),
                     ("`.swap`", "сменить регистр всех символов на противоположный")
                 ]
             },
@@ -69,49 +100,389 @@ class Dont65Lib(BasePlugin):
                 ]
             }
         }
+        # Логгеры создадим в on_plugin_load, чтобы иметь доступ к get_setting
+        self.logger = None
+        self.cmd_logger = None
 
+    # ---------- НАСТРОЙКИ ----------
     def create_settings(self):
+        # Функция принудительной проверки (использует self.logger, который будет готов к моменту вызова)
+        def force_update(_):
+            if _autoupdater:
+                _autoupdater.forced_check = True
+                if self.logger:
+                    self.logger.info("Forced update triggered")
+            else:
+                if self.logger:
+                    self.logger.info("AutoUpdater not ready")
+
         return [
             Header("Dont65 Library"),
-            Divider(text = "Официальное ядро для плагинов @dont65."),
+            Divider(text="Официальное ядро для плагинов @dont65."),
+
+            # --- КНОПКА-ССЫЛКА НА КАНАЛ ---
+            Text(
+                text="Канал создателей",
+                icon="msg_channel",
+                accent=False,
+                on_click=lambda view: run_on_ui_thread(lambda: get_messages_controller().openByUserName("dontplugin", get_last_fragment(), 1))
+            ),
+            Divider(),
+
+            # --- Секция автообновления ---
+            Header("⚙️ Автообновление плагинов"),
+            Text("🔄 Проверить обновления сейчас", icon="msg_photo_switch2", on_click=force_update),
+            Input(
+                key="autoupdate_timeout",
+                text="Таймаут проверки (сек)",
+                subtext="Частота проверки обновлений",
+                default="600",
+                icon="msg2_autodelete"
+            ),
+            Switch(
+                key="disable_autoupdate",
+                text="Отключить автообновление",
+                subtext="Все задачи автообновления будут остановлены",
+                default=False,
+                icon="msg_download",
+                on_change=lambda enabled: _autoupdater.force_stop() if enabled else run_on_ui_thread(_autoupdater.run)
+            ),
+            Switch(
+                key="disable_ts_check",
+                text="Игнорировать дату редактирования",
+                subtext="Обновлять даже если файл не менялся",
+                default=False,
+                icon="msg_recent"
+            ),
+            Divider(),
+
+            # --- Секция отладки ---
+            Header("🛠 Отладка"),
+            Switch(
+                key="debug_mode",
+                text="Режим отладки",
+                subtext="Подробные логи в консоли",
+                default=False,
+                icon="msg_log"
+                # on_change убрали – уровень логгера будет обновляться в on_plugin_load и при каждом логировании
+            ),
+
+            # --- СТАРЫЕ НАСТРОЙКИ ---
             Switch(key="enable_help", text="Включить команду .help", default=True),
             Divider(),
-            Text("Автор: @dont65")
+            Text(
+                text = "Автор: @dont65", 
+                accent=False,
+                on_click=lambda view: run_on_ui_thread(lambda: get_messages_controller().openByUserName("dont65", get_last_fragment(), 1))
+                )
         ]
 
+    # ---------- ЗАГРУЗКА / ВЫГРУЗКА ----------
     def on_plugin_load(self):
-        self.add_on_send_message_hook(priority=100)
+        global _setting_getter, _autoupdater
+        _setting_getter = self.get_setting
 
+        # Инициализация логгеров с учётом debug_mode
+        self.logger = self._build_logger(__name__)
+        self.cmd_logger = self._build_logger(f"{__name__}.commands")
+        
+        # Сохраняем логгеры в глобальные переменные для доступа из утилит
+        global logger, cmd_logger
+        logger = self.logger
+        cmd_logger = self.cmd_logger
+
+        # Автообновление (если не отключено)
+        if not _setting_getter("disable_autoupdate", False):
+            _autoupdater = AutoUpdater(self.logger)  # передаём логгер
+            _autoupdater.add_task(UpdaterTask(__id__, AUTOUPDATE_CHANNEL_ID, AUTOUPDATE_MSG_ID))
+            _autoupdater.run()
+            self.logger.info("AutoUpdater initialized")
+
+        self.add_on_send_message_hook(priority=100)
+        self.logger.info("Plugin loaded")
+
+    def on_plugin_unload(self):
+        if _autoupdater:
+            _autoupdater.force_stop()
+        if self.logger:
+            self.logger.info("Plugin unloaded")
+
+    # ---------- ХУК СООБЩЕНИЙ ----------
     def on_send_message_hook(self, account, params):
-        msg = params.message or params.caption or ""
+        msg = getattr(params, 'message', '') or getattr(params, 'caption', '')
         if msg.lower().strip() == ".help" and self.get_setting("enable_help", True):
             lines = ["🛠 **Dont65 Plugins Hub**", ""]
-            
             for p_id, info in self.known_plugins.items():
-                is_installed = p_id in sys.modules
-                status = "✅" if is_installed else "❌"
+                installed = p_id in sys.modules
+                status = "✅" if installed else "❌"
                 lines.append(f"**{info['name']}** {status}")
-                
-                if is_installed:
+                if installed:
                     for cmd, desc in info['commands']:
                         lines.append(f"{cmd} — {desc}")
                 else:
                     lines.append("Плагин не установлен ❌")
                 lines.append("")
-            
-            new_params = Dont65Utils.apply_markdown(params, "\n".join(lines))
-            return HookResult(strategy=HookStrategy.MODIFY_FINAL, params=new_params)
+            return HookResult(
+                strategy=HookStrategy.MODIFY_FINAL,
+                params=Dont65Utils.apply_markdown(params, "\n".join(lines))
+            )
         return HookResult()
 
+    # ---------- ВНУТРЕННИЙ МЕТОД ДЛЯ СОЗДАНИЯ ЛОГГЕРА ----------
+    def _build_logger(self, name: str) -> logging.Logger:
+        """Создаёт кастомный логгер с записью в android log."""
+        class Dont65Logger(logging.Logger):
+            def _log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1):
+                caller = inspect.stack()[2]
+                func = caller.function
+                level_name = logging.getLevelName(level).upper()
+                prefix = " ".join(filter(None, [f"[{level_name}]", self.name, f"[{func}]"]))
+                try:
+                    formatted = str(msg) % args if args else str(msg)
+                except:
+                    formatted = f"{msg} {' '.join(map(str, args))}" if args else str(msg)
+                _android_log(f"{prefix} {formatted}")
+
+        log = Dont65Logger(name)
+        # Уровень логирования берём из текущей настройки
+        debug_mode = self.get_setting("debug_mode", False)
+        log.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+        return log
+
+
+# ----------------------------------------------------------------------
+#  ГЛОБАЛЬНЫЕ ЛОГГЕРЫ (будут заполнены при загрузке плагина)
+# ----------------------------------------------------------------------
+logger: logging.Logger = None
+cmd_logger: logging.Logger = None
+
+
+# ----------------------------------------------------------------------
+#  ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ (ИДУТ СРАЗУ ПОСЛЕ ПЛАГИНА)
+# ----------------------------------------------------------------------
+class CacheFile:
+    def __init__(self, filename: str, read_on_init=True):
+        self.filename = filename
+        self.path = os.path.join(CACHE_DIR, filename)
+        self._content: Optional[bytes] = None
+        if read_on_init:
+            self.read()
+
+    def read(self):
+        if not os.path.exists(self.path):
+            self._content = None
+            return
+        try:
+            with open(self.path, "rb") as f:
+                self._content = f.read()
+        except Exception:
+            self._content = None
+
+    def write(self):
+        if self._content is None:
+            return
+        try:
+            with open(self.path, "wb") as f:
+                f.write(self._content)
+        except Exception:
+            pass
+
+    def wipe(self):
+        self._content = None
+        self.write()
+
+    def delete(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    @property
+    def content(self) -> Optional[bytes]:
+        return self._content
+
+    @content.setter
+    def content(self, value: Optional[bytes]):
+        self._content = value
+
+
+class JsonCacheFile(CacheFile):
+    def __init__(self, filename: str, default: Any, read_on_init=True):
+        self._default = default
+        self.json_content = default
+        super().__init__(filename, read_on_init)
+
+    def read(self):
+        super().read()
+        if not self._content:
+            self.json_content = self._default
+            self._content = json.dumps(self.json_content).encode()
+            return
+        try:
+            self.json_content = json.loads(self._content.decode("utf-8", errors="replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.json_content = self._default
+
+    def write(self):
+        self._content = json.dumps(self.json_content).encode("utf-8", errors="replace")
+        super().write()
+
+    @property
+    def content(self) -> Any:
+        return self.json_content
+
+    @content.setter
+    def content(self, value: Any):
+        self.json_content = value
+
+
+@dataclass
+class UpdaterTask:
+    plugin_id: str
+    channel_id: int
+    message_id: int
+
+
+class AutoUpdater:
+    def __init__(self, log: logging.Logger = None):
+        self.thread: Optional[threading.Thread] = None
+        self.forced_stop = False
+        self.forced_check = False
+        self.tasks: List[UpdaterTask] = []
+        self.edited_ts = JsonCacheFile("autoupdater_edited.json", {})
+        self.logger = log or (globals().get('logger'))  # если логгер не передан, используем глобальный
+
+    def run(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.forced_stop = False
+        self.thread = threading.Thread(target=self._cycle, daemon=True)
+        self.thread.start()
+        if self.logger:
+            self.logger.info("AutoUpdater thread started")
+
+    def force_stop(self):
+        self.forced_stop = True
+        if self.logger:
+            self.logger.info("AutoUpdater stop requested")
+
+    def _cycle(self):
+        while not self.forced_stop:
+            try:
+                self._check_all()
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"Check error: {Dont65Utils.format_exc_only(e)}")
+            timeout = int(_setting_getter("autoupdate_timeout", "600"))
+            start = time.time()
+            while (time.time() - start) < timeout and not self.forced_stop and not self.forced_check:
+                threading.Event().wait(1)
+            if self.forced_check:
+                self.forced_check = False
+                if self.logger:
+                    self.logger.info("Forced update check")
+
+    def _check_all(self):
+        for task in list(self.tasks):
+            plugin = PluginsController.getInstance().plugins.get(task.plugin_id)
+            if not plugin or not plugin.isEnabled():
+                if self.logger:
+                    self.logger.info(f"Removing task {task.plugin_id} – plugin disabled/missing")
+                self.tasks.remove(task)
+                continue
+            self._check_plugin_update(task)
+
+    def _check_plugin_update(self, task: UpdaterTask):
+        def on_message(msg: Optional[TLRPC.TL_message]):
+            if not msg or isinstance(msg, TLRPC.TL_messageEmpty):
+                if self.logger:
+                    self.logger.info(f"No message for {task.plugin_id}, removing task")
+                self.tasks.remove(task)
+                return
+            if not msg.media:
+                if self.logger:
+                    self.logger.info(f"No media in message for {task.plugin_id}, removing")
+                self.tasks.remove(task)
+                return
+            doc = msg.media.getDocument()
+            if not PluginsController.getInstance().isPlugin(get_file_loader().getPathToAttach(doc, True)):
+                if self.logger:
+                    self.logger.info(f"Attached file is not a plugin for {task.plugin_id}, removing")
+                self.tasks.remove(task)
+                return
+            disable_ts = _setting_getter("disable_ts_check", False)
+            last_edit = self.edited_ts.content.get(task.plugin_id)
+            if not disable_ts and msg.edit_date == last_edit:
+                if self.logger:
+                    self.logger.info(f"No changes for {task.plugin_id}, skip")
+                return
+            self.edited_ts.content[task.plugin_id] = msg.edit_date
+            self.edited_ts.write()
+            run_on_queue(lambda: self._download_and_install(msg, task.plugin_id))
+
+        Requests.get_message(-task.channel_id, task.message_id, on_message)
+
+    def _download_and_install(self, msg: TLRPC.TL_message, plugin_id: str, tries=0, max_tries=10):
+        file_loader = get_file_loader()
+        doc = msg.media.getDocument()
+        path = file_loader.getPathToAttach(doc, True)
+        if not path.exists():
+            if tries >= max_tries:
+                if self.logger:
+                    self.logger.error(f"Max tries exceeded for {plugin_id}")
+                return
+            file_loader.loadFile(doc, "plugin", FileLoader.PRIORITY_NORMAL, 1)
+            run_on_queue(lambda: self._download_and_install(msg, plugin_id, tries + 1), delay=1)
+            return
+        try:
+            PluginsController.getInstance().loadPluginFromFile(str(path), None, Utilities.Callback(lambda err: None))
+        except TypeError:
+            PluginsController.getInstance().loadPluginFromFile(str(path), Utilities.Callback(lambda err: None))
+        if self.logger:
+            self.logger.info(f"Installed {plugin_id}")
+
+    def add_task(self, task: UpdaterTask):
+        if not any(t.plugin_id == task.plugin_id for t in self.tasks):
+            self.tasks.append(task)
+            if self.logger:
+                self.logger.info(f"Added task {task.plugin_id}")
+
+    def remove_task(self, plugin_id: str):
+        self.tasks = [t for t in self.tasks if t.plugin_id != plugin_id]
+        if self.logger:
+            self.logger.info(f"Removed task {plugin_id}")
+
+
+class Requests:
+    @staticmethod
+    def get_message(peer_id: int, msg_id: int, callback: Callable):
+        ctrl = get_messages_controller()
+        def _fetch():
+            ctrl.reloadMessages(ArrayList([msg_id]), peer_id, 0)
+            msg = get_messages_storage().getMessage(peer_id, msg_id)
+            if msg:
+                callback(msg)
+            else:
+                run_on_queue(_fetch, delay=1)
+        run_on_queue(_fetch)
+
+
+# ======================================================================
+#  УТИЛИТЫ Dont65Utils – ВСЕ ПУБЛИЧНЫЕ МЕТОДЫ
+# ======================================================================
 class Dont65Utils:
+    """Набор публичных методов для использования в других плагинах."""
+
+    # --- РАБОТА С MARKDOWN И СООБЩЕНИЯМИ (старые методы) ---
     @staticmethod
     def apply_markdown(params, text):
         parsed = parse_markdown(text)
         ents = ArrayList()
         if parsed.entities:
-            for e in parsed.entities: ents.add(e.to_tlrpc_object())
-        if hasattr(params, 'caption') and params.caption: params.caption = parsed.text
-        else: params.message = parsed.text
+            for e in parsed.entities:
+                ents.add(e.to_tlrpc_object())
+        if hasattr(params, 'caption') and params.caption:
+            params.caption = parsed.text
+        else:
+            params.message = parsed.text
         params.entities = ents
         return params
 
@@ -120,53 +491,61 @@ class Dont65Utils:
         full_msg = ""
         ents = ArrayList()
         offset = 0
-        def _u16(s): return len(s.encode('utf-16-le')) // 2
+
+        def _u16(s):
+            return len(s.encode('utf-16-le')) // 2
 
         if source:
             clean_source = source.replace('\n', ' ')
             src_s = f"📝 {clean_source[:100]}"
-            if len(clean_source) > 100: src_s += "..."
-            
+            if len(clean_source) > 100:
+                src_s += "..."
             b = TLRPC.TL_messageEntityBlockquote()
-            b.collapsed, b.offset, b.length = True, 0, _u16(src_s)
+            b.collapsed = True
+            b.offset = 0
+            b.length = _u16(src_s)
             ents.add(b)
-            full_msg, offset = src_s + "\n\n", _u16(src_s) + 2
+            full_msg = src_s + "\n\n"
+            offset = _u16(src_s) + 2
 
         if header:
             p = parse_markdown(header)
             if p.entities:
                 for e in p.entities:
-                    te = e.to_tlrpc_object(); te.offset += offset; ents.add(te)
+                    te = e.to_tlrpc_object()
+                    te.offset += offset
+                    ents.add(te)
             full_msg += p.text + "\n"
             offset += _u16(p.text) + 1
 
         p_b = parse_markdown(body)
         if p_b.entities:
             for e in p_b.entities:
-                te = e.to_tlrpc_object(); te.offset += offset; ents.add(te)
-        
+                te = e.to_tlrpc_object()
+                te.offset += offset
+                ents.add(te)
+
         if quote:
             qb = TLRPC.TL_messageEntityBlockquote()
-            qb.collapsed, qb.offset, qb.length = (quote=='collapsed'), offset, _u16(p_b.text)
+            qb.collapsed = (quote == 'collapsed')
+            qb.offset = offset
+            qb.length = _u16(p_b.text)
             ents.add(qb)
-        
+
         full_msg += p_b.text
-        if hasattr(params, 'caption') and params.caption: params.caption = full_msg
-        else: params.message = full_msg
+        if hasattr(params, 'caption') and params.caption:
+            params.caption = full_msg
+        else:
+            params.message = full_msg
         params.entities = ents
         return params
 
-    # ============ ВЫНЕСЕННЫЕ ФУНКЦИИ ИЗ MULTITOOL ============
-    
     @staticmethod
     def switch_layout(text):
-        """Смена раскладки (русская/английская)"""
         en_layout = "qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~`"
         ru_layout = "йцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,Ёё"
-        
         en_chars = len(re.findall(r'[a-zA-Z]', text))
         ru_chars = len(re.findall(r'[а-яА-ЯёЁ]', text))
-        
         if en_chars >= ru_chars:
             table = str.maketrans(en_layout, ru_layout)
         else:
@@ -175,7 +554,6 @@ class Dont65Utils:
 
     @staticmethod
     def quality_symbols(text):
-        """Подсчет символов (всех, без переносов, без пробелов)"""
         total_symbols = len(text)
         text_no_newlines = re.sub(r'\n', '', text)
         symbols_no_newlines = len(text_no_newlines)
@@ -185,66 +563,74 @@ class Dont65Utils:
 
     @staticmethod
     def do_translit(text):
-        """Транслитерация (рус↔англ)"""
+        # ИСПРАВЛЕНО: 'х' -> 'h' (было 'kh')
         ru_to_en = {
             'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
             'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
             'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-            'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+            'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
             'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
         }
         en_to_ru = {v: k for k, v in ru_to_en.items()}
         is_cyrillic = bool(re.search('[а-яА-ЯёЁ]', text))
-        
-        result = ""
         if is_cyrillic:
+            result = ""
             for char in text:
                 lower_char = char.lower()
                 if lower_char in ru_to_en:
                     trans = ru_to_en[lower_char]
                     result += trans.upper() if char.isupper() else trans
-                else: result += char
+                else:
+                    result += char
+            return result
         else:
             temp_text = text
             sorted_en = sorted(en_to_ru.keys(), key=len, reverse=True)
             for en_char in sorted_en:
-                if not en_char: continue
+                if not en_char:
+                    continue
                 ru_char = en_to_ru[en_char]
                 pattern = re.compile(re.escape(en_char), re.IGNORECASE)
-                temp_text = pattern.sub(lambda m: ru_char.upper() if m.group(0).isupper() else ru_char, temp_text)
-            result = temp_text
-
-        return result
+                temp_text = pattern.sub(
+                    lambda m: ru_char.upper() if m.group(0).isupper() else ru_char,
+                    temp_text
+                )
+            return temp_text
 
     @staticmethod
     def get_message_info(reply_msg_obj, params=None):
-        """Получение информации о сообщении (возвращает данные, не форматированный текст)"""
         def _get_attr(obj, *attrs):
             for attr in attrs:
                 if hasattr(obj, attr):
                     val = getattr(obj, attr)
                     if callable(val):
-                        try: return val()
-                        except: continue
+                        try:
+                            return val()
+                        except:
+                            continue
                     return val
             return None
 
         def _extract_id_safe(peer_obj):
-            if peer_obj is None: return None
-            if isinstance(peer_obj, int): return peer_obj
-            if hasattr(peer_obj, 'user_id'): return peer_obj.user_id
-            if hasattr(peer_obj, 'channel_id'): return peer_obj.channel_id
-            if hasattr(peer_obj, 'chat_id'): return peer_obj.chat_id
+            if peer_obj is None:
+                return None
+            if isinstance(peer_obj, int):
+                return peer_obj
+            if hasattr(peer_obj, 'user_id'):
+                return peer_obj.user_id
+            if hasattr(peer_obj, 'channel_id'):
+                return peer_obj.channel_id
+            if hasattr(peer_obj, 'chat_id'):
+                return peer_obj.chat_id
             return str(peer_obj)
 
         msg_id = _get_attr(reply_msg_obj, 'id', 'message_id', 'msg_id', 'getId') or "Unknown"
-        
         chat_id = None
         if params:
             chat_id = _get_attr(params, 'chatId', 'chat_id', 'chatId_long', 'getChatId')
         if not chat_id:
             chat_id = _get_attr(reply_msg_obj, 'chat_id', 'chatId', 'getChatId')
-        if not chat_id: 
+        if not chat_id:
             chat_id = "Unknown"
 
         sender_id = "Unknown"
@@ -268,59 +654,46 @@ class Dont65Utils:
 
     @staticmethod
     def extract_text_aggressively(reply_msg_obj):
-        """Агрессивное извлечение текста из объекта сообщения"""
         text = ""
         try:
             if hasattr(reply_msg_obj, 'getMessageText'):
                 text_cs = reply_msg_obj.getMessageText()
-                if text_cs: return str(text_cs).strip()
-        except Exception: pass
-
+                if text_cs:
+                    return str(text_cs).strip()
+        except Exception:
+            pass
         for attr in ['message', 'caption', 'text']:
             val = getattr(reply_msg_obj, attr, None)
-            if val: return str(val).strip()
-
+            if val:
+                return str(val).strip()
         if hasattr(reply_msg_obj, 'messageOwner'):
             owner = reply_msg_obj.messageOwner
             for attr in ['message', 'caption', 'text']:
                 val = getattr(owner, attr, None)
-                if val: return str(val).strip()
+                if val:
+                    return str(val).strip()
         return ""
 
-    # ============ ВЫНЕСЕННЫЕ ФУНКЦИИ ИЗ DICE_ROLLER ============
-    
     @staticmethod
     def generate_random_number(min_val, max_val):
-        """Генерация случайного числа с защитой от слишком больших диапазонов"""
-        # Защита: если min больше max, меняем местами
         if min_val > max_val:
             min_val, max_val = max_val, min_val
-        
-        # Проверка на слишком большие числа
         if abs(max_val - min_val) > 1000000:
             raise ValueError("Диапазон слишком большой")
-        
         return random.randint(min_val, max_val)
 
     @staticmethod
     def get_current_user_info(account):
-        """Получение информации о текущем пользователе"""
         try:
             from org.telegram.messenger import UserConfig
             current_user = UserConfig.getInstance(account).getCurrentUser()
             if not current_user:
                 return None
-            
             user_id = current_user.id
             username = getattr(current_user, 'username', None)
-            
-            # Формируем гиперссылку на пользователя
             tg_link = f"tg://openmessage?user_id={user_id}"
-            
-            # Используем username если есть, иначе "Пользователь"
             display_name = f"@{username}" if username else "Пользователь"
             markdown_link = f"[{display_name}]({tg_link})"
-            
             return {
                 "id": user_id,
                 "username": username,
@@ -329,3 +702,57 @@ class Dont65Utils:
             }
         except Exception:
             return None
+
+    # --- НОВЫЕ ПУБЛИЧНЫЕ МЕТОДЫ ---
+    @staticmethod
+    def add_autoupdater_task(plugin_id: str, channel_id: int, message_id: int):
+        """Зарегистрировать плагин в системе автообновления."""
+        if _autoupdater is None:
+            if logger:
+                logger.error("AutoUpdater not initialized, cannot add task")
+            return
+        task = UpdaterTask(plugin_id, channel_id, message_id)
+        _autoupdater.add_task(task)
+
+    @staticmethod
+    def remove_autoupdater_task(plugin_id: str):
+        """Удалить задачу автообновления для плагина."""
+        if _autoupdater:
+            _autoupdater.remove_task(plugin_id)
+
+    @staticmethod
+    def build_log(name: str) -> logging.Logger:
+        """Создать логгер для другого плагина (использует ту же систему)."""
+        # Используем тот же метод, что и в Dont65Lib, но без доступа к экземпляру
+        class Dont65Logger(logging.Logger):
+            def _log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1):
+                caller = inspect.stack()[2]
+                func = caller.function
+                level_name = logging.getLevelName(level).upper()
+                prefix = " ".join(filter(None, [f"[{level_name}]", self.name, f"[{func}]"]))
+                try:
+                    formatted = str(msg) % args if args else str(msg)
+                except:
+                    formatted = f"{msg} {' '.join(map(str, args))}" if args else str(msg)
+                _android_log(f"{prefix} {formatted}")
+
+        log = Dont65Logger(name)
+        # Уровень логирования определяем по глобальной настройке debug_mode
+        debug_mode = Dont65Utils.is_debug_mode()
+        log.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+        return log
+
+    @staticmethod
+    def format_exc() -> str:
+        """Полный трейсбек текущего исключения."""
+        return traceback.format_exc().strip()
+
+    @staticmethod
+    def format_exc_only(e: Exception) -> str:
+        """Только тип и сообщение исключения."""
+        return "".join(traceback.format_exception_only(type(e), e)).strip()
+
+    @staticmethod
+    def is_debug_mode() -> bool:
+        """Текущее состояние debug-режима (из глобальной настройки)."""
+        return bool(_setting_getter("debug_mode", False)) if _setting_getter else False
