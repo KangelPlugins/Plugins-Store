@@ -1,0 +1,1783 @@
+__id__ = "MessageForwarder"
+__name__ = "Message Forwarder"
+__author__ = "@Nikita218000 || @RooniPlugin (оригинальная идея и реализация)"
+__version__ = "1.2.0"
+__description__ = "Пересылает все сообщения из одного чата в другой, с сохранением авторства или без, частями и с задержками.\n\n*Примечание:\nНе работает в каналах где запрещена пересылка.\n\nЧто добавили в 1.2.0?\n1. Можно связать два чата и если в первом чате появится сообщение оно перешлется в другой чат. Поддерживает несколько связок чатов.\n2. Небольшие фиксы того что некоторые сообщения не пересылались когда отключено сохранение авторства.\n\n\n⛔️ВНИМАНИЕ!!!⛔️\n⚠️ При пересылке большого количества сообщений возможен бан аккаунта!"
+__icon__ = "IconForPlugins_by_TgEmodziBot/7"
+__min_version__ = "12.1.1"
+
+import json
+import re
+import threading
+import time
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+
+from android.os import Bundle
+from android.text import InputType
+from android.view import Gravity
+from android.widget import LinearLayout, TextView, Switch as AndroidSwitch, EditText, SeekBar, ProgressBar
+from java import dynamic_proxy
+from java.lang import Integer as JInteger
+from java.util import ArrayList
+from com.exteragram.messenger.utils import ChatUtils
+from org.telegram.messenger import (MessagesController, MessageObject, DialogObject,
+                                    NotificationCenter, UserConfig, AndroidUtilities, Utilities, R, ApplicationLoader)
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui import DialogsActivity, LaunchActivity
+from org.telegram.ui.ActionBar import BaseFragment, Theme, AlertDialog
+from hook_utils import find_class
+
+from base_plugin import BasePlugin, HookResult, MenuItemData, MenuItemType
+from client_utils import (get_last_fragment, get_messages_controller,
+                          send_message, send_request, RequestCallback)
+from android_utils import run_on_ui_thread, log
+from ui.settings import Header, Divider, Text, Input, Switch as SettingsSwitch
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+def _log_critical(message: str):
+    log(message)
+
+class DialogsDelegate(dynamic_proxy(DialogsActivity.DialogsActivityDelegate)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def didSelectDialogs(self, fragment, dialogs, message, param, notify, scheduleDate, topicsFragment):
+        try:
+            self.callback(fragment, dialogs, message, param, notify, scheduleDate, topicsFragment)
+        except Exception as e:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка выбора чата"))
+
+class MessagesForwarderPlugin(BasePlugin):
+    RULES_SETTING_KEY = "forward_rules_v1"
+    POLL_INTERVAL_SETTING_KEY = "poll_interval_seconds"
+    POLL_INTERVAL_SECONDS = 5
+    POLL_LIMIT_PER_SOURCE = 20
+    POLL_HISTORY_TIMEOUT_MIN_SECONDS = 1.5
+    POLL_HISTORY_TIMEOUT_MAX_SECONDS = 2.5
+    POLL_MAX_PARALLEL_SOURCES = 6
+    MAX_CACHE_AGE_SECONDS = 15 * 60
+    MAX_CACHE_SIZE = 5000
+    PENDING_TEXT_AGE_SECONDS = 180
+    AUTO_FORWARD_MAX_ATTEMPTS = 4
+    MANUAL_FORWARD_MAX_ATTEMPTS = 4
+    FORWARD_RETRY_MAX_DELAY_SECONDS = 90
+
+    def __init__(self):
+        super().__init__()
+        self.is_running = False
+        self.is_paused = False
+        self.is_in_background = False
+        self.stop_event = threading.Event()
+        self.current_account = -1
+
+        self.progress_dialog_builder = None
+        self.progress_bar = None
+        self.status_text = None
+        self.pause_button = None
+        self.notification_id = hash(f"{__name__}_notification") & 0x7FFFFFFF
+
+        self.R_attr = None
+        self.broadcast_receiver = None
+
+        self.cache_lock = threading.Lock()
+        self.recent_source_message_cache: Dict[Tuple[int, int], float] = {}
+        self.forwarded_by_plugin_cache: Dict[Tuple[int, int], float] = {}
+        self.pending_outgoing_text_cache: Dict[Tuple[int, str], Dict[str, float]] = {}
+        self.source_last_seen_message_ids: Dict[int, int] = {}
+        self.poll_stop_event = threading.Event()
+        self.poll_thread: Optional[threading.Thread] = None
+        self.poll_interval_seconds = self.POLL_INTERVAL_SECONDS
+
+        self.ACTION_SHOW = f"com.pi.forwarder.{id(self)}.ACTION_SHOW_DIALOG"
+
+        try:
+            self.R_attr = find_class("android.R$attr")
+        except Exception as e:
+            self.R_attr = None
+
+    def on_plugin_load(self):
+        self._create_notification_channel()
+        self._register_broadcast_receiver()
+        self._normalize_rules_in_settings()
+        self.poll_interval_seconds = self._get_poll_interval_seconds()
+        self.set_setting(self.POLL_INTERVAL_SETTING_KEY, str(self.poll_interval_seconds), reload_settings=False)
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Переслать сообщения",
+            icon="msg_forward",
+            on_click=self.on_forward_history_click
+        ))
+
+        for update_name in (
+            "TL_updateNewMessage",
+            "TL_updateNewChannelMessage",
+            "TL_updates",
+            "TL_updatesCombined",
+            "TL_updateShort",
+            "TL_updateShortMessage",
+            "TL_updateShortChatMessage"
+        ):
+            try:
+                self.add_hook(update_name, match_substring=True)
+            except Exception as e:
+                pass
+
+        self._start_poll_worker()
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        try:
+            raw = str(value).strip()
+            if not raw:
+                return None
+            try:
+                return int(raw)
+            except Exception:
+                pass
+
+            # Accept values like "5 сек", "10.0", "  7s".
+            float_candidate = raw.replace(",", ".")
+            try:
+                return int(float(float_candidate))
+            except Exception:
+                pass
+
+            match = re.search(r"-?\d+", raw)
+            if match:
+                return int(match.group(0))
+        except Exception:
+            pass
+        return None
+
+    def _clamp_poll_interval(self, value: int) -> int:
+        if value < 1:
+            return 1
+        if value > 30:
+            return 30
+        return value
+
+    def _get_poll_interval_seconds(self) -> int:
+        raw_value = self.get_setting(self.POLL_INTERVAL_SETTING_KEY, str(self.POLL_INTERVAL_SECONDS))
+        parsed = self._to_int(raw_value)
+        if parsed is None:
+            return self.POLL_INTERVAL_SECONDS
+        return self._clamp_poll_interval(parsed)
+
+    def _set_poll_interval_seconds(self, new_value: Any):
+        parsed = self._to_int(new_value)
+        if parsed is None:
+            return
+
+        normalized = self._clamp_poll_interval(parsed)
+        self.set_setting(self.POLL_INTERVAL_SETTING_KEY, str(normalized), reload_settings=False)
+
+        if self.poll_interval_seconds != normalized:
+            self.poll_interval_seconds = normalized
+            self._restart_poll_worker()
+
+    def _restart_poll_worker(self):
+        self._stop_poll_worker()
+        self._start_poll_worker()
+
+    def _dialog_id_variants(self, dialog_id: int) -> List[int]:
+        variants: List[int] = []
+        try:
+            base = int(dialog_id)
+        except Exception:
+            return variants
+
+        variants.append(base)
+        if base >= 0:
+            return variants
+
+        abs_id = abs(base)
+        # Some builds can expose channel dialog ids in either -channel_id or -100... format.
+        if abs_id < 1_000_000_000_000:
+            variants.append(-(1_000_000_000_000 + abs_id))
+        elif abs_id > 1_000_000_000_000:
+            reduced = abs_id - 1_000_000_000_000
+            if reduced > 0:
+                variants.append(-reduced)
+
+        # Preserve order while removing duplicates.
+        unique: List[int] = []
+        seen = set()
+        for value in variants:
+            if value in seen:
+                continue
+            seen.add(value)
+            unique.append(value)
+        return unique
+
+    def _dialog_ids_equal(self, left_dialog_id: int, right_dialog_id: int) -> bool:
+        left_variants = set(self._dialog_id_variants(left_dialog_id))
+        right_variants = set(self._dialog_id_variants(right_dialog_id))
+        return bool(left_variants.intersection(right_variants))
+
+    def _canonical_dialog_id(self, dialog_id: int) -> int:
+        variants = self._dialog_id_variants(dialog_id)
+        if not variants:
+            return int(dialog_id)
+        return min(variants, key=lambda value: (abs(value), value))
+
+    def _rule_title(self, rule: Dict[str, Any]) -> str:
+        source_title = str(rule.get("source_title") or rule.get("source_chat_id"))
+        target_title = str(rule.get("target_title") or rule.get("target_chat_id"))
+        return f"{source_title} -> {target_title}"
+
+    def _normalize_rule(self, rule: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(rule, dict):
+            return None
+
+        source_id = self._to_int(rule.get("source_chat_id"))
+        target_id = self._to_int(rule.get("target_chat_id"))
+        if source_id is None or target_id is None:
+            return None
+
+        normalized = {
+            "id": str(rule.get("id") or self._generate_rule_id()),
+            "source_chat_id": source_id,
+            "target_chat_id": target_id,
+            "source_title": str(rule.get("source_title") or source_id),
+            "target_title": str(rule.get("target_title") or target_id),
+            "enabled": bool(rule.get("enabled", True)),
+            "preserve_author": bool(rule.get("preserve_author", True)),
+            "last_error": str(rule.get("last_error") or "")
+        }
+        normalized["title"] = str(rule.get("title") or self._rule_title(normalized))
+        return normalized
+
+    def _generate_rule_id(self) -> str:
+        return f"rule_{time.time_ns()}"
+
+    def _get_rules(self) -> List[Dict[str, Any]]:
+        raw_rules = self.get_setting(self.RULES_SETTING_KEY, "[]")
+        try:
+            parsed = json.loads(raw_rules)
+        except Exception:
+            return []
+
+        if not isinstance(parsed, list):
+            return []
+
+        rules = []
+        for item in parsed:
+            rule = self._normalize_rule(item)
+            if rule:
+                rules.append(rule)
+        return rules
+
+    def _save_rules(self, rules: List[Dict[str, Any]], reload_settings: bool = False):
+        normalized_rules = []
+        for rule in rules:
+            normalized = self._normalize_rule(rule)
+            if normalized:
+                normalized_rules.append(normalized)
+
+        self.set_setting(
+            self.RULES_SETTING_KEY,
+            json.dumps(normalized_rules, ensure_ascii=False),
+            reload_settings=reload_settings
+        )
+
+    def _normalize_rules_in_settings(self):
+        rules = self._get_rules()
+        self._save_rules(rules, reload_settings=False)
+
+    def _find_rule(self, rule_id: str) -> Optional[Dict[str, Any]]:
+        for rule in self._get_rules():
+            if rule.get("id") == rule_id:
+                return rule
+        return None
+
+    def _rule_exists(self, source_chat_id: int, target_chat_id: int, exclude_rule_id: Optional[str] = None) -> bool:
+        for rule in self._get_rules():
+            if exclude_rule_id and rule.get("id") == exclude_rule_id:
+                continue
+            rule_source = int(rule.get("source_chat_id"))
+            rule_target = int(rule.get("target_chat_id"))
+            if self._dialog_ids_equal(rule_source, source_chat_id) and self._dialog_ids_equal(rule_target, target_chat_id):
+                return True
+        return False
+
+    def _resolve_dialog_title(self, dialog_id: int) -> str:
+        try:
+            chat_utils = ChatUtils.getInstance(UserConfig.selectedAccount)
+            title = chat_utils.getName(dialog_id)
+            if title:
+                return str(title)
+        except Exception:
+            pass
+        return str(dialog_id)
+
+    def _open_dialog_picker(self, on_selected, silent: bool = False) -> bool:
+        last_fragment = LaunchActivity.getLastFragment()
+        if not last_fragment:
+            if not silent:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть выбор чата"))
+            return False
+
+        args = Bundle()
+        args.putBoolean("onlySelect", True)
+        args.putBoolean("checkCanWrite", True)
+        args.putInt("dialogsType", 0)
+        args.putBoolean("allowGlobalSearch", True)
+        args.putBoolean("destroyAfterSelect", True)
+
+        dialogs_activity = DialogsActivity(args)
+
+        def _handle_dialog_selected(fragment, dialogs, message, param, notify, scheduleDate, topicsFragment):
+            if dialogs.isEmpty():
+                return
+
+            selected_id = int(dialogs.get(0).dialogId)
+            selected_title = self._resolve_dialog_title(selected_id)
+            def _finish_and_continue():
+                try:
+                    dialogs_activity.finishFragment()
+                except Exception as finish_error:
+                    pass
+                on_selected(selected_id, selected_title)
+
+            run_on_ui_thread(_finish_and_continue)
+
+        dialogs_activity.setDelegate(DialogsDelegate(_handle_dialog_selected))
+
+        try:
+            last_fragment.presentFragment(dialogs_activity)
+            return True
+        except Exception as e:
+            if not silent:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть выбор чата"))
+            return False
+
+    def _add_rule_via_picker(self, _view=None):
+        self._open_source_picker_for_new_rule()
+
+    def _close_fragment_safe(self, fragment_ref, label: str):
+        if not fragment_ref:
+            return
+        try:
+            removed = self._remove_fragment_from_stack_safe(fragment_ref, label)
+            if not removed:
+                fragment_ref.finishFragment()
+        except Exception as close_error:
+            pass
+
+    def _remove_fragment_from_stack_safe(self, fragment_ref, label: str) -> bool:
+        if not fragment_ref:
+            return False
+        try:
+            if hasattr(fragment_ref, "removeSelfFromStack"):
+                try:
+                    fragment_ref.removeSelfFromStack(True)
+                except TypeError:
+                    fragment_ref.removeSelfFromStack()
+                return True
+        except Exception as remove_error:
+            pass
+            pass
+
+        try:
+            parent_layout = fragment_ref.getParentLayout() if hasattr(fragment_ref, "getParentLayout") else None
+            if parent_layout and hasattr(parent_layout, "removeFragmentFromStack"):
+                try:
+                    parent_layout.removeFragmentFromStack(fragment_ref, True)
+                except TypeError:
+                    parent_layout.removeFragmentFromStack(fragment_ref)
+                return True
+        except Exception as remove_error:
+            pass
+
+        return False
+
+    def _is_dialogs_activity_fragment(self, fragment_ref) -> bool:
+        if not fragment_ref:
+            return False
+        try:
+            class_name = str(fragment_ref.getClass().getName()) if hasattr(fragment_ref, "getClass") else str(type(fragment_ref))
+            return "DialogsActivity" in class_name
+        except Exception:
+            return False
+
+    def _close_rule_add_dialog_stack(self, source_picker=None, to_close: int = 2, retries_left: int = 12):
+        if retries_left <= 0 or to_close <= 0:
+            return
+
+        # First try to forcibly remove stored source picker from stack.
+        if source_picker:
+            if self._remove_fragment_from_stack_safe(source_picker, "source picker"):
+                to_close -= 1
+            source_picker = None
+
+        try:
+            current_fragment = LaunchActivity.getLastFragment()
+            if self._is_dialogs_activity_fragment(current_fragment):
+                self._close_fragment_safe(current_fragment, "top dialogs fragment")
+                to_close -= 1
+        except Exception as e:
+            pass
+
+        if to_close <= 0:
+            return
+
+        threading.Timer(
+            0.10,
+            lambda: run_on_ui_thread(
+                lambda: self._close_rule_add_dialog_stack(None, to_close, retries_left - 1)
+            )
+        ).start()
+
+    def _open_source_picker_for_new_rule(self):
+        last_fragment = LaunchActivity.getLastFragment()
+        if not last_fragment:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть выбор чата"))
+            return
+
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Выберите чат ОТКУДА пересылать"))
+
+        args = Bundle()
+        args.putBoolean("onlySelect", True)
+        args.putBoolean("checkCanWrite", True)
+        args.putInt("dialogsType", 0)
+        args.putBoolean("allowGlobalSearch", True)
+        args.putBoolean("destroyAfterSelect", False)
+
+        source_picker = DialogsActivity(args)
+
+        def _on_source_selected(fragment, dialogs, message, param, notify, scheduleDate, topicsFragment):
+            if dialogs.isEmpty():
+                return
+
+            source_id = int(dialogs.get(0).dialogId)
+            source_title = self._resolve_dialog_title(source_id)
+            self._open_target_picker_for_new_rule(source_picker, source_id, source_title)
+
+        source_picker.setDelegate(DialogsDelegate(_on_source_selected))
+
+        try:
+            last_fragment.presentFragment(source_picker)
+        except Exception as e:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть выбор чата"))
+
+    def _open_target_picker_for_new_rule(self, source_picker, source_id: int, source_title: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Выберите чат КУДА пересылать"))
+
+        args = Bundle()
+        args.putBoolean("onlySelect", True)
+        args.putBoolean("checkCanWrite", True)
+        args.putInt("dialogsType", 0)
+        args.putBoolean("allowGlobalSearch", True)
+        args.putBoolean("destroyAfterSelect", True)
+
+        target_picker = DialogsActivity(args)
+
+        def _on_target_selected(fragment, dialogs, message, param, notify, scheduleDate, topicsFragment):
+            if dialogs.isEmpty():
+                return
+
+            target_id = int(dialogs.get(0).dialogId)
+            target_title = self._resolve_dialog_title(target_id)
+
+            def _close_both_and_save():
+                self._close_fragment_safe(fragment, "target picker delegate fragment")
+                self._close_fragment_safe(target_picker, "target picker")
+                self._close_rule_add_dialog_stack(source_picker, to_close=2, retries_left=12)
+
+                self._on_target_selected_for_new_rule(source_id, source_title, target_id, target_title)
+
+            run_on_ui_thread(_close_both_and_save)
+
+        target_picker.setDelegate(DialogsDelegate(_on_target_selected))
+
+        def _present_target_picker():
+            try:
+                source_picker.presentFragment(target_picker)
+            except Exception as e:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть второй выбор чата"))
+
+        run_on_ui_thread(_present_target_picker)
+
+    def _on_target_selected_for_new_rule(self, source_id: int, source_title: str, target_id: int, target_title: str):
+        if source_id == target_id:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Источник и назначение должны отличаться"))
+            return
+
+        if self._rule_exists(source_id, target_id):
+            run_on_ui_thread(lambda: BulletinHelper.show_info("Такое правило уже существует"))
+            return
+
+        rules = self._get_rules()
+        rule = {
+            "id": self._generate_rule_id(),
+            "source_chat_id": source_id,
+            "target_chat_id": target_id,
+            "source_title": source_title,
+            "target_title": target_title,
+            "enabled": True,
+            "preserve_author": True,
+            "last_error": ""
+        }
+        rule["title"] = self._rule_title(rule)
+        rules.append(rule)
+        self._save_rules(rules, reload_settings=True)
+        run_on_ui_thread(lambda: BulletinHelper.show_success(f"Правило добавлено: {rule['title']}"))
+
+    def _select_source_for_rule(self, rule_id: str):
+        self._open_dialog_picker(lambda source_id, source_title: self._update_rule_source(rule_id, source_id, source_title))
+
+    def _select_target_for_rule(self, rule_id: str):
+        self._open_dialog_picker(lambda target_id, target_title: self._update_rule_target(rule_id, target_id, target_title))
+
+    def _update_rule_source(self, rule_id: str, source_id: int, source_title: str):
+        rules = self._get_rules()
+        updated = False
+        for rule in rules:
+            if rule.get("id") != rule_id:
+                continue
+            if source_id == int(rule.get("target_chat_id")):
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Источник и назначение должны отличаться"))
+                return
+            if self._rule_exists(source_id, int(rule.get("target_chat_id")), exclude_rule_id=rule_id):
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Такое правило уже существует"))
+                return
+            rule["source_chat_id"] = source_id
+            rule["source_title"] = source_title
+            rule["title"] = self._rule_title(rule)
+            rule["last_error"] = ""
+            updated = True
+            break
+
+        if updated:
+            self._save_rules(rules, reload_settings=True)
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Источник обновлен"))
+
+    def _update_rule_target(self, rule_id: str, target_id: int, target_title: str):
+        rules = self._get_rules()
+        updated = False
+        for rule in rules:
+            if rule.get("id") != rule_id:
+                continue
+            if target_id == int(rule.get("source_chat_id")):
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Источник и назначение должны отличаться"))
+                return
+            if self._rule_exists(int(rule.get("source_chat_id")), target_id, exclude_rule_id=rule_id):
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Такое правило уже существует"))
+                return
+            rule["target_chat_id"] = target_id
+            rule["target_title"] = target_title
+            rule["title"] = self._rule_title(rule)
+            rule["last_error"] = ""
+            updated = True
+            break
+
+        if updated:
+            self._save_rules(rules, reload_settings=True)
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Назначение обновлено"))
+
+    def _delete_rule(self, rule_id: str):
+        rules = self._get_rules()
+        new_rules = [rule for rule in rules if rule.get("id") != rule_id]
+        if len(new_rules) == len(rules):
+            return
+        self._save_rules(new_rules, reload_settings=True)
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Правило удалено"))
+
+    def _set_rule_enabled(self, rule_id: str, enabled: bool):
+        rules = self._get_rules()
+        changed = False
+        for rule in rules:
+            if rule.get("id") == rule_id:
+                rule["enabled"] = bool(enabled)
+                changed = True
+                break
+        if changed:
+            self._save_rules(rules, reload_settings=False)
+            state = "enabled" if enabled else "disabled"
+
+    def _set_rule_preserve_author(self, rule_id: str, preserve_author: bool):
+        rules = self._get_rules()
+        changed = False
+        for rule in rules:
+            if rule.get("id") == rule_id:
+                rule["preserve_author"] = bool(preserve_author)
+                changed = True
+                break
+        if changed:
+            self._save_rules(rules, reload_settings=False)
+            state = "on" if preserve_author else "off"
+
+    def _mark_rule_error(self, rule_id: str, error_text: str):
+        rules = self._get_rules()
+        changed = False
+        for rule in rules:
+            if rule.get("id") == rule_id:
+                normalized_error = str(error_text or "")[:300]
+                if rule.get("last_error") != normalized_error:
+                    rule["last_error"] = normalized_error
+                    changed = True
+                break
+        if changed:
+            self._save_rules(rules, reload_settings=False)
+
+    def _clear_rule_error(self, rule_id: str):
+        rules = self._get_rules()
+        changed = False
+        for rule in rules:
+            if rule.get("id") == rule_id and rule.get("last_error"):
+                rule["last_error"] = ""
+                changed = True
+                break
+        if changed:
+            self._save_rules(rules, reload_settings=False)
+
+    def create_settings(self) -> List[Any]:
+        rules = self._get_rules()
+        settings: List[Any] = [
+            Header(text="Общие настройки"),
+            Text(
+                text="Добавить правило",
+                icon="msg_addbot",
+                on_click=self._add_rule_via_picker
+            ),
+            Input(
+                key=self.POLL_INTERVAL_SETTING_KEY,
+                text="Интервал проверки (1–30 сек)",
+                default=str(self._get_poll_interval_seconds()),
+                icon="input_schedule_solar",
+                on_change=lambda value: self._set_poll_interval_seconds(value)
+            ),
+            Divider(),
+            Header(text="Постоянная прослушка")
+        ]
+
+        if not rules:
+            settings.append(Text(text="Правила пока не добавлены.", icon="msg_info"))
+            return settings
+
+        for idx, rule in enumerate(rules):
+            rule_id = str(rule.get("id"))
+            if idx > 0:
+                settings.append(Divider())
+            settings.extend([
+                Header(text=f"Правило #{idx + 1}: {rule.get('title', self._rule_title(rule))}"),
+                SettingsSwitch(
+                    key=f"rule_enabled_{rule_id}",
+                    text="Статус",
+                    default=bool(rule.get("enabled", True)),
+                    icon="filled_folder_new",
+                    on_change=lambda enabled, rid=rule_id: self._set_rule_enabled(rid, enabled)
+                ),
+                Text(
+                    text=f"Откуда: {rule.get('source_title', rule.get('source_chat_id'))}",
+                    icon="chat_calls_outgoing",
+                    on_click=lambda view, rid=rule_id: self._select_source_for_rule(rid)
+                ),
+                Text(
+                    text=f"Куда: {rule.get('target_title', rule.get('target_chat_id'))}",
+                    icon="chat_calls_incoming",
+                    on_click=lambda view, rid=rule_id: self._select_target_for_rule(rid)
+                ),
+                SettingsSwitch(
+                    key=f"rule_preserve_author_{rule_id}",
+                    text="Сохранение автора",
+                    default=bool(rule.get("preserve_author", True)),
+                    icon="camera_revert1",
+                    on_change=lambda value, rid=rule_id: self._set_rule_preserve_author(rid, value)
+                ),
+                Text(
+                    text="Удалить правило",
+                    icon="msg_filled_blocked_solar",
+                    red=True,
+                    on_click=lambda view, rid=rule_id: self._delete_rule(rid)
+                )
+            ])
+
+            last_error = str(rule.get("last_error") or "").strip()
+            if last_error:
+                settings.append(Text(text=f"Последняя ошибка: {last_error}", icon="msg_error", red=True))
+
+        return settings
+
+    def _start_poll_worker(self):
+        if self.poll_thread and self.poll_thread.is_alive():
+            return
+
+        self.poll_stop_event.clear()
+        self.poll_thread = threading.Thread(
+            target=self._poll_worker_loop,
+            daemon=True,
+            name="MessageForwarderPollWorker"
+        )
+        self.poll_thread.start()
+
+    def _stop_poll_worker(self):
+        self.poll_stop_event.set()
+        if self.poll_thread and self.poll_thread.is_alive():
+            self.poll_thread.join(timeout=1.0)
+        self.poll_thread = None
+
+    def _poll_worker_loop(self):
+        while not self.poll_stop_event.is_set():
+            cycle_started_at = time.time()
+            try:
+                self._poll_enabled_sources_once()
+            except Exception as e:
+                pass
+            runtime_interval = self._get_poll_interval_seconds()
+            if runtime_interval != self.poll_interval_seconds:
+                self.poll_interval_seconds = runtime_interval
+            elapsed = time.time() - cycle_started_at
+            wait_seconds = self.poll_interval_seconds - elapsed
+            if wait_seconds < 0:
+                wait_seconds = 0
+            self.poll_stop_event.wait(wait_seconds)
+
+    def _collect_enabled_source_ids(self) -> List[int]:
+        unique_sources: Dict[int, int] = {}
+        for rule in self._get_rules():
+            if not bool(rule.get("enabled", True)):
+                continue
+            try:
+                source_id = int(rule.get("source_chat_id"))
+            except Exception:
+                continue
+            canonical = self._canonical_dialog_id(source_id)
+            if canonical not in unique_sources:
+                unique_sources[canonical] = source_id
+        return list(unique_sources.values())
+
+    def _get_poll_account(self) -> int:
+        if self.current_account >= 0:
+            return int(self.current_account)
+        try:
+            return int(UserConfig.selectedAccount)
+        except Exception:
+            return 0
+
+    def _get_poll_history_timeout_seconds(self) -> float:
+        # Poll interval controls "how often", this controls "how long we wait for one history request".
+        # Keep it short so one slow source does not block all others for 10+ seconds.
+        base_interval = float(self.poll_interval_seconds if self.poll_interval_seconds > 0 else self.POLL_INTERVAL_SECONDS)
+        timeout = base_interval + 1.0
+        if timeout < self.POLL_HISTORY_TIMEOUT_MIN_SECONDS:
+            return self.POLL_HISTORY_TIMEOUT_MIN_SECONDS
+        if timeout > self.POLL_HISTORY_TIMEOUT_MAX_SECONDS:
+            return self.POLL_HISTORY_TIMEOUT_MAX_SECONDS
+        return timeout
+
+    def _fetch_recent_messages_from_source(self, account: int, source_chat_id: int, timeout_seconds: Optional[float] = None) -> List[Any]:
+        input_peer = self._get_input_peer(account, source_chat_id)
+        if not input_peer:
+            return []
+
+        request = TLRPC.TL_messages_getHistory()
+        request.peer = input_peer
+        request.offset_id = 0
+        request.offset_date = 0
+        request.add_offset = 0
+        request.max_id = 0
+        request.min_id = 0
+        request.limit = self.POLL_LIMIT_PER_SOURCE
+        request.hash = 0
+
+        done = threading.Event()
+        holder: Dict[str, Any] = {"messages": [], "error": None}
+
+        def _on_response(response, error):
+            holder["error"] = error
+            if not error and response and hasattr(response, "messages"):
+                try:
+                    holder["messages"] = list(response.messages.toArray()) if hasattr(response.messages, "toArray") else list(response.messages)
+                except Exception:
+                    holder["messages"] = []
+            done.set()
+
+        send_request(request, RequestCallback(_on_response))
+        wait_timeout = float(timeout_seconds) if timeout_seconds is not None else self._get_poll_history_timeout_seconds()
+        done.wait(wait_timeout)
+
+        if not done.is_set():
+            return []
+
+        if holder["error"]:
+            error_text = self._extract_error_text(holder["error"])
+            return []
+
+        return holder["messages"]
+
+    def _poll_single_source(self, account: int, source_chat_id: int, timeout_seconds: Optional[float] = None):
+        messages = self._fetch_recent_messages_from_source(account, source_chat_id, timeout_seconds=timeout_seconds)
+        if not messages:
+            return
+
+        parsed_messages: List[Tuple[int, Any]] = []
+        for message in messages:
+            message_id = int(getattr(message, "id", 0) or 0)
+            if message_id <= 0:
+                continue
+            message_dialog_id = self._extract_message_dialog_id(account, message)
+            if message_dialog_id is None:
+                continue
+            if not self._dialog_ids_equal(message_dialog_id, source_chat_id):
+                continue
+            parsed_messages.append((message_id, message))
+
+        if not parsed_messages:
+            return
+
+        max_message_id = max(item[0] for item in parsed_messages)
+        source_key = self._canonical_dialog_id(source_chat_id)
+        with self.cache_lock:
+            last_seen_message_id = self.source_last_seen_message_ids.get(source_key)
+            if last_seen_message_id is None:
+                self.source_last_seen_message_ids[source_key] = max_message_id
+                return
+
+        if max_message_id <= last_seen_message_id:
+            return
+
+        new_messages = [item for item in parsed_messages if item[0] > last_seen_message_id]
+        if not new_messages:
+            with self.cache_lock:
+                self.source_last_seen_message_ids[source_key] = max_message_id
+            return
+
+        new_messages.sort(key=lambda item: item[0])
+        for _, message in new_messages:
+            self._handle_new_message_update(account, message)
+
+        with self.cache_lock:
+            current_last_seen = self.source_last_seen_message_ids.get(source_key, 0)
+            if max_message_id > current_last_seen:
+                self.source_last_seen_message_ids[source_key] = max_message_id
+
+    def _poll_single_source_safe(self, account: int, source_chat_id: int, timeout_seconds: float):
+        try:
+            self._poll_single_source(account, source_chat_id, timeout_seconds=timeout_seconds)
+        except Exception as e:
+            pass
+
+    def _poll_enabled_sources_once(self):
+        source_ids = self._collect_enabled_source_ids()
+        if not source_ids:
+            return
+
+        account = self._get_poll_account()
+        per_source_timeout = self._get_poll_history_timeout_seconds()
+        if len(source_ids) == 1:
+            if not self.poll_stop_event.is_set():
+                self._poll_single_source_safe(account, source_ids[0], per_source_timeout)
+            return
+
+        # Poll multiple sources in parallel batches so slow sources do not add up linearly.
+        batch_size = max(1, int(self.POLL_MAX_PARALLEL_SOURCES))
+        for batch_start in range(0, len(source_ids), batch_size):
+            if self.poll_stop_event.is_set():
+                return
+
+            batch = source_ids[batch_start:batch_start + batch_size]
+            threads: List[threading.Thread] = []
+
+            for source_chat_id in batch:
+                worker = threading.Thread(
+                    target=lambda sid=source_chat_id: self._poll_single_source_safe(account, sid, per_source_timeout),
+                    daemon=True,
+                    name=f"MessageForwarderSourcePoll-{source_chat_id}"
+                )
+                threads.append(worker)
+                worker.start()
+
+            join_timeout = per_source_timeout + 0.5
+            for worker in threads:
+                worker.join(timeout=join_timeout)
+
+    def _extract_message_text(self, message: Any) -> str:
+        try:
+            text = getattr(message, "message", "")
+            if text is None:
+                return ""
+            return str(text)
+        except Exception:
+            return ""
+
+    def _extract_message_dialog_id(self, account: int, message: Any) -> Optional[int]:
+        try:
+            dialog_id = int(MessageObject.getDialogId(message))
+            if dialog_id:
+                return dialog_id
+        except Exception:
+            pass
+
+        try:
+            dialog_id = int(getattr(message, "dialog_id", 0) or 0)
+            if dialog_id:
+                return dialog_id
+        except Exception:
+            pass
+
+        try:
+            message_object = MessageObject(account, message, False, False)
+            dialog_id = int(message_object.getDialogId())
+            if dialog_id:
+                return dialog_id
+        except Exception:
+            pass
+
+        peer = getattr(message, "peer_id", None)
+        if peer:
+            try:
+                dialog_id = int(DialogObject.getPeerDialogId(peer))
+                if dialog_id:
+                    return dialog_id
+            except Exception:
+                pass
+            channel_id = int(getattr(peer, "channel_id", 0) or 0)
+            if channel_id:
+                return -channel_id
+            chat_id = int(getattr(peer, "chat_id", 0) or 0)
+            if chat_id:
+                return -chat_id
+            user_id = int(getattr(peer, "user_id", 0) or 0)
+            if user_id:
+                return user_id
+        return None
+
+    def _cache_cleanup_locked(self, cache: Dict[Any, float], now: Optional[float] = None):
+        if now is None:
+            now = time.time()
+
+        stale_keys = [key for key, ts in cache.items() if now - ts > self.MAX_CACHE_AGE_SECONDS]
+        for key in stale_keys:
+            cache.pop(key, None)
+
+        overflow = len(cache) - self.MAX_CACHE_SIZE
+        if overflow > 0:
+            oldest_keys = sorted(cache.keys(), key=lambda item: cache[item])[:overflow]
+            for key in oldest_keys:
+                cache.pop(key, None)
+
+    def _cache_contains(self, cache: Dict[Any, float], key: Any) -> bool:
+        now = time.time()
+        with self.cache_lock:
+            self._cache_cleanup_locked(cache, now)
+            return key in cache
+
+    def _cache_add(self, cache: Dict[Any, float], key: Any):
+        now = time.time()
+        with self.cache_lock:
+            cache[key] = now
+            self._cache_cleanup_locked(cache, now)
+
+    def _cache_add_dialog_message(self, cache: Dict[Any, float], dialog_id: int, message_id: int):
+        for dialog_variant in self._dialog_id_variants(dialog_id):
+            self._cache_add(cache, (dialog_variant, message_id))
+
+    def _cache_contains_dialog_message(self, cache: Dict[Any, float], dialog_id: int, message_id: int) -> bool:
+        for dialog_variant in self._dialog_id_variants(dialog_id):
+            if self._cache_contains(cache, (dialog_variant, message_id)):
+                return True
+        return False
+
+    def _mark_pending_outgoing_text(self, chat_id: int, text: str):
+        if not text:
+            return
+        now = time.time()
+        with self.cache_lock:
+            for dialog_variant in self._dialog_id_variants(chat_id):
+                key = (int(dialog_variant), text[:512])
+                current = self.pending_outgoing_text_cache.get(key, {"count": 0, "expire_at": 0.0})
+                current["count"] = int(current.get("count", 0)) + 1
+                current["expire_at"] = now + self.PENDING_TEXT_AGE_SECONDS
+                self.pending_outgoing_text_cache[key] = current
+
+            stale = [k for k, entry in self.pending_outgoing_text_cache.items() if now > float(entry.get("expire_at", 0.0))]
+            for stale_key in stale:
+                self.pending_outgoing_text_cache.pop(stale_key, None)
+
+    def _consume_pending_outgoing_text(self, chat_id: int, text: str) -> bool:
+        if not text:
+            return False
+        now = time.time()
+        with self.cache_lock:
+            stale = [k for k, entry in self.pending_outgoing_text_cache.items() if now > float(entry.get("expire_at", 0.0))]
+            for stale_key in stale:
+                self.pending_outgoing_text_cache.pop(stale_key, None)
+
+            for dialog_variant in self._dialog_id_variants(chat_id):
+                key = (int(dialog_variant), text[:512])
+                current = self.pending_outgoing_text_cache.get(key)
+                if not current:
+                    continue
+
+                count = int(current.get("count", 0))
+                if count <= 0:
+                    self.pending_outgoing_text_cache.pop(key, None)
+                    continue
+
+                count -= 1
+                if count <= 0:
+                    self.pending_outgoing_text_cache.pop(key, None)
+                else:
+                    current["count"] = count
+                    self.pending_outgoing_text_cache[key] = current
+                return True
+            return False
+
+    def _extract_error_text(self, error: Any) -> str:
+        if not error:
+            return "Unknown error"
+        for field in ("text", "message"):
+            value = getattr(error, field, None)
+            if value:
+                return str(value)
+        return str(error)
+
+    def _build_forward_request(self, from_peer: Any, to_peer: Any, message_ids: List[int], drop_author: bool):
+        request = TLRPC.TL_messages_forwardMessages()
+        request.from_peer = from_peer
+        request.to_peer = to_peer
+        request.flags = 0
+        request.drop_author = bool(drop_author)
+
+        id_list = ArrayList()
+        random_id_list = ArrayList()
+        for msg_id in message_ids:
+            id_list.add(JInteger(int(msg_id)))
+            random_id_list.add(Utilities.random.nextLong())
+        request.id = id_list
+        request.random_id = random_id_list
+        return request
+
+    def _send_request_sync(self, request: Any, timeout_seconds: float = 60.0) -> Tuple[Any, Any, bool]:
+        done = threading.Event()
+        holder: Dict[str, Any] = {"response": None, "error": None}
+
+        def _on_response(response, error):
+            holder["response"] = response
+            holder["error"] = error
+            done.set()
+
+        send_request(request, RequestCallback(_on_response))
+        completed = done.wait(timeout_seconds)
+        return holder.get("response"), holder.get("error"), completed
+
+    def _extract_flood_wait_seconds(self, error_text: str) -> Optional[int]:
+        text = str(error_text or "").upper()
+        for pattern in (r"FLOOD_WAIT_?(\d+)", r"A WAIT OF (\d+)", r"TRY AGAIN IN (\d+)"):
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return max(1, int(match.group(1)))
+                except Exception:
+                    return None
+        return None
+
+    def _is_non_retryable_forward_error(self, error_text: str) -> bool:
+        text = str(error_text or "").upper()
+        non_retryable_markers = (
+            "CHAT_WRITE_FORBIDDEN",
+            "CHAT_ADMIN_REQUIRED",
+            "CHANNEL_PRIVATE",
+            "PEER_ID_INVALID",
+            "MESSAGE_ID_INVALID",
+            "MESSAGE_NOT_MODIFIED",
+            "USER_BANNED_IN_CHANNEL",
+            "CHAT_FORWARDS_RESTRICTED",
+            "CHAT_SEND_MEDIA_FORBIDDEN",
+            "CHAT_SEND_STICKERS_FORBIDDEN",
+            "CHAT_SEND_GIFS_FORBIDDEN",
+            "CHAT_SEND_INLINE_FORBIDDEN",
+        )
+        return any(marker in text for marker in non_retryable_markers)
+
+    def _compute_retry_delay_seconds(self, error_text: str, attempt: int) -> float:
+        flood_wait = self._extract_flood_wait_seconds(error_text)
+        if flood_wait is not None:
+            return float(min(self.FORWARD_RETRY_MAX_DELAY_SECONDS, flood_wait + 1))
+        base = max(1.0, float(attempt))
+        return float(min(self.FORWARD_RETRY_MAX_DELAY_SECONDS, base))
+
+    def _should_retry_live_forward_error(self, error_text: str, attempt: int) -> bool:
+        if attempt >= self.AUTO_FORWARD_MAX_ATTEMPTS:
+            return False
+        if self._is_non_retryable_forward_error(error_text):
+            return False
+        return True
+
+    def _forward_chunk_with_retries(
+        self,
+        account: int,
+        source_chat_id: int,
+        target_chat_id: int,
+        message_ids: List[int],
+        preserve_author: bool,
+        max_attempts: int
+    ) -> Tuple[bool, str, Any]:
+        if not message_ids:
+            return True, "", None
+
+        from_peer = self._get_input_peer(account, source_chat_id)
+        to_peer = self._get_input_peer(account, target_chat_id)
+        if not from_peer or not to_peer:
+            return False, "Unable to resolve source or target peer", None
+
+        attempts = max(1, int(max_attempts))
+        last_error_text = ""
+        last_response = None
+
+        for attempt in range(1, attempts + 1):
+            request = self._build_forward_request(
+                from_peer=from_peer,
+                to_peer=to_peer,
+                message_ids=message_ids,
+                drop_author=not preserve_author
+            )
+            response, error, completed = self._send_request_sync(request, timeout_seconds=70.0)
+            last_response = response
+
+            if completed and not error:
+                return True, "", response
+
+            if not completed:
+                last_error_text = "Forward request timeout"
+            else:
+                last_error_text = self._extract_error_text(error)
+
+            if attempt >= attempts or self._is_non_retryable_forward_error(last_error_text):
+                break
+
+            retry_delay = self._compute_retry_delay_seconds(last_error_text, attempt)
+            waited = 0.0
+            while waited < retry_delay:
+                if self.stop_event.is_set():
+                    return False, last_error_text, last_response
+                sleep_chunk = min(0.25, retry_delay - waited)
+                time.sleep(sleep_chunk)
+                waited += sleep_chunk
+
+        return False, last_error_text, last_response
+
+    def _get_input_peer(self, account: int, dialog_id: int):
+        for dialog_variant in self._dialog_id_variants(dialog_id):
+            try:
+                input_peer = MessagesController.getInstance(account).getInputPeer(dialog_variant)
+                if input_peer:
+                    return input_peer
+            except Exception:
+                pass
+            try:
+                input_peer = get_messages_controller().getInputPeer(dialog_variant)
+                if input_peer:
+                    return input_peer
+            except Exception:
+                pass
+        return None
+
+    def _collect_messages_from_response(self, account: int, response: Any) -> List[Tuple[int, int]]:
+        messages = []
+        result_keys: List[Tuple[int, int]] = []
+
+        updates_field = getattr(response, "updates", None)
+        if updates_field is not None:
+            try:
+                update_items = list(updates_field.toArray()) if hasattr(updates_field, "toArray") else list(updates_field)
+            except Exception:
+                update_items = []
+            for upd in update_items:
+                message = getattr(upd, "message", None)
+                if message is not None:
+                    messages.append(message)
+
+        messages_field = getattr(response, "messages", None)
+        if messages_field is not None:
+            try:
+                message_items = list(messages_field.toArray()) if hasattr(messages_field, "toArray") else list(messages_field)
+            except Exception:
+                message_items = []
+            for message in message_items:
+                messages.append(message)
+
+        for message in messages:
+            dialog_id = self._extract_message_dialog_id(account, message)
+            message_id = int(getattr(message, "id", 0) or 0)
+            if dialog_id is not None and message_id > 0:
+                result_keys.append((dialog_id, message_id))
+        return result_keys
+
+    def _fallback_send_as_text(self, target_chat_id: int, original_message: Any, rule_id: str, error_text: str):
+        text = self._extract_message_text(original_message)
+        if not text:
+            return
+
+        try:
+            self._mark_pending_outgoing_text(target_chat_id, text)
+            send_message({
+                "peer": int(target_chat_id),
+                "message": text
+            })
+        except Exception as fallback_error:
+            self._mark_rule_error(rule_id, f"{error_text}; fallback failed: {fallback_error}")
+
+    def _retry_live_forward(self, account: int, original_message: Any, rule_id: str, attempt: int):
+        current_rule = self._find_rule(rule_id)
+        if not current_rule:
+            return
+        if not bool(current_rule.get("enabled", True)):
+            return
+        self._forward_message_for_rule(account, original_message, current_rule, attempt)
+
+    def _on_forward_response(self, account: int, rule_id: str, source_chat_id: int, target_chat_id: int, original_message: Any, attempt: int, response: Any, error: Any):
+        if error:
+            error_text = self._extract_error_text(error)
+            if self._should_retry_live_forward_error(error_text, attempt):
+                retry_delay = self._compute_retry_delay_seconds(error_text, attempt)
+                threading.Timer(
+                    retry_delay,
+                    lambda: self._retry_live_forward(account, original_message, rule_id, attempt + 1)
+                ).start()
+                return
+
+            self._mark_rule_error(rule_id, error_text)
+            self._fallback_send_as_text(target_chat_id, original_message, rule_id, error_text)
+            return
+
+        for cache_key in self._collect_messages_from_response(account, response):
+            self._cache_add_dialog_message(self.forwarded_by_plugin_cache, cache_key[0], cache_key[1])
+
+        self._clear_rule_error(rule_id)
+
+    def _forward_message_for_rule(self, account: int, message: Any, rule: Dict[str, Any], attempt: int = 1):
+        source_chat_id = int(rule.get("source_chat_id"))
+        target_chat_id = int(rule.get("target_chat_id"))
+        preserve_author = bool(rule.get("preserve_author", True))
+        message_id = int(getattr(message, "id", 0) or 0)
+        rule_id = str(rule.get("id"))
+
+        if message_id <= 0:
+            return
+
+        from_peer = self._get_input_peer(account, source_chat_id)
+        to_peer = self._get_input_peer(account, target_chat_id)
+        if not from_peer or not to_peer:
+            error_text = "Unable to resolve source or target peer"
+            self._mark_rule_error(rule_id, error_text)
+            return
+
+        request = self._build_forward_request(
+            from_peer=from_peer,
+            to_peer=to_peer,
+            message_ids=[message_id],
+            drop_author=not preserve_author
+        )
+
+        send_request(
+            request,
+            RequestCallback(
+                lambda response, error: self._on_forward_response(
+                    account,
+                    rule_id,
+                    source_chat_id,
+                    target_chat_id,
+                    message,
+                    attempt,
+                    response,
+                    error
+                )
+            )
+        )
+
+    def _get_matching_rules(self, chat_id: int) -> List[Dict[str, Any]]:
+        matches: List[Dict[str, Any]] = []
+        for rule in self._get_rules():
+            try:
+                rule_source = int(rule.get("source_chat_id"))
+            except Exception:
+                continue
+            if self._dialog_ids_equal(rule_source, chat_id):
+                matches.append(rule)
+        return matches
+
+    def _handle_new_message_update(self, account: int, message: Any):
+        chat_id = self._extract_message_dialog_id(account, message)
+        message_id = int(getattr(message, "id", 0) or 0)
+        if chat_id is None or message_id <= 0:
+            return
+
+        message_text = self._extract_message_text(message)
+        if self._consume_pending_outgoing_text(chat_id, message_text):
+            return
+
+        if self._cache_contains_dialog_message(self.forwarded_by_plugin_cache, chat_id, message_id):
+            return
+
+        if self._cache_contains_dialog_message(self.recent_source_message_cache, chat_id, message_id):
+            return
+        self._cache_add_dialog_message(self.recent_source_message_cache, chat_id, message_id)
+
+        matched_rules = self._get_matching_rules(chat_id)
+        if not matched_rules:
+            return
+
+        for rule in matched_rules:
+            if not bool(rule.get("enabled", True)):
+                continue
+            self._forward_message_for_rule(account, message, rule)
+
+    def _extract_messages_from_updates_container(self, updates: Any) -> List[Any]:
+        messages: List[Any] = []
+        updates_field = getattr(updates, "updates", None)
+        if updates_field is None:
+            return messages
+
+        try:
+            update_items = list(updates_field.toArray()) if hasattr(updates_field, "toArray") else list(updates_field)
+        except Exception:
+            update_items = []
+
+        for upd in update_items:
+            message = getattr(upd, "message", None)
+            if message is not None:
+                messages.append(message)
+        return messages
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        result = HookResult()
+        try:
+            if "update" not in str(update_name).lower():
+                return result
+
+            message = getattr(update, "message", None)
+            if message is None:
+                return result
+
+            self._handle_new_message_update(account, message)
+        except Exception as e:
+            pass
+        return result
+
+    def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
+        result = HookResult()
+        try:
+            for message in self._extract_messages_from_updates_container(updates):
+                self._handle_new_message_update(account, message)
+        except Exception as e:
+            pass
+        return result
+
+    def on_forward_history_click(self, context: dict):
+        if self.is_running:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Процесс пересылки уже запущен."))
+            self._show_progress_dialog()
+            return
+            
+        def action():
+            try:
+                if not context or not hasattr(context, 'containsKey'):
+                    BulletinHelper.show_error("Ошибка: не удалось получить контекст меню.")
+                    return
+
+                self.current_account = context.get("account") if context.containsKey("account") else UserConfig.selectedAccount
+                source_dialog_id = context.get("dialog_id") if context.containsKey("dialog_id") else None
+                
+                if not source_dialog_id:
+                    BulletinHelper.show_error("Не удалось определить исходный чат.")
+                    return
+                self.open_chat_selection(source_dialog_id)
+            except Exception as e:
+                _log_critical(f"[Forwarder] Критическая ошибка: {e}\n{traceback.format_exc()}")
+        run_on_ui_thread(action)
+
+    def open_chat_selection(self, source_dialog_id: int):
+        last_fragment = LaunchActivity.getLastFragment()
+        if not last_fragment:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть список чатов"))
+            return
+
+        args = Bundle()
+        args.putBoolean("onlySelect", True)
+        args.putBoolean("checkCanWrite", True)
+        args.putInt("dialogsType", 0)
+        args.putBoolean("allowGlobalSearch", True)
+        args.putBoolean("destroyAfterSelect", True)
+
+        dialogs_activity = DialogsActivity(args)
+        dialogs_activity.setDelegate(DialogsDelegate(
+            lambda fragment, dialogs, message, param, notify, scheduleDate, topicsFragment:
+                self._on_dialog_selected(source_dialog_id, dialogs_activity, fragment, dialogs, message, param, notify, scheduleDate, topicsFragment)
+        ))
+
+        try:
+            last_fragment.presentFragment(dialogs_activity)
+        except Exception as e:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось открыть выбор чата"))
+
+    def _on_dialog_selected(self, source_dialog_id: int, activity, fragment, dialogs, message, param, notify, scheduleDate, topicsFragment):
+        activity.finishFragment()
+        if dialogs.isEmpty():
+            return
+        target_dialog_id = dialogs.get(0).dialogId
+        run_on_ui_thread(lambda: self.show_settings_dialog(source_dialog_id, target_dialog_id))
+
+    def show_settings_dialog(self, source_dialog_id: int, target_dialog_id: int):
+        fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
+        if not activity: return
+
+        builder = AlertDialogBuilder(activity); builder.set_title("Настройки пересылки")
+        layout = LinearLayout(activity); layout.setOrientation(LinearLayout.VERTICAL)
+        pad = AndroidUtilities.dp(24); layout.setPadding(pad, AndroidUtilities.dp(16), pad, AndroidUtilities.dp(16))
+        textColor = Theme.getColor(Theme.key_dialogTextBlack); hintColor = Theme.getColor(Theme.key_dialogTextHint)
+
+        def add_view(view, top=16):
+            params = LinearLayout.LayoutParams(-1, -2)
+            params.topMargin = AndroidUtilities.dp(top)
+            layout.addView(view, params)
+
+        # 1. Количество сообщений
+        limit_label = TextView(activity)
+        limit_label.setText("Количество сообщений")
+        limit_label.setTextColor(textColor)
+        add_view(limit_label, 0)
+
+        limit_input = EditText(activity)
+        limit_input.setHint("Пусто = вся история")
+        limit_input.setInputType(InputType.TYPE_CLASS_NUMBER)
+        limit_input.setTextColor(textColor)
+        limit_input.setHintTextColor(hintColor)
+        add_view(limit_input, 4)
+
+        # 2. Размер куска
+        chunk_size_label = TextView(activity)
+        chunk_size_label.setText("Размер куска: 50")
+        chunk_size_label.setGravity(Gravity.CENTER_HORIZONTAL)
+        chunk_size_label.setTextColor(textColor)
+        add_view(chunk_size_label, 16)
+
+        chunk_seekbar = SeekBar(activity)
+        chunk_seekbar.setMax(99)
+        chunk_seekbar.setProgress(49)
+        add_view(chunk_seekbar, 4)
+
+        class SeekBarListener(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
+            def __init__(self, label): super().__init__(); self.label = label
+            def onProgressChanged(self, s, p, f): self.label.setText(f"Размер куска: {p + 1}")
+            def onStartTrackingTouch(self, s): pass
+            def onStopTrackingTouch(self, s): pass
+        chunk_seekbar.setOnSeekBarChangeListener(SeekBarListener(chunk_size_label))
+
+        # 3. Задержка
+        delay_label = TextView(activity)
+        delay_label.setText("Задержка между кусками (сек)")
+        delay_label.setTextColor(textColor)
+        add_view(delay_label, 16)
+
+        delay_input = EditText(activity)
+        delay_input.setText("10")
+        delay_input.setInputType(InputType.TYPE_CLASS_NUMBER)
+        delay_input.setTextColor(textColor)
+        delay_input.setHintTextColor(hintColor)
+        add_view(delay_input, 4)
+
+        # 4. Скрыть имя отправителя
+        hide_author_switch = AndroidSwitch(activity)
+        hide_author_switch.setText("Скрыть имя отправителя")
+        hide_author_switch.setChecked(False)
+        hide_author_switch.setTextColor(textColor)
+        add_view(hide_author_switch, 16)
+
+        builder.set_view(layout)
+
+        def on_start_click(bld, which):
+            self.stop_event.clear()
+            delay_str = str(delay_input.getText())
+            delay = int(delay_str) if delay_str.isdigit() and int(delay_str) > 0 else 10
+            chunk_size = chunk_seekbar.getProgress() + 1
+            
+            hide_author = hide_author_switch.isChecked()
+
+            limit_str = str(limit_input.getText()).strip()
+            limit = int(limit_str) if limit_str.isdigit() and int(limit_str) > 0 else 0
+
+            self._start_forwarding_process(source_dialog_id, target_dialog_id, hide_author, delay, chunk_size, limit)
+            bld.dismiss()
+
+        builder.set_positive_button("Начать", on_start_click)
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.show()
+
+    def _start_forwarding_process(self, source_id, target_id, hide_author, delay, chunk_size, limit: int):
+        self.is_running = True; self.is_paused = False; self.is_in_background = False; self.stop_event.clear()
+        self._show_progress_dialog()
+        threading.Thread(target=self._forwarding_worker, args=(source_id, target_id, hide_author, delay, chunk_size, limit), daemon=True).start()
+
+    def _forwarding_worker(self, source_id, target_id, hide_author, delay, chunk_size, limit: int):
+        # Здесь мы храним полные объекты сообщений (TLRPC.Message)
+        all_messages = [] 
+        try:
+            offset_id = 0
+            total_to_fetch = limit if limit > 0 else float('inf')
+
+            # 1. Сбор сообщений
+            while len(all_messages) < total_to_fetch and not self.stop_event.is_set():
+                while self.is_paused and not self.stop_event.is_set():
+                    time.sleep(0.5)
+                    self._update_progress_ui(len(all_messages), int(total_to_fetch) if total_to_fetch != float('inf') else 0, "На паузе...")
+
+                status_msg = f"Собираю историю... ({len(all_messages)})"
+                self._update_progress_ui(len(all_messages), int(total_to_fetch) if total_to_fetch != float('inf') else 0, status_msg)
+
+                history_event = threading.Event(); message_chunk = []
+                def on_history_loaded(msgs): nonlocal message_chunk; message_chunk = msgs; history_event.set()
+                
+                # Получаем объекты сообщений
+                self.get_message_history_objects_async(source_id, offset_id, 100, on_history_loaded)
+                history_event.wait(20)
+
+                if not message_chunk:
+                    break
+
+                all_messages.extend(message_chunk)
+                # Берем ID последнего сообщения для следующего запроса
+                offset_id = message_chunk[-1].id 
+
+                if limit > 0 and len(all_messages) >= limit:
+                    all_messages = all_messages[:limit]
+                    break
+
+            if self.stop_event.is_set():
+                raise InterruptedError()
+
+            # Разворачиваем, чтобы отправлять от старых к новым
+            all_messages.reverse()
+            all_message_ids = [int(getattr(msg, "id", 0) or 0) for msg in all_messages]
+            all_message_ids = [msg_id for msg_id in all_message_ids if msg_id > 0]
+            total_messages = len(all_message_ids)
+            account = self.current_account if self.current_account >= 0 else self._get_poll_account()
+            failed_message_ids: List[int] = []
+
+            # 2. Отправка сообщений
+            if hide_author:
+                # Без сохранения автора отправляем по одному с ретраями и подтверждением ответа.
+                for i, msg_id in enumerate(all_message_ids):
+                    if self.stop_event.is_set(): break
+                    while self.is_paused and not self.stop_event.is_set():
+                        time.sleep(0.5)
+                        self._update_progress_ui(i, total_messages, f"На паузе ({i}/{total_messages})")
+
+                    self._update_progress_ui(i + 1, total_messages, f"Копирую {i + 1} из {total_messages}...")
+
+                    success, error_text, _ = self._forward_chunk_with_retries(
+                        account=account,
+                        source_chat_id=source_id,
+                        target_chat_id=target_id,
+                        message_ids=[msg_id],
+                        preserve_author=False,
+                        max_attempts=self.MANUAL_FORWARD_MAX_ATTEMPTS
+                    )
+                    if not success:
+                        failed_message_ids.append(msg_id)
+
+                    if i + 1 < total_messages and not self.stop_event.is_set():
+                        time.sleep(delay if delay > 0.5 else 0.5)
+
+            else:
+                # РСЃРїРѕР»СЊР·СѓРµРј forwardMessages РїР°С‡РєР°РјРё (РІРѕ РІСЂРµРјСЏ РѕР±С‹С‡ РїРµСЂРµСЃС‹Р»РєРё РєС‚Рѕ РЅРµ РїРѕРЅСЏР»)
+                for i in range(0, total_messages, chunk_size):
+                    if self.stop_event.is_set(): break
+                    while self.is_paused and not self.stop_event.is_set():
+                        time.sleep(0.5)
+                        self._update_progress_ui(i, total_messages, f"На паузе ({i}/{total_messages})")
+
+                    current_chunk = all_message_ids[i:i + chunk_size]
+                    status_msg = f"Пересылаю {i + len(current_chunk)} из {total_messages}..."
+                    self._update_progress_ui(i + len(current_chunk), total_messages, status_msg)
+
+                    success, error_text, _ = self._forward_chunk_with_retries(
+                        account=account,
+                        source_chat_id=source_id,
+                        target_chat_id=target_id,
+                        message_ids=current_chunk,
+                        preserve_author=True,
+                        max_attempts=self.MANUAL_FORWARD_MAX_ATTEMPTS
+                    )
+                    if not success:
+                        failed_message_ids.extend(current_chunk)
+
+                    if i + chunk_size < total_messages and not self.stop_event.is_set():
+                        time.sleep(delay)
+
+            if not self.stop_event.is_set():
+                if failed_message_ids:
+                    failed_count = len(failed_message_ids)
+                    run_on_ui_thread(lambda: BulletinHelper.show_info(f"Пересылка завершена с пропусками: {failed_count}"))
+                else:
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Пересылка завершена!"))
+
+        except InterruptedError:
+            run_on_ui_thread(lambda: BulletinHelper.show_info("Пересылка отменена."))
+        except Exception as e:
+            _log_critical(f"[Forwarder] Ошибка: {e}\n{traceback.format_exc()}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {e}"))
+        finally:
+            self.is_running = False; self.is_paused = False
+            run_on_ui_thread(lambda: self._cleanup_ui())
+
+    def _update_progress_ui(self, current, total, status_msg):
+        def action():
+            dialog = self.progress_dialog_builder.get_dialog() if self.progress_dialog_builder else None
+            if dialog and dialog.isShowing():
+                self.status_text.setText(status_msg)
+                if total > 0:
+                    self.progress_bar.setMax(total)
+                    self.progress_bar.setProgress(current)
+                self.pause_button.setText("Продолжить" if self.is_paused else "Пауза")
+            if self.is_in_background:
+                self._update_notification(current, total if total > 0 else 1, status_msg)
+        run_on_ui_thread(action)
+
+    def _show_progress_dialog(self):
+        self.is_in_background = False
+        if self.progress_dialog_builder and self.progress_dialog_builder.get_dialog() and self.progress_dialog_builder.get_dialog().isShowing():
+            return
+        self._cancel_notification()
+
+        fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
+        if not activity: return
+
+        builder = AlertDialogBuilder(activity); builder.set_title("Пересылка сообщений")
+        layout = LinearLayout(activity); layout.setOrientation(LinearLayout.VERTICAL)
+        pad = AndroidUtilities.dp(24); layout.setPadding(pad, pad, pad, pad)
+        self.status_text = TextView(activity); self.status_text.setText("Подготовка..."); self.status_text.setTextColor(Theme.getColor(Theme.key_dialogTextBlack)); self.status_text.setTextSize(16); layout.addView(self.status_text)
+
+        if self.R_attr:
+            self.progress_bar = ProgressBar(activity, None, self.R_attr.progressBarStyleHorizontal)
+        else:
+            self.progress_bar = ProgressBar(activity)
+        params = LinearLayout.LayoutParams(-1, -2); params.topMargin = AndroidUtilities.dp(16); layout.addView(self.progress_bar, params)
+        builder.set_view(layout)
+
+        def handle_pause(b, w): self.is_paused = not self.is_paused
+        def handle_cancel(b, w): self.stop_event.set(); b.dismiss()
+        def handle_background(b, w):
+            self.is_in_background = True
+            b.get_dialog().dismiss()
+            status = str(self.status_text.getText()) if self.status_text else "Пересылка в фоне..."
+            self._show_notification(self.progress_bar.getProgress(), self.progress_bar.getMax(), status)
+
+        builder.set_neutral_button("В фон", handle_background)
+        builder.set_negative_button("Отмена", handle_cancel)
+        builder.set_positive_button("Пауза", handle_pause)
+
+        self.progress_dialog_builder = builder.show()
+        self.progress_dialog_builder.set_cancelable(False)
+        self.pause_button = self.progress_dialog_builder.get_button(AlertDialog.BUTTON_POSITIVE)
+
+    def _create_notification_channel(self):
+        try:
+            Build = find_class("android.os.Build")
+            if Build.VERSION.SDK_INT >= Build.VERSION_CODES.O:
+                NotificationManager = find_class("android.app.NotificationManager")
+                NotificationChannel = find_class("android.app.NotificationChannel")
+                app_context = ApplicationLoader.applicationContext
+                channel = NotificationChannel("forwarder_channel", "Пересылка сообщений", NotificationManager.IMPORTANCE_LOW)
+                app_context.getSystemService("notification").createNotificationChannel(channel)
+        except Exception as e:
+            pass
+
+    def _show_notification(self, current, total, text):
+        try:
+            NotificationManagerCompat = find_class("androidx.core.app.NotificationManagerCompat")
+            NotificationCompat_Builder = find_class("androidx.core.app.NotificationCompat$Builder")
+            Intent = find_class("android.content.Intent")
+            PendingIntent = find_class("android.app.PendingIntent")
+            app_context = ApplicationLoader.applicationContext
+
+            return_intent = Intent(self.ACTION_SHOW); return_intent.setPackage(app_context.getPackageName())
+            pending_return = PendingIntent.getBroadcast(app_context, 1, return_intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+
+            builder = NotificationCompat_Builder(app_context, "forwarder_channel")
+            builder.setSmallIcon(R.drawable.msg_forward)
+            builder.setContentTitle("Пересылка истории")
+            builder.setContentText(text)
+            builder.setProgress(total, current, False)
+            builder.setContentIntent(pending_return)
+            builder.setOngoing(True)
+
+            NotificationManagerCompat.from_(app_context).notify(self.notification_id, builder.build())
+        except Exception as e:
+            pass
+
+    def _update_notification(self, current, total, text):
+        if self.is_in_background: self._show_notification(current, total, text)
+
+    def _cancel_notification(self):
+        try:
+            NotificationManagerCompat = find_class("androidx.core.app.NotificationManagerCompat")
+            NotificationManagerCompat.from_(ApplicationLoader.applicationContext).cancel(self.notification_id)
+        except Exception as e:
+            pass
+
+    def _cleanup_ui(self):
+        if self.progress_dialog_builder and self.progress_dialog_builder.get_dialog() and self.progress_dialog_builder.get_dialog().isShowing():
+            self.progress_dialog_builder.get_dialog().dismiss()
+        self.progress_dialog_builder = None
+        self._cancel_notification()
+
+    def get_message_history_objects_async(self, dialog_id, offset_id, limit, callback):
+        request = TLRPC.TL_messages_getHistory()
+        request.peer = get_messages_controller().getInputPeer(dialog_id)
+        if not request.peer:
+            callback([])
+            return
+        request.offset_id = offset_id
+        request.limit = limit
+
+        def on_response(response, error):
+            if error:
+                callback([])
+                return
+            # Возвращаем список объектов TLRPC.Message
+            messages = list(response.messages.toArray()) if hasattr(response, 'messages') else []
+            callback(messages)
+
+        send_request(request, RequestCallback(on_response))
+
+    def _register_broadcast_receiver(self):
+        try:
+            IntentFilter = find_class("android.content.IntentFilter")
+            BroadcastReceiver = find_class("android.content.BroadcastReceiver")
+            app_context = ApplicationLoader.applicationContext
+
+            class ForwarderNotificationReceiver(dynamic_proxy(BroadcastReceiver)):
+                def __init__(self, plugin_instance): super().__init__(); self.plugin = plugin_instance
+                def onReceive(self, context, intent):
+                    if intent.getAction() == self.plugin.ACTION_SHOW:
+                        run_on_ui_thread(self.plugin._show_progress_dialog)
+
+            self.broadcast_receiver = ForwarderNotificationReceiver(self)
+            intent_filter = IntentFilter(self.ACTION_SHOW)
+            app_context.registerReceiver(self.broadcast_receiver, intent_filter)
+        except Exception as e:
+            pass
+
+    def _unregister_broadcast_receiver(self):
+        if self.broadcast_receiver:
+            try:
+                ApplicationLoader.applicationContext.unregisterReceiver(self.broadcast_receiver)
+                self.broadcast_receiver = None
+            except Exception as e:
+                pass
+    def on_plugin_unload(self):
+        self._stop_poll_worker()
+        self.stop_event.set()
+        self._unregister_broadcast_receiver()
