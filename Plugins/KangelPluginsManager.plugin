@@ -60,12 +60,127 @@ from android.text import SpannableString, Spanned, TextWatcher, TextUtils
 from android.text.style import StrikethroughSpan
 from android.util import TypedValue
 from android.view import Gravity, View, ViewGroup
+import threading
+import urllib.request
+import uuid
+
+
+MKSTATS_API_URL = os.getenv("MKSTATS_API_URL", "https://mkstats.mk69.su/api")
+MKSTATS_PING_INTERVAL = int(os.getenv("MKSTATS_PING_INTERVAL", "1500"))
+MKSTATS_POW_SOLVE_SECONDS = int(os.getenv("MKSTATS_POW_SOLVE_SECONDS", "6"))
+
+def generate_user_hash(device_id: str, plugin_id: str) -> str:
+    payload = f"{device_id}:{plugin_id}:mkstats:v1"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def generate_device_fingerprint(device_id: str) -> str:
+    payload = f"{device_id}:mkstats:device:v1"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def _normalize_api_base(api_url: str) -> str:
+    base = api_url.rstrip("/")
+    if base.endswith("/api"):
+        return f"{base}/v1"
+    return base
+
+def _post_json(url: str, payload: dict) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body)
+
+def _pow_valid(challenge: str, nonce: str, difficulty: int) -> bool:
+    if not challenge or not nonce or difficulty <= 0:
+        return False
+    prefix = "0" * max(1, int(difficulty))
+    digest = hashlib.sha256(f"{challenge}:{nonce}".encode("utf-8")).hexdigest()
+    return digest.startswith(prefix)
+
+def _solve_pow(challenge: str, difficulty: int, max_seconds: int = MKSTATS_POW_SOLVE_SECONDS) -> str | None:
+    difficulty = max(1, int(difficulty or 0))
+    deadline = time.time() + max(1, int(max_seconds or 0))
+    nonce = 0
+    prefix = "0" * difficulty
+    while time.time() < deadline:
+        candidate = format(nonce, "x")
+        digest = hashlib.sha256(f"{challenge}:{candidate}".encode("utf-8")).hexdigest()
+        if digest.startswith(prefix):
+            return candidate
+        nonce += 1
+    return None
+
+class MkStatsCoreClient:
+    def __init__(self, api_url: str, plugin_id: str, plugin_version: str, user_hash: str, device_fingerprint: str, client_version: str | None = None, client_name: str | None = None) -> None:
+        self.api_base = _normalize_api_base(api_url)
+        self.plugin_id = plugin_id
+        self.plugin_version = plugin_version
+        self.client_version = client_version
+        self.client_name = client_name
+        self.user_hash = user_hash
+        self.device_fingerprint = device_fingerprint
+
+    def handshake(self) -> dict:
+        payload = {
+            "plugin_id": self.plugin_id,
+            "version": self.plugin_version,
+            "client_name": self.client_name,
+            "client_version": self.client_version,
+            "user_hash": self.user_hash,
+            "device_fingerprint": self.device_fingerprint,
+        }
+        response = _post_json(f"{self.api_base}/handshake", payload)
+        token = (response or {}).get("install_token", "")
+        if token:
+            return response
+        pow_required = bool((response or {}).get("pow_required"))
+        pow_challenge = (response or {}).get("pow_challenge")
+        if pow_required and pow_challenge:
+            difficulty = int((response or {}).get("pow_difficulty") or 0)
+            nonce = _solve_pow(pow_challenge, difficulty)
+            if nonce and _pow_valid(pow_challenge, nonce, difficulty):
+                payload["pow_challenge"] = pow_challenge
+                payload["pow_nonce"] = nonce
+                response = _post_json(f"{self.api_base}/handshake", payload)
+        return response
+
+    def send_ping(self, install_token: str, timestamp=None) -> dict:
+        payload = {
+            "plugin_id": self.plugin_id,
+            "version": self.plugin_version,
+            "client_name": self.client_name,
+            "client_version": self.client_version,
+            "user_hash": self.user_hash,
+            "device_fingerprint": self.device_fingerprint,
+            "install_token": install_token,
+            "timestamp": timestamp or int(time.time()),
+        }
+        return _post_json(f"{self.api_base}/data", payload)
+
+    def send_event(self, install_token: str, event: str, count: int = 1, timestamp=None) -> dict:
+        payload = {
+            "plugin_id": self.plugin_id,
+            "version": self.plugin_version,
+            "client_name": self.client_name,
+            "client_version": self.client_version,
+            "user_hash": self.user_hash,
+            "device_fingerprint": self.device_fingerprint,
+            "install_token": install_token,
+            "event": event,
+            "count": count,
+            "timestamp": timestamp or int(time.time()),
+        }
+        return _post_json(f"{self.api_base}/event", payload)
+# === mkStats: embed client end ===
+
 from android.widget import (AbsListView, AdapterView, ArrayAdapter,
                             BaseAdapter, EditText, FrameLayout, ImageView,
                             LinearLayout, ListView)
 from android.widget import TextView
 from android.widget import TextView as AndroidTextView
-from android_utils import log, run_on_ui_thread
+from android_utils import log as _android_log, run_on_ui_thread
 from androidx.core.widget import NestedScrollView
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
 from client_utils import (get_last_fragment, get_messages_controller,
@@ -105,9 +220,27 @@ Requirements:exteraGram/AyuGram 12.1.1 or higher
 __author__ = "@ArThirtyFour | @KangelPlugins"
 __min_version__ = "12.1.1"
 __icon__ = "Kangelcons_by_fStikBot/5"
-__version__ = "1.11"
+__version__ = "1.2"
 
 PLUGINS_DIR = f'/data/user/0/{ApplicationLoader.applicationContext.getPackageName()}/files/plugins'
+
+_kpm_instance = None
+
+def _kpm_logs_enabled():
+    inst = globals().get("_kpm_instance")
+    if inst is None:
+        return True
+    try:
+        return bool(inst.get_setting("logs_enabled", True))
+    except Exception:
+        return True
+
+def log(*args, **kwargs):
+    try:
+        if _kpm_logs_enabled():
+            _android_log(*args, **kwargs)
+    except Exception:
+        pass
 
 def _get_lang():
     lang = Locale.getDefault().getLanguage().lower()
@@ -185,10 +318,27 @@ def _tr(key):
             "ui_settings": "UI Settings",
             "about_plugin": "About Plugin",
             "open_github": "GitHub repository",
+            "faq": "FAQ",
+            "other_settings": "Other",
             "status_plugin": "Plugin",
             "status_library": "Library",
+            "status_customization": "Customization",
+            "status_utilities": "Utilities",
+            "status_informational": "Informational",
+            "status_fun": "Fun",
+            "status_messages": "Messages",
+            "sort_status": "By status",
             "kpm_use_md3": "MD3 containers",
             "kpm_use_md3_sub": "Use Material Design 3 style for plugin list",
+            "share_view_raw": "View raw URL",
+            "share_raw_title": "Raw URL",
+            "share_open": "Open",
+            "filter_status": "Filter",
+            "filter_all": "All",
+            "telemetry": "Telemetry (mkStats)",
+            "telemetry_sub": "Send anonymous usage metrics",
+            "logs": "Logs",
+            "logs_sub": "Enable internal debug logs",
         },
         "ru": {
             "header": "Kangel Plugins Manager",
@@ -259,13 +409,64 @@ def _tr(key):
             "ui_settings": "Интерфейс",
             "about_plugin": "О плагине",
             "open_github": "Репозиторий GitHub",
+            "faq": "FAQ",
+            "other_settings": "Прочее",
             "status_plugin": "Плагин",
             "status_library": "Библиотека",
+            "status_customization": "Кастомизация",
+            "status_utilities": "Утилиты",
+            "status_informational": "Информация",
+            "status_fun": "Развлечения",
+            "status_messages": "Сообщения",
+            "sort_status": "По статусу",
             "kpm_use_md3": "MD3 контейнеры",
             "kpm_use_md3_sub": "Использовать стиль Material Design 3 для списка плагинов",
+            "share_view_raw": "Raw ссылка",
+            "share_raw_title": "Raw ссылка",
+            "share_open": "Открыть",
+            "filter_status": "Фильтр",
+            "filter_all": "Все",
+            "telemetry": "Телеметрия (mkStats)",
+            "telemetry_sub": "Отправлять анонимные метрики использования",
+            "logs": "Логи",
+            "logs_sub": "Включить внутренние debug-логи",
         }
     }
     return strings.get(lang, strings["en"]).get(key, key)
+
+def _status_label(status: str):
+    try:
+        s = (status or "plugin").lower()
+    except Exception:
+        s = "plugin"
+    if s == "library":
+        return _tr("status_library")
+    if s == "customization":
+        return _tr("status_customization")
+    if s == "utilities":
+        return _tr("status_utilities")
+    if s == "informational":
+        return _tr("status_informational")
+    if s == "fun":
+        return _tr("status_fun")
+    if s == "messages":
+        return _tr("status_messages")
+    return _tr("status_plugin")
+
+def _status_sort_key(status: str):
+    try:
+        s = (status or "plugin").lower()
+    except Exception:
+        s = "plugin"
+    order = {
+        "library": 0,
+        "customization": 1,
+        "utilities": 2,
+        "informational": 3,
+        "messages": 4,
+        "fun": 5,
+    }
+    return order.get(s, 99)
 
 def open_link(url):
     fragment = get_last_fragment()
@@ -350,6 +551,8 @@ class KPMSettingsHeaderHook:
 class KangelPluginsManager(BasePlugin):
     def __init__(self):
         super().__init__()
+        global _kpm_instance
+        _kpm_instance = self
         self.store_json_urls = [
             "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/refs/heads/main/store.json",
             "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/store.json",
@@ -363,9 +566,23 @@ class KangelPluginsManager(BasePlugin):
         self._search_text_cache = {}
         self.auto_update = True
         self.load_cache()
+        try:
+            run_on_queue(lambda: self._mkstats_ping_if_needed())
+        except Exception:
+            pass
 
     def has_settings(self):
         return True
+
+    def _open_faq(self, *_):
+        try:
+            lang = str(LocaleController.getInstance().getCurrentLocale().getLanguage())
+        except Exception:
+            lang = "en"
+        if lang == "ru":
+            open_link("https://t.me/KangelPluginsManager/166/172")
+        else:
+            open_link("https://t.me/KangelPluginsManager/166/6441")
 
     def create_settings(self):
         return [
@@ -384,6 +601,11 @@ class KangelPluginsManager(BasePlugin):
                 text=_tr("ui_settings"),
                 icon="msg_theme",
                 create_sub_fragment=self._create_ui_settings
+            ),
+            Text(
+                text=_tr("other_settings"),
+                icon="msg_info",
+                create_sub_fragment=self._create_other_settings
             ),
             Text(
                 text=_tr("about_plugin"),
@@ -555,7 +777,32 @@ class KangelPluginsManager(BasePlugin):
                 default=True,
                 icon="avd_flip",
                 subtext=_tr("kpm_use_md3_sub")
-            )
+            ),
+        ]
+
+    def _create_other_settings(self):
+        return [
+            Header(text=_tr("other_settings")),
+            Switch(
+                key="telemetry_enabled",
+                text=_tr("telemetry"),
+                default=True,
+                icon="menu_2sv_on",
+                subtext=_tr("telemetry_sub")
+            ),
+            Switch(
+                key="logs_enabled",
+                text=_tr("logs"),
+                default=True,
+                icon="msg_info",
+                subtext=_tr("logs_sub")
+            ),
+            Divider(),
+            Text(
+                text=_tr("faq"),
+                icon="msg_info",
+                on_click=lambda _: self._open_faq()
+            ),
         ]
     
     def _update_drawer_menu(self):
@@ -758,9 +1005,9 @@ class KangelPluginsManager(BasePlugin):
                     current_account = 0
 
                 media_controller = MediaDataController.getInstance(current_account)
-                sticker_set = media_controller.getStickerSetByName("LostChocolateFlamingo_by_fStikBot")
-                if sticker_set and sticker_set.documents and sticker_set.documents.size() > 80:
-                    sticker_document = sticker_set.documents.get(12)
+                sticker_set = media_controller.getStickerSetByName("Rain_Stickers_Set")
+                if sticker_set and sticker_set.documents and sticker_set.documents.size() > 2:
+                    sticker_document = sticker_set.documents.get(2)
                     image_location = ImageLocation.getForDocument(sticker_document)
                     sticker_image_view.setImage(image_location, "90_90", None, 0, sticker_document)
                     log("[KPM] Sticker loaded from cache: LostChocolateFlamingo_by_fStikBot/74")
@@ -768,12 +1015,12 @@ class KangelPluginsManager(BasePlugin):
                     log("[KPM] Sticker cache miss, requesting set")
                     try:
                         input_set = TLRPC.TL_inputStickerSetShortName()
-                        input_set.short_name = "LostChocolateFlamingo_by_fStikBot"
+                        input_set.short_name = "Rain_Stickers_Set"
 
                         def _on_set_response(result):
                             try:
-                                if result and result.documents and result.documents.size() > 80:
-                                    doc = result.documents.get(12)
+                                if result and result.documents and result.documents.size() > 2:
+                                    doc = result.documents.get(2)
                                     img_loc = ImageLocation.getForDocument(doc)
                                     run_on_ui_thread(lambda: sticker_image_view.setImage(img_loc, "90_90", None, 0, doc))
                                     log("[KPM] Sticker loaded after fetch: LostChocolateFlamingo_by_fStikBot/74")
@@ -792,9 +1039,9 @@ class KangelPluginsManager(BasePlugin):
 
                         media_controller.getStickerSet(input_set, None, False, Callback1(_on_set_response))
                     except Exception as _e_fetch:
-                        log(f"[KPM] Error requesting sticker set 'LostChocolateFlamingo_by_fStikBot': {_e_fetch}")
+                        log(f"[KPM] Error requesting sticker set 'Rain_Stickers_Set': {_e_fetch}")
             except Exception as e:
-                log(f"[KPM] Error loading sticker: {e}")
+                pass
             
 
             title_text_view = SimpleTextView(context)
@@ -809,7 +1056,7 @@ class KangelPluginsManager(BasePlugin):
 
             version_text = TextView(context)
             version_text.setGravity(Gravity.CENTER)
-            version_text.setText(f"{__version__} | 'Internet Overdose'")
+            version_text.setText(f"{__version__} | 'Angel Yamu'")
             version_text.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
             version_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
             linear_layout.addView(version_text, LayoutHelper.createLinear(-1, -2, Gravity.TOP, 24, 4, 24, 0))
@@ -818,11 +1065,11 @@ class KangelPluginsManager(BasePlugin):
             info_text.setGravity(Gravity.CENTER)
             if lang == "ru":
                 info_lines = [
-                    "Столько, сколько и тебе писать всякий бред. Захотела и поставила Кангел на фоне ЭКСТЕРАГРАМ — всё? \nВопросы кончились?"
+                    "-Грустно Кангел скачать \n-Человек обои скачать... ЕБЛАН"
                 ]
             else:
                     info_lines = [
-                    "As much as I'm writing all this nonsense to you. I just wanted to and installed OMGKawaiiAngelChan alongside EXTERAGRAM that's it?\n Are you out of questions?"
+                    "-Sad Kangel download \n-Man wallpaper download... BLYAT"
                 ]
             info_text.setText("\n".join(info_lines))
             info_text.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
@@ -836,6 +1083,7 @@ class KangelPluginsManager(BasePlugin):
             log(traceback.format_exc())
 
     def on_plugin_load(self):
+        self._mkstats_start()
         self.add_on_send_message_hook()
         self.add_deeplink_hook()
         self.add_drawer_menu_item()
@@ -847,6 +1095,14 @@ class KangelPluginsManager(BasePlugin):
         self.search_listener_hooks = None
 
     def on_plugin_unload(self):
+        if hasattr(self, "_mkstats_stop"):
+            self._mkstats_stop.set()
+            self._mkstats_log("mkStats: stop requested")
+            try:
+                if hasattr(self, "_mkstats_thread") and self._mkstats_thread is not None:
+                    self._mkstats_thread.join(timeout=1.0)
+            except Exception:
+                pass
         self.remove_hook("on_send_message_hook")
     
     def add_drawer_menu_item(self):
@@ -1118,7 +1374,7 @@ class KangelPluginsManager(BasePlugin):
                                             for dep_id in self.deps_list:
                                                 try:
                                                     log(f"[KPM] Installing dependency: {dep_id}")
-                                                    self.plugin_instance.install_plugin_by_id(dep_id)
+                                                    self.plugin_instance.install_plugin_by_id(dep_id, enable_after=True)
                                                     log(f"[KPM] Successfully installed dependency: {dep_id}")
                                                     success_count += 1
                                                 except Exception as e:
@@ -1203,7 +1459,7 @@ class KangelPluginsManager(BasePlugin):
                                     plugin_info = self.plugin.plugins_list.get(matched_key)
                                     if isinstance(plugin_info, dict):
                                         status = plugin_info.get("status", "plugin")
-                            status_label = _tr("status_library") if status == "library" else _tr("status_plugin")
+                            status_label = _status_label(status)
                             try:
                                 from android.util import TypedValue
                                 from android.view import Gravity
@@ -1902,6 +2158,10 @@ class KangelPluginsManager(BasePlugin):
     def show_plugin_info_and_install(self, plugin_id, enable_after=False):
         def load_info():
             try:
+                try:
+                    self._mkstats_event("install_dialog_opened", 1)
+                except Exception:
+                    pass
                 if not self.plugins_list:
                     log(f"[KPM] plugins_list is empty, refreshing store...")
                     self.refresh_store()
@@ -1952,6 +2212,10 @@ class KangelPluginsManager(BasePlugin):
                                 f.write(plugin_content)
                             
                             PluginsController.getInstance().showInstallDialog(fragment, temp_path, True)
+                            try:
+                                self._mkstats_event("install_dialog_shown", 1)
+                            except Exception:
+                                pass
                             
                             log(f"[KPM] Opened Extera install dialog for {plugin_id}")
                         except Exception as download_error:
@@ -1971,13 +2235,220 @@ class KangelPluginsManager(BasePlugin):
                 
                 if dependencies:
                     log(f"[KPM] Found {len(dependencies)} dependencies for {plugin_id}: {dependencies}")
+                    def install_deps_then_open():
+                        failed = []
+                        for dep_id in dependencies:
+                            try:
+                                log(f"[KPM] Installing dependency: {dep_id}")
+                                self.install_plugin_by_id(dep_id, enable_after=True)
+                            except Exception as dep_e:
+                                failed.append(dep_id)
+                                log(f"[KPM] ERROR installing dependency {dep_id}: {dep_e}")
+                        if failed:
+                            try:
+                                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Deps failed: {', '.join(failed)}"))
+                            except Exception:
+                                pass
+                        run_on_ui_thread(install_main_plugin)
+                    run_on_queue(install_deps_then_open)
+                else:
+                    run_on_ui_thread(install_main_plugin)
                 
-                run_on_ui_thread(install_main_plugin)
             except Exception as e:
                 log(f"[KPM] Error loading plugin info: {e}")
         
         run_on_queue(load_info)
-    
+    def _mkstats_get_setting(self, key: str, default):
+        try:
+            if hasattr(self, "get_setting"):
+                return self.get_setting(key, default)
+            if hasattr(self, "getsetting"):
+                return self.getsetting(key, default)
+        except Exception:
+            pass
+        return default
+
+    def _mkstats_set_setting(self, key: str, value, reload_settings: bool = False):
+        try:
+            if hasattr(self, "set_setting"):
+                return self.set_setting(key, value, reload_settings=reload_settings)
+            if hasattr(self, "setsetting"):
+                return self.setsetting(key, value, reloadsettings=reload_settings)
+        except Exception:
+            pass
+        return None
+
+    def _mkstats_get_device_id(self) -> str:
+        device_id = self._mkstats_get_setting("mkstats_device_id", "")
+        if not device_id:
+            device_id = uuid.uuid4().hex
+            self._mkstats_set_setting("mkstats_device_id", device_id, reload_settings=False)
+        return device_id
+
+    def _mkstats_get_client_version(self) -> str:
+        try:
+            from org.telegram.messenger import BuildVars
+            version = getattr(BuildVars, "BUILD_VERSION_STRING", None) or getattr(BuildVars, "BUILD_VERSION", None)
+            if version:
+                return str(version)
+        except Exception:
+            pass
+        try:
+            from org.telegram.messenger import BuildConfig as TgBuildConfig
+            version = getattr(TgBuildConfig, "VERSION_NAME", None)
+            if version:
+                return str(version)
+        except Exception:
+            pass
+        try:
+            from com.radolyn.ayugram import BuildConfig as AyuBuildConfig
+            version = getattr(AyuBuildConfig, "VERSION_NAME", None)
+            if version:
+                return str(version)
+        except Exception:
+            pass
+        try:
+            from com.exteragram.messenger import BuildConfig as ExBuildConfig
+            version = getattr(ExBuildConfig, "VERSION_NAME", None)
+            if version:
+                return str(version)
+        except Exception:
+            pass
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            if ctx:
+                pm = ctx.getPackageManager()
+                pkg = ctx.getPackageName()
+                info = pm.getPackageInfo(pkg, 0)
+                version = getattr(info, "versionName", None) or getattr(info, "versionCode", None)
+                if version:
+                    return str(version)
+        except Exception:
+            pass
+        return "unknown"
+
+    def _mkstats_get_client_name(self) -> str:
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            if ctx:
+                pkg = ctx.getPackageName()
+                if pkg == "com.radolyn.ayugram":
+                    return "AyuGram"
+                if pkg == "com.exteragram.messenger":
+                    return "exteraGram"
+        except Exception:
+            pass
+        try:
+            from com.radolyn.ayugram import BuildConfig as AyuBuildConfig
+            _ = AyuBuildConfig.VERSION_NAME
+            return "AyuGram"
+        except Exception:
+            pass
+        try:
+            from com.exteragram.messenger import BuildConfig as ExBuildConfig
+            _ = ExBuildConfig.VERSION_NAME
+            return "exteraGram"
+        except Exception:
+            pass
+        return "unknown"
+
+    def _mkstats_log(self, message: str) -> None:
+        if hasattr(self, "log"):
+            try:
+                self.log(message)
+            except Exception:
+                pass
+
+    def _mkstats_event(self, event: str, count: int = 1) -> None:
+        if not event:
+            return
+        if not bool(self._mkstats_get_setting("telemetry_enabled", True)):
+            return
+
+        def _send():
+            try:
+                if not hasattr(self, "_mkstats_client"):
+                    return
+                if not getattr(self, "_mkstats_token", ""):
+                    data = self._mkstats_client.handshake()
+                    self._mkstats_token = data.get("install_token", "")
+                    if self._mkstats_token:
+                        self._mkstats_set_setting("mkstats_install_token", self._mkstats_token, reload_settings=False)
+                if self._mkstats_token:
+                    self._mkstats_client.send_event(self._mkstats_token, event, count=count)
+            except Exception as exc:
+                self._mkstats_log(f"mkStats: event error {exc}")
+                self._mkstats_token = ""
+                self._mkstats_set_setting("mkstats_install_token", "", reload_settings=False)
+
+        try:
+            threading.Thread(target=_send, daemon=True).start()
+        except Exception:
+            pass
+
+    def _mkstats_loop(self):
+        while not self._mkstats_stop.is_set():
+            try:
+                if not bool(self._mkstats_get_setting("telemetry_enabled", True)):
+                    self._mkstats_stop.wait(MKSTATS_PING_INTERVAL)
+                    continue
+
+                if not self._mkstats_token:
+                    self._mkstats_log("mkStats: handshake start")
+                    data = self._mkstats_client.handshake()
+                    self._mkstats_token = data.get("install_token", "")
+                    if self._mkstats_token:
+                        self._mkstats_set_setting("mkstats_install_token", self._mkstats_token, reload_settings=False)
+                        self._mkstats_log("mkStats: handshake ok, token stored")
+                    else:
+                        self._mkstats_log("mkStats: handshake response missing token")
+
+                if self._mkstats_token:
+                    self._mkstats_log("mkStats: sending ping")
+                    self._mkstats_client.send_ping(self._mkstats_token)
+                    self._mkstats_log("mkStats: ping sent")
+            except Exception as exc:
+                self._mkstats_log(f"mkStats: error {exc}")
+                self._mkstats_token = ""
+                self._mkstats_set_setting("mkstats_install_token", "", reload_settings=False)
+            self._mkstats_stop.wait(MKSTATS_PING_INTERVAL)
+
+    def _mkstats_start(self):
+        try:
+            device_id = self._mkstats_get_device_id()
+            user_hash = generate_user_hash(device_id, "kangel_plugins_manager")
+            device_fingerprint = generate_device_fingerprint(device_id)
+            client_name = self._mkstats_get_client_name()
+            client_version = self._mkstats_get_client_version()
+            self._mkstats_client = MkStatsCoreClient(MKSTATS_API_URL, "kangel_plugins_manager", "1.2", user_hash, device_fingerprint, client_version, client_name)
+            self._mkstats_stop = threading.Event()
+            self._mkstats_token = self._mkstats_get_setting("mkstats_install_token", "")
+            self._mkstats_thread = threading.Thread(target=self._mkstats_loop, daemon=True)
+            self._mkstats_thread.start()
+            self._mkstats_log(f"mkStats: client started ({self._mkstats_client.api_base})")
+        except Exception:
+            pass
+    def __init__(self):
+        super().__init__()
+        global _kpm_instance
+        _kpm_instance = self
+        self.store_json_urls = [
+            "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/refs/heads/main/store.json",
+            "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/store.json",
+        ]
+        self.github_api_url = "https://api.github.com/repos/KangelPlugins/Plugins-Store/commits/main"
+        self.cache_file = os.path.join(PLUGINS_DIR, ".kpm_cache.json")
+        self.plugins_list = {}
+        self.plugin_names_cache = {}
+        self._install_dialog_views_cache = {}
+        self._trigram_index = {}
+        self._search_text_cache = {}
+        self.auto_update = True
+        self.load_cache()
+        self._mkstats_start()
+
     def show_plugin_info_and_delete(self, plugin_id, fn = None):
         log('taaakk')
         def load_info():
@@ -2398,11 +2869,25 @@ class KangelPluginsManager(BasePlugin):
         fragment = get_last_fragment()
         if not fragment:
             return
+        attempts = [0]
         
         def load_and_show():
             try:
                 ids = self.list_available_ids()
                 if not ids:
+                    if attempts[0] < 3:
+                        attempts[0] += 1
+                        try:
+                            self.refresh_store(force=True)
+                        except Exception:
+                            pass
+                        try:
+                            import time
+                            time.sleep(1.0)
+                        except Exception:
+                            pass
+                        run_on_queue(load_and_show)
+                        return
                     run_on_ui_thread(lambda: BulletinHelper.show_error(_tr("list_empty")))
                     return
                 
@@ -2460,6 +2945,7 @@ class KangelPluginsManager(BasePlugin):
         fragment = UniversalFragment(delegate)
         current_fragment.presentFragment(fragment)
         fragment.setTitle(title, False, 0)
+        base_title = title
         from java.lang import Boolean, Integer
         from org.telegram.ui.ActionBar import (ActionBar, ActionBarMenuItem,
                                                BackDrawable)
@@ -2545,10 +3031,158 @@ class KangelPluginsManager(BasePlugin):
                 except Exception as e:
                     log(f"[KPM] sort dialog error: {e}")
 
-            fragment.getActionBar().createMenu().addItem(10, R_tg.drawable.menu_sort_value).setOnClickListener(OnClickListener(show_sort_dialog))
+            fragment.getActionBar().createMenu().addItem(5, R_tg.drawable.menu_sort_value).setOnClickListener(OnClickListener(show_sort_dialog))
         except Exception as e:
             log(f"[KPM] Failed to add sort button: {e}")
-    
+
+        try:
+            from android_utils import OnClickListener
+
+            statuses = [
+                ("*", _tr("filter_all")),
+                ("customization", _tr("status_customization")),
+                ("utilities", _tr("status_utilities")),
+                ("informational", _tr("status_informational")),
+                ("messages", _tr("status_messages")),
+                ("fun", _tr("status_fun")),
+                ("library", _tr("status_library")),
+            ]
+
+            action_bar = fragment.getActionBar()
+            title_tv = None
+            try:
+                title_tv = action_bar.getTitleTextView()
+            except Exception:
+                title_tv = None
+
+            def _label_for(key):
+                try:
+                    for k, l in statuses:
+                        if k == key:
+                            return l
+                except Exception:
+                    pass
+                return _tr("filter_all")
+
+            def _apply_header_label(key):
+                try:
+                    label = _label_for(key)
+                    txt = f"{base_title}"
+                    if title_tv is not None:
+                        try:
+                            title_tv.setLeftDrawable(R_tg.drawable.menu_filter)
+                        except Exception:
+                            pass
+                        try:
+                            try:
+                                title_tv.setLeftDrawableOutside(True)
+                            except Exception:
+                                pass
+                            title_tv.setGravity(Gravity.CENTER)
+                        except Exception:
+                            try:
+                                title_tv.setGravity(Gravity.CENTER)
+                            except Exception:
+                                pass
+                        try:
+                            title_tv.setDrawablePadding(AndroidUtilities.dp(4.0))
+                        except Exception:
+                            pass
+                        title_tv.setText(txt)
+                        try:
+                            action_bar.setSubtitle(str(label))
+                        except Exception:
+                            pass
+                        try:
+                            stv = action_bar.getSubtitleTextView()
+                            if stv is not None:
+                                try:
+                                    stv.setGravity(Gravity.CENTER)
+                                except Exception:
+                                    pass
+                                try:
+                                    stv.setLayoutParams(LayoutHelper.createFrame(-1, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    else:
+                        action_bar.setTitle(txt)
+                        try:
+                            action_bar.setSubtitle(str(label))
+                        except Exception:
+                            pass
+                        try:
+                            stv = action_bar.getSubtitleTextView()
+                            if stv is not None:
+                                try:
+                                    stv.setGravity(Gravity.CENTER)
+                                except Exception:
+                                    pass
+                                try:
+                                    stv.setLayoutParams(LayoutHelper.createFrame(-1, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            def show_filter_dialog(*_):
+                try:
+                    labels = [x[1] for x in statuses]
+                    current = str(self.get_setting("plugins_status_filter", "*") or "*")
+
+                    def on_pick(bld, which):
+                        try:
+                            key = statuses[int(which)][0]
+                            try:
+                                self.set_setting("plugins_status_filter", key, reload_settings=False)
+                            except Exception:
+                                self.set_setting("plugins_status_filter", key)
+                            try:
+                                self._mkstats_event("filter_status_changed", 1)
+                            except Exception:
+                                pass
+                            _apply_header_label(key)
+                            try:
+                                delegate.adapter.update(True)
+                            except Exception:
+                                pass
+                            try:
+                                bld.dismiss()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                    builder = AlertDialogBuilder(fragment.getParentActivity())
+                    builder.set_title(_tr("filter_status"))
+                    builder.set_items(labels, on_pick)
+                    builder.set_negative_button(_tr("cancel"), lambda b, w: b.dismiss())
+                    builder.show()
+                except Exception as e:
+                    log(f"[KPM] filter dialog error: {e}")
+
+            if title_tv is not None:
+                try:
+                    title_tv.setOnClickListener(OnClickListener(show_filter_dialog))
+                except Exception:
+                    pass
+            else:
+                try:
+                    action_bar.setOnClickListener(OnClickListener(show_filter_dialog))
+                except Exception:
+                    pass
+
+            try:
+                current = str(self.get_setting("plugins_status_filter", "*") or "*")
+            except Exception:
+                current = "*"
+            _apply_header_label(current)
+        except Exception as e:
+            log(f"[KPM] Failed to setup filter title: {e}")
+
     INSTALL = 0
     DELETE = 1
     UPDATE = 2
@@ -2620,6 +3254,38 @@ class KangelPluginsManager(BasePlugin):
                 def copy_link():
                     AndroidUtilities.addToClipboard(link)
                     BulletinHelper.show_copied_to_clipboard()
+
+                def view_raw_url():
+                    try:
+                        try:
+                            self.outer.pl._mkstats_event("raw_opened", 1)
+                        except Exception:
+                            pass
+                        plugin_info = self.outer.pl.plugins_list.get(plugin_id)
+                        if not plugin_info:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error(_tr("list_empty")))
+                            return
+                        url = plugin_info.get("url") if isinstance(plugin_info, dict) else plugin_info
+                        if not url:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error(_tr("error_download").format("No URL")))
+                            return
+
+                        def show_dialog():
+                            try:
+                                builder = AlertDialogBuilder(fragment.getParentActivity())
+                                builder.set_title(_tr("share_raw_title"))
+                                builder.set_message(str(url))
+                                builder.set_positive_button(_tr("share_copy_link"), lambda d, w: AndroidUtilities.addToClipboard(str(url)))
+                                builder.set_neutral_button(_tr("share_open"), lambda d, w: open_link(str(url)))
+                                builder.set_negative_button(_tr("cancel"), lambda d, w: d.dismiss())
+                                builder.show()
+                            except Exception as e:
+                                log(f"[KPM] raw url dialog error: {e}")
+                                open_link(str(url))
+
+                        run_on_ui_thread(show_dialog)
+                    except Exception as e:
+                        log(f"[KPM] view_raw_url error: {e}")
 
                 def send_to_tg():
                     def do_send():
@@ -2721,6 +3387,10 @@ class KangelPluginsManager(BasePlugin):
 
                 def show_actions():
                     try:
+                        try:
+                            self.outer.pl._mkstats_event("share_menu_opened", 1)
+                        except Exception:
+                            pass
                         builder = AlertDialogBuilder(fragment.getParentActivity())
                         builder.set_title(_tr("share_title"))
                         builder.set_items([
@@ -2730,7 +3400,7 @@ class KangelPluginsManager(BasePlugin):
                         ], lambda _, which: (
                             copy_link() if which == 0 else
                             send_to_tg() if which == 1 else
-                            send_as_file()
+                            send_as_file() if which == 2 else None
                         ))
                         builder.set_negative_button(_tr("cancel"), lambda d, w: d.dismiss())
                         builder.show()
@@ -2790,7 +3460,7 @@ class KangelPluginsManager(BasePlugin):
                         version_text = p.getVersion() or ""
                         if author:
                             if version_text:
-                                desc.setText(f"{author} • {version_text}")
+                                desc.setText(f"{version_text} • {author}")
                             else:
                                 desc.setText(author)
                         else:
@@ -2832,8 +3502,31 @@ class KangelPluginsManager(BasePlugin):
                             OnClickListener(lambda *_: fn()))
                         
                     button = None
+                    view_button = None
                     if self.outer.type == KangelPluginsManager.INSTALL:
                         button = create_button(R_tg.drawable.msg_download, lambda: self.outer.pl.show_plugin_info_and_install(p.getId()))
+                        def open_raw():
+                            try:
+                                try:
+                                    self.outer.pl._mkstats_event("raw_opened", 1)
+                                except Exception:
+                                    pass
+                                plugin_id2 = p.getId()
+                                plugin_info2 = self.outer.pl.plugins_list.get(plugin_id2)
+                                if not plugin_info2:
+                                    run_on_ui_thread(lambda: BulletinHelper.show_error(_tr("list_empty")))
+                                    return
+                                url2 = plugin_info2.get("url") if isinstance(plugin_info2, dict) else plugin_info2
+                                if not url2:
+                                    run_on_ui_thread(lambda: BulletinHelper.show_error(_tr("error_download").format("No URL")))
+                                    return
+                                open_link(str(url2))
+                            except Exception as e:
+                                log(f"[KPM] open_raw error: {e}")
+                        try:
+                            view_button = create_button(R_tg.drawable.menu_instant_view, open_raw)
+                        except Exception:
+                            view_button = create_button(R_tg.drawable.menu_instant_view, open_raw)
                     elif self.outer.type == KangelPluginsManager.UPDATE:
                         def on_update():
                             self.outer.plugin_ids.remove(p.getId())
@@ -2845,13 +3538,15 @@ class KangelPluginsManager(BasePlugin):
                     
                     new_buttons_layout = LinearLayout(get_last_fragment().getContext())
                     new_buttons_layout.setTag("kpm_buttons")
-                    new_buttons_layout.setOrientation(LinearLayout.VERTICAL)
-                    gravity = Gravity.TOP
+                    new_buttons_layout.setOrientation(LinearLayout.HORIZONTAL)
+                    gravity = Gravity.BOTTOM
                     if self.outer.type == KangelPluginsManager.INSTALL:
-                        gravity = Gravity.TOP
+                        gravity = Gravity.BOTTOM
                         if share_button.getParent():
                             share_button.getParent().removeView(share_button)
                         new_buttons_layout.addView(share_button, share_button.getLayoutParams())
+                        if view_button is not None:
+                            new_buttons_layout.addView(view_button, share_button.getLayoutParams())
                     elif self.outer.type == KangelPluginsManager.DELETE:
                         if delete_button.getParent():
                             delete_button.getParent().removeView(delete_button)
@@ -2860,7 +3555,7 @@ class KangelPluginsManager(BasePlugin):
                     if button is not None:
                         new_buttons_layout.addView(button, share_button.getLayoutParams())
                     
-                    this.addView(new_buttons_layout, LayoutHelper.createFrame(-2, -2, gravity | Gravity.RIGHT))
+                    this.addView(new_buttons_layout, LayoutHelper.createFrame(-2, -2, gravity | Gravity.RIGHT, 0, 0, 0, 8))
                 except Exception as e:
                     log(str(e))
         
@@ -2898,6 +3593,7 @@ class KangelPluginsManager(BasePlugin):
                 self.Callback5(self.onClick),
                 self.Callback5Return(self.onLongClick)
             )
+
             self.content_view.addView(self.recycler, LayoutHelper.createFrame(-1, -1))
 
             if self.type == KangelPluginsManager.UPDATE and len(self.plugin_ids) > 0:
@@ -2938,12 +3634,27 @@ class KangelPluginsManager(BasePlugin):
             self.adapter = adapter
             self.items = items
             self.fill_id += 1
+            try:
+                status_filter = str(self.pl.get_setting("plugins_status_filter", "*") or "*")
+            except Exception:
+                status_filter = "*"
+
+            def _passes_status(pid):
+                if status_filter == "*":
+                    return True
+                try:
+                    info = self.pl.plugins_list.get(pid)
+                    if isinstance(info, dict):
+                        return (info.get("status") or "plugin") == status_filter
+                except Exception:
+                    pass
+                return status_filter == "plugin"
             if self.search_query:
                 query = str(self.search_query)
                 if len(query.strip()) >= 3 and getattr(self.pl, "_trigram_index", None):
                     ranked = self.pl._trigram_search(query, allowed_ids=self.plugin_ids)
                     if ranked:
-                        plugin_ids = ranked
+                        plugin_ids = [pid for pid in ranked if _passes_status(pid)]
                     else:
                         plugin_ids = []
                 else:
@@ -2957,9 +3668,9 @@ class KangelPluginsManager(BasePlugin):
                         query_lower = query.lower()
                         return query_lower in name.lower() or query_lower in pid.lower()
 
-                    plugin_ids = [pid for pid in self.plugin_ids if match(pid)] 
+                    plugin_ids = [pid for pid in self.plugin_ids if match(pid) and _passes_status(pid)]
             else:
-                plugin_ids = self.plugin_ids
+                plugin_ids = [pid for pid in self.plugin_ids if _passes_status(pid)]
 
             try:
                 mode = int(self.pl.get_setting("plugins_sort_mode", 0) or 0)
@@ -2983,6 +3694,15 @@ class KangelPluginsManager(BasePlugin):
                         pass
                     return ""
 
+                def _status_for_sort(pid):
+                    try:
+                        info = self.pl.plugins_list.get(pid)
+                        if isinstance(info, dict):
+                            return info.get("status", "plugin")
+                    except Exception:
+                        pass
+                    return "plugin"
+
                 if mode == 1:
                     plugin_ids = sorted(plugin_ids, key=lambda pid: _name_for_sort(pid).lower(), reverse=False)
                 elif mode == 2:
@@ -2991,6 +3711,8 @@ class KangelPluginsManager(BasePlugin):
                     plugin_ids = sorted(plugin_ids, key=lambda pid: (_author_for_sort(pid), _name_for_sort(pid).lower()), reverse=False)
                 elif mode == 4:
                     plugin_ids = sorted(plugin_ids, key=lambda pid: (_author_for_sort(pid), _name_for_sort(pid).lower()), reverse=True)
+                elif mode == 5:
+                    plugin_ids = sorted(plugin_ids, key=lambda pid: (_status_sort_key(_status_for_sort(pid)), _name_for_sort(pid).lower()), reverse=False)
 
             except Exception as e:
                 log(f"[KPM] Sort error: {e}")
