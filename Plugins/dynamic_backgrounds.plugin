@@ -1,0 +1,1387 @@
+__id__ = "dynamic_backgrounds"
+__name__ = "Dynamic Backgrounds"
+__description__ = "Динамический фон в чате на основе реальной погоды"
+__author__ = "@rei_plugins (@optimist_opti)"
+__version__ = "5.4.0"
+__icon__ = "formyetgplugins_by_fStikBot/9"
+__min_version__ = "11.12.0"
+
+# ─── ТИПЫ ЭФФЕКТОВ ────────────────────────────────────────────────────────────
+#
+#  clear        → солнце (вращающиеся лучи) + мерцающие искры
+#  partly_cloudy→ солнце полупрозрачное + плывущие облака
+#  cloudy       → только облака (плывут горизонтально)
+#  fog          → медленные полупрозрачные пятна
+#  light_rain   → редкие тонкие капли (морось, Patchy rain)
+#  rain         → обычный дождь
+#  thunder      → дождь + вспышки молнии
+#  light_snow   → редкие лёгкие снежинки
+#  snow         → густой снег (алгоритм SnowflakesEffect.java)
+#  sleet        → смесь снежинок и дождевых капель
+#  hail         → быстрые маленькие шарики-градины
+#
+# ptype частиц:
+#   0 — снежный хлопок (точка)
+#   1 — 6-лучевая снежинка
+#   2 — дождевая капля (линия)
+#   3 — туманное пятно (большая точка)
+#   4 — облако (5 перекрывающихся кругов)
+#   6 — солнечная искра (мерцающий кружок)
+#   7 — градина (белый шарик с обводкой)
+
+import threading
+import math
+import random
+import time
+
+import requests
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from client_utils import run_on_queue, get_last_fragment
+from hook_utils import find_class
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text, Divider, Input
+from typing import List, Any, Optional
+
+from android.graphics import Paint
+from android.content import Intent
+from android.net import Uri
+from android.view import Gravity as _G
+from android.widget import FrameLayout as _FL, LinearLayout as _LL, TextView as _TV
+from android.util import TypedValue as _TypedValue
+from org.telegram.messenger import AndroidUtilities as _AU
+from org.telegram.ui.ActionBar import Theme as _Theme
+from org.telegram.ui.Components import LayoutHelper as _LH
+from android_utils import OnClickListener
+from hook_utils import get_private_field
+
+# ─── WMO weather codes → тип эффекта (Open-Meteo) ───────────────────────────
+# https://open-meteo.com/en/docs#weathervariables (weathercode / weather_code)
+WMO = {
+    0:  "clear",        # Ясно
+    1:  "clear",        # Преимущественно ясно
+    2:  "partly_cloudy",# Переменная облачность
+    3:  "cloudy",       # Пасмурно
+    45: "fog",          # Туман
+    48: "fog",          # Оседающий туман (изморозь)
+    51: "light_rain",   # Морось слабая
+    53: "light_rain",   # Морось умеренная
+    55: "rain",         # Морось сильная
+    56: "light_rain",   # Ледяная морось слабая
+    57: "rain",         # Ледяная морось сильная
+    61: "light_rain",   # Дождь слабый
+    63: "rain",         # Дождь умеренный
+    65: "rain",         # Дождь сильный
+    66: "sleet",        # Ледяной дождь слабый
+    67: "sleet",        # Ледяной дождь сильный
+    71: "light_snow",   # Снег слабый
+    73: "snow",         # Снег умеренный
+    75: "snow",         # Снег сильный
+    77: "hail",         # Снежная крупа
+    80: "light_rain",   # Ливень слабый
+    81: "rain",         # Ливень умеренный
+    82: "rain",         # Ливень сильный
+    85: "light_snow",   # Снежный ливень слабый
+    86: "snow",         # Снежный ливень сильный
+    95: "thunder",      # Гроза
+    96: "thunder",      # Гроза с градом слабым
+    99: "thunder",      # Гроза с градом сильным
+}
+
+DP          = 3.0
+ANGLE_DIFF  = math.pi / 3.0
+UPDATE_SEC  = 30 * 60
+CACHE_SEC   = 10 * 60
+
+def _tc(key, fallback=0):
+    try:    return _Theme.getColor(key)
+    except: return fallback
+
+
+# ─── Particle ─────────────────────────────────────────────────────────────────
+
+class Particle:
+    __slots__ = ("x","y","vx","vy","velocity","alpha","life_time",
+                 "current_time","scale","ptype","angle","spin")
+
+    def __init__(self):
+        self.x = self.y = self.vx = self.vy = 0.0
+        self.velocity = self.alpha = self.life_time = self.current_time = 0.0
+        self.scale = 1.0
+        self.ptype = 0
+        self.angle = 0.0
+        self.spin  = 0.0
+
+    def reset(self):
+        self.alpha = 0.0
+        self.current_time = 0.0
+        self.angle = 0.0
+        self.spin  = 0.0
+
+
+# ─── WeatherEffect ────────────────────────────────────────────────────────────
+
+class WeatherEffect:
+
+    FREE_POOL = 100
+
+    def __init__(self):
+        self.weather_type = "clear"
+        self.running      = False
+        self.last_view    = None
+
+        self.particles: List[Particle] = []
+        self._free: List[Particle]     = [Particle() for _ in range(50)]
+
+        self._last_mono: float = 0.0
+        self._lightning_alpha: int = 0
+        self._lightning_timer: int = 0
+        self._lightning_next:  int = random.randint(80, 240)
+        self._lightning_spots: list = []
+        self._sun_angle: float = 0.0
+        # Настройка интенсивности молнии
+        self.cfg_lightning_intensity = 210  # макс. яркость вспышки (0–255)
+        self.cfg_lightning_speed     = 18   # скорость затухания (1–40)
+
+        # ── cfg: ясно ─────────────────────────────────────────────
+        self.cfg_spark_spawn   = 0.85
+        self.cfg_spark_count   = 20
+        self.cfg_sun_pos_x     = 0.82   # доля ширины
+        self.cfg_sun_pos_y     = 0.12   # доля высоты
+        self.cfg_sun_ray_speed = 0.0003
+        # ── cfg: облачно ──────────────────────────────────────────
+        self.cfg_cloud_speed   = 11.0
+        self.cfg_cloud_spawn   = 0.97
+        self.cfg_cloud_count   = 12
+        # ── cfg: туман ────────────────────────────────────────────
+        self.cfg_fog_speed     = 6.0
+        self.cfg_fog_spawn     = 0.88
+        self.cfg_fog_count     = 12
+        # ── cfg: лёгкий дождь ─────────────────────────────────────
+        self.cfg_lrain_speed   = 35.0
+        self.cfg_lrain_spawn   = 0.80
+        self.cfg_lrain_count   = 50
+        # ── cfg: дождь ────────────────────────────────────────────
+        self.cfg_rain_speed    = 55.0
+        self.cfg_rain_spawn    = 0.55
+        self.cfg_rain_count    = 150
+        # ── cfg: гроза ────────────────────────────────────────────
+        self.cfg_thunder_speed = 75.0
+        self.cfg_thunder_spawn = 0.45
+        # ── cfg: лёгкий снег ──────────────────────────────────────
+        self.cfg_lsnow_speed   = 18.0
+        self.cfg_lsnow_spawn   = 0.82
+        self.cfg_lsnow_count   = 40
+        # ── cfg: снег ─────────────────────────────────────────────
+        self.cfg_snow_speed    = 22.0
+        self.cfg_snow_spawn    = 0.70
+        self.cfg_snow_count    = 100
+        # ── cfg: grad ─────────────────────────────────────────────
+        self.cfg_hail_speed    = 90.0
+        self.cfg_hail_spawn    = 0.50
+        self.cfg_hail_count    = 120
+
+        # Paint объекты — один раз
+        self._thick = Paint(Paint.ANTI_ALIAS_FLAG)
+        self._thick.setStrokeCap(Paint.Cap.ROUND)
+        self._thick.setStyle(Paint.Style.STROKE)
+
+        self._thin = Paint(Paint.ANTI_ALIAS_FLAG)
+        self._thin.setStrokeCap(Paint.Cap.ROUND)
+        self._thin.setStyle(Paint.Style.STROKE)
+
+        self._fill = Paint(Paint.ANTI_ALIAS_FLAG)
+        self._fill.setStyle(Paint.Style.FILL)
+
+        self._bg = Paint()
+        self._bg.setStyle(Paint.Style.FILL)
+
+        self._refresh_paint()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _argb(paint, c: int):
+        paint.setARGB((c>>24)&0xFF, (c>>16)&0xFF, (c>>8)&0xFF, c&0xFF)
+
+    def _refresh_paint(self):
+        wt = self.weather_type
+        if wt in ("rain","thunder","sleet","light_rain"):
+            col = 0xFF99BBDD
+        elif wt == "fog":
+            col = 0xFFCCCCCC
+        elif wt == "clear":
+            col = 0xFFFFDD88
+        elif wt in ("cloudy","partly_cloudy"):
+            col = 0xFFDDDDEE
+        elif wt == "hail":
+            col = 0xFFBBCCDD
+        else:
+            col = 0xFFDDEEFF
+        self._argb(self._thick, col)
+        self._argb(self._thin,  col)
+        self._argb(self._fill,  col)
+        self._thick.setStrokeWidth(DP * 1.5)
+        self._thin.setStrokeWidth(DP * 0.5)
+
+    def _alloc(self) -> Particle:
+        p = self._free.pop() if self._free else Particle()
+        p.reset()
+        return p
+
+    def _recycle(self, p: Particle):
+        if len(self._free) < self.FREE_POOL:
+            self._free.append(p)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_weather(self, wt: str):
+        if self.weather_type == wt:
+            return
+        self.weather_type = wt
+        self._lightning_alpha = 0
+        self._lightning_timer = 0
+        self._lightning_next  = random.randint(80, 240)
+        self._last_mono       = 0.0
+        for p in self.particles:
+            self._recycle(p)
+        self.particles.clear()
+        self._refresh_paint()
+        if self.last_view is not None:
+            try:    self.last_view.invalidate()
+            except: self.last_view = None
+
+    def apply_cfg(self,
+                  spark_spawn, spark_count, sun_pos_x, sun_pos_y, sun_ray_speed,
+                  cloud_speed, cloud_spawn, cloud_count,
+                  fog_speed, fog_spawn, fog_count,
+                  lrain_speed, lrain_spawn, lrain_count,
+                  rain_speed, rain_spawn, rain_count,
+                  thunder_speed, thunder_spawn,
+                  lsnow_speed, lsnow_spawn, lsnow_count,
+                  snow_speed, snow_spawn, snow_count,
+                  hail_speed, hail_spawn, hail_count,
+                  lightning_intensity, lightning_speed):
+        def f(v): return max(1.0, float(v))
+        def s(v): return max(0.01, min(0.99, float(v)/100.0))
+        def i(v): return max(1, int(v))
+        self.cfg_spark_spawn   = s(spark_spawn)
+        self.cfg_spark_count   = i(spark_count)
+        self.cfg_sun_pos_x     = max(0.1, min(0.95, float(sun_pos_x)/100.0))
+        self.cfg_sun_pos_y     = max(0.01, min(0.5,  float(sun_pos_y)/100.0))
+        self.cfg_sun_ray_speed = max(0.0, float(sun_ray_speed)/10000.0)
+        self.cfg_cloud_speed   = f(cloud_speed)
+        self.cfg_cloud_spawn   = s(cloud_spawn)
+        self.cfg_cloud_count   = i(cloud_count)
+        self.cfg_fog_speed     = f(fog_speed)
+        self.cfg_fog_spawn     = s(fog_spawn)
+        self.cfg_fog_count     = i(fog_count)
+        self.cfg_lrain_speed   = f(lrain_speed)
+        self.cfg_lrain_spawn   = s(lrain_spawn)
+        self.cfg_lrain_count   = i(lrain_count)
+        self.cfg_rain_speed    = f(rain_speed)
+        self.cfg_rain_spawn    = s(rain_spawn)
+        self.cfg_rain_count    = i(rain_count)
+        self.cfg_thunder_speed = f(thunder_speed)
+        self.cfg_thunder_spawn = s(thunder_spawn)
+        self.cfg_lsnow_speed   = f(lsnow_speed)
+        self.cfg_lsnow_spawn   = s(lsnow_spawn)
+        self.cfg_lsnow_count   = i(lsnow_count)
+        self.cfg_snow_speed    = f(snow_speed)
+        self.cfg_snow_spawn    = s(snow_spawn)
+        self.cfg_snow_count    = i(snow_count)
+        self.cfg_hail_speed    = f(hail_speed)
+        self.cfg_hail_spawn    = s(hail_spawn)
+        self.cfg_hail_count          = i(hail_count)
+        self.cfg_lightning_intensity  = max(0, min(255, int(lightning_intensity)))
+        self.cfg_lightning_speed      = max(1, int(lightning_speed))
+        for p in self.particles:
+            self._recycle(p)
+        self.particles.clear()
+
+    # ── Spawn ─────────────────────────────────────────────────────────────────
+
+    def _spawn(self, w: int, h: int):
+        wt = self.weather_type
+        # Выбираем порог и лимит по типу
+        if   wt == "clear":         thresh, limit = self.cfg_spark_spawn,   self.cfg_spark_count
+        elif wt == "partly_cloudy": thresh, limit = self.cfg_cloud_spawn,   self.cfg_cloud_count
+        elif wt == "cloudy":        thresh, limit = self.cfg_cloud_spawn,   self.cfg_cloud_count
+        elif wt == "fog":           thresh, limit = self.cfg_fog_spawn,     self.cfg_fog_count
+        elif wt == "light_rain":    thresh, limit = self.cfg_lrain_spawn,   self.cfg_lrain_count
+        elif wt == "rain":          thresh, limit = self.cfg_rain_spawn,    self.cfg_rain_count
+        elif wt == "thunder":       thresh, limit = self.cfg_thunder_spawn, self.cfg_rain_count
+        elif wt == "light_snow":    thresh, limit = self.cfg_lsnow_spawn,   self.cfg_lsnow_count
+        elif wt == "snow":          thresh, limit = self.cfg_snow_spawn,    self.cfg_snow_count
+        elif wt == "sleet":         thresh, limit = self.cfg_snow_spawn,    self.cfg_snow_count
+        elif wt == "hail":          thresh, limit = self.cfg_hail_spawn,    self.cfg_hail_count
+        else:                       return
+
+        if random.random() > thresh or len(self.particles) >= limit:
+            return
+
+        p = self._alloc()
+        p.x = random.random() * w
+        p.y = random.random() * h
+
+        if wt == "clear":
+            # Искры — статичные мерцающие точки
+            p.vx = p.vy = p.velocity = 0.0
+            p.life_time = 800.0 + random.randint(0, 600)
+            p.scale     = random.random() * 0.8 + 0.3
+            p.ptype     = 6
+
+        elif wt in ("partly_cloudy", "cloudy"):
+            # Облака плывут горизонтально, появляются сбоку
+            d = 1 if random.random() > 0.5 else -1
+            p.x = -120.0 if d > 0 else w + 120.0
+            p.y = random.random() * h * 0.65
+            p.vx = float(d); p.vy = 0.0
+            p.velocity  = self.cfg_cloud_speed + random.random() * 6.0
+            p.life_time = 12000.0 + random.randint(0, 5000)
+            p.scale     = random.random() * 1.5 + 1.0
+            p.ptype     = 4
+
+        elif wt == "fog":
+            # Клуб тумана — большое мягкое пятно, медленно дрейфует
+            angle = random.uniform(0, math.pi * 2)  # любое направление
+            p.vx  = math.cos(angle)
+            p.vy  = math.sin(angle) * 0.3   # горизонтальный дрейф сильнее вертикального
+            p.x   = random.random() * w
+            p.y   = random.random() * h
+            p.velocity  = self.cfg_fog_speed * 0.25 + random.random() * 0.8
+            p.life_time = 12000.0 + random.randint(0, 8000)
+            p.scale     = random.random() * 1.8 + 1.2   # радиус-множитель
+            p.ptype     = 3
+
+        elif wt == "light_rain":
+            # Редкие тонкие капли, медленнее и прозрачнее
+            rad = math.radians(random.randint(-15, 15) + 90)
+            p.vx = math.cos(rad); p.vy = math.sin(rad)
+            spd = self.cfg_lrain_speed + random.random() * 10.0
+            p.velocity  = spd
+            p.life_time = max(400.0, ((h-p.y)+80.0) / (spd*16.0/500.0) * 16.0)
+            p.scale     = random.random() * 0.4 + 0.2
+            p.ptype     = 2
+
+        elif wt in ("rain", "thunder"):
+            # Полноценный дождь
+            rad = math.radians(random.randint(-20, 20) + 90)
+            p.vx = math.cos(rad); p.vy = math.sin(rad)
+            spd = (self.cfg_thunder_speed if wt == "thunder"
+                   else self.cfg_rain_speed) + random.random() * 20.0
+            p.velocity  = spd
+            p.life_time = max(300.0, ((h-p.y)+80.0) / (spd*16.0/500.0) * 16.0)
+            p.scale     = random.random() * 0.7 + 0.4
+            p.ptype     = 2
+
+        elif wt == "light_snow":
+            # Редкие лёгкие снежинки, чуть крутит ветром
+            rad = math.radians(random.randint(-25, 25) + 90)
+            p.vx = math.cos(rad); p.vy = math.sin(rad)
+            p.velocity  = self.cfg_lsnow_speed + random.random() * 3.0
+            p.life_time = 3000.0 + random.randint(0, 500)
+            p.scale     = random.random() * 0.7 + 0.15
+            p.ptype     = random.randint(0, 1)
+
+        elif wt == "snow":
+            # Густой снег — крупные хлопья и шестиугольники
+            rad = math.radians(random.randint(-20, 20) + 90)
+            p.vx = math.cos(rad); p.vy = math.sin(rad)
+            p.velocity  = self.cfg_snow_speed + random.random() * 4.0
+            p.life_time = 2000.0 + random.randint(0, 100)
+            p.scale     = random.random() * 1.2 + 0.2
+            p.ptype     = random.randint(0, 1)
+
+        elif wt == "sleet":
+            # Слякоть = ~55% снежинки + ~45% дождь
+            rad = math.radians(random.randint(-20, 20) + 90)
+            p.vx = math.cos(rad); p.vy = math.sin(rad)
+            if random.random() > 0.45:
+                spd = self.cfg_snow_speed + random.random() * 4.0
+                p.velocity  = spd
+                p.life_time = 2000.0 + random.randint(0, 100)
+                p.scale     = random.random() * 0.9 + 0.2
+                p.ptype     = random.randint(0, 1)
+            else:
+                spd = self.cfg_rain_speed * 0.7 + random.random() * 10.0
+                p.velocity  = spd
+                p.life_time = max(300.0, ((h-p.y)+80.0) / (spd*16.0/500.0) * 16.0)
+                p.scale     = random.random() * 0.5 + 0.3
+                p.ptype     = 2
+
+        elif wt == "hail":
+            # Grad — почти вертикально, быстро, маленькие шарики
+            rad = math.radians(random.randint(-8, 8) + 90)
+            p.vx = math.cos(rad); p.vy = math.sin(rad)
+            spd = self.cfg_hail_speed + random.random() * 30.0
+            p.velocity  = spd
+            p.life_time = max(200.0, ((h-p.y)+80.0) / (spd*16.0/500.0) * 16.0)
+            p.scale     = random.random() * 0.6 + 0.35
+            p.spin      = float(random.randint(0, 2))   # форма: 0=гекс, 1=ромб, 2=осколок
+            p.angle     = random.uniform(0, math.pi)    # фиксированный поворот
+            p.ptype     = 7
+
+        self.particles.append(p)
+
+    # ── Update ────────────────────────────────────────────────────────────────
+
+    def _update(self, dt: float):
+        k     = dt / 500.0
+        alive = []
+        for p in self.particles:
+            p.current_time += dt
+            ct = p.current_time
+            lt = p.life_time
+            if ct >= lt:
+                self._recycle(p)
+                continue
+            if ct < 200.0:
+                t = ct / 200.0
+                p.alpha = t * t
+            else:
+                t = (ct - 200.0) / (lt - 200.0)
+                p.alpha = 1.0 - t * t
+            vk = p.velocity * k
+            p.x += p.vx * vk
+            p.y += p.vy * vk
+            alive.append(p)
+        self.particles = alive
+
+    # ── Draw particle ─────────────────────────────────────────────────────────
+
+    def _draw_particle(self, canvas, p: Particle):
+        a = int(255.0 * p.alpha)
+        if a <= 0:
+            return
+        t = p.ptype
+
+        if t == 0:
+            # Снежный хлопок
+            self._thick.setAlpha(a)
+            self._thick.setStrokeWidth(DP * 1.5 * p.scale)
+            canvas.drawPoint(p.x, p.y, self._thick)
+
+        elif t == 1:
+            # 6-лучевая снежинка (SnowflakesEffect.java)
+            self._thin.setAlpha(a)
+            angle = -math.pi / 2.0
+            sc = p.scale
+            px  =  DP * 4.0  * sc
+            px1 = -DP * 1.14 * sc
+            py1 =  DP * 3.10 * sc
+            x, y = p.x, p.y
+            for _ in range(6):
+                ca, sa = math.cos(angle), math.sin(angle)
+                x1 = ca * px;  y1 = sa * px
+                cx = x1 * 0.66; cy = y1 * 0.66
+                canvas.drawLine(x, y, x+x1, y+y1, self._thin)
+                a2 = angle - math.pi / 2.0
+                c2, s2 = math.cos(a2), math.sin(a2)
+                bx  =  c2*px1 - s2*py1;  by  = s2*px1 + c2*py1
+                bx2 = -c2*px1 - s2*py1;  by2 = -s2*px1 + c2*py1
+                canvas.drawLine(x+cx, y+cy, x+bx,  y+by,  self._thin)
+                canvas.drawLine(x+cx, y+cy, x+bx2, y+by2, self._thin)
+                angle += ANGLE_DIFF
+
+        elif t == 2:
+            # Дождевая капля — линия по вектору падения
+            fast = p.velocity > 60
+            self._thick.setAlpha(a)
+            self._thick.setStrokeWidth(DP * (1.1 if fast else 0.8) * p.scale)
+            ln = DP * (13.0 if fast else 8.0) * p.scale
+            canvas.drawLine(p.x, p.y, p.x + p.vx*ln, p.y + p.vy*ln, self._thick)
+
+        elif t == 3:
+            # Туман — мягкое пятно из концентрических кругов (радиальный fade)
+            # Внутри ярче, снаружи прозрачнее — имитация объёмного клуба тумана
+            base_r = DP * 60.0 * p.scale
+            self._argb(self._fill, 0xFFE8E8E8)
+            # 6 концентрических кругов: от центра к краю прозрачность падает
+            rings = (
+                (0.15, 0.10),   # ядро
+                (0.30, 0.08),
+                (0.50, 0.06),
+                (0.68, 0.04),
+                (0.84, 0.02),
+                (1.00, 0.01),   # внешний край — почти невидим
+            )
+            for r_frac, opacity in rings:
+                ring_a = int(a * opacity)
+                if ring_a <= 0: continue
+                self._fill.setAlpha(ring_a)
+                canvas.drawCircle(p.x, p.y, base_r * r_frac, self._fill)
+
+        elif t == 4:
+            # Облако — 5 перекрывающихся кругов
+            self._argb(self._fill, 0xFFEEEEFF)
+            self._fill.setAlpha(min(a, 160))
+            sc = p.scale * DP * 10.0
+            for ox, oy, os in ((-2.0, 0.0, 0.8), (-0.8, -0.6, 1.0),
+                                (0.6, -0.8, 1.2), (2.0, -0.4, 0.9), (1.2, 0.2, 0.7)):
+                canvas.drawCircle(p.x + ox*sc, p.y + oy*sc, sc*os, self._fill)
+
+        elif t == 6:
+            # Солнечная искра — мерцает синусоидально
+            flicker = 0.5 + 0.5 * math.sin(p.current_time * 0.015)
+            self._argb(self._fill, 0xFFFFEE88)
+            self._fill.setAlpha(int(a * flicker))
+            canvas.drawCircle(p.x, p.y, DP * 1.5 * p.scale, self._fill)
+
+        elif t == 7:
+            # Кубик льда — полупрозрачный многоугольник, форма задаётся через spin (seed)
+            # spin хранит случайный seed формы (0,1,2), angle — начальный поворот
+            seed = int(p.spin) % 3
+            base = DP * 4.0 * p.scale
+            rot  = p.angle   # фиксированный угол поворота конкретной льдинки
+            cx, cy = p.x, p.y
+
+            # Заливка — очень прозрачный голубой
+            self._argb(self._fill, 0x99CCEEFF)
+            self._fill.setAlpha(int(a * 0.45))
+
+            # Контур — чуть ярче
+            self._argb(self._thick, 0xCCAADDFF)
+            self._thick.setAlpha(int(a * 0.75))
+            self._thick.setStrokeWidth(DP * 0.7)
+
+            if seed == 0:
+                # Шестиугольник (гексагональный кристалл)
+                pts = []
+                for k in range(6):
+                    ang = rot + k * math.pi / 3.0
+                    pts.append((cx + math.cos(ang)*base, cy + math.sin(ang)*base))
+                for k in range(6):
+                    x1,y1 = pts[k]; x2,y2 = pts[(k+1)%6]
+                    canvas.drawLine(x1,y1, x2,y2, self._thick)
+                # Внутренние линии — звезда кристалла
+                self._thick.setAlpha(int(a * 0.3))
+                for k in range(6):
+                    x1,y1 = pts[k]
+                    canvas.drawLine(cx,cy, x1,y1, self._thick)
+
+            elif seed == 1:
+                # Ромб (уплощённый кристалл)
+                w2 = base * 0.65
+                h2 = base * 1.2
+                cos_r = math.cos(rot); sin_r = math.sin(rot)
+                verts = [
+                    ( w2*cos_r - 0   *sin_r,  w2*sin_r + 0   *cos_r),
+                    ( 0  *cos_r - h2 *sin_r,  0  *sin_r + h2 *cos_r),
+                    (-w2*cos_r - 0   *sin_r, -w2*sin_r + 0   *cos_r),
+                    ( 0  *cos_r + h2 *sin_r,  0  *sin_r - h2 *cos_r),
+                ]
+                self._thick.setAlpha(int(a * 0.75))
+                for k in range(4):
+                    x1,y1 = verts[k]; x2,y2 = verts[(k+1)%4]
+                    canvas.drawLine(cx+x1,cy+y1, cx+x2,cy+y2, self._thick)
+                # Диагонали
+                self._thick.setAlpha(int(a * 0.3))
+                canvas.drawLine(cx+verts[0][0],cy+verts[0][1], cx+verts[2][0],cy+verts[2][1], self._thick)
+                canvas.drawLine(cx+verts[1][0],cy+verts[1][1], cx+verts[3][0],cy+verts[3][1], self._thick)
+
+            else:
+                # Неправильный пятиугольник (осколок льда)
+                offsets = [
+                    (1.0, 0.0), (0.3, -1.1), (-0.9, -0.8),
+                    (-1.0, 0.4), (0.1, 1.0),
+                ]
+                cos_r = math.cos(rot); sin_r = math.sin(rot)
+                pts = []
+                for ox, oy in offsets:
+                    rx = ox*cos_r - oy*sin_r
+                    ry = ox*sin_r + oy*cos_r
+                    pts.append((cx + rx*base, cy + ry*base))
+                self._thick.setAlpha(int(a * 0.75))
+                for k in range(5):
+                    x1,y1 = pts[k]; x2,y2 = pts[(k+1)%5]
+                    canvas.drawLine(x1,y1, x2,y2, self._thick)
+                # Трещина
+                self._thick.setAlpha(int(a * 0.25))
+                canvas.drawLine(cx,cy, pts[2][0],pts[2][1], self._thick)
+
+    # ── Солнце ────────────────────────────────────────────────────────────────
+
+    def _draw_sun(self, canvas, w: int, h: int, dt: float, alpha: float = 1.0):
+        """Рисует солнце. alpha=1.0 — ясно, 0.5 — за облаками (partly_cloudy)."""
+        self._sun_angle += dt * self.cfg_sun_ray_speed
+        cx = w * self.cfg_sun_pos_x
+        cy = h * self.cfg_sun_pos_y
+
+        # Ядро
+        self._argb(self._fill, 0xFFFFCC44)
+        self._fill.setAlpha(int(220 * alpha))
+        canvas.drawCircle(cx, cy, DP * 14.0, self._fill)
+
+        # Мягкое свечение
+        self._argb(self._fill, 0x55FFD966)
+        self._fill.setAlpha(int(60 * alpha))
+        canvas.drawCircle(cx, cy, DP * 22.0, self._fill)
+
+        # 8 вращающихся лучей
+        self._argb(self._thick, 0xFFFFCC44)
+        self._thick.setStrokeWidth(DP * 2.5)
+        for i in range(8):
+            angle = self._sun_angle + i * math.pi / 4.0
+            inner = DP * 18.0
+            outer = DP * (28.0 + 4.0 * math.sin(self._sun_angle * 3 + i))
+            self._thick.setAlpha(int(180 * alpha))
+            canvas.drawLine(
+                cx + math.cos(angle)*inner, cy + math.sin(angle)*inner,
+                cx + math.cos(angle)*outer, cy + math.sin(angle)*outer,
+                self._thick,
+            )
+
+    def _draw_cloud_bg(self, canvas, w: int, h: int):
+        """Статичное фоновое облако вверху для cloudy/partly_cloudy."""
+        self._argb(self._fill, 0xFFEEEEFF)
+        self._fill.setAlpha(30)
+        sc = DP * 18.0
+        for ox, oy, os in ((-3,0,1.0),(-1,-1,1.3),(1,-1.2,1.5),(3,-0.5,1.1),(2,0.3,0.8)):
+            canvas.drawCircle(w*0.5+ox*sc, h*0.1+oy*sc, sc*os, self._fill)
+
+    # ── on_draw ───────────────────────────────────────────────────────────────
+
+    def on_draw(self, view, canvas):
+        if not self.running:
+            return
+        wt = self.weather_type
+        try:
+            w = view.getWidth()
+            h = view.getHeight()
+            if w <= 0 or h <= 0:
+                return
+
+            now = time.monotonic()
+            dt  = min(32.0, (now - self._last_mono)*1000.0) if self._last_mono > 0 else 16.0
+            self._last_mono = now
+
+            needs_invalidate = False
+
+            if wt == "clear":
+                self._draw_sun(canvas, w, h, dt, alpha=1.0)
+                for p in self.particles: self._draw_particle(canvas, p)
+                self._spawn(w, h)
+                self._update(dt)
+                needs_invalidate = True   # солнце всегда анимировано
+
+            elif wt == "partly_cloudy":
+                self._draw_sun(canvas, w, h, dt, alpha=0.5)
+                self._draw_cloud_bg(canvas, w, h)
+                for p in self.particles: self._draw_particle(canvas, p)
+                self._spawn(w, h)
+                self._update(dt)
+                needs_invalidate = True
+
+            elif wt == "cloudy":
+                self._draw_cloud_bg(canvas, w, h)
+                for p in self.particles: self._draw_particle(canvas, p)
+                self._spawn(w, h)
+                self._update(dt)
+                needs_invalidate = bool(self.particles)
+
+            elif wt in ("fog","light_rain","rain","thunder",
+                        "light_snow","snow","sleet","hail"):
+                if wt == "thunder":
+                    self._lightning_timer += 1
+                    if self._lightning_timer >= self._lightning_next:
+                        self._lightning_alpha = self.cfg_lightning_intensity
+                        self._lightning_timer = 0
+                        self._lightning_next  = random.randint(80, 240)
+                        # Генерируем 2-4 случайных пятна вспышки
+                        self._lightning_spots = [
+                            (random.random() * w, random.random() * h,
+                             DP * (random.random() * 80 + 60))   # x, y, radius
+                            for _ in range(random.randint(2, 4))
+                        ]
+                    elif self._lightning_alpha > 0:
+                        self._lightning_alpha = max(0, self._lightning_alpha - self.cfg_lightning_speed)
+                    if self._lightning_alpha > 0 and self._lightning_spots:
+                        self._argb(self._fill, 0xFFFFFFEE)
+                        for sx, sy, sr in self._lightning_spots:
+                            # Каждое пятно — 3 концентрических круга (яркий центр, fade к краям)
+                            self._fill.setAlpha(self._lightning_alpha)
+                            canvas.drawCircle(sx, sy, sr * 0.35, self._fill)
+                            self._fill.setAlpha(self._lightning_alpha * 2 // 5)
+                            canvas.drawCircle(sx, sy, sr * 0.65, self._fill)
+                            self._fill.setAlpha(self._lightning_alpha // 6)
+                            canvas.drawCircle(sx, sy, sr, self._fill)
+
+                for p in self.particles: self._draw_particle(canvas, p)
+                self._spawn(w, h)
+                self._update(dt)
+                needs_invalidate = bool(self.particles) or self._lightning_alpha > 0
+
+            if needs_invalidate:
+                view.invalidate()
+
+        except Exception as e:
+            log(f"[DynBG] on_draw: {e}")
+
+
+
+# ─── Settings header hook (как в morse_keyboard) ──────────────────────────────
+
+class _SettingsHeaderHook(MethodHook):
+    def __init__(self, plugin):
+        self._plugin = plugin
+
+    def before_hooked_method(self, param): return
+
+    def after_hooked_method(self, param):
+        try:
+            activity = param.thisObject
+            items    = param.args[0]
+            if not items or items.size() == 0: return
+            plugin_obj = get_private_field(activity, "plugin")
+            if not plugin_obj or str(plugin_obj.getId()) != __id__: return
+            callback = get_private_field(activity, "createSubFragmentCallback")
+            if callback is not None: return
+            header = self._plugin._create_settings_header_view(activity.getContext())
+            if not header: return
+            from org.telegram.ui.Components import UItem
+            try:
+                from com.exteragram.messenger.plugins.models import HeaderSetting
+                item = UItem.asCustom(header)
+                item.settingItem = HeaderSetting(f"{__id__}_header")
+            except Exception:
+                item = UItem.asCustom(header)
+            try: item.setTransparent(True)
+            except Exception: pass
+            items.add(0, item)
+        except Exception: pass
+
+
+_effect = WeatherEffect()
+
+
+# ─── Hooks ────────────────────────────────────────────────────────────────────
+
+class DrawHook(MethodHook):
+    def after_hooked_method(self, param):
+        try:
+            view   = param.thisObject
+            canvas = param.args[0]
+            if canvas is not None:
+                _effect.on_draw(view, canvas)
+            _effect.last_view = view
+        except Exception as e:
+            log(f"[DynBG] DrawHook: {e}")
+
+
+class ResumeHook(MethodHook):
+    def __init__(self, plugin): self._p = plugin
+    def after_hooked_method(self, param):
+        try:    self._p._on_resumed()
+        except Exception as e: log(f"[DynBG] ResumeHook: {e}")
+
+
+class PauseHook(MethodHook):
+    def before_hooked_method(self, param):
+        _effect.running = False
+
+
+# ─── Plugin ───────────────────────────────────────────────────────────────────
+
+class DynamicBackgroundsPlugin(BasePlugin):
+
+    TAG = "[DynBG]"
+
+    _CMDS = {
+        ".bg clear":         "clear",
+        ".bg partly_cloudy": "partly_cloudy",
+        ".bg cloudy":        "cloudy",
+        ".bg fog":           "fog",
+        ".bg light_rain":    "light_rain",
+        ".bg rain":          "rain",
+        ".bg thunder":       "thunder",
+        ".bg light_snow":    "light_snow",
+        ".bg snow":          "snow",
+        ".bg sleet":         "sleet",
+        ".bg hail":          "hail",
+    }
+    _LABELS = {
+        "clear":         "☀️ Ясно",
+        "partly_cloudy": "⛅ Переменная облачность",
+        "cloudy":        "☁️ Облачно",
+        "fog":           "🌫 Туман",
+        "light_rain":    "🌦 Лёгкий дождь",
+        "rain":          "🌧 Дождь",
+        "thunder":       "⛈ Гроза",
+        "light_snow":    "🌨 Лёгкий снег",
+        "snow":          "❄️ Снег",
+        "sleet":         "🌧 Слякоть",
+        "hail":          "🌨 Град",
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._weather_type  = "clear"
+        self._last_update   = 0.0
+        self._cache         = {}
+        self._loop_running  = False
+        self._fetch_lock    = threading.Lock()
+        self._location_name = "—"
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def on_plugin_load(self):
+        self.log(f"{self.TAG} v5.4 loading")
+        self._setup_hooks()
+        self._apply_cfg()
+        self._start_weather_loop()
+        self.add_on_send_message_hook()
+        self._install_settings_header_hook()
+        BulletinHelper.show_success("Dynamic Backgrounds 🌦")
+
+    def _install_settings_header_hook(self):
+        try:
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if not PSA: return
+            method = PSA.getClass().getDeclaredMethod(
+                "fillItems",
+                find_class("java.util.ArrayList"),
+                find_class("org.telegram.ui.Components.UniversalAdapter"),
+            )
+            method.setAccessible(True)
+            self.hook_method(method, _SettingsHeaderHook(self))
+            self.log(f"{self.TAG} settings header hooked")
+        except Exception as e:
+            self.log(f"{self.TAG} header hook: {e}")
+
+    def on_plugin_unload(self):
+        self._loop_running = False
+        _effect.running    = False
+
+    # ── Settings subpages ─────────────────────────────────────────────────────
+
+    def _sub_clear(self) -> List[Any]:
+        return [
+            Header(text="☀️ Ясно — Солнце"),
+            Input(key="sun_pos_x",     text="Позиция X",          default="82",
+                  subtext="0–100% от ширины экрана",  icon="msg_media", on_change=self._apply_cfg),
+            Input(key="sun_pos_y",     text="Позиция Y",          default="12",
+                  subtext="0–50% от высоты экрана",   icon="msg_media", on_change=self._apply_cfg),
+            Input(key="sun_ray_speed", text="Скорость вращения",  default="3",
+                  subtext="0 = стоит, выше = быстрее", icon="msg_media", on_change=self._apply_cfg),
+            Divider(),
+            Header(text="☀️ Ясно — Искры"),
+            Input(key="spark_spawn",   text="Частота искр",       default="85",
+                  subtext="0–100 (меньше = чаще)",    icon="msg_media", on_change=self._apply_cfg),
+            Input(key="spark_count",   text="Макс. искр",         default="20",
+                  subtext="штук",                     icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_cloudy(self) -> List[Any]:
+        return [
+            Header(text="⛅ / ☁️ Облачность"),
+            Input(key="cloud_speed", text="Скорость облаков", default="11",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="cloud_spawn", text="Частота спавна",  default="97",
+                  subtext="0–100 (меньше = чаще)", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="cloud_count", text="Макс. облаков",   default="12",
+                  subtext="штук", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_fog(self) -> List[Any]:
+        return [
+            Header(text="🌫 Туман"),
+            Input(key="fog_speed", text="Скорость частиц", default="6",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="fog_spawn", text="Частота спавна",  default="88",
+                  subtext="0–100 (меньше = чаще)", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="fog_count", text="Макс. частиц",    default="12",
+                  subtext="штук", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_light_rain(self) -> List[Any]:
+        return [
+            Header(text="🌦 Лёгкий дождь / Морось"),
+            Input(key="lrain_speed", text="Скорость", default="35",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="lrain_spawn", text="Частота спавна", default="80",
+                  subtext="0–100", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="lrain_count", text="Макс. капель",   default="50",
+                  subtext="штук", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_rain(self) -> List[Any]:
+        return [
+            Header(text="🌧 Дождь"),
+            Input(key="rain_speed", text="Скорость", default="55",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="rain_spawn", text="Частота спавна", default="55",
+                  subtext="0–100 (меньше = чаще)", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="rain_count", text="Макс. капель",   default="150",
+                  subtext="штук", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_thunder(self) -> List[Any]:
+        return [
+            Header(text="⚡ Гроза"),
+            Input(key="thunder_speed", text="Скорость дождя", default="75",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="thunder_spawn", text="Частота дождя", default="45",
+                  subtext="0–100", icon="msg_media", on_change=self._apply_cfg),
+            Divider(),
+            Header(text="⚡ Молния"),
+            Input(key="lightning_intensity", text="Яркость вспышки", default="210",
+                  subtext="0–255", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="lightning_speed", text="Скорость затухания", default="18",
+                  subtext="1–40 (меньше = дольше светит)", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_light_snow(self) -> List[Any]:
+        return [
+            Header(text="🌨 Лёгкий снег"),
+            Input(key="lsnow_speed", text="Скорость", default="18",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="lsnow_spawn", text="Частота спавна", default="82",
+                  subtext="0–100", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="lsnow_count", text="Макс. снежинок", default="40",
+                  subtext="штук", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_snow(self) -> List[Any]:
+        return [
+            Header(text="❄️ Снег / Буран"),
+            Input(key="snow_speed", text="Скорость", default="22",
+                  subtext="px/500ms", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="snow_spawn", text="Частота спавна", default="70",
+                  subtext="0–100", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="snow_count", text="Макс. снежинок", default="100",
+                  subtext="штук (слякоть использует те же)", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _sub_hail(self) -> List[Any]:
+        return [
+            Header(text="🌨 Ледяная крупа / Град"),
+            Input(key="hail_speed", text="Скорость", default="90",
+                  subtext="px/500ms (очень быстро)", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="hail_spawn", text="Частота спавна", default="50",
+                  subtext="0–100", icon="msg_media", on_change=self._apply_cfg),
+            Input(key="hail_count", text="Макс. градин",   default="120",
+                  subtext="штук", icon="msg_media", on_change=self._apply_cfg),
+        ]
+
+    def _apply_cfg(self, _=None):
+        def _i(k, d):
+            try:    return max(1, int(self.get_setting(k, str(d))))
+            except: return d
+        _effect.apply_cfg(
+            spark_spawn=_i("spark_spawn",85),     spark_count=_i("spark_count",20),
+            sun_pos_x=_i("sun_pos_x",82),         sun_pos_y=_i("sun_pos_y",12),
+            sun_ray_speed=_i("sun_ray_speed",3),
+            cloud_speed=_i("cloud_speed",11),     cloud_spawn=_i("cloud_spawn",97),
+            cloud_count=_i("cloud_count",12),
+            fog_speed=_i("fog_speed",6),          fog_spawn=_i("fog_spawn",88),
+            fog_count=_i("fog_count",12),
+            lrain_speed=_i("lrain_speed",35),     lrain_spawn=_i("lrain_spawn",80),
+            lrain_count=_i("lrain_count",50),
+            rain_speed=_i("rain_speed",55),       rain_spawn=_i("rain_spawn",55),
+            rain_count=_i("rain_count",150),
+            thunder_speed=_i("thunder_speed",75), thunder_spawn=_i("thunder_spawn",45),
+            lsnow_speed=_i("lsnow_speed",18),     lsnow_spawn=_i("lsnow_spawn",82),
+            lsnow_count=_i("lsnow_count",40),
+            snow_speed=_i("snow_speed",22),       snow_spawn=_i("snow_spawn",70),
+            snow_count=_i("snow_count",100),
+            hail_speed=_i("hail_speed",90),       hail_spawn=_i("hail_spawn",50),
+            hail_count=_i("hail_count",120),
+            lightning_intensity=_i("lightning_intensity",210),
+            lightning_speed=_i("lightning_speed",18),
+        )
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Dynamic Backgrounds"),
+            Switch(key="enabled", text="Включить эффект", default=True, icon="msg_settings"),
+            Divider(),
+            Header(text="Погода"),
+            Input(key="city", text="Город (запасной)", default="",
+                  subtext="Если задан — используется вместо GPS/IP. Пример: Moscow",
+                  icon="msg_location",
+                  on_change=lambda v: (self.set_setting("city", str(v).strip()),
+                                       self._invalidate_cache())),
+            Text(text="Обновить погоду сейчас", icon="media_repost",
+                 on_click=self._force_refresh),
+            Input(key="update_interval", text="Интервал обновления", default="30",
+                  subtext="минут (минимум 5)", icon="msg_calendar2",
+                  on_change=lambda v: self.set_setting("update_interval", str(max(5, int(v or 30))))),
+            Divider(),
+            Header(text="Настройки частиц"),
+            Text(text="☀️ Ясно",                  icon="msg_list", create_sub_fragment=self._sub_clear),
+            Text(text="⛅ Переменная облачность",  icon="msg_list", create_sub_fragment=self._sub_cloudy),
+            Text(text="☁️ Облачно / Пасмурно",    icon="msg_list", create_sub_fragment=self._sub_cloudy),
+            Text(text="🌫 Туман",                  icon="msg_list", create_sub_fragment=self._sub_fog),
+            Text(text="🌦 Лёгкий дождь / Морось",  icon="msg_list", create_sub_fragment=self._sub_light_rain),
+            Text(text="🌧 Дождь",                  icon="msg_list", create_sub_fragment=self._sub_rain),
+            Text(text="⚡ Гроза",                  icon="msg_list", create_sub_fragment=self._sub_thunder),
+            Text(text="🌨 Лёгкий снег",            icon="msg_list", create_sub_fragment=self._sub_light_snow),
+            Text(text="❄️ Снег / Буран",           icon="msg_list", create_sub_fragment=self._sub_snow),
+            Text(text="🌧 Слякоть",                icon="msg_list", create_sub_fragment=self._sub_snow),
+            Text(text="🌨 Ледяная крупа / Град",   icon="msg_list", create_sub_fragment=self._sub_hail),
+            Divider(),
+            Header(text="Авторы"),
+            Text(
+                text="@rei_plugins",
+                icon="msg_openprofile",
+                on_click=lambda v: self._open_profile("rei_plugins"),
+            ),
+            Text(
+                text="@optimist_opti",
+                icon="msg_openprofile",
+                on_click=lambda v: self._open_profile("optimist_opti"),
+            ),
+        ]
+
+    def _force_refresh(self, _):
+        self._last_update = 0.0
+        self._cache.clear()
+        run_on_queue(self._fetch_and_apply)
+        BulletinHelper.show_info("Обновляем погоду…")
+
+    def _invalidate_cache(self):
+        self._cache.clear()
+        self._last_update = 0.0
+
+    def _create_settings_header_view(self, context):
+        try:
+            container = _FL(context)
+            content   = _LL(context)
+            content.setOrientation(_LL.VERTICAL)
+
+            # Аватарка текущего пользователя
+            try:
+                from org.telegram.messenger import MessagesController, UserConfig
+                from org.telegram.ui.Components import AvatarDrawable, BackupImageView
+                account = int(getattr(UserConfig, "selectedAccount", 0))
+                mc   = MessagesController.getInstance(account)
+                uc   = UserConfig.getInstance(account)
+                user = mc.getUser(uc.getClientUserId()) if mc and uc else None
+                if user:
+                    img = BackupImageView(context)
+                    img.setRoundRadius(_AU.dp(40))
+                    img.setForUserOrChat(user, AvatarDrawable(user))
+                    content.addView(img, _LH.createLinear(80, 80, _G.CENTER_HORIZONTAL, 0, 20, 0, 12))
+            except Exception as e:
+                self.log(f"{self.TAG} avatar: {e}")
+
+            title_tv = _TV(context)
+            title_tv.setText("Dynamic Backgrounds")
+            title_tv.setTextSize(_TypedValue.COMPLEX_UNIT_DIP, 22)
+            title_tv.setGravity(_G.CENTER)
+            title_tv.setTextColor(_tc(_Theme.key_windowBackgroundWhiteBlackText))
+            try: title_tv.setTypeface(_AU.getTypeface(_AU.TYPEFACE_ROBOTO_MEDIUM))
+            except Exception: pass
+            content.addView(title_tv, _LH.createLinear(-2, -2, _G.CENTER_HORIZONTAL, 16, 0, 16, 4))
+
+            desc_tv = _TV(context)
+            desc_tv.setText("Динамический фон на основе реальной погоды")
+            desc_tv.setTextSize(_TypedValue.COMPLEX_UNIT_DIP, 13)
+            desc_tv.setGravity(_G.CENTER)
+            desc_tv.setTextColor(_tc(_Theme.key_windowBackgroundWhiteGrayText))
+            content.addView(desc_tv, _LH.createLinear(-2, -2, _G.CENTER_HORIZONTAL, 24, 0, 24, 12))
+
+            authors_row = _LL(context)
+            authors_row.setOrientation(_LL.HORIZONTAL)
+            authors_row.setGravity(_G.CENTER)
+
+            def make_link(name, username):
+                tv = _TV(context)
+                tv.setText(name)
+                tv.setTextSize(_TypedValue.COMPLEX_UNIT_DIP, 13)
+                tv.setTextColor(_tc(_Theme.key_windowBackgroundWhiteBlueText))
+                tv.setClickable(True)
+                tv.setOnClickListener(OnClickListener(
+                    lambda v, u=username: self._open_profile(u)))
+                return tv
+
+            sep = _TV(context)
+            sep.setText("  •  ")
+            sep.setTextSize(_TypedValue.COMPLEX_UNIT_DIP, 13)
+            sep.setTextColor(_tc(_Theme.key_windowBackgroundWhiteGrayText))
+
+            authors_row.addView(make_link("@rei_plugins",  "rei_plugins"))
+            authors_row.addView(sep)
+            authors_row.addView(make_link("@optimist_opti", "optimist_opti"))
+            content.addView(authors_row, _LH.createLinear(-2, -2, _G.CENTER_HORIZONTAL, 0, 0, 0, 20))
+
+            container.addView(content, _LH.createFrame(-1, -2, _G.CENTER))
+            return container
+        except Exception as e:
+            self.log(f"{self.TAG} header view: {e}")
+            return None
+
+    def _open_profile(self, username):
+        try:
+            frag = get_last_fragment()
+            act  = frag.getParentActivity() if frag else None
+            if act:
+                try:
+                    intent = Intent(Intent.ACTION_VIEW,
+                                    Uri.parse(f"tg://resolve?domain={username}"))
+                    intent.setPackage(act.getPackageName())
+                    act.startActivity(intent)
+                except Exception:
+                    act.startActivity(Intent(Intent.ACTION_VIEW,
+                        Uri.parse(f"https://t.me/{username}")))
+        except Exception as e:
+            self.log(f"{self.TAG} open_profile: {e}")
+
+    def _open_api_site(self, _):
+        try:
+            fragment = get_last_fragment()
+            if not fragment: return
+            activity = fragment.getParentActivity()
+            if not activity: return
+            intent = Intent(Intent.ACTION_VIEW)
+            intent.setData(Uri.parse("https://www.weatherapi.com/signup.aspx"))
+            activity.startActivity(intent)
+        except Exception as e:
+            self.log(f"{self.TAG} open_api_site: {e}")
+
+    # ── Commands ──────────────────────────────────────────────────────────────
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        msg = params.message
+        if not isinstance(msg, str) or not msg.startswith(".bg"):
+            return HookResult()
+        cmd = msg.strip().lower()
+
+        if cmd in (".bg", ".bg help"):
+            params.message = (
+                "🌦 Dynamic Backgrounds\n\n"
+                ".bg clear / partly_cloudy / cloudy / fog\n"
+                ".bg light_rain / rain / thunder\n"
+                ".bg light_snow / snow / sleet / hail\n"
+                ".bg auto   — обновить по API\n"
+                ".bg status — текущее состояние"
+            )
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if cmd == ".bg status":
+            e   = _effect
+            params.message = (
+                f"🌦 DynBG v5.4\n"
+                f"Локация: {self._location_name}\n"
+                f"Погода: {self._LABELS.get(self._weather_type, self._weather_type)}\n"
+                f"Частиц: {len(e.particles)}\n"
+                f"Анимация: {'▶️' if e.running else '⏸'}"
+            )
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if cmd == ".bg auto":
+            self._last_update = 0.0
+            self._cache.clear()
+            run_on_queue(self._fetch_and_apply)
+            params.message = "🔄 Обновляю погоду…"
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        wt = self._CMDS.get(cmd)
+        if wt is None:
+            params.message = f"❓ Неизвестная команда: {cmd}\nНапиши .bg help"
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        self._weather_type = wt
+        self._last_update  = time.time()
+        run_on_ui_thread(self._sync)
+        params.message = f"{self._LABELS[wt]} — применён!"
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+    # ── Hooks ─────────────────────────────────────────────────────────────────
+
+    def _setup_hooks(self):
+        try:
+            ChatClass = find_class("org.telegram.ui.ChatActivity")
+            if ChatClass:
+                self.hook_all_methods(ChatClass, "onResume", ResumeHook(self))
+                self.hook_all_methods(ChatClass, "onPause",  PauseHook())
+                self.log(f"{self.TAG} ChatActivity hooked")
+            draw_hook = DrawHook()
+            for cname in (
+                "org.telegram.ui.ChatActivity$ChatActivityFragmentView",
+                "org.telegram.ui.Components.SizeNotifierFrameLayout",
+                "org.telegram.ui.ActionBar.ActionBar",
+            ):
+                cls = find_class(cname)
+                if not cls: continue
+                for mname in ("dispatchDraw", "onDraw"):
+                    try:
+                        res = self.hook_all_methods(cls, mname, draw_hook)
+                        if res:
+                            self.log(f"{self.TAG} hooked {cname}.{mname}")
+                            return
+                    except Exception: pass
+            self.log(f"{self.TAG} WARNING: draw hook not found!")
+        except Exception as e:
+            self.log(f"{self.TAG} _setup_hooks: {e}")
+
+    def _on_resumed(self):
+        if not self.get_setting("enabled", True):
+            return
+        def go():
+            _effect.running = True
+            self._sync()
+            self.log(f"{self.TAG} resumed, weather={self._weather_type}")
+        run_on_ui_thread(go)
+
+    def _sync(self):
+        wt = self._weather_type if self.get_setting("enabled", True) else "clear"
+        _effect.set_weather(wt)
+
+    # ── Weather loop ──────────────────────────────────────────────────────────
+
+    def _get_update_interval(self) -> float:
+        try:    return max(5, int(self.get_setting("update_interval", "30"))) * 60.0
+        except: return UPDATE_SEC
+
+    def _start_weather_loop(self):
+        self._loop_running = True
+        def loop():
+            while self._loop_running:
+                if time.time() - self._last_update >= self._get_update_interval():
+                    self._fetch_and_apply()
+                time.sleep(60)
+        threading.Thread(target=loop, daemon=True, name="DynBG-loop").start()
+
+    def _fetch_and_apply(self):
+        if not self._fetch_lock.acquire(blocking=False):
+            return
+        try:
+            # 1. Получаем координаты
+            lat, lon, location_name = self._get_location()
+            if lat is None:
+                self.log(f"{self.TAG} location unavailable, skip")
+                return
+
+            # 2. Запрашиваем погоду Open-Meteo (бесплатно, без ключа)
+            ck = f"{lat:.3f}_{lon:.3f}"
+            if ck in self._cache:
+                data, ts = self._cache[ck]
+                if time.time() - ts < CACHE_SEC:
+                    self.log(f"{self.TAG} cached ({location_name})")
+                    wt = data
+                    self._weather_type = wt
+                    self._last_update  = time.time()
+                    self._location_name = location_name
+                    run_on_ui_thread(self._sync)
+                    return
+
+            r = requests.get(
+                "https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat}&longitude={lon}"
+                "&current=weather_code"
+                "&forecast_days=1",
+                timeout=10,
+                headers={"User-Agent": "DynamicBackgrounds/5.4"},
+            )
+            self.log(f"{self.TAG} Open-Meteo {r.status_code}")
+            if r.status_code != 200:
+                self.log(f"{self.TAG} error: {r.text[:200]}")
+                return
+
+            code = r.json().get("current", {}).get("weather_code", 0)
+            wt   = WMO.get(int(code), "clear")
+            self.log(f"{self.TAG} WMO {code} → {wt} @ {location_name}")
+
+            self._cache[ck]      = (wt, time.time())
+            self._weather_type   = wt
+            self._location_name  = location_name
+            self._last_update    = time.time()
+            run_on_ui_thread(self._sync)
+        except Exception as e:
+            self.log(f"{self.TAG} _fetch_and_apply: {e}")
+        finally:
+            self._fetch_lock.release()
+
+    def _get_location(self):
+        """Возвращает (lat, lon, name). Приоритет: ручной город → GPS → IP."""
+        # ── Попытка 0: ручной город из настроек (если задан) ─────────────────
+        city = self.get_setting("city", "").strip()
+        if city:
+            try:
+                r = requests.get(
+                    "https://geocoding-api.open-meteo.com/v1/search"
+                    f"?name={requests.utils.quote(city)}&count=1&language=ru",
+                    timeout=8,
+                    headers={"User-Agent": "DynamicBackgrounds/5.4"},
+                )
+                if r.status_code == 200:
+                    results = r.json().get("results", [])
+                    if results:
+                        res  = results[0]
+                        lat  = float(res["latitude"])
+                        lon  = float(res["longitude"])
+                        name = res.get("name", city)
+                        self.log(f"{self.TAG} manual city '{city}' → {lat},{lon}")
+                        return lat, lon, name
+            except Exception as e:
+                self.log(f"{self.TAG} manual geocoding: {e}")
+
+        # ── Попытка 1: Android LocationManager ───────────────────────────────
+        try:
+            from android.content import Context
+            from android.location import LocationManager
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            lm  = ctx.getSystemService(Context.LOCATION_SERVICE)
+            best = None
+            for provider in (LocationManager.GPS_PROVIDER,
+                             LocationManager.NETWORK_PROVIDER):
+                try:
+                    if not lm.isProviderEnabled(provider):
+                        continue
+                    loc = lm.getLastKnownLocation(provider)
+                    if loc is None:
+                        continue
+                    age = (time.time() * 1000 - loc.getTime()) / 1000
+                    if age > 3600:   # не старше 1 часа
+                        continue
+                    if best is None or loc.getAccuracy() < best.getAccuracy():
+                        best = loc
+                except Exception:
+                    continue
+            if best is not None:
+                lat = best.getLatitude()
+                lon = best.getLongitude()
+                name = self._reverse_geocode(lat, lon)
+                self.log(f"{self.TAG} GPS location: {lat:.3f},{lon:.3f}")
+                return lat, lon, name
+        except Exception as e:
+            self.log(f"{self.TAG} LocationManager: {e}")
+
+        # ── Попытка 2: ip-api.com (без ключа, ~1000 запросов/день) ──────────
+        try:
+            r = requests.get("http://ip-api.com/json/?fields=lat,lon,city,country",
+                             timeout=6,
+                             headers={"User-Agent": "DynamicBackgrounds/5.4"})
+            if r.status_code == 200:
+                d    = r.json()
+                lat  = float(d["lat"])
+                lon  = float(d["lon"])
+                name = f"{d.get('city','?')}, {d.get('country','?')}"
+                self.log(f"{self.TAG} IP location: {name}")
+                return lat, lon, name
+        except Exception as e:
+            self.log(f"{self.TAG} ip-api: {e}")
+
+        return None, None, "?"
+
+    def _reverse_geocode(self, lat: float, lon: float) -> str:
+        """Получаем название города по координатам через Open-Meteo geocoding."""
+        try:
+            r = requests.get(
+                f"https://nominatim.openstreetmap.org/reverse"
+                f"?lat={lat}&lon={lon}&format=json&zoom=10",
+                timeout=5,
+                headers={"User-Agent": "DynamicBackgrounds/5.4"},
+            )
+            if r.status_code == 200:
+                addr = r.json().get("address", {})
+                city = (addr.get("city") or addr.get("town")
+                        or addr.get("village") or addr.get("county", "?"))
+                country = addr.get("country_code", "").upper()
+                return f"{city}, {country}"
+        except Exception:
+            pass
+        return f"{lat:.2f},{lon:.2f}"
