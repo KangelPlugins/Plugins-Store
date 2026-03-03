@@ -1,0 +1,1979 @@
+# Extera Banner — кастомные баннеры профилей
+# by @jimu312
+__id__ = "Extera_Profile"
+__name__ = "Extera Banner"
+__author__ = "@jimu312"
+__version__ = "2.0.0"
+__description__ = "Устанавливайте собственные баннеры для любого профиля — фото или видео. Поддержка эффектов (размытие, затемнение), синхронизация баннеров между пользователями через сервер и автобаннер из аватарки."
+__min_version__ = "11.12.0"
+
+import base64
+import json as _json
+import os
+import re
+import threading
+import time
+import weakref
+from datetime import datetime
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from hook_utils import find_class
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Text
+from ui.alert import AlertDialogBuilder
+
+try:
+    from ui.settings import Divider
+    _HAS_DIV = True
+except Exception:
+    _HAS_DIV = False
+
+from android.app import Activity
+from android.content import Intent, ClipboardManager, ClipData, Context
+from android.net import Uri
+from android.view import View, ViewGroup
+from android.widget import EditText
+from android.text import InputType
+from android.graphics import (
+    BitmapFactory, Bitmap, Color, LinearGradient, Paint, Shader, Matrix
+)
+from java.io import File, BufferedInputStream, FileOutputStream
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities
+
+try:
+    from java import jclass, jarray
+except Exception:
+    jclass = jarray = None
+
+# Canvas/ActionBar нужны для хука onDraw
+_JCanvas = _JActionBar = None
+if jclass:
+    try:
+        _JCanvas = jclass("android.graphics.Canvas")
+        _JActionBar = jclass("org.telegram.ui.ActionBar.ActionBar")
+    except Exception:
+        pass
+
+_MISS = object()  # sentinel
+
+
+# ─── Серверный клиент ───────────────────────────────────────────────
+
+class _Server:
+    API = "https://api.xd1.me"
+    CACHE_TTL = 3600
+    UCOUNT_TTL = 300
+
+    def __init__(self, plug):
+        self.p = plug
+        self._cache = {}
+        self._etags = {}
+        self._lock = threading.Lock()
+        self._inflight = set()
+        self._cache_dir = ""
+        self._ucount = None
+        self._ucount_ts = 0
+
+    def init_dirs(self):
+        base = self.p._dir or ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath()
+        d = os.path.join(base, "srv")
+        os.makedirs(d, exist_ok=True)
+        self._cache_dir = d
+
+    # -- token --
+    def _dev_key(self):
+        try:
+            import hashlib
+            ctx = ApplicationLoader.applicationContext
+            aid = str(ctx.getPackageName()) + "eb"
+            return hashlib.md5(aid.encode()).hexdigest()[:16]
+        except Exception:
+            return "exterabanner_k0"
+
+    def store_token(self, raw):
+        key = self._dev_key().encode()
+        xored = bytes(a ^ b for a, b in zip(raw.encode(), (key * 8)[:len(raw.encode())]))
+        self.p.set_setting("eb.srv.tok", base64.b64encode(xored).decode())
+
+    def load_token(self):
+        enc = self.p._s("eb.srv.tok", "")
+        if not enc:
+            return ""
+        try:
+            data = base64.b64decode(enc)
+            key = self._dev_key().encode()
+            raw = bytes(a ^ b for a, b in zip(data, (key * 8)[:len(data)]))
+            return raw.decode()
+        except Exception:
+            return enc  # fallback: plain text
+
+    def _headers(self):
+        tok = self.load_token()
+        return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+    # -- HTTP helpers --
+    def _get(self, url, timeout=15, etag=None):
+        hdrs = {}
+        if etag:
+            hdrs["If-None-Match"] = etag
+        try:
+            import requests
+            r = requests.get(url, headers=hdrs, timeout=timeout, verify=True)
+            return r.status_code, r.content, r.headers.get("ETag", "")
+        except ImportError:
+            pass
+        from java.net import URL, HttpURLConnection
+        conn = URL(url).openConnection()
+        conn.setRequestMethod("GET")
+        if etag:
+            conn.setRequestProperty("If-None-Match", etag)
+        conn.setConnectTimeout(timeout * 1000)
+        conn.setReadTimeout(timeout * 1000)
+        try:
+            code = conn.getResponseCode()
+            ret_etag = conn.getHeaderField("ETag") or ""
+            if code == 304:
+                return 304, b"", ret_etag
+            s = conn.getInputStream() if code < 400 else conn.getErrorStream()
+            chunks, buf = [], bytearray(8192)
+            while True:
+                n = s.read(buf)
+                if n == -1:
+                    break
+                chunks.append(bytes(buf[:n]))
+            s.close()
+            return code, b"".join(chunks), ret_etag
+        finally:
+            conn.disconnect()
+
+    def _delete(self, url, timeout=10):
+        hdrs = self._headers()
+        try:
+            import requests
+            return requests.delete(url, headers=hdrs, timeout=timeout, verify=True).status_code
+        except ImportError:
+            pass
+        from java.net import URL, HttpURLConnection
+        c = URL(url).openConnection()
+        c.setRequestMethod("DELETE")
+        for k, v in hdrs.items():
+            c.setRequestProperty(k, v)
+        c.setConnectTimeout(timeout * 1000)
+        c.setReadTimeout(timeout * 1000)
+        try:
+            return c.getResponseCode()
+        finally:
+            c.disconnect()
+
+    def _post_file(self, url, fields, fpath, timeout=30):
+        ext = os.path.splitext(fpath)[1].lower()
+        ct_map = {".gif": "image/gif", ".png": "image/png", ".webp": "image/webp", ".mp4": "video/mp4"}
+        ct = ct_map.get(ext, "image/jpeg")
+        fname = "banner" + (ext or ".jpg")
+        hdrs = self._headers()
+        try:
+            import requests
+            with open(fpath, "rb") as f:
+                r = requests.post(url, headers=hdrs, data=fields,
+                                  files={"file": (fname, f, ct)}, timeout=timeout, verify=True)
+            return r.status_code, r.text
+        except ImportError:
+            pass
+        from java.net import URL, HttpURLConnection
+        boundary = "----EB" + str(int(time.time() * 1000))
+        c = URL(url).openConnection()
+        c.setRequestMethod("POST")
+        for k, v in hdrs.items():
+            c.setRequestProperty(k, v)
+        c.setDoOutput(True)
+        c.setConnectTimeout(timeout * 1000)
+        c.setReadTimeout(timeout * 1000)
+        c.setRequestProperty("Content-Type", f"multipart/form-data; boundary={boundary}")
+        out = c.getOutputStream()
+        for name, value in fields.items():
+            out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+        out.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\nContent-Type: {ct}\r\n\r\n".encode())
+        with open(fpath, "rb") as f:
+            while True:
+                ch = f.read(8192)
+                if not ch:
+                    break
+                out.write(ch)
+        out.write(f"\r\n--{boundary}--\r\n".encode())
+        out.flush(); out.close()
+        try:
+            code = c.getResponseCode()
+            s = c.getInputStream() if code < 400 else c.getErrorStream()
+            body = b""
+            if s:
+                parts, buf = [], bytearray(4096)
+                while True:
+                    n = s.read(buf)
+                    if n == -1:
+                        break
+                    parts.append(bytes(buf[:n]))
+                s.close()
+                body = b"".join(parts)
+            return code, body.decode("utf-8", errors="replace")
+        finally:
+            c.disconnect()
+
+    # -- high-level --
+    def upload(self, fpath, effect="none", tmode="", force=False):
+        if not self.p._b("eb.srv.consent", False):
+            if force:
+                self.p._msg("Включите 'Согласие' в настройках!")
+            return
+        if not force and not self.p._b("eb.srv.auto", True):
+            return
+        uid = self.p._my_uid()
+        if not uid:
+            return
+        def _go():
+            try:
+                code, body = self._post_file(
+                    f"{self.API}/api/banner/upload",
+                    {"user_id": uid, "effect": effect, "text_mode": tmode}, fpath)
+                if code == 200:
+                    self.p._msg("Баннер загружен на сервер!")
+                else:
+                    err = ""
+                    try:
+                        err = _json.loads(body).get("detail", "")
+                    except Exception:
+                        pass
+                    codes = {413: "Слишком большой", 429: "Частые запросы", 401: "Плохой токен", 507: "Сервер полон"}
+                    self.p._msg(f"Ошибка: {err or codes.get(code, f'Код {code}')}")
+            except Exception as e:
+                self.p._log(f"upload: {e}")
+        threading.Thread(target=_go, daemon=True).start()
+
+    def upload_bmp(self, bmp, effect="none", tmode=""):
+        tmp = os.path.join(self._cache_dir or self.p._dir, "_up.jpg")
+        out = FileOutputStream(tmp)
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        out.close()
+        self.upload(tmp, effect, tmode, force=True)
+
+    def remove(self):
+        if not self.p._b("eb.srv.consent", False):
+            return
+        uid = self.p._my_uid()
+        if not uid:
+            return
+        def _go():
+            try:
+                self._delete(f"{self.API}/api/banner/{uid}")
+            except Exception:
+                pass
+        threading.Thread(target=_go, daemon=True).start()
+
+    def is_fetching(self, uid_str):
+        return uid_str in self._inflight
+
+    def fetch(self, uid_str):
+        """Фоновая загрузка баннера. Возвращает закэшированный entry или None."""
+        if not self.p._b("eb.srv.fetch", True):
+            return None
+        with self._lock:
+            hit = self._cache.get(uid_str)
+        if hit:
+            if time.time() - hit.get("ts", 0) < self.CACHE_TTL:
+                p = hit.get("path", "")
+                return hit if (p and os.path.exists(p)) else None
+        if uid_str in self._inflight:
+            return None
+        self._inflight.add(uid_str)
+
+        def _bg():
+            try:
+                old_etag = ""
+                with self._lock:
+                    old_etag = self._etags.get(uid_str, "")
+                # check meta first
+                code_m, body_m, _ = self._get(f"{self.API}/api/banner/{uid_str}/meta", timeout=10)
+                meta = _json.loads(body_m.decode()) if code_m == 200 and body_m else None
+                if not meta or not meta.get("exists"):
+                    with self._lock:
+                        self._cache[uid_str] = {"path": "", "ts": time.time()}
+                    return
+                fmt = meta.get("format", "jpeg")
+                ext = ".mp4" if fmt == "mp4" or meta.get("type") == "video" else ".jpg"
+                code, data, new_etag = self._get(
+                    f"{self.API}/api/banner/{uid_str}", etag=old_etag, timeout=25)
+                if new_etag:
+                    with self._lock:
+                        self._etags[uid_str] = new_etag
+                if code == 304:
+                    with self._lock:
+                        if uid_str in self._cache:
+                            self._cache[uid_str]["ts"] = time.time()
+                    return
+                if code != 200 or not data or len(data) < 100:
+                    with self._lock:
+                        self._cache[uid_str] = {"path": "", "ts": time.time()}
+                    return
+                cdir = self._cache_dir or self.p._dir
+                cpath = os.path.join(cdir, f"s_{uid_str}{ext}")
+                with open(cpath, "wb") as f:
+                    f.write(data)
+                entry = {"path": cpath, "effect": meta.get("effect", "none"),
+                         "tmode": meta.get("text_mode", ""), "type": meta.get("type", "image"),
+                         "ts": time.time()}
+                with self._lock:
+                    self._cache[uid_str] = entry
+                run_on_ui_thread(lambda: self.p._invalidate_ui())
+            except Exception as e:
+                self.p._log(f"fetch({uid_str}): {e}")
+            finally:
+                self._inflight.discard(uid_str)
+        threading.Thread(target=_bg, daemon=True).start()
+        return None
+
+    def cached_meta(self, uid_str, field):
+        with self._lock:
+            c = self._cache.get(uid_str)
+        return c.get(field, "") if c else ""
+
+    def user_count(self):
+        now = time.time()
+        if self._ucount is not None and now - self._ucount_ts < self.UCOUNT_TTL:
+            return self._ucount
+        try:
+            code, body, _ = self._get(f"{self.API}/api/stats/users", timeout=8)
+            if code == 200:
+                d = _json.loads(body.decode())
+                self._ucount = d.get("count", "?")
+                self._ucount_ts = now
+        except Exception:
+            pass
+        return self._ucount
+
+
+# ─── Видео-движок ───────────────────────────────────────────────────
+
+class _Video:
+    def __init__(self, plug):
+        self.p = plug
+        self._player = None
+        self._tex = None
+        self._src = None
+        self._host = None
+        self._args = None
+
+    def play(self, host, path, w, h):
+        key = (id(host), path, w, h)
+        if self._args == key:
+            return
+        self._args = key
+        run_on_ui_thread(lambda: self._setup(host, path, w, h))
+
+    def _setup(self, host, path, w, h):
+        if self._player and self._src == path and self._host == host:
+            if self._tex:
+                try:
+                    lp = self._tex.getLayoutParams()
+                    if lp and (lp.width != w or lp.height != h):
+                        lp.width, lp.height = w, h
+                        self._tex.setLayoutParams(lp)
+                        self._crop(self._tex, w, h)
+                except Exception:
+                    pass
+            return
+        self.stop()
+        from android.view import TextureView as TV
+        from android.widget import FrameLayout as FL
+        from android.media import MediaPlayer as MP
+        from android.view import Surface as SF
+        # убираем старые TextureView
+        for i in range(host.getChildCount() - 1, -1, -1):
+            ch = host.getChildAt(i)
+            if isinstance(ch, TV):
+                host.removeViewAt(i)
+        tex = TV(host.getContext())
+        host.addView(tex, 0, FL.LayoutParams(w, h))
+        player = MP()
+        muted = not self.p._b("eb.sound", False)
+
+        def _run():
+            try:
+                st = None
+                for _ in range(20):
+                    st = tex.getSurfaceTexture()
+                    if st:
+                        break
+                    time.sleep(0.1)
+                if not st:
+                    return
+                player.setSurface(SF(st))
+                player.setDataSource(path)
+                player.prepare()
+                player.setVolume(0.0 if muted else 1.0, 0.0 if muted else 1.0)
+                player.start()
+                vw, vh = player.getVideoWidth(), player.getVideoHeight()
+                if vw > 0 and vh > 0:
+                    run_on_ui_thread(lambda: self._crop(tex, w, h, vw, vh))
+                # loop listener
+                try:
+                    from java import dynamic_proxy
+                    OCL = jclass("android.media.MediaPlayer$OnCompletionListener")
+                    class _Loop(dynamic_proxy(OCL)):
+                        def onCompletion(self, mp):
+                            try:
+                                mp.seekTo(0); mp.start()
+                            except Exception:
+                                pass
+                    player.setOnCompletionListener(_Loop())
+                except Exception:
+                    pass
+                # detach watcher — stop video when leaving profile
+                while self._player == player and not self.p._stop:
+                    try:
+                        if not host.isAttachedToWindow():
+                            run_on_ui_thread(lambda: self.stop())
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.8)
+            except Exception as e:
+                self.p._log(f"video: {e}")
+        threading.Thread(target=_run, daemon=True).start()
+        self._player, self._tex, self._src, self._host = player, tex, path, host
+
+    def _crop(self, tex, vw, vh, vid_w=None, vid_h=None):
+        if not vid_w or not vid_h:
+            if self._player:
+                vid_w, vid_h = self._player.getVideoWidth(), self._player.getVideoHeight()
+        if not vid_w or not vid_h or not vw or not vh:
+            return
+        m = Matrix()
+        sx = max(float(vw) / vid_w, float(vh) / vid_h) / (float(vw) / vid_w)
+        sy = max(float(vw) / vid_w, float(vh) / vid_h) / (float(vh) / vid_h)
+        m.setScale(sx, sy, vw / 2.0, vh / 2.0)
+        tex.setTransform(m)
+
+    def stop(self):
+        if self._player:
+            p = self._player
+            self._player = None
+            try:
+                p.stop(); p.release()
+            except Exception:
+                pass
+        if self._tex and self._host:
+            try:
+                self._host.removeView(self._tex)
+            except Exception:
+                pass
+        self._tex = self._src = self._host = None
+        self._args = None
+
+    def pause(self):
+        if self._player:
+            try:
+                if self._player.isPlaying():
+                    self._player.pause()
+            except Exception:
+                pass
+
+    def resume(self):
+        if self._player:
+            try:
+                if not self._player.isPlaying():
+                    self._player.start()
+            except Exception:
+                pass
+
+    @property
+    def playing(self):
+        try:
+            return self._player and self._player.isPlaying()
+        except Exception:
+            return False
+
+
+# ─── Рендер ─────────────────────────────────────────────────────────
+
+class _Renderer:
+    def __init__(self, plug):
+        self.p = plug
+        self._p_bmp = None
+        self._p_dark = None
+        self._p_fade = None
+        self._fade_key = None
+
+    def draw(self, canvas, topview, key, bmp, effect, is_vid, y1, w, progress):
+        if effect == "blur":
+            bmp = self.p._blurred(key, bmp)
+        bw, bh = bmp.getWidth(), bmp.getHeight()
+        if bw <= 0 or bh <= 0:
+            return
+        vis = 1.0 - progress
+        if vis <= 0.02:
+            return
+        sc = max(w / float(bw), y1 / float(bh)) * 1.02
+        mat = Matrix()
+        mat.postScale(float(sc), float(sc))
+        mat.postTranslate((w - bw * sc) * 0.5, (y1 - bh * sc) * 0.5)
+        sid = canvas.save()
+        try:
+            canvas.clipRect(0, 0, int(w), int(y1))
+            if not self._p_bmp:
+                self._p_bmp = Paint()
+                self._p_bmp.setFilterBitmap(True)
+            # skip static frame when video plays
+            if not (is_vid and self.p.vid.playing):
+                self._p_bmp.setAlpha(255)
+                canvas.drawBitmap(bmp, mat, self._p_bmp)
+            if effect == "darken":
+                dp = self.p._pct("eb.dark", 70)
+                alpha = int(255 * dp / 100.0)
+                if alpha > 0:
+                    if not self._p_dark:
+                        self._p_dark = Paint()
+                        self._p_dark.setStyle(Paint.Style.FILL)
+                    self._p_dark.setARGB(alpha, 0, 0, 0)
+                    canvas.drawRect(0, 0, w, y1, self._p_dark)
+            # fade gradient
+            fa = self.p._i("eb.fade", 90)
+            fa = int(max(0, min(255, int(fa * vis))))
+            if fa > 0:
+                gh = int(max(1, y1 * 0.35))
+                fk = (y1, gh, fa)
+                if not self._p_fade:
+                    self._p_fade = Paint()
+                if self._fade_key != fk:
+                    self._fade_key = fk
+                    self._p_fade.setShader(LinearGradient(
+                        0, y1 - gh, 0, y1,
+                        int(0x00000000), int((fa << 24) & 0xFF000000),
+                        Shader.TileMode.CLAMP))
+                canvas.drawRect(0, y1 - gh, w, y1, self._p_fade)
+            # loading indicator — server fetch or video thumbnail extraction
+            loading = False
+            if key.startswith("uid_") and self.p.srv.is_fetching(key[4:]):
+                loading = True
+            if key in self.p._extracting:
+                loading = True
+            if loading:
+                # dark overlay (use raw int color, not Color.argb which returns long on Android 14+)
+                op = Paint()
+                op.setColor(int(0x78000000))
+                canvas.drawRect(0, 0, w, y1, op)
+                # text
+                tp = Paint()
+                tp.setColor(int(0xFFFFFFFF))
+                tp.setTextSize(float(AndroidUtilities.dp(14)))
+                tp.setAntiAlias(True)
+                tp.setShadowLayer(4.0, 0.0, 1.0, int(0xB4000000))
+                txt = "⏳ Загрузка баннера..."
+                tx = (w - tp.measureText(txt)) / 2.0
+                ty = y1 / 2.0
+                canvas.drawText(txt, tx, ty, tp)
+        finally:
+            try:
+                canvas.restoreToCount(sid)
+            except Exception:
+                canvas.restore()
+
+
+# ─── Хуки ───────────────────────────────────────────────────────────
+
+class _ColorHook(MethodHook):
+    """Перехват Theme.getColor() для смены цвета текста в ProfileActivity."""
+    def __init__(self, plug, kind):
+        self.p = plug
+        self.kind = kind  # "int" or "str"
+
+    def before_hooked_method(self, param):
+        try:
+            mode, frag = self.p._profile_tmode()
+            if not mode:
+                return
+            cn = frag.getClass().getName() if frag else ""
+            if "ProfileActivity" not in cn:
+                return
+            nc, sc = _text_colors(mode)
+            if self.kind == "int":
+                ki = int(param.args[0])
+                k = self.p._tkeys
+                if ki == k.get("title"):
+                    param.setResult(nc)
+                elif ki in (k.get("sub_bue"), k.get("sub_blue")):
+                    param.setResult(sc)
+            else:
+                ks = str(param.args[0] or "").strip()
+                if ks == "profile_title":
+                    param.setResult(nc)
+                elif ks in ("avatar_subtitleInProfileBue", "avatar_subtitleInProfileBlue"):
+                    param.setResult(sc)
+        except Exception:
+            pass
+
+
+class _DrawHook(MethodHook):
+    """Хук onDraw у TopView для отрисовки кастомного баннера."""
+    def __init__(self, plug):
+        self.p = plug
+
+    def before_hooked_method(self, param):
+        if not self.p._b("eb.on", False):
+            return
+        try:
+            tv = param.thisObject
+            if not tv:
+                return
+            outer = _get_outer(tv)
+            if not outer:
+                return
+            key = self.p._key_from_frag(outer)
+            mode = self.p._tmode(key)
+            if mode:
+                self.p._color_text(tv, outer, mode)
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        try:
+            if not self.p._b("eb.on", False):
+                return
+            tv = param.thisObject
+            canvas = param.args[0]
+            if not canvas or not tv:
+                return
+            outer = _get_outer(tv)
+            key = "unknown"
+            if outer:
+                key = self.p._key_from_frag(outer)
+            bmp = self.p._bitmap(key)
+            is_vid = self.p._is_vid(key)
+            vpath = self.p._src_map.get(key, "") if is_vid else ""
+            if bmp is None and not is_vid:
+                return
+            effect = self.p._effect(key)
+            if effect not in ("blur", "darken", "none"):
+                effect = "blur"
+            y1, progress = _calc_y1(outer, tv)
+            w = tv.getMeasuredWidth()
+            if w <= 0 or y1 <= 0:
+                return
+            self.p.render.draw(canvas, tv, key, bmp, effect, is_vid, y1, w, progress)
+            # video overlay
+            if is_vid and vpath:
+                self.p.vid.play(tv, vpath, int(w), int(y1))
+            elif not is_vid and self.p.vid._player:
+                self.p.vid.stop()
+        except Exception as e:
+            self.p._log(f"draw: {e}")
+
+
+def _get_outer(topview):
+    try:
+        f = topview.getClass().getDeclaredField("this$0")
+        f.setAccessible(True)
+        return f.get(topview)
+    except Exception:
+        return None
+
+
+def _text_colors(mode):
+    if mode == "light":
+        return int(0xFFFFFFFF), int(0xE6FFFFFF)
+    return int(0xFF000000), int(0xD2000000)
+
+
+def _calc_y1(outer, topview):
+    y1 = None
+    progress = 0.0
+    try:
+        ab = outer.getActionBar() if outer else None
+        status = AndroidUtilities.statusBarHeight
+        try:
+            ab_h = _JActionBar.getCurrentActionBarHeight()
+        except Exception:
+            ab_h = AndroidUtilities.dp(56)
+        h = ab_h + (status if ab and ab.getOccupyStatusBar() else 0)
+        extra = search = media = 0.0
+        cls = outer.getClass()
+        for name in ("extraHeight", "searchTransitionOffset", "mediaHeaderAnimationProgress"):
+            try:
+                ff = cls.getDeclaredField(name)
+                ff.setAccessible(True)
+                v = float(ff.get(outer))
+                if name == "extraHeight":
+                    extra = v
+                elif name == "searchTransitionOffset":
+                    search = v
+                else:
+                    media = v
+            except Exception:
+                pass
+        progress = max(0.0, min(1.0, media))
+        y1 = int((extra + h + search) * (1.0 - progress))
+    except Exception:
+        pass
+    if not y1 or y1 <= 0:
+        y1 = AndroidUtilities.dp(240)
+    try:
+        tvh = topview.getMeasuredHeight()
+        if tvh > 0:
+            y1 = min(y1, tvh)
+    except Exception:
+        pass
+    return y1, progress
+
+
+# ─── Главный плагин ─────────────────────────────────────────────────
+
+class BannerPlugin(BasePlugin):
+    REQ_CODE = 33201
+
+    def __init__(self):
+        super().__init__()
+        self._frag_ref = None
+        self._act_hook = None
+        self._bmp = {}
+        self._blur_cache = {}
+        self._src_map = {}
+        self._bmp_order = []
+        self._dir = ""
+        self._draw_hook = None
+        self._draw_cls = None
+        self._tkeys = {}
+        self._theme_refs = []
+        self._stop = False
+        self._last_blur = None
+        self._logs = []
+        self._dbg = False
+        self._extracting = set()
+        self.srv = _Server(self)
+        self.vid = _Video(self)
+        self.render = _Renderer(self)
+        try:
+            self._canvas_cls = find_class("android.graphics.Canvas")
+        except Exception:
+            self._canvas_cls = None
+
+    # -- log --
+    def _log(self, msg, ui=False):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._logs.append(f"{ts} {msg}")
+        if len(self._logs) > 200:
+            self._logs = self._logs[-150:]
+        log(f"[EB] {msg}")
+        if ui:
+            BulletinHelper.show(f"[EB] {msg}")
+
+    def _msg(self, txt):
+        def _show():
+            try:
+                BulletinHelper.show(txt)
+                return
+            except Exception:
+                pass
+            try:
+                Toast = find_class("android.widget.Toast")
+                ctx = ApplicationLoader.applicationContext
+                t = Toast.makeText(ctx, str(txt), getattr(Toast, "LENGTH_SHORT", 0))
+                t.show()
+            except Exception:
+                pass
+        run_on_ui_thread(_show)
+
+    # -- lifecycle --
+    def on_plugin_load(self):
+        self._init_defaults()
+        self._init_dir()
+        self.srv.init_dirs()
+        self._dbg = self._b("eb.dbg", False)
+        self._migrate_old_settings()
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                text="Баннер профиля", icon="msg_gallery",
+                on_click=self._on_menu, priority=1000))
+        except Exception:
+            pass
+        self._hook_theme()
+        self._hook_lifecycle()
+        threading.Thread(target=self._poll, name="EB_poll", daemon=True).start()
+
+    def on_plugin_unload(self):
+        self._stop = True
+        try:
+            self.vid.stop()
+        except Exception:
+            pass
+        if self._draw_hook:
+            try:
+                self.unhook_method(self._draw_hook)
+            except Exception:
+                pass
+            self._draw_hook = None
+        for r in self._theme_refs:
+            try:
+                self.unhook_method(r)
+            except Exception:
+                pass
+        self._theme_refs = []
+        if self._act_hook:
+            try:
+                self._act_hook.unhook()
+            except Exception:
+                pass
+            self._act_hook = None
+        for r in getattr(self, '_life_refs', []):
+            try:
+                self.unhook_method(r)
+            except Exception:
+                pass
+        self._life_refs = []
+
+    def create_settings(self):
+        return self._settings_ui()
+
+    def get_settings(self):
+        return self._settings_ui()
+
+    # -- settings UI --
+    def _settings_ui(self):
+        try:
+            rows = []
+            # ── Основное ──
+            rows.append(Header(text="⚙️ Основное"))
+            rows.append(Switch(key="eb.av", text="Автобаннер из аватарки",
+                               subtext="Если нет кастомного фона — аватарка станет баннером.",
+                               default=self._b("eb.av", True),
+                               on_change=lambda v: (self.set_setting("eb.av", bool(v)), self._reload())))
+            if self._b("eb.av", True):
+                fx_names = {"blur": "Размытие", "darken": "Затемнение", "none": "Оригинал"}
+                cur = self._fx_str("eb.av.fx", "darken")
+                rows.append(Text(text=f"Обработка аватарки → {fx_names.get(cur, cur)}",
+                                 on_click=lambda _: self._pick_fx_dialog()))
+            rows.append(Input(key="eb.blur", text="Интенсивность блюра",
+                              subtext="Сила размытия фона (1–100)", default=str(self._pct("eb.blur", 60)),
+                              on_change=lambda v: self._save_pct("eb.blur", v)))
+            rows.append(Input(key="eb.dark", text="Уровень затемнения",
+                              subtext="Насколько тёмным будет оверлей (1–100)", default=str(self._pct("eb.dark", 70)),
+                              on_change=lambda v: self._save_pct("eb.dark", v)))
+            if _HAS_DIV:
+                rows.append(Divider())
+            # ── Видео ──
+            rows.append(Header(text="🎬 Видео-баннер"))
+            rows.append(Switch(key="eb.sound", text="Звук видео",
+                               subtext="Воспроизводить звук из видеобаннера.",
+                               default=self._b("eb.sound", False),
+                               on_change=lambda v: self.set_setting("eb.sound", bool(v))))
+            if _HAS_DIV:
+                rows.append(Divider(text="Видео устанавливается через меню профиля → Баннер профиля."))
+            # ── Синхронизация ──
+            rows.append(Header(text="☁️ Синхронизация"))
+            rows.append(Switch(key="eb.srv.consent", text="Разрешить обмен данными",
+                               subtext="Баннер, UID и эффекты будут отправлены на сервер (api.xd1.me, HTTPS).",
+                               default=self._b("eb.srv.consent", False),
+                               on_change=lambda v: self.set_setting("eb.srv.consent", bool(v))))
+            if self._b("eb.srv.consent", False):
+                rows.append(Switch(key="eb.srv.auto", text="Автоматическая отправка",
+                                   subtext="Загружать баннер на сервер при каждой смене.",
+                                   default=self._b("eb.srv.auto", True),
+                                   on_change=lambda v: self.set_setting("eb.srv.auto", bool(v))))
+                rows.append(Input(key="eb.srv.tok.input", text="API-токен",
+                                  subtext="Получите у @Extera_profile_bot",
+                                  default="",
+                                  on_change=lambda v: self.srv.store_token(str(v).strip())))
+                rows.append(Text(text="Открыть бота для токена",
+                                 on_click=lambda _: self._open_bot()))
+            rows.append(Switch(key="eb.srv.fetch", text="Показывать чужие баннеры",
+                               subtext="Загружать кастомные баннеры от других пользователей.",
+                               default=self._b("eb.srv.fetch", True),
+                               on_change=lambda v: self.set_setting("eb.srv.fetch", bool(v))))
+            uc = self.srv.user_count()
+            uc_text = str(uc) if uc is not None else "загрузка..."
+            rows.append(Text(text=f"👥 Пользователей с баннерами: {uc_text}"))
+            if _HAS_DIV:
+                rows.append(Divider())
+            # ── Прочее ──
+            rows.append(Header(text="🔧 Прочее"))
+            rows.append(Switch(key="eb.dbg", text="Режим разработчика",
+                               subtext="Запись подробных логов работы плагина.",
+                               default=self._dbg,
+                               on_change=lambda v: self._toggle_dbg(v)))
+            rows.append(Text(text="📋 Просмотр логов",
+                             on_click=lambda _: self._show_logs()))
+            return rows
+        except Exception:
+            return [Header("Extera Banner"), Text("Ошибка загрузки настроек")]
+
+    def _pick_fx_dialog(self):
+        frag = get_last_fragment()
+        parent = frag.getParentActivity() if frag else None
+        if not parent:
+            return
+        opts = ["Размытие", "Затемнение", "Без эффекта"]
+        vals = ["blur", "darken", "none"]
+        def _sel(d, i):
+            self.set_setting("eb.av.fx", vals[i])
+            self._reload()
+            self._msg(f"Эффект: {opts[i]}")
+        b = AlertDialogBuilder(parent)
+        b.set_title("Эффект аватара")
+        b.set_items(opts, _sel)
+        b.set_negative_button("Отмена", None)
+        b.show()
+
+    # -- menu --
+    def _on_menu(self, ctx):
+        frag = ctx.get("fragment")
+        if not frag:
+            return
+        self._frag_ref = weakref.ref(frag)
+        key = self._key_from_frag(frag)
+        parent = frag.getParentActivity()
+        if not parent:
+            return
+        my_uid = self._my_uid()
+        is_own = key.startswith("uid_") and key[4:] == my_uid
+        opts = ["Из галереи", "Удалить фон"]
+        if is_own:
+            opts.insert(1, "Загрузить на сервер")
+        def _sel(d, i):
+            if i == 0:
+                self._pick_file(key)
+            elif is_own and i == 1:
+                self._upload_current(key)
+            elif (is_own and i == 2) or (not is_own and i == 1):
+                self._remove_bg(key, is_own)
+        b = AlertDialogBuilder(parent)
+        b.set_title("Баннер профиля")
+        b.set_items(opts, _sel)
+        b.set_negative_button("Отмена", None)
+        b.show()
+
+    def _upload_current(self, key):
+        src = self._source(key)
+        if not src:
+            self._msg("Сначала установите баннер.")
+            return
+        if src.startswith("avatar://"):
+            bmp = self._bitmap(key)
+            if bmp:
+                self.srv.upload_bmp(bmp, self._effect(key), self._tmode(key))
+                self._msg("Загрузка аватар-баннера...")
+        elif os.path.isfile(src):
+            self.srv.upload(src, self._effect(key), self._tmode(key), force=True)
+            self._msg("Загрузка...")
+
+    def _remove_bg(self, key, is_own):
+        try:
+            self.delete_setting(self._ks(key))
+        except Exception:
+            self.set_setting(self._ks(key), "")
+        self.set_setting(self._kt(key), "")
+        try:
+            self.delete_setting(self._kf(key))
+        except Exception:
+            pass
+        self._drop_cache(key)
+        if self._is_vid(key):
+            self.vid.stop()
+        if is_own:
+            self.srv.remove()
+        self._msg("Фон удалён")
+
+    # -- file picker --
+    class _ResultHook(MethodHook):
+        def __init__(self, plug, key):
+            self.p, self.key = plug, key
+        def before_hooked_method(self, param):
+            try:
+                rc, res, data = param.args[0], param.args[1], param.args[2]
+                if rc == self.p.REQ_CODE:
+                    param.setResult(None)
+                    if res == Activity.RESULT_OK and data:
+                        uri = data.getData()
+                        if uri:
+                            self.p._msg("⏳ Обработка файла...")
+                            threading.Thread(target=self.p._on_file, args=(uri, self.key), daemon=True).start()
+                        else:
+                            self.p._msg("Файл не выбран")
+                    if self.p._act_hook:
+                        self.p._act_hook.unhook()
+                        self.p._act_hook = None
+            except Exception as e:
+                self.p._log(f"result hook: {e}")
+                self.p._msg("Ошибка при получении файла")
+
+    def _pick_file(self, key):
+        frag = self._frag() 
+        act = frag.getParentActivity() if frag else None
+        if not act:
+            return
+        if self._act_hook:
+            try:
+                self._act_hook.unhook()
+            except Exception:
+                pass
+        ITYPE = find_class("java.lang.Integer").TYPE
+        m = act.getClass().getDeclaredMethod("onActivityResult", ITYPE, ITYPE, Intent)
+        self._act_hook = self.hook_method(m, self._ResultHook(self, key))
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*")
+        # Java String[] для MIME фильтра
+        try:
+            StrCls = find_class("java.lang.String")
+            Array = find_class("java.lang.reflect.Array")
+            mimes = Array.newInstance(StrCls, 2)
+            Array.set(mimes, 0, "image/*")
+            Array.set(mimes, 1, "video/mp4")
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, mimes)
+        except Exception:
+            intent.setType("image/*")
+        act.startActivityForResult(Intent.createChooser(intent, "Выберите файл"), self.REQ_CODE)
+
+    def _on_file(self, uri, key):
+        try:
+            cr = ApplicationLoader.applicationContext.getContentResolver()
+            ins = cr.openInputStream(uri)
+            if not ins:
+                self._msg("Не удалось открыть файл")
+                return
+            # detect type
+            mime = str(cr.getType(uri) or "")
+            ext = ".mp4" if "video" in mime else ".jpg"
+            safe = re.sub(r"[^a-zA-Z0-9_\-.]", "_", key)
+            out_path = os.path.join(self._dir, f"b_{safe}{ext}")
+            is_vid = ext == ".mp4"
+            # всегда останавливаем видео перед записью нового файла
+            if is_vid and self.vid._player:
+                done_ev = threading.Event()
+                def _stop_sync():
+                    try:
+                        self.vid.stop()
+                    except Exception:
+                        pass
+                    finally:
+                        done_ev.set()
+                run_on_ui_thread(_stop_sync)
+                done_ev.wait(timeout=3.0)
+                self._drop_cache(key)
+            out = FileOutputStream(out_path)
+            try:
+                if not is_vid:
+                    bmp = BitmapFactory.decodeStream(BufferedInputStream(ins))
+                    if not bmp:
+                        ins.close()
+                        self._msg("Не удалось декодировать изображение")
+                        return
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                else:
+                    written = 0
+                    limit = 15 * 1024 * 1024  # 15MB
+                    buf = bytearray(8192)
+                    while True:
+                        r = ins.read(buf)
+                        if r == -1:
+                            break
+                        written += r
+                        if written > limit:
+                            out.close()
+                            ins.close()
+                            self._msg(f"Файл слишком большой (>{limit // (1024*1024)}МБ)")
+                            try:
+                                os.remove(out_path)
+                            except Exception:
+                                pass
+                            return
+                        out.write(buf, 0, r)
+            finally:
+                out.close()
+                ins.close()
+            self.set_setting(self._ks(key), out_path)
+            self.set_setting("eb.on", True)
+            self._drop_cache(key)
+            if is_vid:
+                self._check_vid_size(out_path)
+            # auto-upload only if user explicitly enabled both consent AND auto
+            my = self._my_uid()
+            if key.startswith("uid_") and key[4:] == my:
+                if self._b("eb.srv.consent", False) and self._b("eb.srv.auto", False):
+                    self.srv.upload(out_path, self._effect(key), self._tmode(key))
+            what = "Видео" if is_vid else "Изображение"
+            def _done():
+                self._msg(f"{what} применено")
+                self._invalidate(self._frag())
+                if is_vid:
+                    self._ask_tmode(key)
+                else:
+                    self._ask_effect(key, then=lambda: self._ask_tmode(key))
+            run_on_ui_thread(_done)
+        except Exception as e:
+            self._log(f"file: {e}")
+            self._msg("Ошибка обработки файла")
+
+    def _check_vid_size(self, path):
+        try:
+            sz = os.path.getsize(path)
+            if sz > 5 * 1024 * 1024:
+                self._msg(f"Видео {sz // (1024*1024)}МБ — макс 5МБ")
+            from android.media import MediaMetadataRetriever
+            mmr = MediaMetadataRetriever()
+            try:
+                mmr.setDataSource(str(path))
+                w = int(mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH) or "0")
+                h = int(mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT) or "0")
+                if w > 1920 or h > 1920:
+                    self._msg(f"Разрешение {w}x{h} — макс 1920")
+            finally:
+                mmr.release()
+        except Exception:
+            pass
+
+    # -- effect/text mode dialogs --
+    def _ask_effect(self, key, then=None):
+        frag = self._frag()
+        parent = frag.getParentActivity() if frag else None
+        if not parent:
+            if then:
+                then()
+            return
+        b = AlertDialogBuilder(parent)
+        b.set_title("Эффект")
+        b.set_positive_button("Размытие", lambda d, w: self._set_fx(key, "blur", then))
+        b.set_negative_button("Затемнение", lambda d, w: self._set_fx(key, "darken", then))
+        b.set_neutral_button("Без", lambda d, w: self._set_fx(key, "none", then))
+        b.show()
+
+    def _set_fx(self, key, fx, then=None):
+        self.set_setting(self._kf(key), fx)
+        self._drop_cache(key)
+        self._invalidate(self._frag())
+        names = {"blur": "размытие", "darken": "затемнение", "none": "без эффектов"}
+        self._msg(f"Эффект: {names.get(fx, fx)}")
+        if then:
+            then()
+
+    def _ask_tmode(self, key):
+        frag = self._frag()
+        parent = frag.getParentActivity() if frag else None
+        if not parent:
+            return
+        b = AlertDialogBuilder(parent)
+        b.set_title("Стиль текста")
+        b.set_positive_button("Светлый", lambda d, w: self._set_tmode(key, "light"))
+        b.set_negative_button("Тёмный", lambda d, w: self._set_tmode(key, "dark"))
+        b.set_neutral_button("Не менять", lambda d, w: self._set_tmode(key, ""))
+        b.show()
+
+    def _set_tmode(self, key, mode):
+        self.set_setting(self._kt(key), mode)
+        self._invalidate(self._frag())
+        labels = {"light": "светлый", "dark": "тёмный", "": "по умолчанию"}
+        self._msg(f"Текст: {labels.get(mode, mode)}")
+
+    # -- watcher --
+    def _poll(self):
+        while not self._stop:
+            try:
+                f = get_last_fragment()
+                if f and f.getClass().getName().endswith(".ProfileActivity"):
+                    tv = self._find_topview(f)
+                    if tv:
+                        self._hook_draw(tv)
+                time.sleep(2.0)
+            except Exception:
+                time.sleep(1.0)
+
+    def _find_topview(self, frag):
+        cls = frag.getClass()
+        for n in ("topView", "mTopView"):
+            try:
+                ff = cls.getDeclaredField(n)
+                ff.setAccessible(True)
+                v = ff.get(frag)
+                if v:
+                    return v
+            except Exception:
+                pass
+        # fallback: tree walk
+        try:
+            root = frag.getFragmentView()
+            if not root:
+                return None
+            stack = [root]
+            while stack:
+                v = stack.pop()
+                cn = v.getClass().getName()
+                if "ProfileActivity$TopView" in cn:
+                    return v
+                if isinstance(v, ViewGroup):
+                    for i in range(v.getChildCount()):
+                        stack.append(v.getChildAt(i))
+        except Exception:
+            pass
+        return None
+
+    def _hook_draw(self, tv):
+        cn = tv.getClass().getName()
+        if self._draw_hook and self._draw_cls == cn:
+            return
+        if self._draw_hook:
+            try:
+                self.unhook_method(self._draw_hook)
+            except Exception:
+                pass
+        cparam = _JCanvas or self._canvas_cls
+        if not cparam:
+            return
+        m = tv.getClass().getDeclaredMethod("onDraw", cparam)
+        m.setAccessible(True)
+        self._draw_hook = self.hook_method(m, _DrawHook(self))
+        self._draw_cls = cn
+
+    # -- lifecycle hooks (pause/resume video) --
+    def _hook_lifecycle(self):
+        self._life_refs = []
+        try:
+            ActCls = find_class("org.telegram.ui.LaunchActivity")
+        except Exception:
+            try:
+                ActCls = find_class("org.telegram.ui.ActionBar.BaseFragment").getDeclaringClass()
+            except Exception:
+                return
+        plug = self
+        class _PauseHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plug.vid.pause()
+                except Exception:
+                    pass
+        class _ResumeHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plug.vid.resume()
+                except Exception:
+                    pass
+        try:
+            m_pause = ActCls.getDeclaredMethod("onPause")
+            r = self.hook_method(m_pause, _PauseHook())
+            if r:
+                self._life_refs.append(r)
+        except Exception:
+            pass
+        try:
+            m_resume = ActCls.getDeclaredMethod("onResume")
+            r = self.hook_method(m_resume, _ResumeHook())
+            if r:
+                self._life_refs.append(r)
+        except Exception:
+            pass
+
+    # -- theme hooks --
+    def _hook_theme(self):
+        try:
+            TC = find_class("org.telegram.ui.ActionBar.Theme")
+            SC = find_class("java.lang.String")
+            IT = find_class("java.lang.Integer").TYPE
+            BT = find_class("java.lang.Boolean").TYPE
+            RP = None
+            try:
+                RP = find_class("org.telegram.ui.ActionBar.Theme$ResourcesProvider")
+            except Exception:
+                pass
+            self._tkeys = {}
+            for n, alias in (("key_profile_title", "title"),
+                             ("key_avatar_subtitleInProfileBue", "sub_bue"),
+                             ("key_avatar_subtitleInProfileBlue", "sub_blue")):
+                try:
+                    ff = TC.getDeclaredField(n)
+                    ff.setAccessible(True)
+                    self._tkeys[alias] = int(ff.get(None))
+                except Exception:
+                    pass
+            sigs = []
+            for sig in (("getColor", (IT,)), ("getColor", (IT, BT)), ("getColorOrDefault", (IT,))):
+                try:
+                    sigs.append(("int", TC.getDeclaredMethod(sig[0], *sig[1])))
+                except Exception:
+                    pass
+            if RP:
+                for sig in (("getColor", (IT, RP)), ("getColorOrDefault", (IT, RP))):
+                    try:
+                        sigs.append(("int", TC.getDeclaredMethod(sig[0], *sig[1])))
+                    except Exception:
+                        pass
+            for sig in (("getColor", (SC,)), ("getColorOrDefault", (SC,))):
+                try:
+                    sigs.append(("str", TC.getDeclaredMethod(sig[0], *sig[1])))
+                except Exception:
+                    pass
+            if RP:
+                for sig in (("getColor", (SC, RP)), ("getColorOrDefault", (SC, RP))):
+                    try:
+                        sigs.append(("str", TC.getDeclaredMethod(sig[0], *sig[1])))
+                    except Exception:
+                        pass
+            self._theme_refs = []
+            for kind, method in sigs:
+                try:
+                    ref = self.hook_method(method, _ColorHook(self, kind))
+                    if ref:
+                        self._theme_refs.append(ref)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # -- text colors --
+    def _profile_tmode(self):
+        try:
+            f = get_last_fragment()
+            if not f:
+                return ("", None)
+            cn = f.getClass().getName()
+            if "ProfileActivity" not in cn:
+                return ("", f)
+            return (self._tmode(self._key_from_frag(f)), f)
+        except Exception:
+            return ("", None)
+
+    def _color_text(self, tv, outer, mode):
+        if not mode:
+            return
+        nc, sc = _text_colors(mode)
+        shadow = mode == "light"
+        shc = int(0x6E000000) if shadow else 0
+        def _apply(val, primary):
+            c = nc if primary else sc
+            try:
+                val.setTextColor(c)
+                val.setShadowLayer(2.0 if shadow else 0.0, 0.0, 1.0 if shadow else 0.0, shc)
+                return
+            except Exception:
+                pass
+            # could be array
+            try:
+                length = len(val)
+            except Exception:
+                try:
+                    length = val.length
+                except Exception:
+                    length = None
+            if length is None:
+                try:
+                    Arr = find_class("java.lang.reflect.Array")
+                    length = Arr.getLength(val)
+                    for i in range(int(length)):
+                        it = Arr.get(val, i)
+                        if it:
+                            try:
+                                it.setTextColor(c)
+                                it.setShadowLayer(2.0 if shadow else 0.0, 0.0, 1.0 if shadow else 0.0, shc)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                return
+            for i in range(int(length)):
+                try:
+                    it = val[i]
+                    if it:
+                        it.setTextColor(c)
+                        it.setShadowLayer(2.0 if shadow else 0.0, 0.0, 1.0 if shadow else 0.0, shc)
+                except Exception:
+                    pass
+        for host in (tv, outer):
+            if not host:
+                continue
+            cls = host.getClass()
+            for fn in ("nameTextView", "titleTextView", "nameView", "titleView"):
+                try:
+                    ff = cls.getDeclaredField(fn); ff.setAccessible(True)
+                    v = ff.get(host)
+                    if v:
+                        _apply(v, True)
+                except Exception:
+                    pass
+            for fn in ("onlineTextView", "statusTextView", "subtitleTextView", "subtitleView"):
+                try:
+                    ff = cls.getDeclaredField(fn); ff.setAccessible(True)
+                    v = ff.get(host)
+                    if v:
+                        _apply(v, False)
+                except Exception:
+                    pass
+
+    # -- bitmap loading --
+    _MAX_BMP = 10
+
+    def _bitmap(self, key):
+        if not self._b("eb.on", False):
+            return None
+        src = self._source(key)
+        if not src:
+            return None
+        hit = self._bmp.get(key)
+        if hit and self._src_map.get(key) == src and not hit.isRecycled():
+            return hit
+        bmp = None
+        if src.startswith("avatar://"):
+            bmp = self._load_avatar(key)
+            if bmp:
+                bmp = self._cap(bmp)
+                self._bmp[key] = bmp
+                self._src_map[key] = src
+                self._evict(key)
+                return bmp
+            return None
+        if src.startswith("file://"):
+            try:
+                src = Uri.parse(src).getPath() or src[7:]
+            except Exception:
+                src = src[7:]
+        # video: placeholder + async extract
+        if src.lower().endswith(".mp4"):
+            ph = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+            ph.eraseColor(Color.BLACK)
+            self._bmp[key] = ph
+            self._src_map[key] = src
+            if key not in self._extracting:
+                self._extracting.add(key)
+                _src_copy = str(src)
+                def _ex():
+                    try:
+                        self._log(f"extract thumb: {_src_copy}")
+                        frame = self._decode(_src_copy)
+                        if frame:
+                            self._bmp[key] = self._cap(frame)
+                            self._evict(key)
+                            self._log(f"thumb ok: {frame.getWidth()}x{frame.getHeight()}")
+                            run_on_ui_thread(lambda: self._invalidate(None))
+                        else:
+                            self._log(f"thumb failed: no frame from {_src_copy}")
+                    except Exception as e:
+                        self._log(f"thumb error: {e}")
+                    finally:
+                        self._extracting.discard(key)
+                threading.Thread(target=_ex, daemon=True, name="EB_thumb").start()
+            return ph
+        # URL download
+        if src.startswith("http://") or src.startswith("https://"):
+            target = os.path.join(self._dir, f"dl_{re.sub(r'[^a-z0-9]', '_', key)}.jpg")
+            ok = False
+            try:
+                import requests
+                r = requests.get(src, stream=True, timeout=25, verify=True)
+                r.raise_for_status()
+                with open(target, "wb") as f:
+                    for ch in r.iter_content(65536):
+                        if ch:
+                            f.write(ch)
+                ok = True
+            except Exception:
+                pass
+            if not ok:
+                try:
+                    from java.net import URL as JU
+                    c = JU(src).openConnection()
+                    c.setConnectTimeout(20000); c.setReadTimeout(25000)
+                    inp = BufferedInputStream(c.getInputStream())
+                    out = FileOutputStream(target)
+                    try:
+                        buf = bytearray(65536)
+                        while True:
+                            n = inp.read(buf)
+                            if n == -1:
+                                break
+                            out.write(buf, 0, n)
+                    finally:
+                        out.close(); inp.close(); c.disconnect()
+                    ok = True
+                except Exception:
+                    pass
+            if ok:
+                bmp = self._decode(target)
+        elif src.startswith("content://"):
+            try:
+                ctx = ApplicationLoader.applicationContext
+                s = ctx.getContentResolver().openInputStream(Uri.parse(src))
+                if s:
+                    bmp = BitmapFactory.decodeStream(BufferedInputStream(s))
+                    s.close()
+            except Exception:
+                pass
+        else:
+            bmp = self._decode(src)
+        if not bmp:
+            return None
+        bmp = self._cap(bmp)
+        self._bmp[key] = bmp
+        self._src_map[key] = src
+        self._evict(key)
+        return bmp
+
+    def _decode(self, path):
+        if not path or not File(path).exists():
+            return None
+        if path.lower().endswith(".mp4"):
+            from android.media import MediaMetadataRetriever
+            mmr = MediaMetadataRetriever()
+            try:
+                mmr.setDataSource(path)
+                return mmr.getFrameAtTime(0)
+            finally:
+                mmr.release()
+        return BitmapFactory.decodeFile(path, BitmapFactory.Options())
+
+    def _cap(self, bmp, mx=4096):
+        w, h = bmp.getWidth(), bmp.getHeight()
+        if w <= mx and h <= mx:
+            return bmp
+        s = min(mx / max(1, w), mx / max(1, h))
+        return Bitmap.createScaledBitmap(bmp, max(1, int(w * s)), max(1, int(h * s)), True)
+
+    def _evict(self, new_key):
+        if new_key in self._bmp_order:
+            self._bmp_order.remove(new_key)
+        self._bmp_order.append(new_key)
+        while len(self._bmp_order) > self._MAX_BMP:
+            old = self._bmp_order.pop(0)
+            ob = self._bmp.pop(old, None)
+            self._blur_cache.pop(old, None)
+            self._src_map.pop(old, None)
+            if ob and not ob.isRecycled():
+                ob.recycle()
+
+    def _drop_cache(self, key):
+        self._bmp.pop(key, None)
+        self._blur_cache.pop(key, None)
+        self._src_map.pop(key, None)
+
+    # -- blur --
+    def _blurred(self, key, bmp):
+        bp = self._pct("eb.blur", 60)
+        if self._last_blur != bp:
+            self._blur_cache.clear()
+            self._last_blur = bp
+        hit = self._blur_cache.get(key)
+        if hit:
+            cb, cp = hit
+            if cp == bp and cb and not cb.isRecycled():
+                return cb
+        bw, bh = bmp.getWidth(), bmp.getHeight()
+        if bw <= 2 or bh <= 2:
+            return bmp
+        ratio = max(1, min(100, bp)) / 100.0
+        ms = max(bw, bh)
+        df = max(0.45, min(0.85, 0.85 - 0.40 * ratio))
+        ts = min(1080, max(360, int(ms * df)))
+        sc = min(1.0, ts / float(ms))
+        sw, sh = max(2, int(bw * sc)), max(2, int(bh * sc))
+        small = Bitmap.createScaledBitmap(bmp, sw, sh, True)
+        rad = min(20.0, max(2.0, int(5 + ratio * 22) * 0.8))
+        passes = 1 if bp < 85 else 2
+        result = self._rs_blur(small, rad, passes)
+        if not result:
+            # fallback: heavy downscale/upscale
+            tiny = Bitmap.createScaledBitmap(bmp, max(4, sw // 4), max(4, sh // 4), True)
+            result = Bitmap.createScaledBitmap(tiny, sw, sh, True)
+        self._blur_cache[key] = (result, bp)
+        return result or bmp
+
+    def _rs_blur(self, bmp, radius=12.0, passes=1):
+        try:
+            RS = find_class("android.renderscript.RenderScript")
+            Alloc = find_class("android.renderscript.Allocation")
+            SIB = find_class("android.renderscript.ScriptIntrinsicBlur")
+            Elem = find_class("android.renderscript.Element")
+        except Exception:
+            return None
+        try:
+            rs = RS.create(ApplicationLoader.applicationContext)
+        except Exception:
+            return None
+        try:
+            cur = bmp
+            for _ in range(max(1, passes)):
+                inp = Alloc.createFromBitmap(rs, cur)
+                out = Alloc.createTyped(rs, inp.getType())
+                s = SIB.create(rs, Elem.U8_4(rs))
+                s.setRadius(float(min(25.0, max(0.1, radius))))
+                s.setInput(inp)
+                s.forEach(out)
+                tmp = Bitmap.createBitmap(cur.getWidth(), cur.getHeight(), Bitmap.Config.ARGB_8888)
+                out.copyTo(tmp)
+                try:
+                    s.destroy(); inp.destroy(); out.destroy()
+                except Exception:
+                    pass
+                cur = tmp
+            rs.destroy()
+            return cur
+        except Exception:
+            try:
+                rs.destroy()
+            except Exception:
+                pass
+            return None
+
+    # -- source resolution --
+    def _source(self, key):
+        per = str(self.get_setting(self._ks(key), "") or "").strip()
+        if per == "none":
+            return ""
+        if per:
+            return per
+        # server
+        if key.startswith("uid_"):
+            uid = key[4:]
+            if uid != self._my_uid():
+                entry = self.srv.fetch(uid)
+                if entry and entry.get("path"):
+                    # сервер вернул баннер — сбрасываем кэш аватара
+                    if self._src_map.get(key, "").startswith("avatar://"):
+                        self._drop_cache(key)
+                    return entry["path"]
+        # avatar fallback
+        if self._b("eb.av", True):
+            return f"avatar://{key}"
+        return ""
+
+    def _effect(self, key):
+        src = self._source(key)
+        is_av = src.startswith("avatar://") if src else False
+        v = self.get_setting(self._kf(key), None)
+        if v is not None and str(v).strip():
+            s = self._sanitize_fx(v)
+            if is_av and s == "none":
+                return self._fx_str("eb.av.fx", "darken")
+            return s
+        # server effect
+        if key.startswith("uid_"):
+            se = self.srv.cached_meta(key[4:], "effect")
+            if se in ("none", "blur", "darken"):
+                return se
+        if is_av:
+            return self._fx_str("eb.av.fx", "darken")
+        return self._fx_str("eb.fx.default", "blur")
+
+    def _tmode(self, key):
+        v = self.get_setting(self._kt(key), "")
+        s = str(v or "").strip().lower()
+        if s in ("light", "dark"):
+            return s
+        # server mode
+        if key.startswith("uid_"):
+            st = self.srv.cached_meta(key[4:], "tmode")
+            if st in ("light", "dark"):
+                return st
+        return ""
+
+    def _is_vid(self, key):
+        s = self._src_map.get(key, "")
+        return s.lower().endswith(".mp4") if s else False
+
+    # -- key helpers --
+    def _ks(self, key):
+        return f"eb.src.{key}"
+
+    def _kf(self, key):
+        return f"eb.fx.{key}"
+
+    def _kt(self, key):
+        return f"eb.tm.{key}"
+
+    # -- avatar --
+    def _load_avatar(self, key):
+        try:
+            UC = find_class("org.telegram.messenger.UserConfig")
+            acc = UC.selectedAccount
+            MC = find_class("org.telegram.messenger.MessagesController")
+            ctrl = MC.getInstance(acc)
+            if key.startswith("uid_"):
+                uid = int(key[4:])
+                user = ctrl.getUser(uid)
+                if not user or not user.photo:
+                    return None
+                floc = user.photo.photo_big
+            elif key.startswith("cid_"):
+                cid = int(key[4:])
+                chat = ctrl.getChat(abs(cid))
+                if not chat or not chat.photo:
+                    return None
+                floc = chat.photo.photo_big
+            else:
+                return None
+            FL = find_class("org.telegram.messenger.FileLoader")
+            af = FL.getInstance(acc).getPathToAttach(floc, True)
+            if af and af.exists():
+                return BitmapFactory.decodeFile(af.getAbsolutePath())
+        except Exception:
+            pass
+        return None
+
+    # -- key from fragment --
+    def _key_from_frag(self, frag):
+        try:
+            cls = frag.getClass()
+            try:
+                m = cls.getDeclaredMethod("getDialogId")
+                m.setAccessible(True)
+                did = int(m.invoke(frag))
+                return f"cid_{-did}" if did < 0 else f"uid_{did}"
+            except Exception:
+                pass
+            for n in ("dialogId", "dialog_id"):
+                try:
+                    ff = cls.getDeclaredField(n); ff.setAccessible(True)
+                    v = int(ff.get(frag))
+                    return f"cid_{-v}" if v < 0 else f"uid_{v}"
+                except Exception:
+                    pass
+            uid = cid = None
+            for n in ("userId", "user_id"):
+                try:
+                    ff = cls.getDeclaredField(n); ff.setAccessible(True)
+                    uid = int(ff.get(frag)); break
+                except Exception:
+                    pass
+            for n in ("chatId", "chat_id"):
+                try:
+                    ff = cls.getDeclaredField(n); ff.setAccessible(True)
+                    cid = int(ff.get(frag)); break
+                except Exception:
+                    pass
+            if cid and cid > 0:
+                return f"cid_{cid}"
+            if uid and uid > 0:
+                return f"uid_{uid}"
+        except Exception:
+            pass
+        return "unknown"
+
+    def _my_uid(self):
+        try:
+            UC = find_class("org.telegram.messenger.UserConfig")
+            return str(int(UC.getInstance(UC.selectedAccount).getClientUserId()))
+        except Exception:
+            return ""
+
+    # -- util --
+    def _b(self, k, d=False):
+        v = self.get_setting(k, d)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return v != 0
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes")
+        return bool(v)
+
+    def _s(self, k, d=""):
+        v = self.get_setting(k, d)
+        return str(v) if v is not None else d
+
+    def _i(self, k, d=0):
+        try:
+            return int(self.get_setting(k, d))
+        except Exception:
+            return d
+
+    def _pct(self, k, d=50):
+        try:
+            return max(1, min(100, int(self.get_setting(k, d))))
+        except Exception:
+            return d
+
+    def _save_pct(self, k, v):
+        try:
+            self.set_setting(k, max(1, min(100, int(str(v).strip()))))
+        except Exception:
+            pass
+
+    def _fx_str(self, k, d="none"):
+        v = str(self.get_setting(k, d) or "").strip().lower()
+        return v if v in ("none", "blur", "darken") else d
+
+    def _count_banners(self):
+        cnt = 0
+        try:
+            for k, v in self._bmp.items():
+                if v and not v.isRecycled():
+                    cnt += 1
+            # also count settings-based sources not yet loaded
+            if hasattr(self, 'get_all_settings'):
+                for k, v in self.get_all_settings().items():
+                    if k.startswith("eb.src.") and v and str(v).strip() not in ("", "none"):
+                        cnt = max(cnt, cnt)  # already counted above
+        except Exception:
+            pass
+        # Count from files in plugin dir
+        if not cnt:
+            try:
+                for f in os.listdir(self._dir):
+                    if f.startswith("b_") and (f.endswith(".jpg") or f.endswith(".mp4")):
+                        cnt += 1
+            except Exception:
+                pass
+        return cnt
+
+    def _plural(self, n):
+        n = abs(n) % 100
+        if 11 <= n <= 19:
+            return "ов"
+        r = n % 10
+        if r == 1:
+            return ""
+        if 2 <= r <= 4:
+            return "а"
+        return "ов"
+
+    def _sanitize_fx(self, v):
+        s = str(v or "").strip().lower()
+        return s if s in ("none", "blur", "darken") else "none"
+
+    def _frag(self):
+        if self._frag_ref:
+            f = self._frag_ref()
+            if f:
+                return f
+        return get_last_fragment()
+
+    def _invalidate(self, frag):
+        try:
+            if not frag:
+                frag = get_last_fragment()
+            if frag and frag.getClass().getName().endswith(".ProfileActivity"):
+                v = frag.getFragmentView()
+                if v:
+                    run_on_ui_thread(lambda: v.invalidate())
+        except Exception:
+            pass
+
+    def _invalidate_ui(self):
+        try:
+            f = self._frag() or get_last_fragment()
+            if f:
+                v = f.getFragmentView()
+                if v:
+                    v.invalidate()
+                    if isinstance(v, ViewGroup):
+                        for i in range(v.getChildCount()):
+                            try:
+                                v.getChildAt(i).invalidate()
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+    def _reload(self):
+        try:
+            PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+            PC.getInstance().loadPluginSettings(self.id)
+        except Exception:
+            pass
+
+    def _init_dir(self):
+        try:
+            base = ApplicationLoader.getFilesDirFixed()
+            d = File(base, self.id)
+            if not d.exists():
+                d.mkdirs()
+            self._dir = d.getAbsolutePath()
+        except Exception:
+            pass
+
+    def _init_defaults(self):
+        defaults = {"eb.on": True, "eb.fade": 90, "eb.blur": 60, "eb.dark": 70,
+                     "eb.av": True, "eb.av.fx": "darken", "eb.mute": True,
+                     "eb.srv.auto": False, "eb.srv.fetch": True, "eb.dbg": False,
+                     "eb.fx.default": "blur"}
+        for k, v in defaults.items():
+            if self.get_setting(k, _MISS) is _MISS:
+                self.set_setting(k, v)
+
+    def _open_bot(self):
+        try:
+            from android.content import Intent as I
+            i = I(I.ACTION_VIEW, Uri.parse("tg://resolve?domain=Extera_profile_bot"))
+            i.setFlags(I.FLAG_ACTIVITY_NEW_TASK)
+            ApplicationLoader.applicationContext.startActivity(i)
+        except Exception:
+            self._msg("Не удалось открыть бота")
+
+    def _toggle_dbg(self, v):
+        self._dbg = bool(v)
+        self.set_setting("eb.dbg", self._dbg)
+        self._reload()
+
+    def _show_logs(self):
+        try:
+            txt = "\n".join(self._logs[-50:]) or "Пусто"
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if not act:
+                self._copy_logs()
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title("Логи плагина")
+            b.set_message(txt)
+            b.set_positive_button("Закрыть", None)
+            b.set_negative_button("Копировать", lambda d, w: self._copy_logs())
+            b.show()
+        except Exception:
+            self._copy_logs()
+
+    def _copy_logs(self):
+        try:
+            txt = "\n".join(self._logs[-200:]) or "Пусто"
+            cb = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+            cb.setPrimaryClip(ClipData.newPlainText("EB Logs", txt))
+            self._msg("Логи скопированы")
+        except Exception:
+            pass
+
+    # -- migration --
+    def _migrate_old_settings(self):
+        old_check = self.get_setting("profileHeader.enable", _MISS)
+        if old_check is _MISS:
+            return  # no old settings
+        mapping = {
+            "profileHeader.enable": "eb.on",
+            "profileHeader.fade": "eb.fade",
+            "profileHeader.blurIntensity": "eb.blur",
+            "profileHeader.darkenIntensity": "eb.dark",
+            "profileHeader.defaultEffect": "eb.fx.default",
+            "profileHeader.avatarBanner.enable": "eb.av",
+            "profileHeader.avatarBanner.effect": "eb.av.fx",
+            "profileHeader.server.autoUpload": "eb.srv.auto",
+            "profileHeader.server.fetchOthers": "eb.srv.fetch",
+            "profileHeader.server.consent": "eb.srv.consent",
+            "profileHeader.debug.enable": "eb.dbg",
+            "profileHeader.video.mute": "eb.mute",
+        }
+        migrated = 0
+        for old, new in mapping.items():
+            v = self.get_setting(old, _MISS)
+            if v is not _MISS:
+                self.set_setting(new, v)
+                try:
+                    self.delete_setting(old)
+                except Exception:
+                    pass
+                migrated += 1
+        # migrate token
+        old_tok = self.get_setting("profileHeader.server.token", _MISS)
+        if old_tok is not _MISS and old_tok:
+            self.srv.store_token(str(old_tok))
+            try:
+                self.delete_setting("profileHeader.server.token")
+            except Exception:
+                pass
+            migrated += 1
+        if migrated:
+            self._msg(f"Настройки перенесены ({migrated})")
+
+
+Plugin = BannerPlugin
