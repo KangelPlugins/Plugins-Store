@@ -1,0 +1,1466 @@
+__id__ = "sticker_hints_ecubz"
+__name__ = "bind stickers"
+__description__ = "Привязка стикеров, фото, видео, гифок, кружков, гс и аудио к словам с авто-отправкой после твоего сообщения."
+__author__ = "@bsod4ik & @bsod4ik_plugins"
+__version__ = "2.2.2"
+__icon__ = "eCubzPlugin/1"
+__min_version__ = "10.0.0"
+
+import json
+import os
+import re
+import shutil
+import threading
+import time
+
+from java import dynamic_proxy
+from java.io import File as JFile
+from java.util import HashMap
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy
+from hook_utils import find_class
+from ui.settings import Header, Switch, Input, Text, Divider
+from android_utils import run_on_ui_thread
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from client_utils import get_last_fragment, send_request, RequestCallback
+
+from org.telegram.messenger import (
+    MediaDataController,
+    Utilities,
+    MessageObject,
+    SendMessagesHelper,
+    FileLoader,
+    UserConfig,
+)
+from org.telegram.tgnet import TLRPC
+
+MAX_LOG_LINES = 300
+MEDIA_STORE_DIR = "/sdcard/Download/bind_stickers_media"
+
+
+class StickerHintsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._bind_menu_id = None
+        self._logs = []
+        self._bindings_cache = None
+        self._auto_send_lock = False
+
+    # ---------- lifecycle ----------
+
+    def on_plugin_load(self):
+        try:
+            self._bind_menu_id = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="📌 Привязать к слову",
+                icon="msg_sticker",
+                on_click=self._on_bind_media_click,
+                condition="message != null",
+                priority=500
+            ))
+            self._append_log("menu added: bind media")
+        except Exception as e:
+            self._append_log(f"menu add error: {e}")
+
+        try:
+            self.add_on_send_message_hook()
+            self._append_log("send hook added")
+        except Exception as e:
+            self._append_log(f"send hook add error: {e}")
+
+        self._append_log("plugin loaded")
+
+    def on_plugin_unload(self):
+        try:
+            if self._bind_menu_id is not None:
+                self.remove_menu_item(self._bind_menu_id)
+                self._bind_menu_id = None
+        except Exception:
+            pass
+
+        self._bindings_cache = None
+        self._logs.clear()
+
+    # ---------- settings ----------
+
+    def create_settings(self):
+        items = [
+            Header(text="⚙️ Основные"),
+            Switch(
+                key="enabled",
+                text="🔌 Включить авто-отправку",
+                subtext="После твоего сообщения с ключевым словом отправляет привязанное медиа",
+                default=True,
+                icon="msg_settings",
+            ),
+            Switch(
+                key="case_sensitive",
+                text="🔤 Учитывать регистр",
+                subtext="Если выключено, «Привет» и «привет» считаются одинаковыми",
+                default=False,
+                icon="msg_edit",
+            ),
+            Input(
+                key="bind_command",
+                text="Команда привязки",
+                subtext="Например: .bind",
+                default=".bind",
+            ),
+            Text(text="Логи", icon="msg_log", on_click=self.show_logs),
+            Divider(),
+            Header(text="📌 Привязки"),
+        ]
+
+        data = self._load_bindings_full()
+        if not data:
+            items.append(Text(
+                text="Нет привязок.\nОтветь на стикер/фото/видео/кружок/гс/аудио и напиши .bind слово",
+                icon="msg_info"
+            ))
+        else:
+            for word in sorted(data.keys()):
+                info = data[word] if isinstance(data[word], dict) else {}
+                media_type = str(info.get("media_type", "sticker") or "sticker")
+                emoji = str(info.get("emoji", "") or "").strip()
+                label = f"{word} -> {self._media_title(media_type)}"
+                if emoji:
+                    label += f" {emoji}"
+
+                fp = str(info.get("file_path", "") or "").strip()
+                if fp:
+                    label += f" ({os.path.basename(fp)})"
+                elif media_type in ("photo", "video", "round", "voice", "audio"):
+                    label += " (файл не скачан)"
+
+                doc_id = info.get("doc_id")
+                if doc_id is not None:
+                    label += f" [id:{doc_id}]"
+
+                def make_delete(bound_word):
+                    def on_long_click(_ctx):
+                        def _ui():
+                            frag = get_last_fragment()
+                            act = frag.getParentActivity() if frag else None
+                            if act is None:
+                                return
+                            b = AlertDialogBuilder(act)
+                            b.set_title("Удалить привязку?")
+                            b.set_message(f"Удалить привязку для слова: {bound_word}?")
+                            b.set_positive_button("Удалить", lambda d, _w: self._delete_binding(bound_word))
+                            b.set_negative_button("Отмена", lambda d, _w: d.dismiss())
+                            b.show()
+                        run_on_ui_thread(_ui)
+                    return on_long_click
+
+                items.append(Text(text=label, icon="msg_sticker", on_long_click=make_delete(word)))
+
+            items.append(Divider(text="Удерживай привязку для удаления"))
+
+        items.append(Divider())
+        return items
+
+    # ---------- logs ----------
+
+    def _append_log(self, text):
+        try:
+            line = f"[{time.strftime('%H:%M:%S')}] {text}"
+        except Exception:
+            line = str(text)
+
+        self._logs.append(line)
+        if len(self._logs) > MAX_LOG_LINES:
+            self._logs = self._logs[-MAX_LOG_LINES:]
+
+        try:
+            self.log(f"[bind stickers] {line}")
+        except Exception:
+            pass
+
+    def show_logs(self, _view=None):
+        txt = "\n".join(self._logs[-120:]) if self._logs else "Логи пустые"
+
+        def _copy(_d=None, _w=None):
+            try:
+                from android.content import ClipData, Context
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+                if act is None:
+                    return
+                cm = act.getSystemService(Context.CLIPBOARD_SERVICE)
+                cm.setPrimaryClip(ClipData.newPlainText("BindStickersLogs", txt))
+                BulletinHelper.show_copied_to_clipboard()
+                self._append_log("logs copied")
+            except Exception as e:
+                self._append_log(f"copy logs error: {e}")
+
+        def _ui():
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if act is None:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title("Логи")
+            b.set_message(txt)
+            b.set_positive_button("Copy", _copy)
+            b.set_negative_button("Close", lambda d, _w: d.dismiss())
+            b.show()
+
+        run_on_ui_thread(_ui)
+
+    # ---------- storage ----------
+
+    def _load_bindings_full(self):
+        try:
+            raw = self.get_setting("bindings_v3", "")
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+
+        data = {}
+
+        # legacy fallback
+        try:
+            legacy = self.get_setting("bindings_list", "")
+            if legacy:
+                for pair in legacy.split(","):
+                    if "=" not in pair:
+                        continue
+                    w, e = pair.split("=", 1)
+                    w = w.strip()
+                    e = e.strip()
+                    if w and e:
+                        data[w] = {
+                            "media_type": "sticker",
+                            "emoji": e,
+                        }
+        except Exception:
+            pass
+
+        try:
+            legacy_json = self.get_setting("bindings_json", "")
+            if legacy_json and not data:
+                old = json.loads(legacy_json)
+                if isinstance(old, dict):
+                    for w, e in old.items():
+                        data[w] = {
+                            "media_type": "sticker",
+                            "emoji": str(e or "").strip(),
+                        }
+        except Exception:
+            pass
+
+        try:
+            doc_ids_raw = self.get_setting("bound_doc_ids", "{}")
+            if doc_ids_raw and data:
+                doc_ids = json.loads(doc_ids_raw)
+                for word_lower, entry in doc_ids.items():
+                    for w in list(data.keys()):
+                        if w.lower() != str(word_lower).lower():
+                            continue
+                        if isinstance(entry, dict):
+                            if entry.get("doc_id") is not None:
+                                data[w]["doc_id"] = entry.get("doc_id")
+                            if entry.get("set_name"):
+                                data[w]["set_name"] = entry.get("set_name")
+                        elif isinstance(entry, (int, float)):
+                            data[w]["doc_id"] = int(entry)
+                        break
+        except Exception:
+            pass
+
+        if data:
+            self._save_bindings_full(data)
+
+        return data
+
+    def _save_bindings_full(self, data):
+        self.set_setting("bindings_v3", json.dumps(data, ensure_ascii=False))
+        self._bindings_cache = None
+
+    def _save_binding(self, word, binding):
+        try:
+            data = self._load_bindings_full()
+
+            # replace case-insensitive duplicate key
+            for w in list(data.keys()):
+                if w.lower() == word.lower() and w != word:
+                    del data[w]
+
+            data[word] = dict(binding)
+            self._save_bindings_full(data)
+            self._append_log(f"saved binding: {word} -> {binding.get('media_type')}")
+
+            BulletinHelper.show_success(f"Привязано: {word} -> {self._media_title(binding.get('media_type', 'sticker'))}")
+        except Exception as e:
+            self._append_log(f"save binding error: {e}")
+
+    def _delete_binding(self, word):
+        try:
+            data = self._load_bindings_full()
+            if word in data:
+                del data[word]
+                self._save_bindings_full(data)
+                BulletinHelper.show_info(f"Удалено: {word}")
+                self._append_log(f"deleted binding: {word}")
+        except Exception as e:
+            self._append_log(f"delete binding error: {e}")
+
+    def _get_binding_for_word(self, word):
+        try:
+            data = self._load_bindings_full()
+            case_sensitive = self.get_setting("case_sensitive", False)
+            if case_sensitive:
+                v = data.get(word)
+                return dict(v) if isinstance(v, dict) else None
+
+            for w, v in data.items():
+                if str(w).lower() == str(word).lower() and isinstance(v, dict):
+                    return dict(v)
+        except Exception:
+            pass
+        return None
+
+    def _media_title(self, media_type):
+        mt = str(media_type or "sticker")
+        if mt == "photo":
+            return "фото"
+        if mt == "gif":
+            return "гиф"
+        if mt == "video":
+            return "видео"
+        if mt == "round":
+            return "кружок"
+        if mt == "voice":
+            return "гс"
+        if mt == "audio":
+            return "аудио"
+        return "стикер"
+
+    def _sanitize_name(self, value):
+        try:
+            s = re.sub(r"[^0-9a-zA-Zа-яА-Я_\\-]+", "_", str(value or ""))
+            s = s.strip("_.-")
+            return s or "media"
+        except Exception:
+            return "media"
+
+    def _guess_media_extension(self, media_type, source_path, mime_type):
+        try:
+            ext = os.path.splitext(str(source_path or ""))[1].strip()
+            if ext and len(ext) <= 8:
+                return ext
+        except Exception:
+            pass
+
+        mime = str(mime_type or "").lower()
+        if media_type == "photo":
+            if "png" in mime:
+                return ".png"
+            if "webp" in mime:
+                return ".webp"
+            return ".jpg"
+        if media_type == "gif":
+            if "gif" in mime:
+                return ".gif"
+            return ".mp4"
+        if media_type in ("video", "round"):
+            if "quicktime" in mime:
+                return ".mov"
+            return ".mp4"
+        if media_type == "voice":
+            if "mp4" in mime:
+                return ".m4a"
+            return ".ogg"
+        if media_type == "audio":
+            if "ogg" in mime:
+                return ".ogg"
+            if "flac" in mime:
+                return ".flac"
+            return ".mp3"
+        return ".bin"
+
+    def _persist_media_file_for_binding(self, word, media_type, source_path, mime_type):
+        if not source_path or not os.path.exists(source_path):
+            return ""
+        try:
+            os.makedirs(MEDIA_STORE_DIR, exist_ok=True)
+            base = self._sanitize_name(word)
+            ext = self._guess_media_extension(media_type, source_path, mime_type)
+            dst = os.path.join(MEDIA_STORE_DIR, f"{base}_{media_type}_{int(time.time())}{ext}")
+            shutil.copy2(source_path, dst)
+            return dst
+        except Exception as e:
+            self._append_log(f"persist media copy error: {e}")
+            return ""
+
+    def _get_message_owner(self, msg_obj):
+        return getattr(msg_obj, "messageOwner", msg_obj)
+
+    def _pick_photo_size(self, msg_owner):
+        try:
+            media = getattr(msg_owner, "media", None)
+            photo = getattr(media, "photo", None)
+            if photo is None:
+                return None
+            sizes = getattr(photo, "sizes", None)
+            if sizes is None:
+                return None
+            try:
+                if sizes.size() > 0:
+                    return sizes.get(sizes.size() - 1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return None
+
+    def _try_start_fileloader_download(self, account, msg_obj):
+        try:
+            loader = FileLoader.getInstance(int(account))
+            if loader is None:
+                return False
+
+            msg_owner = self._get_message_owner(msg_obj)
+            doc_obj = None
+            try:
+                doc_obj = MessageObject.getDocument(msg_obj)
+            except Exception:
+                doc_obj = None
+
+            photo_size = self._pick_photo_size(msg_owner)
+            photo_obj = None
+            file_location = None
+            try:
+                photo_obj = getattr(getattr(msg_owner, "media", None), "photo", None)
+                file_location = getattr(photo_size, "location", None)
+            except Exception:
+                pass
+
+            # 1) direct dynamic calls (fast path)
+            for args in (
+                (doc_obj, msg_obj, 1, 1),
+                (doc_obj, msg_obj, 1),
+                (doc_obj, msg_obj),
+                (doc_obj,),
+                (photo_size, msg_obj, 1, 1),
+                (photo_size, msg_obj, 1),
+                (photo_size, msg_obj),
+                (photo_size,),
+                (photo_obj, msg_obj, 1, 1),
+                (photo_obj, msg_obj, 1),
+                (photo_obj, msg_obj),
+                (photo_obj,),
+            ):
+                try:
+                    if args[0] is None:
+                        continue
+                    loader.loadFile(*args)
+                except Exception:
+                    pass
+
+            # 2) reflection fallback for unknown overloads
+            try:
+                cls = loader.getClass()
+                methods = cls.getDeclaredMethods()
+                for m in methods:
+                    try:
+                        if m.getName() not in ("loadFile", "loadStreamFile"):
+                            continue
+                        pts = m.getParameterTypes()
+                        vals = []
+                        ok = True
+                        for pt in pts:
+                            name = pt.getName()
+                            v = None
+                            if "TLRPC$Document" in name:
+                                v = doc_obj
+                            elif "MessageObject" in name:
+                                v = msg_obj
+                            elif name.endswith("TLRPC$Message"):
+                                v = msg_owner
+                            elif "TLRPC$PhotoSize" in name:
+                                v = photo_size
+                            elif "TLRPC$Photo" in name:
+                                v = photo_obj
+                            elif "TLRPC$FileLocation" in name or "TLRPC$InputFileLocation" in name:
+                                v = file_location
+                            elif name in ("int", "java.lang.Integer"):
+                                v = 1
+                            elif name in ("boolean", "java.lang.Boolean"):
+                                v = True
+                            elif name in ("long", "java.lang.Long"):
+                                v = 0
+                            elif name == "java.lang.String":
+                                v = None
+
+                            if "TLRPC$" in name and v is None:
+                                ok = False
+                                break
+                            vals.append(v)
+                        if not ok:
+                            continue
+                        m.setAccessible(True)
+                        m.invoke(loader, *vals)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            self._append_log(f"fileloader start download error: {e}")
+            return False
+
+    def _ensure_local_media_path(self, msg_obj, info, timeout_sec=25):
+        try:
+            account = int(getattr(msg_obj, "currentAccount", UserConfig.selectedAccount))
+            msg_owner = self._get_message_owner(msg_obj)
+            loader = FileLoader.getInstance(account)
+            if loader is None:
+                return str(info.get("file_path", "") or "")
+
+            try:
+                p = loader.getPathToMessage(msg_owner)
+                if p is not None:
+                    candidate = str(p.toString() or "")
+                    if candidate and os.path.exists(candidate):
+                        return candidate
+            except Exception:
+                pass
+
+            self._try_start_fileloader_download(account, msg_obj)
+
+            t0 = time.time()
+            while time.time() - t0 < float(timeout_sec):
+                try:
+                    p = loader.getPathToMessage(msg_owner)
+                    if p is not None:
+                        candidate = str(p.toString() or "")
+                        if candidate and os.path.exists(candidate):
+                            self._append_log(f"media auto-downloaded: {candidate}")
+                            return candidate
+                except Exception:
+                    pass
+                try:
+                    time.sleep(0.35)
+                except Exception:
+                    break
+        except Exception as e:
+            self._append_log(f"ensure local media path error: {e}")
+
+        return str(info.get("file_path", "") or "")
+
+    # ---------- bind extraction ----------
+
+    def _extract_media_info(self, msg_obj):
+        try:
+            message_owner = getattr(msg_obj, "messageOwner", msg_obj)
+            account = int(getattr(msg_obj, "currentAccount", UserConfig.selectedAccount))
+
+            doc_obj = None
+            try:
+                doc_obj = MessageObject.getDocument(msg_obj)
+            except Exception:
+                doc_obj = None
+
+            media_type = None
+            emoji = None
+            doc_id = None
+            set_input = None
+            set_name = None
+            mime_type = None
+            duration = 0
+            w = 0
+            h = 0
+            file_name = ""
+            round_flag = False
+            voice_flag = False
+            audio_title = ""
+            audio_performer = ""
+
+            if doc_obj is not None:
+                try:
+                    doc_id = int(doc_obj.id)
+                except Exception:
+                    doc_id = None
+                try:
+                    mime_type = str(getattr(doc_obj, "mime_type", "") or "")
+                except Exception:
+                    mime_type = ""
+
+                attrs = getattr(doc_obj, "attributes", None)
+                if attrs is not None:
+                    arr = attrs.toArray()
+                    for attr in arr:
+                        try:
+                            if isinstance(attr, (TLRPC.TL_documentAttributeSticker, TLRPC.TL_documentAttributeCustomEmoji)):
+                                media_type = "sticker"
+                                alt = getattr(attr, "alt", None)
+                                if alt:
+                                    emoji = str(alt).strip()
+                                set_input = getattr(attr, "stickerset", None)
+                                try:
+                                    sn = getattr(set_input, "short_name", None)
+                                    if sn:
+                                        set_name = str(sn)
+                                except Exception:
+                                    pass
+                            elif isinstance(attr, TLRPC.TL_documentAttributeVideo):
+                                d = getattr(attr, "duration", 0)
+                                duration = int(d or 0)
+                                w = int(getattr(attr, "w", 0) or 0)
+                                h = int(getattr(attr, "h", 0) or 0)
+                                round_flag = bool(getattr(attr, "round_message", False))
+                                if media_type is None and not round_flag:
+                                    if "gif" in str(mime_type or "").lower():
+                                        media_type = "gif"
+                                    elif bool(getattr(msg_obj, "isGif", lambda: False)()):
+                                        media_type = "gif"
+                                    else:
+                                        media_type = "video"
+                            elif isinstance(attr, TLRPC.TL_documentAttributeAnimated):
+                                media_type = "gif"
+                            elif isinstance(attr, TLRPC.TL_documentAttributeAudio):
+                                d = getattr(attr, "duration", 0)
+                                duration = int(d or 0)
+                                voice_flag = bool(getattr(attr, "voice", False))
+                                t = getattr(attr, "title", None)
+                                p = getattr(attr, "performer", None)
+                                if t:
+                                    audio_title = str(t)
+                                if p:
+                                    audio_performer = str(p)
+                                if media_type is None:
+                                    media_type = "voice" if voice_flag else "audio"
+                            elif isinstance(attr, TLRPC.TL_documentAttributeFilename):
+                                fn = getattr(attr, "file_name", None)
+                                if fn:
+                                    file_name = str(fn)
+                        except Exception:
+                            continue
+
+            # Fallback by MessageObject type
+            try:
+                if media_type is None:
+                    if bool(msg_obj.isRoundVideo()) or round_flag:
+                        media_type = "round"
+                    elif hasattr(msg_obj, "isGif") and bool(msg_obj.isGif()):
+                        media_type = "gif"
+                    elif bool(msg_obj.isVideo()):
+                        media_type = "video"
+                    elif bool(msg_obj.isVoice()) or voice_flag:
+                        media_type = "voice"
+                    elif bool(msg_obj.isMusic()):
+                        media_type = "audio"
+                    elif bool(msg_obj.isPhoto()):
+                        media_type = "photo"
+            except Exception:
+                pass
+
+            if media_type is None:
+                return None
+
+            file_path = ""
+            try:
+                p = FileLoader.getInstance(account).getPathToMessage(message_owner)
+                if p is not None:
+                    file_path = str(p.toString() or "")
+            except Exception:
+                file_path = ""
+
+            info = {
+                "media_type": media_type,
+                "emoji": emoji,
+                "doc_id": doc_id,
+                "set_name": set_name,
+                "mime_type": mime_type,
+                "duration": duration,
+                "w": w,
+                "h": h,
+                "file_name": file_name,
+                "file_path": file_path,
+                "voice": bool(voice_flag),
+                "title": audio_title,
+                "performer": audio_performer,
+            }
+
+            # keep runtime-only object for sticker-set resolve
+            if set_input is not None:
+                info["set_input"] = set_input
+
+            return info
+        except Exception as e:
+            self._append_log(f"extract media info error: {e}")
+            return None
+
+    def _save_sticker_binding_with_set_resolve(self, word, info):
+        set_input = info.get("set_input")
+        set_name = info.get("set_name")
+
+        def _save(resolved_set_name):
+            self._save_binding(word, {
+                "media_type": "sticker",
+                "emoji": info.get("emoji", ""),
+                "doc_id": info.get("doc_id"),
+                "set_name": resolved_set_name,
+            })
+
+        if set_name or not set_input:
+            _save(set_name)
+            return
+
+        try:
+            req = TLRPC.TL_messages_getStickerSet()
+            req.stickerset = set_input
+            req.hash = 0
+
+            def on_set_loaded(response, error):
+                resolved = None
+                try:
+                    if not error and response:
+                        set_data = getattr(response, "set", None)
+                        if set_data:
+                            sn = getattr(set_data, "short_name", None)
+                            if sn:
+                                resolved = str(sn)
+                except Exception:
+                    resolved = None
+                _save(resolved)
+
+            send_request(req, RequestCallback(on_set_loaded))
+        except Exception as e:
+            self._append_log(f"sticker set resolve error: {e}")
+            _save(None)
+
+    def _save_media_binding(self, word, info, msg_obj=None):
+        media_type = str(info.get("media_type", "") or "")
+
+        if media_type == "sticker":
+            self._save_sticker_binding_with_set_resolve(word, info)
+            return
+
+        file_path = str(info.get("file_path", "") or "")
+        if (not file_path or not os.path.exists(file_path)) and msg_obj is not None:
+            self._append_log(f"media file missing, trying auto-download: type={media_type}")
+            file_path = self._ensure_local_media_path(msg_obj, info, timeout_sec=30)
+
+        pending_file = False
+        if not file_path or not os.path.exists(file_path):
+            pending_file = True
+            file_path = ""
+            self._append_log(f"bind pending: file still missing for {media_type}")
+
+        stored_path = self._persist_media_file_for_binding(
+            word,
+            media_type,
+            file_path,
+            str(info.get("mime_type", "") or ""),
+        )
+        if stored_path:
+            file_path = stored_path
+            pending_file = False
+
+        self._save_binding(word, {
+            "media_type": media_type,
+            "file_path": file_path,
+            "mime_type": str(info.get("mime_type", "") or ""),
+            "duration": int(info.get("duration", 0) or 0),
+            "w": int(info.get("w", 0) or 0),
+            "h": int(info.get("h", 0) or 0),
+            "file_name": str(info.get("file_name", "") or ""),
+            "voice": bool(info.get("voice", False)),
+            "title": str(info.get("title", "") or ""),
+            "performer": str(info.get("performer", "") or ""),
+            "pending_file": bool(pending_file),
+        })
+
+        if pending_file:
+            try:
+                BulletinHelper.show_info("Привязка сохранена, но файл еще не скачан. Удаление доступно в настройках.")
+            except Exception:
+                pass
+
+    def _on_bind_media_click(self, context):
+        try:
+            message = context.get("message") if context else None
+            if message is None:
+                return
+
+            info = self._extract_media_info(message)
+            if not info:
+                BulletinHelper.show_error("Поддерживается: стикер, фото, видео, гиф, кружок, гс, аудио")
+                return
+
+            mt = self._media_title(info.get("media_type", "sticker"))
+
+            def _ui():
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+                if act is None:
+                    return
+
+                EditText = find_class("android.widget.EditText")
+                FrameLayout = find_class("android.widget.FrameLayout")
+                from org.telegram.messenger import AndroidUtilities
+
+                container = FrameLayout(act)
+                edit_text = EditText(act)
+                edit_text.setHint("Введите слово...")
+                edit_text.setSingleLine(True)
+
+                pad = AndroidUtilities.dp(20)
+                container.setPadding(pad, AndroidUtilities.dp(10), pad, AndroidUtilities.dp(10))
+                container.addView(edit_text)
+
+                b = AlertDialogBuilder(act)
+                b.set_title(f"Привязать {mt} к слову")
+                b.set_message("После твоего сообщения с этим словом медиа отправится автоматически")
+                b.set_view(container)
+
+                def on_save(_d, _w):
+                    word = edit_text.getText().toString().strip()
+                    if not word:
+                        BulletinHelper.show_error("Слово пустое")
+                        return
+                    BulletinHelper.show_info("Сохраняю привязку, при необходимости скачаю медиа...")
+                    threading.Thread(
+                        target=lambda: self._save_media_binding(word, info, message),
+                        daemon=True,
+                    ).start()
+
+                b.set_positive_button("Сохранить", on_save)
+                b.set_negative_button("Отмена", lambda d, _w: d.dismiss())
+                b.show()
+
+            run_on_ui_thread(_ui)
+        except Exception as e:
+            self._append_log(f"bind click error: {e}")
+
+    # ---------- trigger ----------
+
+    def _contains_trigger_word(self, text, trigger, case_sensitive):
+        txt = str(text or "")
+        trg = str(trigger or "")
+        if not txt or not trg:
+            return False
+
+        flags = 0 if case_sensitive else re.IGNORECASE
+
+        if " " in trg:
+            try:
+                return re.search(re.escape(trg), txt, flags) is not None
+            except Exception:
+                if case_sensitive:
+                    return trg in txt
+                return trg.lower() in txt.lower()
+
+        pattern = r"(^|[^\w])" + re.escape(trg) + r"([^\w]|$)"
+        try:
+            return re.search(pattern, txt, flags) is not None
+        except Exception:
+            if case_sensitive:
+                return trg in txt
+            return trg.lower() in txt.lower()
+
+    def _find_trigger_word_in_text(self, text):
+        data = self._load_bindings_full()
+        if not data:
+            return None
+
+        case_sensitive = self.get_setting("case_sensitive", False)
+        words = [w for w in data.keys() if str(w).strip()]
+        words.sort(key=lambda w: len(str(w)), reverse=True)
+
+        for w in words:
+            if self._contains_trigger_word(text, w, case_sensitive):
+                return w
+        return None
+
+    # ---------- send helpers ----------
+
+    def _peer_to_id(self, account, peer):
+        try:
+            if isinstance(peer, (int, float)):
+                return int(peer)
+        except Exception:
+            pass
+
+        try:
+            if peer is not None and "InputPeerSelf" in str(peer):
+                return int(UserConfig.getInstance(int(account)).getClientUserId())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(peer, "user_id") and peer.user_id:
+                return int(peer.user_id)
+            if hasattr(peer, "chat_id") and peer.chat_id:
+                return -int(peer.chat_id)
+            if hasattr(peer, "channel_id") and peer.channel_id:
+                return -int(peer.channel_id)
+        except Exception:
+            pass
+
+        try:
+            if peer is not None and str(peer).isdigit():
+                return int(str(peer))
+        except Exception:
+            pass
+
+        try:
+            frag = get_last_fragment()
+            if frag is not None and hasattr(frag, "getDialogId"):
+                return int(frag.getDialogId())
+        except Exception:
+            pass
+
+        return 0
+
+    def _get_account_instance(self, account):
+        try:
+            AccountInstance = find_class("org.telegram.messenger.AccountInstance")
+            if AccountInstance is None:
+                return None
+            return AccountInstance.getInstance(int(account))
+        except Exception:
+            return None
+
+    def _get_active_enter_view(self):
+        frag = get_last_fragment()
+        if frag is None:
+            return None
+
+        try:
+            ev = frag.getChatActivityEnterView()
+            if ev is not None:
+                return ev
+        except Exception:
+            pass
+
+        try:
+            from hook_utils import get_private_field
+            for field in ("chatActivityEnterView", "enterView"):
+                ev = get_private_field(frag, field)
+                if ev is not None:
+                    return ev
+        except Exception:
+            pass
+
+        return None
+
+    def _send_sticker_doc_now(self, account, send_ctx, doc, query_word):
+        if doc is None:
+            self._append_log("send sticker skipped: no doc")
+            return
+
+        peer_id = self._peer_to_id(account, send_ctx.get("peer"))
+        if peer_id == 0:
+            self._append_log("send sticker skipped: invalid peer")
+            return
+
+        reply_msg = send_ctx.get("reply_to_msg")
+        reply_top = send_ctx.get("reply_to_top")
+
+        def _ui_send():
+            try:
+                send_helper = SendMessagesHelper.getInstance(int(account))
+                SendMessageParams = find_class("org.telegram.messenger.SendMessagesHelper$SendMessageParams")
+                if send_helper is None or SendMessageParams is None:
+                    raise RuntimeError("send helper unavailable")
+
+                send_params = SendMessageParams.of(
+                    doc,
+                    None,
+                    None,
+                    peer_id,
+                    reply_msg,
+                    reply_top,
+                    None,
+                    None,
+                    None,
+                    None,
+                    True,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    False,
+                )
+                send_helper.sendMessage(send_params)
+                self._append_log(
+                    f"sticker sent for '{query_word}', doc={int(doc.id)}, reply={reply_msg is not None}"
+                )
+            except Exception as e:
+                self._append_log(f"send sticker via params error: {e}")
+                try:
+                    # fallback for older API builds
+                    enter_view = self._get_active_enter_view()
+                    if enter_view is None:
+                        self._append_log("send sticker fallback skipped: no active chat")
+                        return
+                    enter_view.onStickerSelected(doc, query_word, None, None, True, True, 0, 0)
+                    self._append_log(f"sticker sent by fallback for '{query_word}', doc={int(doc.id)}")
+                except Exception as e2:
+                    self._append_log(f"send sticker fallback error: {e2}")
+
+        run_on_ui_thread(_ui_send)
+
+    def _send_photo_file_now(self, account, send_ctx, binding, query_word):
+        path = str(binding.get("file_path", "") or "")
+        if not path or not os.path.exists(path):
+            self._append_log(f"send photo skipped, missing file: {path}")
+            BulletinHelper.show_error("Фото не найдено в кэше. Перепривяжи после открытия медиа.")
+            return
+
+        peer_id = self._peer_to_id(account, send_ctx.get("peer"))
+        if peer_id == 0:
+            self._append_log("send photo skipped: invalid peer")
+            return
+
+        account_inst = self._get_account_instance(account)
+        if account_inst is None:
+            self._append_log("send photo skipped: account instance missing")
+            return
+
+        reply_msg = send_ctx.get("reply_to_msg")
+        reply_top = send_ctx.get("reply_to_top")
+
+        def _ui_send():
+            try:
+                SendMessagesHelper.prepareSendingPhoto(
+                    account_inst,
+                    path,
+                    None,
+                    peer_id,
+                    reply_msg,
+                    reply_top,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    True,
+                    0,
+                    0,
+                    None,
+                    0,
+                )
+                self._append_log(f"photo sent for '{query_word}', path={path}")
+            except Exception as e:
+                self._append_log(f"send photo error: {e}")
+
+        run_on_ui_thread(_ui_send)
+
+    def _build_video_doc(self, binding, path):
+        doc = TLRPC.TL_document()
+        doc.id = 0
+        doc.access_hash = 0
+        doc.file_reference = bytearray()
+        doc.date = int(time.time())
+        doc.dc_id = 0
+        doc.size = int(JFile(path).length())
+
+        media_type = str(binding.get("media_type", "video") or "video")
+        mime = str(binding.get("mime_type", "") or "").strip()
+        if media_type == "gif":
+            if mime:
+                doc.mime_type = mime
+            else:
+                doc.mime_type = "video/mp4"
+        else:
+            doc.mime_type = mime if mime else "video/mp4"
+
+        fname = str(binding.get("file_name", "") or "").strip()
+        if not fname:
+            fname = os.path.basename(path)
+
+        fattr = TLRPC.TL_documentAttributeFilename()
+        fattr.file_name = fname
+        doc.attributes.add(fattr)
+
+        if media_type == "gif":
+            if "mp4" in str(doc.mime_type or "").lower():
+                try:
+                    aattr = TLRPC.TL_documentAttributeAnimated()
+                    doc.attributes.add(aattr)
+                except Exception:
+                    pass
+            return doc
+
+        vattr = TLRPC.TL_documentAttributeVideo()
+        vattr.duration = int(binding.get("duration", 0) or 0)
+        vattr.w = int(binding.get("w", 0) or 0)
+        vattr.h = int(binding.get("h", 0) or 0)
+        vattr.round_message = bool(media_type == "round")
+        vattr.supports_streaming = not vattr.round_message
+        doc.attributes.add(vattr)
+
+        return doc
+
+    def _build_audio_doc(self, binding, path):
+        doc = TLRPC.TL_document()
+        doc.id = 0
+        doc.access_hash = 0
+        doc.file_reference = bytearray()
+        doc.date = int(time.time())
+        doc.dc_id = 0
+        doc.size = int(JFile(path).length())
+
+        mime = str(binding.get("mime_type", "") or "").strip()
+        if mime:
+            doc.mime_type = mime
+        else:
+            doc.mime_type = "audio/ogg" if bool(binding.get("voice", False)) else "audio/mpeg"
+
+        fname = str(binding.get("file_name", "") or "").strip()
+        if not fname:
+            fname = os.path.basename(path)
+
+        fattr = TLRPC.TL_documentAttributeFilename()
+        fattr.file_name = fname
+        doc.attributes.add(fattr)
+
+        aattr = TLRPC.TL_documentAttributeAudio()
+        aattr.duration = int(binding.get("duration", 0) or 0)
+        aattr.voice = bool(binding.get("voice", False))
+
+        title = str(binding.get("title", "") or "").strip()
+        performer = str(binding.get("performer", "") or "").strip()
+        if title:
+            aattr.title = title
+        if performer:
+            aattr.performer = performer
+
+        doc.attributes.add(aattr)
+        return doc
+
+    def _send_video_or_round_now(self, account, send_ctx, binding, query_word):
+        path = str(binding.get("file_path", "") or "")
+        media_type = str(binding.get("media_type", "video") or "video")
+
+        if not path or not os.path.exists(path):
+            self._append_log(f"send {media_type} skipped, missing file: {path}")
+            BulletinHelper.show_error("Файл медиа не найден в кэше. Перепривяжи после открытия медиа.")
+            return
+
+        peer_id = self._peer_to_id(account, send_ctx.get("peer"))
+        if peer_id == 0:
+            self._append_log(f"send {media_type} skipped: invalid peer")
+            return
+
+        reply_msg = send_ctx.get("reply_to_msg")
+        reply_top = send_ctx.get("reply_to_top")
+
+        def _ui_send():
+            try:
+                send_helper = SendMessagesHelper.getInstance(int(account))
+                SendMessageParams = find_class("org.telegram.messenger.SendMessagesHelper$SendMessageParams")
+                if send_helper is None or SendMessageParams is None:
+                    self._append_log(f"send {media_type} skipped: send helper unavailable")
+                    return
+
+                doc = self._build_video_doc(binding, path)
+                extra = HashMap()
+                extra.put("originalPath", path)
+
+                send_params = SendMessageParams.of(
+                    doc,
+                    None,
+                    path,
+                    peer_id,
+                    reply_msg,
+                    reply_top,
+                    None,
+                    None,
+                    None,
+                    extra,
+                    True,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    False,
+                )
+                send_helper.sendMessage(send_params)
+                self._append_log(f"{media_type} sent for '{query_word}', path={path}")
+            except Exception as e:
+                self._append_log(f"send {media_type} error: {e}")
+
+        run_on_ui_thread(_ui_send)
+
+    def _send_audio_or_voice_now(self, account, send_ctx, binding, query_word):
+        path = str(binding.get("file_path", "") or "")
+        media_type = str(binding.get("media_type", "audio") or "audio")
+
+        if not path or not os.path.exists(path):
+            self._append_log(f"send {media_type} skipped, missing file: {path}")
+            BulletinHelper.show_error("Файл медиа не найден в кэше. Перепривяжи после открытия медиа.")
+            return
+
+        peer_id = self._peer_to_id(account, send_ctx.get("peer"))
+        if peer_id == 0:
+            self._append_log(f"send {media_type} skipped: invalid peer")
+            return
+
+        reply_msg = send_ctx.get("reply_to_msg")
+        reply_top = send_ctx.get("reply_to_top")
+
+        def _ui_send():
+            try:
+                send_helper = SendMessagesHelper.getInstance(int(account))
+                SendMessageParams = find_class("org.telegram.messenger.SendMessagesHelper$SendMessageParams")
+                if send_helper is None or SendMessageParams is None:
+                    self._append_log(f"send {media_type} skipped: send helper unavailable")
+                    return
+
+                doc = self._build_audio_doc(binding, path)
+                extra = HashMap()
+                extra.put("originalPath", path)
+
+                send_params = SendMessageParams.of(
+                    doc,
+                    None,
+                    path,
+                    peer_id,
+                    reply_msg,
+                    reply_top,
+                    None,
+                    None,
+                    None,
+                    extra,
+                    True,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    False,
+                )
+                send_helper.sendMessage(send_params)
+                self._append_log(f"{media_type} sent for '{query_word}', path={path}")
+            except Exception as e:
+                self._append_log(f"send {media_type} error: {e}")
+
+        run_on_ui_thread(_ui_send)
+
+    def _resolve_sticker_doc_for_binding(self, account, binding, on_done):
+        doc_id = binding.get("doc_id")
+        set_name = str(binding.get("set_name", "") or "").strip()
+        emoji = str(binding.get("emoji", "") or "").strip()
+
+        def pick_doc(docs):
+            try:
+                if docs is None or docs.size() == 0:
+                    return None
+                if doc_id is not None:
+                    for i in range(docs.size()):
+                        d = docs.get(i)
+                        try:
+                            if int(d.id) == int(doc_id):
+                                return d
+                        except Exception:
+                            continue
+                return docs.get(0)
+            except Exception:
+                return None
+
+        if set_name:
+            try:
+                req = TLRPC.TL_messages_getStickerSet()
+                input_set = TLRPC.TL_inputStickerSetShortName()
+                input_set.short_name = set_name
+                req.stickerset = input_set
+                req.hash = 0
+
+                def on_set_loaded(response, error):
+                    doc = None
+                    try:
+                        if not error and response:
+                            doc = pick_doc(getattr(response, "documents", None))
+                    except Exception:
+                        doc = None
+                    if doc is not None:
+                        on_done(doc)
+                        return
+                    self._resolve_sticker_by_emoji(account, emoji, doc_id, on_done)
+
+                send_request(req, RequestCallback(on_set_loaded))
+                return
+            except Exception as e:
+                self._append_log(f"sticker set resolve failed: {e}")
+
+        self._resolve_sticker_by_emoji(account, emoji, doc_id, on_done)
+
+    def _resolve_sticker_by_emoji(self, account, emoji, doc_id, on_done):
+        if not emoji:
+            on_done(None)
+            return
+
+        try:
+            media = MediaDataController.getInstance(int(account))
+        except Exception:
+            media = None
+
+        if media is None:
+            on_done(None)
+            return
+
+        class _Cb(dynamic_proxy(Utilities.Callback)):
+            def __init__(self, plugin):
+                super().__init__()
+                self._plugin = plugin
+
+            def run(self, docs):
+                chosen = None
+                try:
+                    if docs is not None and docs.size() > 0:
+                        if doc_id is not None:
+                            for i in range(docs.size()):
+                                d = docs.get(i)
+                                try:
+                                    if int(d.id) == int(doc_id):
+                                        chosen = d
+                                        break
+                                except Exception:
+                                    continue
+                        if chosen is None:
+                            chosen = docs.get(0)
+                except Exception as e:
+                    self._plugin._append_log(f"sticker resolve callback error: {e}")
+                on_done(chosen)
+
+        try:
+            media.searchStickers(False, "", emoji, _Cb(self))
+        except Exception as e:
+            self._append_log(f"sticker resolve error: {e}")
+            on_done(None)
+
+    def _send_binding_now(self, account, send_ctx, word):
+        binding = self._get_binding_for_word(word)
+        if not binding:
+            self._append_log(f"binding not found for '{word}'")
+            return
+
+        media_type = str(binding.get("media_type", "sticker") or "sticker")
+
+        if media_type == "sticker":
+            self._resolve_sticker_doc_for_binding(
+                account,
+                binding,
+                lambda doc: self._send_sticker_doc_now(account, send_ctx, doc, word),
+            )
+            return
+
+        if media_type == "photo":
+            self._send_photo_file_now(account, send_ctx, binding, word)
+            return
+
+        if media_type in ("video", "round", "gif"):
+            self._send_video_or_round_now(account, send_ctx, binding, word)
+            return
+
+        if media_type in ("voice", "audio"):
+            self._send_audio_or_voice_now(account, send_ctx, binding, word)
+            return
+
+        self._append_log(f"unsupported media_type: {media_type}")
+
+    def _schedule_auto_send(self, account, send_ctx, word):
+        if self._auto_send_lock:
+            self._append_log("auto send skipped: lock")
+            return
+
+        self._auto_send_lock = True
+
+        def _unlock():
+            self._auto_send_lock = False
+
+        def _start():
+            try:
+                self._send_binding_now(account, send_ctx, word)
+            except Exception as e:
+                self._append_log(f"schedule auto send error: {e}")
+            finally:
+                try:
+                    run_on_ui_thread(_unlock, delay=500)
+                except Exception:
+                    _unlock()
+
+        try:
+            run_on_ui_thread(_start, delay=220)
+        except Exception:
+            run_on_ui_thread(_start)
+
+    # ---------- send hook ----------
+
+    def _extract_bind_word_from_message(self, text):
+        t = str(text or "").strip()
+        if not t:
+            return None
+
+        custom_cmd = str(self.get_setting("bind_command", ".bind") or ".bind").strip()
+        candidates = [custom_cmd, ".bind", ".привязать"]
+
+        for cmd in candidates:
+            if not cmd:
+                continue
+            pref = cmd + " "
+            if t.lower().startswith(pref.lower()):
+                w = t[len(pref):].strip()
+                if w:
+                    return w
+        return None
+
+    def on_send_message_hook(self, account, params):
+        try:
+            if not self.get_setting("enabled", True):
+                return HookResult()
+
+            if not params or not hasattr(params, "message") or not params.message:
+                return HookResult()
+
+            text = str(params.message).strip()
+            if not text:
+                return HookResult()
+
+            # 1) bind command mode
+            bind_word = self._extract_bind_word_from_message(text)
+            if bind_word:
+                reply_to = getattr(params, "replyToMsg", None)
+                if reply_to is None:
+                    BulletinHelper.show_error("Ответь на стикер/фото/видео/гиф/кружок/гс/аудио и напиши .bind слово")
+                    return HookResult(strategy=HookStrategy.CANCEL)
+
+                info = self._extract_media_info(reply_to)
+                if not info:
+                    BulletinHelper.show_error("Поддерживается: стикер, фото, видео, гиф, кружок, гс, аудио")
+                    return HookResult(strategy=HookStrategy.CANCEL)
+
+                self._save_media_binding(bind_word, info, reply_to)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            # 2) normal message mode
+            trigger_word = self._find_trigger_word_in_text(text)
+            if trigger_word:
+                self._append_log(f"trigger matched in message: '{trigger_word}'")
+                send_ctx = {
+                    "peer": getattr(params, "peer", None),
+                    "reply_to_msg": getattr(params, "replyToMsg", getattr(params, "replyToMsgId", None)),
+                    "reply_to_top": getattr(params, "replyToTopMsg", getattr(params, "replyToTopMsgId", None)),
+                }
+                self._schedule_auto_send(account, send_ctx, trigger_word)
+
+            return HookResult()
+        except Exception as e:
+            self._append_log(f"on_send_message_hook error: {e}")
+            return HookResult()
+
+
+Plugin = StickerHintsPlugin
