@@ -2,11 +2,10 @@ __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Пытается быть хорошим прокси плагином"
 __author__ = "@Altyplugins / Codex"
-__version__ = "1.2"
+__version__ = "1.2.1"
 __icon__ = "Broit_d_by_fStikBot/37"
 __min_version__ = "12.1.1"
 
-#idk i trying to integrate https://github.com/Flowseal/tg-ws-proxy BUT it doens't work ((((((
 
 import base64
 import asyncio
@@ -21,6 +20,7 @@ import ssl
 import random
 import re
 import os
+import gzip
 import socket
 import struct
 from base_plugin import BasePlugin, AppEvent, MethodHook, MenuItemData, MenuItemType
@@ -33,6 +33,13 @@ from hook_utils import find_class
 from org.telegram.messenger import NotificationCenter, SharedConfig, MessagesController, UserConfig, ApplicationLoader
 from org.telegram.messenger.browser import Browser
 from org.telegram.tgnet import ConnectionsManager
+try:
+    from javax.crypto import Cipher as JavaCipher
+    from javax.crypto.spec import SecretKeySpec, IvParameterSpec
+except:
+    JavaCipher = None
+    SecretKeySpec = None
+    IvParameterSpec = None
 
 GITHUB_PROXY_URL = "https://raw.githubusercontent.com/Argh94/Proxy-List/refs/heads/main/MTProto.txt"
 SUBSCRIBE_CHANNEL = "AltyPlugins"
@@ -44,10 +51,20 @@ VLESS_LOCAL_READY_TIMEOUT_SEC = 6.0
 VLESS_LOCAL_APPLY_TIMEOUT_SEC = 3.0
 VLESS_REMOTE_CHECK_TIMEOUT_SEC = 3.0
 VLESS_KIND = "vless"
+TGWS_KIND = "tgws"
+TGWS_LOCAL_PORT = 10805
+TGWS_LOCAL_READY_TIMEOUT_SEC = 6.0
+TGWS_WS_CONNECT_TIMEOUT_SEC = 4.0
+TGWS_WS_FAIL_COOLDOWN_SEC = 60.0
+TGWS_RESERVED_PORTS = {10804, 10808}
 VLESS_TEST_TARGETS = [
     ("149.154.167.51", 443),
     ("1.1.1.1", 443),
 ]
+TGWS_DEFAULT_DC_IP = {
+    "2": "149.154.167.220",
+    "4": "149.154.167.220",
+}
 VLESS_CHAT_LINK_RE = re.compile(r"vless://[^\s\"'<>]+", re.IGNORECASE)
 VLESS_PROVIDER_ITEMS = [
     "Текущий",
@@ -501,6 +518,569 @@ def _vless_node_from_uri(uri_str):
         "security": str(details.get("security", "none") or "none"),
     }
 
+_TGWS_TG_RANGES = [
+    (struct.unpack("!I", socket.inet_aton("185.76.151.0"))[0], struct.unpack("!I", socket.inet_aton("185.76.151.255"))[0]),
+    (struct.unpack("!I", socket.inet_aton("149.154.160.0"))[0], struct.unpack("!I", socket.inet_aton("149.154.175.255"))[0]),
+    (struct.unpack("!I", socket.inet_aton("91.105.192.0"))[0], struct.unpack("!I", socket.inet_aton("91.105.193.255"))[0]),
+    (struct.unpack("!I", socket.inet_aton("91.108.0.0"))[0], struct.unpack("!I", socket.inet_aton("91.108.255.255"))[0]),
+]
+
+_TGWS_IP_TO_DC = {
+    "149.154.175.50": 1,
+    "149.154.175.51": 1,
+    "149.154.175.54": 1,
+    "149.154.167.41": 2,
+    "149.154.167.50": 2,
+    "149.154.167.51": 2,
+    "149.154.167.151": 2,
+    "149.154.167.220": 2,
+    "149.154.167.223": 2,
+    "149.154.175.100": 3,
+    "149.154.175.101": 3,
+    "149.154.166.120": 4,
+    "149.154.166.121": 4,
+    "149.154.167.91": 4,
+    "149.154.167.92": 4,
+    "91.108.56.100": 5,
+    "91.108.56.101": 5,
+    "91.108.56.116": 5,
+    "91.108.56.126": 5,
+    "91.105.192.100": 203,
+}
+
+
+def _tgws_unique_values(*values):
+    out = []
+    seen = set()
+    for value in values:
+        try:
+            trimmed = str(value or "").strip()
+        except:
+            trimmed = ""
+        if not trimmed or trimmed in seen:
+            continue
+        seen.add(trimmed)
+        out.append(trimmed)
+    return out
+
+
+def _tgws_xor_mask(data, mask):
+    if not mask:
+        return data
+    buf = bytearray(data)
+    for idx in range(len(buf)):
+        buf[idx] ^= mask[idx & 3]
+    return bytes(buf)
+
+
+def _tgws_build_frame(opcode, payload, mask=True):
+    try:
+        body = bytes(payload or b"")
+    except:
+        body = b""
+    out = bytearray()
+    out.append(0x80 | (int(opcode) & 0x0F))
+    length = len(body)
+    mask_bit = 0x80 if mask else 0x00
+    if length < 126:
+        out.append(mask_bit | length)
+    elif length <= 0xFFFF:
+        out.append(mask_bit | 126)
+        out.extend(struct.pack(">H", length))
+    else:
+        out.append(mask_bit | 127)
+        out.extend(struct.pack(">Q", length))
+    if mask:
+        mask_key = os.urandom(4)
+        out.extend(mask_key)
+        body = _tgws_xor_mask(body, mask_key)
+    out.extend(body)
+    return bytes(out)
+
+
+def _tgws_read_exact(reader, size):
+    buf = b""
+    need = int(size or 0)
+    while len(buf) < need:
+        chunk = reader.read(need - len(buf))
+        if not chunk:
+            raise EOFError("unexpected eof")
+        buf += chunk
+    return buf
+
+
+def _tgws_recv_exact(conn, size):
+    data = b""
+    need = int(size or 0)
+    while len(data) < need:
+        chunk = conn.recv(need - len(data))
+        if not chunk:
+            raise EOFError("unexpected eof")
+        data += chunk
+    return data
+
+
+def _tgws_is_telegram_ip(ip):
+    try:
+        raw = struct.unpack("!I", socket.inet_aton(str(ip or "")))[0]
+        for lo, hi in _TGWS_TG_RANGES:
+            if lo <= raw <= hi:
+                return True
+    except:
+        pass
+    return False
+
+
+def _tgws_is_http_transport(data):
+    try:
+        raw = bytes(data or b"")
+    except:
+        raw = b""
+    return raw[:5] == b"POST " or raw[:4] == b"GET " or raw[:5] == b"HEAD " or raw[:8] == b"OPTIONS "
+
+
+def _tgws_keystream_java(key_bytes, iv_bytes, size):
+    if JavaCipher is None or SecretKeySpec is None or IvParameterSpec is None:
+        raise RuntimeError("Java crypto unavailable")
+    cipher = JavaCipher.getInstance("AES/CTR/NoPadding")
+    cipher.init(JavaCipher.ENCRYPT_MODE, SecretKeySpec(bytes(key_bytes), "AES"), IvParameterSpec(bytes(iv_bytes)))
+    result = cipher.doFinal(b"\x00" * int(size))
+    try:
+        return bytes(result)
+    except:
+        return bytes(bytearray(result))
+
+
+def _tgws_dc_from_init(data):
+    try:
+        raw = bytes(data or b"")
+        if len(raw) < 64:
+            return None, False
+        key = raw[8:40]
+        iv = raw[40:56]
+        keystream = _tgws_keystream_java(key, iv, 64)
+        plain = bytes(a ^ b for a, b in zip(raw[56:64], keystream[56:64]))
+        proto = struct.unpack("<I", plain[0:4])[0]
+        dc_raw = struct.unpack("<h", plain[4:6])[0]
+        if proto in (0xEFEFEFEF, 0xEEEEEEEE, 0xDDDDDDDD):
+            dc = abs(int(dc_raw))
+            if 1 <= dc <= 1000:
+                return dc, bool(dc_raw < 0)
+    except:
+        pass
+    return None, False
+
+
+def _tgws_ws_domains(dc, is_media):
+    try:
+        dc_num = int(dc or 0)
+    except:
+        dc_num = 0
+    base = "telegram.org" if dc_num > 5 else "web.telegram.org"
+    if is_media:
+        return [f"kws{dc_num}-1.{base}", f"kws{dc_num}.{base}"]
+    return [f"kws{dc_num}.{base}", f"kws{dc_num}-1.{base}"]
+
+
+def _tgws_socks_reply(status):
+    return bytes((0x05, int(status) & 0xFF, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+
+
+def _tgws_read_socks_address(conn, atyp):
+    atyp = int(atyp or 0)
+    if atyp == 0x01:
+        host = socket.inet_ntoa(_tgws_recv_exact(conn, 4))
+        port = int.from_bytes(_tgws_recv_exact(conn, 2), "big")
+        return host, port
+    if atyp == 0x03:
+        size = _tgws_recv_exact(conn, 1)[0]
+        host = _tgws_recv_exact(conn, size).decode("utf-8", errors="ignore")
+        port = int.from_bytes(_tgws_recv_exact(conn, 2), "big")
+        return host, port
+    if atyp == 0x04:
+        host = socket.inet_ntop(socket.AF_INET6, _tgws_recv_exact(conn, 16))
+        port = int.from_bytes(_tgws_recv_exact(conn, 2), "big")
+        return host, port
+    raise ValueError("unsupported atyp")
+
+
+class _TgWsRawWebSocket:
+    def __init__(self, sock, reader):
+        self.sock = sock
+        self.reader = reader
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @staticmethod
+    def connect(ip, domain, timeout=TGWS_WS_CONNECT_TIMEOUT_SEC):
+        sock = socket.create_connection((str(ip), 443), timeout=float(timeout))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        wrapped = ctx.wrap_socket(sock, server_hostname=str(domain or ""))
+        wrapped.settimeout(float(timeout))
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = "\r\n".join([
+            "GET /apiws HTTP/1.1",
+            "Host: " + str(domain or ""),
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Key: " + key,
+            "Sec-WebSocket-Version: 13",
+            "Sec-WebSocket-Protocol: binary",
+            "Origin: https://web.telegram.org",
+            "User-Agent: Mozilla/5.0 (Linux; Android 13)",
+            "",
+            "",
+        ]).encode("utf-8")
+        wrapped.sendall(req)
+        reader = wrapped.makefile("rb")
+        status_line = reader.readline().decode("utf-8", errors="replace").strip()
+        parts = status_line.split(" ", 2)
+        code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        while True:
+            line = reader.readline().decode("utf-8", errors="replace")
+            if not line or line in ("\r\n", "\n"):
+                break
+        wrapped.settimeout(None)
+        if code != 101:
+            try:
+                reader.close()
+            except:
+                pass
+            try:
+                wrapped.close()
+            except:
+                pass
+            raise RuntimeError(status_line or "bad websocket handshake")
+        return _TgWsRawWebSocket(wrapped, reader)
+
+    def send(self, payload):
+        with self._lock:
+            if self._closed:
+                raise EOFError("websocket closed")
+            self.sock.sendall(_tgws_build_frame(0x2, payload, mask=True))
+
+    def _read_frame(self):
+        header = _tgws_read_exact(self.reader, 2)
+        opcode = header[0] & 0x0F
+        masked = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", _tgws_read_exact(self.reader, 2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", _tgws_read_exact(self.reader, 8))[0]
+        mask_key = b""
+        if masked:
+            mask_key = _tgws_read_exact(self.reader, 4)
+        payload = _tgws_read_exact(self.reader, length)
+        if masked:
+            payload = _tgws_xor_mask(payload, mask_key)
+        return opcode, payload
+
+    def recv(self):
+        while True:
+            opcode, payload = self._read_frame()
+            if opcode == 0x8:
+                self.close()
+                return None
+            if opcode == 0x9:
+                self._write_control(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                return payload
+
+    def _write_control(self, opcode, payload):
+        with self._lock:
+            if self._closed:
+                return
+            self.sock.sendall(_tgws_build_frame(opcode, payload, mask=True))
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.sock.sendall(_tgws_build_frame(0x8, b"", mask=True))
+            except:
+                pass
+            try:
+                self.reader.close()
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
+
+
+class TgWsCore:
+    def __init__(self):
+        self.listener = None
+        self.listener_thread = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.tracked = set()
+        self.fail_until = {}
+        self.port = 0
+        self.dc_ip = dict(TGWS_DEFAULT_DC_IP)
+
+    def is_available(self):
+        return JavaCipher is not None
+
+    def _track(self, closer):
+        with self.lock:
+            self.tracked.add(closer)
+
+    def _untrack(self, closer):
+        with self.lock:
+            self.tracked.discard(closer)
+
+    def _close_all_tracked(self):
+        with self.lock:
+            closers = list(self.tracked)
+            self.tracked.clear()
+        for closer in closers:
+            try:
+                closer.close()
+            except:
+                pass
+
+    def _parse_config(self, config_json):
+        cfg = {"port": int(TGWS_LOCAL_PORT), "dc_ip": dict(TGWS_DEFAULT_DC_IP)}
+        raw = str(config_json or "").strip()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                if parsed.get("port"):
+                    cfg["port"] = int(parsed.get("port") or TGWS_LOCAL_PORT)
+                dc_ip = parsed.get("dc_ip")
+                if isinstance(dc_ip, dict):
+                    for key, value in dc_ip.items():
+                        cfg["dc_ip"][str(key)] = str(value)
+        if cfg["port"] <= 0 or cfg["port"] > 65535:
+            cfg["port"] = int(TGWS_LOCAL_PORT)
+        return cfg
+
+    def start(self, config_json):
+        if not self.is_available():
+            return "Java crypto недоступно"
+        try:
+            cfg = self._parse_config(config_json)
+            self.stop()
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((VLESS_LOCAL_HOST, int(cfg["port"])))
+            listener.listen(32)
+            listener.settimeout(1.0)
+            self.listener = listener
+            self.port = int(cfg["port"])
+            self.dc_ip = dict(cfg.get("dc_ip") or {})
+            self.stop_event.clear()
+            self.listener_thread = threading.Thread(target=self._accept_loop, daemon=True)
+            self.listener_thread.start()
+            return ""
+        except Exception as exc:
+            try:
+                if self.listener is not None:
+                    self.listener.close()
+            except:
+                pass
+            self.listener = None
+            return str(exc)
+
+    def stop(self):
+        self.stop_event.set()
+        try:
+            if self.listener is not None:
+                self.listener.close()
+        except:
+            pass
+        self.listener = None
+        self._close_all_tracked()
+        thread = self.listener_thread
+        self.listener_thread = None
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(1.5)
+            except:
+                pass
+
+    def _accept_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except:
+                if self.stop_event.is_set():
+                    break
+                continue
+            self._track(conn)
+            threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+
+    def _close_write(self, conn):
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except:
+            pass
+
+    def _bridge_tcp(self, left, right):
+        done = threading.Event()
+
+        def _forward(src, dst):
+            try:
+                while not done.is_set():
+                    chunk = src.recv(65536)
+                    if not chunk:
+                        break
+                    dst.sendall(chunk)
+            except:
+                pass
+            done.set()
+            self._close_write(dst)
+
+        t1 = threading.Thread(target=_forward, args=(left, right), daemon=True)
+        t2 = threading.Thread(target=_forward, args=(right, left), daemon=True)
+        t1.start()
+        t2.start()
+        while not done.is_set() and (t1.is_alive() or t2.is_alive()):
+            time.sleep(0.1)
+        done.set()
+        for item in (left, right):
+            try:
+                item.close()
+            except:
+                pass
+            self._untrack(item)
+
+    def _bridge_ws(self, client, ws):
+        done = threading.Event()
+
+        def _client_to_ws():
+            try:
+                while not done.is_set():
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    ws.send(chunk)
+            except:
+                pass
+            done.set()
+
+        def _ws_to_client():
+            try:
+                while not done.is_set():
+                    payload = ws.recv()
+                    if not payload:
+                        break
+                    client.sendall(payload)
+            except:
+                pass
+            done.set()
+
+        t1 = threading.Thread(target=_client_to_ws, daemon=True)
+        t2 = threading.Thread(target=_ws_to_client, daemon=True)
+        t1.start()
+        t2.start()
+        while not done.is_set() and (t1.is_alive() or t2.is_alive()):
+            time.sleep(0.1)
+        done.set()
+        try:
+            ws.close()
+        except:
+            pass
+        self._untrack(ws)
+        try:
+            client.close()
+        except:
+            pass
+        self._untrack(client)
+
+    def _direct_passthrough(self, client, dst, port):
+        remote = socket.create_connection((str(dst), int(port)), 10.0)
+        self._track(remote)
+        client.sendall(_tgws_socks_reply(0x00))
+        self._bridge_tcp(client, remote)
+
+    def _tcp_fallback(self, client, dst, port, init_packet):
+        remote = socket.create_connection((str(dst), int(port)), 10.0)
+        self._track(remote)
+        if init_packet:
+            remote.sendall(bytes(init_packet))
+        self._bridge_tcp(client, remote)
+
+    def _handle_client(self, conn):
+        try:
+            conn.settimeout(10.0)
+            header = _tgws_recv_exact(conn, 2)
+            if header[0] != 0x05:
+                return
+            _tgws_recv_exact(conn, header[1])
+            conn.sendall(b"\x05\x00")
+            req = _tgws_recv_exact(conn, 4)
+            if req[1] != 0x01:
+                conn.sendall(_tgws_socks_reply(0x07))
+                return
+            dst, port = _tgws_read_socks_address(conn, req[3])
+            if not _tgws_is_telegram_ip(dst):
+                try:
+                    self._direct_passthrough(conn, dst, port)
+                except:
+                    try:
+                        conn.sendall(_tgws_socks_reply(0x05))
+                    except:
+                        pass
+                return
+            conn.sendall(_tgws_socks_reply(0x00))
+            conn.settimeout(15.0)
+            init_packet = _tgws_recv_exact(conn, 64)
+            conn.settimeout(None)
+            if _tgws_is_http_transport(init_packet):
+                return
+            dc, is_media = _tgws_dc_from_init(init_packet)
+            if dc is None:
+                dc = _TGWS_IP_TO_DC.get(str(dst))
+            if dc is None:
+                self._tcp_fallback(conn, dst, port, init_packet)
+                return
+            target_ip = str((self.dc_ip or {}).get(str(dc), "") or "").strip()
+            dc_key = (int(dc), bool(is_media))
+            fail_until = float(self.fail_until.get(dc_key, 0.0) or 0.0)
+            if fail_until > time.time():
+                self._tcp_fallback(conn, dst, port, init_packet)
+                return
+            ws = None
+            for candidate_ip in _tgws_unique_values(target_ip, dst):
+                for domain in _tgws_ws_domains(dc, is_media):
+                    try:
+                        ws = _TgWsRawWebSocket.connect(candidate_ip, domain, timeout=TGWS_WS_CONNECT_TIMEOUT_SEC)
+                        break
+                    except:
+                        ws = None
+                if ws is not None:
+                    break
+            if ws is None:
+                self.fail_until[dc_key] = time.time() + float(TGWS_WS_FAIL_COOLDOWN_SEC)
+                self._tcp_fallback(conn, dst, port, init_packet)
+                return
+            self.fail_until.pop(dc_key, None)
+            self._track(ws)
+            ws.send(init_packet)
+            self._bridge_ws(conn, ws)
+            return
+        except:
+            pass
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+            self._untrack(conn)
+
 
 class _NativeLinker:
     def __init__(self):
@@ -717,26 +1297,91 @@ def _get_free_port():
         return int(sock.getsockname()[1])
 
 
-def _fetch_text_url(url, timeout_sec=15.0):
+def _pick_tgws_port(preferred=None, excluded=None):
+    used = set(int(x) for x in list(TGWS_RESERVED_PORTS or []))
     try:
-        req = urllib.request.Request(str(url or ""))
+        preferred_port = int(preferred or 0)
+    except:
+        preferred_port = 0
+    if excluded:
+        try:
+            for value in excluded:
+                try:
+                    used.add(int(value))
+                except:
+                    pass
+        except:
+            pass
+    if preferred_port > 0 and preferred_port not in used and _wait_vless_port_closed(preferred_port, timeout_sec=0.05, poll_sec=0.05):
+        return preferred_port
+    for _ in range(32):
+        candidate = _get_free_port()
+        if candidate in used:
+            continue
+        if _wait_vless_port_closed(candidate, timeout_sec=0.05, poll_sec=0.05):
+            return int(candidate)
+    return 0
+
+
+def _subscription_request_headers(url):
+    try:
+        host = str(urllib.parse.urlparse(str(url or "")).netloc or "").strip()
+    except:
+        host = ""
+    headers = {
+        "Accept-Encoding": "gzip",
+        "Connection": "close",
+        "User-agent": "Happ/3.13.0",
+        "X-Device-Locale": "en",
+        "X-Device-model": "Pixel 9",
+        "X-Device-OS": "Android",
+        "X-HWID": "a92bbf26d395e858",
+        "X-Ver-OS": "16",
+    }
+    if host:
+        headers["Host"] = host
+    return headers
+
+
+def _decode_subscription_body(raw, encoding=""):
+    data = bytes(raw or b"")
+    enc = str(encoding or "").lower().strip()
+    if data[:2] == b"\x1f\x8b" or "gzip" in enc:
+        try:
+            data = gzip.decompress(data)
+        except:
+            pass
+    try:
+        return data.decode("utf-8")
+    except:
+        return data.decode("utf-8", errors="ignore")
+
+
+def _fetch_text_url(url, timeout_sec=15.0):
+    headers = _subscription_request_headers(url)
+
+    try:
+        req = urllib.request.Request(str(url or ""), headers=headers)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, timeout=float(timeout_sec), context=ctx) as resp:
             raw = resp.read()
             try:
-                return raw.decode("utf-8")
+                encoding = str(resp.headers.get("Content-Encoding", "") or "")
             except:
-                return raw.decode("utf-8", errors="ignore")
+                encoding = ""
+            return _decode_subscription_body(raw, encoding=encoding)
     except:
         pass
 
     try:
         import requests
-        r = requests.get(str(url or ""), timeout=float(timeout_sec), verify=False)
+        r = requests.get(str(url or ""), timeout=float(timeout_sec), verify=False, headers=headers)
         if int(getattr(r, "status_code", 0) or 0) == 200:
-            return str(getattr(r, "text", "") or "")
+            raw = getattr(r, "content", b"") or b""
+            encoding = str(getattr(getattr(r, "headers", {}), "get", lambda *a, **k: "")("Content-Encoding", "") or "")
+            return _decode_subscription_body(raw, encoding=encoding)
     except:
         pass
     return ""
@@ -751,10 +1396,11 @@ def _fetch_vless_nodes(url):
     if "vless://" not in body:
         try:
             b64 = body.replace("\n", "").replace("\r", "").replace("-", "+").replace("_", "/")
+            b64 = "".join(ch for ch in b64 if ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
             missing = len(b64) % 4
             if missing:
                 b64 += "=" * (4 - missing)
-            decoded = base64.b64decode(b64, validate=False)
+            decoded = base64.b64decode(b64.encode("ascii", errors="ignore"), validate=False)
             body = decoded.decode("utf-8", errors="ignore")
         except:
             pass
@@ -1352,6 +1998,8 @@ class SafeBypassPlugin(BasePlugin):
         self._hot_proxy_cache = []
         self._last_working_proxy = None
         self._connection_mode = "proxy"
+        self._tgws_port = 0
+        self._tgws_running = False
         self._vless_port = 0
         self._vless_running = False
         self._vless_data = {"manual": [], "subs": [], "active_uri": ""}
@@ -1374,6 +2022,7 @@ class SafeBypassPlugin(BasePlugin):
         except:
             pass
 
+        self._tgws_core = TgWsCore()
         self._vless_core = VlessCore(self._libvless_so_path())
             
         self._load_config()
@@ -1566,7 +2215,7 @@ class SafeBypassPlugin(BasePlugin):
 
     def _get_connection_mode(self):
         mode = str(self._connection_mode or "proxy")
-        if mode not in ("proxy", VLESS_KIND):
+        if mode not in ("proxy", VLESS_KIND, TGWS_KIND):
             mode = "proxy"
         return mode
 
@@ -1575,7 +2224,7 @@ class SafeBypassPlugin(BasePlugin):
             target = str(mode or "proxy")
         except:
             target = "proxy"
-        if target not in ("proxy", VLESS_KIND):
+        if target not in ("proxy", VLESS_KIND, TGWS_KIND):
             target = "proxy"
         self._connection_mode = target
         self._save_config()
@@ -1621,6 +2270,12 @@ class SafeBypassPlugin(BasePlugin):
         return self._find_vless_node(self._get_active_vless_uri())
 
     def _is_vless_mode_selected(self):
+        return self._get_connection_mode() == VLESS_KIND and bool(self._get_active_vless_uri())
+
+    def _is_tgws_mode_selected(self):
+        return self._get_connection_mode() == TGWS_KIND
+
+    def _should_run_vless(self):
         return self._get_connection_mode() == VLESS_KIND and bool(self._get_active_vless_uri())
 
 
@@ -2280,6 +2935,9 @@ class SafeBypassPlugin(BasePlugin):
     def _is_local_vless_proxy_applied(self, port):
         return self._is_local_proxy_applied(port)
 
+    def _is_local_tgws_proxy_applied(self, port):
+        return self._is_local_proxy_applied(port)
+
     def _wait_local_telegram_ready(self, port, timeout_sec=3.0, poll_sec=0.2):
         deadline = time.time() + float(timeout_sec)
         while time.time() < deadline:
@@ -2296,6 +2954,9 @@ class SafeBypassPlugin(BasePlugin):
 
     def _wait_vless_telegram_ready(self, timeout_sec=3.0, poll_sec=0.2):
         return self._wait_local_telegram_ready(self._vless_port, timeout_sec=timeout_sec, poll_sec=poll_sec)
+
+    def _wait_tgws_telegram_ready(self, timeout_sec=3.0, poll_sec=0.2):
+        return self._wait_local_telegram_ready(self._tgws_port, timeout_sec=timeout_sec, poll_sec=poll_sec)
 
     def _download_libvless_with_progress(self):
         try:
@@ -2329,7 +2990,13 @@ class SafeBypassPlugin(BasePlugin):
             return False
 
     def _ensure_vless_core_then(self, runner):
+        runner_name = str(getattr(runner, "__name__", "") or "")
+        require_vless_mode = runner_name == "_vless_connect"
+        if require_vless_mode and (not self._should_run_vless()):
+            return
         if self._vless_core.is_available():
+            if require_vless_mode and (not self._should_run_vless()):
+                return
             threading.Thread(target=runner, daemon=True).start()
             return
         if self._vless_prepare_in_progress:
@@ -2343,6 +3010,8 @@ class SafeBypassPlugin(BasePlugin):
                 ok = self._download_libvless_with_progress()
                 self._reload_vless_core()
                 if ok and self._vless_core.is_available():
+                    if require_vless_mode and (not self._should_run_vless()):
+                        return
                     run_on_ui_thread(lambda: BulletinHelper.show_success("Ядро VLESS готово"))
                     try:
                         runner()
@@ -2380,6 +3049,8 @@ class SafeBypassPlugin(BasePlugin):
         return node
 
     def _vless_connect(self):
+        if not self._should_run_vless():
+            return False
         uri = self._get_active_vless_uri()
         if not uri:
             self._append_vless_diag("connect aborted: no active uri")
@@ -2432,6 +3103,14 @@ class SafeBypassPlugin(BasePlugin):
         def _watchdog():
             deadline = time.time() + float(VLESS_LOCAL_READY_TIMEOUT_SEC)
             while time.time() < deadline:
+                if not self._should_run_vless():
+                    self._vless_running = False
+                    self._vless_port = 0
+                    try:
+                        self._vless_core.stop()
+                    except:
+                        pass
+                    return
                 if _check_vless_port(port) and _check_vless_socks_ready(port, timeout=0.5):
                     self._append_vless_diag("local socks ready on %s" % int(port))
                     if not _check_vless_tunnel_ready(port, timeout=1.5):
@@ -2489,6 +3168,81 @@ class SafeBypassPlugin(BasePlugin):
         self._vless_running = False
         self._vless_port = 0
         self._vless_apply_tg_proxy(0, False)
+        if not silent:
+            self._refresh_settings_without_reopen()
+
+    def _tgws_proxy_link(self):
+        try:
+            port = int(self._tgws_port or 0)
+        except:
+            port = 0
+        if port <= 0:
+            port = int(TGWS_LOCAL_PORT)
+        return f"tg://socks?server={VLESS_LOCAL_HOST}&port={int(port)}"
+
+    def _tgws_connect(self):
+        try:
+            self._vless_disconnect_with_reason("tgws_connect_preempt", silent=True)
+        except:
+            pass
+        port = _pick_tgws_port(TGWS_LOCAL_PORT)
+        if int(port or 0) <= 0:
+            self._tgws_running = False
+            self._tgws_port = 0
+            return False
+        self._tgws_port = port
+        config_json = json.dumps({"port": int(port), "verbose": False, "dc_ip": dict(TGWS_DEFAULT_DC_IP)})
+        err = self._tgws_core.start(config_json)
+        if err:
+            self._tgws_running = False
+            self._tgws_port = 0
+            return False
+
+        def _watchdog():
+            deadline = time.time() + float(TGWS_LOCAL_READY_TIMEOUT_SEC)
+            while time.time() < deadline:
+                if _check_vless_port(port) and _check_vless_socks_ready(port, timeout=0.5):
+                    applied = self._apply_local_socks_proxy(port, True)
+                    apply_deadline = time.time() + 1.5
+                    while applied and time.time() < apply_deadline:
+                        if self._is_local_tgws_proxy_applied(port):
+                            break
+                        time.sleep(0.1)
+                    if not applied or (not self._is_local_tgws_proxy_applied(port)):
+                        self._tgws_running = False
+                        self._tgws_port = 0
+                        try:
+                            self._tgws_core.stop()
+                        except:
+                            pass
+                        return
+                    self._tgws_running = True
+                    self._save_config()
+                    run_on_ui_thread(self._refresh_settings_without_reopen)
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("TG WS подключен"))
+                    return
+                time.sleep(0.3)
+            self._tgws_running = False
+            self._tgws_port = 0
+            try:
+                self._tgws_core.stop()
+            except:
+                pass
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+        return True
+
+    def _tgws_disconnect_with_reason(self, reason, silent=False):
+        self._tgws_disconnect(silent=bool(silent))
+
+    def _tgws_disconnect(self, silent=False):
+        try:
+            self._tgws_core.stop()
+        except:
+            pass
+        self._tgws_running = False
+        self._tgws_port = 0
+        self._apply_local_socks_proxy(0, False)
         if not silent:
             self._refresh_settings_without_reopen()
 
@@ -3747,6 +4501,8 @@ class SafeBypassPlugin(BasePlugin):
 
         if self._is_plugin_proxy_enabled() and self._is_vless_mode_selected():
             self._ensure_vless_core_then(self._vless_connect)
+        elif self._is_plugin_proxy_enabled() and self._is_tgws_mode_selected():
+            self._tgws_connect()
         
         try:
             mc_class = find_class("org.telegram.messenger.MessagesController")
@@ -4322,9 +5078,17 @@ class SafeBypassPlugin(BasePlugin):
     def _switch_to_proxy_mode(self):
         self._set_connection_mode("proxy")
         self._vless_disconnect_with_reason("switch_to_proxy_mode", silent=True)
+        self._tgws_disconnect_with_reason("switch_to_proxy_mode", silent=True)
         self._refresh_settings_without_reopen()
         if self._is_plugin_proxy_enabled():
             self._force_update()
+
+    def _switch_to_tgws_mode(self):
+        self._set_connection_mode(TGWS_KIND)
+        self._vless_disconnect_with_reason("switch_to_tgws_mode", silent=True)
+        if self._is_plugin_proxy_enabled():
+            self._tgws_connect()
+        self._refresh_settings_without_reopen()
 
 
     def _create_vless_nodes_subpage(self):
@@ -4538,6 +5302,8 @@ class SafeBypassPlugin(BasePlugin):
         if val:
             if self._is_vless_mode_selected():
                 self._ensure_vless_core_then(self._vless_connect)
+            elif self._is_tgws_mode_selected():
+                self._tgws_connect()
             else:
                 _set_tg_proxy_enabled(True)
                 try:
@@ -4553,6 +5319,10 @@ class SafeBypassPlugin(BasePlugin):
                 pass
             try:
                 self._vless_disconnect_with_reason("use_proxy_disabled", silent=True)
+            except:
+                pass
+            try:
+                self._tgws_disconnect_with_reason("use_proxy_disabled", silent=True)
             except:
                 pass
             try:
@@ -4601,6 +5371,10 @@ class SafeBypassPlugin(BasePlugin):
         except:
             pass
         try:
+            self._tgws_disconnect_with_reason("plugin_unload", silent=True)
+        except:
+            pass
+        try:
             self.remove_menu_item(self._chat_menu_item_id)
         except:
             pass
@@ -4627,6 +5401,9 @@ class SafeBypassPlugin(BasePlugin):
 
             if not self._is_plugin_proxy_enabled():
                 return
+
+            if self._is_tgws_mode_selected() and ((not self._tgws_running) or (self._tgws_port and not _check_vless_port(self._tgws_port))):
+                self._tgws_connect()
 
             if not self._sub_dialog_shown:
                 # Небольшая задержка, чтобы Activity успела появиться
@@ -4750,6 +5527,9 @@ class SafeBypassPlugin(BasePlugin):
             if self._is_vless_mode_selected():
                 if not self._vless_running or (self._vless_port and not _check_vless_port(self._vless_port)):
                     self._ensure_vless_core_then(self._vless_connect)
+            elif self._is_tgws_mode_selected():
+                if not self._tgws_running or (self._tgws_port and not _check_vless_port(self._tgws_port)):
+                    self._tgws_connect()
             elif not self._is_proxy_connection_ready():
                 self._update_proxy_logic()
 
@@ -4767,6 +5547,11 @@ class SafeBypassPlugin(BasePlugin):
                 if self._is_vless_mode_selected():
                     if not self._vless_running or (self._vless_port and not _check_vless_port(self._vless_port)):
                         self._ensure_vless_core_then(self._vless_connect)
+                    continue
+
+                if self._is_tgws_mode_selected():
+                    if not self._tgws_running or (self._tgws_port and not _check_vless_port(self._tgws_port)):
+                        self._tgws_connect()
                     continue
 
                 now = time.time()
@@ -4805,6 +5590,11 @@ class SafeBypassPlugin(BasePlugin):
             self._finding_proxy = False
             if (not self._vless_running) or (self._vless_port and not _check_vless_port(self._vless_port)):
                 self._ensure_vless_core_then(self._vless_connect)
+            return
+        if self._is_tgws_mode_selected():
+            self._finding_proxy = False
+            if (not self._tgws_running) or (self._tgws_port and not _check_vless_port(self._tgws_port)):
+                self._tgws_connect()
             return
 
         if self._finding_proxy:
@@ -5288,6 +6078,11 @@ class SafeBypassPlugin(BasePlugin):
                     self._vless_disconnect_with_reason("apply_proxy_settings_switch_to_proxy", silent=True)
                 except:
                     pass
+            elif current_mode == TGWS_KIND:
+                try:
+                    self._tgws_disconnect_with_reason("apply_proxy_settings_switch_to_proxy", silent=True)
+                except:
+                    pass
             self._set_connection_mode("proxy")
             pi = None
 
@@ -5390,6 +6185,7 @@ class SafeBypassPlugin(BasePlugin):
         try:
             settings = [Header(text="Статус")]
             vless_mode = self._is_vless_mode_selected()
+            tgws_mode = self._is_tgws_mode_selected()
             current_vless = self._current_vless_node()
             has_vless_nodes = bool(self._get_all_vless_nodes())
 
@@ -5471,6 +6267,13 @@ class SafeBypassPlugin(BasePlugin):
                     icon="msg2_proxy_on",
                     on_click=lambda *a, link=str(current_vless.get('uri', '') or ''): self._copy_link(link),
                 ))
+            elif tgws_mode:
+                tgws_prefix = "🟢" if tg_proxy_enabled else "⚪"
+                settings.append(Text(
+                    text=f"{tgws_prefix} TG WS: локальный SOCKS",
+                    icon="msg2_proxy_on",
+                    on_click=lambda *a, link=self._tgws_proxy_link(): self._copy_link(link),
+                ))
             elif enabled and active_server:
                 settings.append(Text(
                     text=f"🟢 Активен: {active_server}:{active_port}",
@@ -5479,6 +6282,19 @@ class SafeBypassPlugin(BasePlugin):
                 ))
             else:
                 settings.append(Text(text="🔴 Прокси не установлен"))
+
+            if tgws_mode:
+                settings.append(Text(
+                    text="Перейти на прокси",
+                    icon="msg_settings",
+                    on_click=lambda *a: self._switch_to_proxy_mode(),
+                ))
+            else:
+                settings.append(Text(
+                    text="Перейти на TG WS",
+                    icon="msg_settings",
+                    on_click=lambda *a: self._switch_to_tgws_mode(),
+                ))
 
             if has_vless_nodes:
                 if vless_mode:
@@ -5578,6 +6394,12 @@ class SafeBypassPlugin(BasePlugin):
                     icon="msg_link",
                     on_click=lambda *a, link=str(current_vless.get('uri', '') or ''): self._copy_link(link)
                 ))
+            elif tgws_mode:
+                settings.append(Text(
+                    text="Скопировать TG WS",
+                    icon="msg_link",
+                    on_click=lambda *a, link=self._tgws_proxy_link(): self._copy_link(link)
+                ))
             elif enabled and active_link:
                 settings.append(Text(
                     text="Скопировать текущий",
@@ -5600,6 +6422,8 @@ class SafeBypassPlugin(BasePlugin):
             return
         if self._is_vless_mode_selected():
             BulletinHelper.show_info("Переподключаю VLESS...")
+        elif self._is_tgws_mode_selected():
+            BulletinHelper.show_info("Переподключаю TG WS...")
         else:
             BulletinHelper.show_info("Поиск прокси...")
         threading.Thread(target=lambda: self._update_proxy_logic(force=True), daemon=True).start()
