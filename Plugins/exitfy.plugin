@@ -20,18 +20,24 @@ from client_utils import get_last_fragment
 from java.util import Locale
 from android.os import Build
 from android.provider import Settings
+from android.content import Context
+from android.net import NetworkCapabilities
 from org.telegram.messenger import (
     ApplicationLoader, SharedConfig, MessagesController,
     NotificationCenter, UserConfig,
 )
 from org.telegram.tgnet import ConnectionsManager
 
+_PROXY_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+VLESS_HEALTH_INTERVAL_SEC = 15.0
+VLESS_HEALTH_FAIL_THRESHOLD = 2
+
 __id__ = "exitfy"
 __name__ = "exitFy"
 __description__ = "Application download speed optimization"
 __icon__ = "exitFy/0"
 __author__ = "@exteraPluginsSup"
-__version__ = "2.1.1"
+__version__ = "2.2"
 __min_version__ = "12.1.1"
 
 PROXY_API_URLS = {
@@ -143,6 +149,104 @@ def _norm(s):
     try: s = re.sub(r"^[\s\(\[<]+", "", s)
     except: pass
     return s
+
+def _is_emoji_char(ch):
+    try:
+        cp = ord(ch)
+    except:
+        return False
+    if cp in (0x200D, 0xFE0E, 0xFE0F):
+        return True
+    if 0x1F1E6 <= cp <= 0x1F1FF:
+        return True
+    if 0x1F300 <= cp <= 0x1FAFF:
+        return True
+    if 0x2600 <= cp <= 0x27BF:
+        return True
+    return False
+
+def _clean_vless_name(raw_name):
+    try:
+        s = str(raw_name or "")
+    except:
+        s = ""
+    try:
+        s = urllib.parse.unquote(s)
+    except:
+        pass
+    out = []
+    for ch in s:
+        out.append(ch)
+    s = "".join(out).strip()
+    try:
+        s = re.sub(r"\s{2,}", " ", s)
+    except:
+        pass
+    if not s:
+        s = Z("vless_node_default")
+    return s
+
+def _is_proxy_uri(s):
+    try:
+        return any(str(s).startswith(scheme) for scheme in _PROXY_SCHEMES)
+    except:
+        return False
+
+def _find_proxy_scheme(s):
+    for scheme in _PROXY_SCHEMES:
+        idx = str(s).find(scheme)
+        if idx >= 0:
+            return scheme, idx
+    return None, -1
+
+def _sanitize_vless_uri(raw_uri):
+    try:
+        s = str(raw_uri or "")
+    except:
+        return ""
+    try:
+        s = unescape(s)
+    except:
+        pass
+    s = s.replace("\n", "").replace("\r", "").strip()
+    if not s:
+        return ""
+
+    try:
+        scheme, idx = _find_proxy_scheme(s)
+        if scheme and idx > 0:
+            s = s[idx:]
+    except:
+        pass
+
+    try:
+        s = re.sub(r"[\s\)\]>,\.;]+$", "", s)
+    except:
+        pass
+
+    if not _is_proxy_uri(s):
+        return s
+    if s.startswith("vmess://"):
+        return s
+    if "#" not in s:
+        return s
+    try:
+        base, frag = s.split("#", 1)
+        frag = urllib.parse.quote(urllib.parse.unquote(frag), safe="")
+        return base + "#" + frag
+    except:
+        return s
+
+def _uri_dedup_key(raw_uri):
+    try:
+        u = _sanitize_vless_uri(raw_uri)
+        if not u:
+            return ""
+        if "#" in u:
+            u = u.split("#", 1)[0]
+        return u.strip()
+    except:
+        return ""
 
 def _parse_link(link):
     try:
@@ -300,67 +404,285 @@ def _log(msg): log(f"[exitfy] {msg}")
 
 class VlessConfigParser:
     @staticmethod
+    def _build_stream(params):
+        net = params.get("type", "tcp")
+        security = params.get("security", "none")
+        fp = params.get("fp", "chrome")
+        stream = {"network": net, "security": security}
+
+        if security == "reality":
+            stream["realitySettings"] = {
+                "show": False, "fingerprint": fp,
+                "serverName": params.get("sni", ""),
+                "publicKey": params.get("pbk", ""),
+                "shortId": params.get("sid", ""),
+                "spiderX": params.get("spx", ""),
+            }
+        elif security == "tls":
+            tls = {"serverName": params.get("sni", ""), "allowInsecure": False, "fingerprint": fp}
+            alpn = params.get("alpn", "")
+            if alpn:
+                try:
+                    tls["alpn"] = str(alpn).split(",")
+                except:
+                    pass
+            stream["tlsSettings"] = tls
+
+        try:
+            if "packetEncoding" not in stream:
+                stream["packetEncoding"] = str(params.get("packetEncoding", "xudp"))
+        except:
+            pass
+
+        if net == "ws":
+            stream["wsSettings"] = {"path": params.get("path", "/"),
+                                     "headers": {"Host": params.get("host", params.get("sni", ""))}}
+        elif net == "grpc":
+            stream["grpcSettings"] = {"serviceName": params.get("serviceName", ""),
+                                       "multiMode": params.get("mode", "multi") == "multi"}
+        elif net in ("h2", "http"):
+            host = params.get("host", params.get("sni", ""))
+            stream["httpSettings"] = {"path": params.get("path", "/"),
+                                       "host": [host] if host else []}
+        elif net in ("kcp", "mkcp"):
+            stream["kcpSettings"] = {"header": {"type": params.get("headerType", "none")},
+                                      "seed": params.get("seed", "")}
+        elif net in ("xhttp", "splithttp"):
+            stream["xhttpSettings"] = {"path": params.get("path", "/"),
+                                        "host": params.get("host", params.get("sni", ""))}
+        elif net == "httpupgrade":
+            stream["httpupgradeSettings"] = {"path": params.get("path", "/"),
+                                              "host": params.get("host", params.get("sni", ""))}
+        return stream
+
+    @staticmethod
+    def _base_config(local_port):
+        return {
+            "log": {"loglevel": "none"},
+            "inbounds": [{"tag": "socks-in", "port": local_port, "listen": "127.0.0.1",
+                          "protocol": "socks",
+                          "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
+                          "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}}],
+            "outbounds": [{"tag": "proxy"}],
+        }
+
+    @staticmethod
+    def _parse_std_uri(uri_str):
+        name = Z("vless_node_default")
+        if "#" in uri_str:
+            uri_str, frag = uri_str.split("#", 1)
+            name = _clean_vless_name(frag)
+            if not name:
+                name = Z("vless_node_default")
+        scheme_end = uri_str.find("://")
+        if scheme_end < 0:
+            return None
+        body = uri_str[scheme_end + 3:]
+        if "@" not in body:
+            return None
+        user_info, rest = body.split("@", 1)
+        if "?" in rest:
+            host_port, params_raw = rest.split("?", 1)
+        else:
+            host_port, params_raw = rest, ""
+        host_port = str(host_port).strip().rstrip("/")
+        if ":" not in host_port:
+            return None
+        host, port_str = host_port.split(":", 1)
+        try:
+            port = int(str(port_str).strip())
+        except:
+            return None
+        params = {}
+        if params_raw:
+            for pair in params_raw.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    params[k] = urllib.parse.unquote(v)
+        return {"user": user_info, "host": host, "port": port, "params": params, "name": name}
+
+    @staticmethod
     def parse(uri_str, local_port):
         try:
-            if not uri_str.startswith("vless://"): return None, None
-            part = uri_str[8:]; name = Z("vless_node_default")
-            if "#" in part:
-                part, name = part.split("#", 1); name = urllib.parse.unquote(name).strip()
-            if "@" not in part: return None, None
-            uuid_str, rest = part.split("@", 1)
-            if "?" in rest: host_port, params_raw = rest.split("?", 1)
-            else: host_port, params_raw = rest, ""
-            host_port = str(host_port).strip().rstrip("/")
-            if ":" not in host_port: return None, None
-            host, port = host_port.split(":", 1)
-            try:
-                port = int(str(port).strip())
-            except:
-                return None, None
-            params = {}
-            if params_raw:
-                for pair in params_raw.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1); params[k] = urllib.parse.unquote(v)
-            config = {
-                "log": {"loglevel": "none"},
-                "inbounds": [{"tag": "socks-in", "port": local_port, "listen": "127.0.0.1",
-                              "protocol": "socks",
-                              "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"},
-                              "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}}],
-                "outbounds": [{"tag": "proxy", "protocol": "vless",
-                               "settings": {"vnext": [{"address": host, "port": port,
-                                                        "users": [{"id": uuid_str, "encryption": "none",
-                                                                   "flow": params.get("flow", "")}]}]},
-                               "streamSettings": {"network": params.get("type", "tcp"),
-                                                  "security": params.get("security", "none")}}]
-            }
-            stream = config["outbounds"][0]["streamSettings"]
-            fp = params.get("fp", "chrome")
-
-            try:
-                if "packetEncoding" not in stream:
-                    stream["packetEncoding"] = str(params.get("packetEncoding", "xudp"))
-            except:
-                pass
-
-            if params.get("security") == "reality":
-                stream["realitySettings"] = {"show": False, "fingerprint": fp,
-                    "serverName": params.get("sni", ""), "publicKey": params.get("pbk", ""),
-                    "shortId": params.get("sid", ""), "spiderX": params.get("spx", "")}
-            elif params.get("security") == "tls":
-                stream["tlsSettings"] = {"serverName": params.get("sni", ""),
-                                         "allowInsecure": False, "fingerprint": fp}
-            net = params.get("type", "tcp")
-            if net == "ws":
-                stream["wsSettings"] = {"path": params.get("path", "/"),
-                    "headers": {"Host": params.get("host", params.get("sni", ""))}}
-            elif net == "grpc":
-                stream["grpcSettings"] = {"serviceName": params.get("serviceName", ""),
-                    "multiMode": params.get("mode", "multi") == "multi"}
-            return json.dumps(config), name
+            uri_str = _sanitize_vless_uri(uri_str)
+            if uri_str.startswith("vless://"):
+                return VlessConfigParser._parse_vless(uri_str, local_port)
+            if uri_str.startswith("vmess://"):
+                return VlessConfigParser._parse_vmess(uri_str, local_port)
+            if uri_str.startswith("trojan://"):
+                return VlessConfigParser._parse_trojan(uri_str, local_port)
+            if uri_str.startswith("ss://"):
+                return VlessConfigParser._parse_ss(uri_str, local_port)
+            return None, None
         except Exception as e:
-            _log(f"VLESS parse error: {e}"); return None, None
+            _log(f"config parse error: {e}"); return None, None
+
+    @staticmethod
+    def _parse_vless(uri_str, local_port):
+        r = VlessConfigParser._parse_std_uri(uri_str)
+        if not r:
+            return None, None
+        uuid_str = r["user"]
+        params = r["params"]
+        flow = params.get("flow", "")
+        users = [{"id": uuid_str, "encryption": "none"}]
+        if flow:
+            users[0]["flow"] = flow
+        config = VlessConfigParser._base_config(local_port)
+        config["outbounds"][0].update({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": r["host"], "port": r["port"], "users": users}]},
+            "streamSettings": VlessConfigParser._build_stream(params),
+        })
+        return json.dumps(config), r["name"]
+
+    @staticmethod
+    def _parse_vmess(uri_str, local_port):
+        try:
+            b64_part = uri_str[8:]
+            if "#" in b64_part:
+                b64_part = b64_part.split("#", 1)[0]
+            b64_part = b64_part.strip().replace("-", "+").replace("_", "/")
+            missing = len(b64_part) % 4
+            if missing:
+                b64_part += "=" * (4 - missing)
+            raw = base64.b64decode(b64_part, validate=False)
+            obj = json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            return None, None
+
+        name = _clean_vless_name(obj.get("ps", "")) or Z("vless_node_default")
+        host = obj.get("add", "")
+        try:
+            port = int(obj.get("port", 0))
+        except:
+            return None, None
+        if not host or not port:
+            return None, None
+
+        uuid_str = obj.get("id", "")
+        aid = _to_int(obj.get("aid", 0), 0)
+        scy = obj.get("scy", "auto") or "auto"
+        users = [{"id": uuid_str, "alterId": aid, "security": scy}]
+
+        net = obj.get("net", "tcp") or "tcp"
+        tls_val = obj.get("tls", "") or ""
+        sni = obj.get("sni", "") or ""
+        fp_val = obj.get("fp", "chrome") or "chrome"
+        alpn_val = obj.get("alpn", "") or ""
+        path_val = obj.get("path", "/") or "/"
+        host_val = obj.get("host", "") or ""
+        header_type = obj.get("type", "none") or "none"
+
+        params = {
+            "type": net,
+            "security": "tls" if tls_val == "tls" else "none",
+            "sni": sni or host_val,
+            "fp": fp_val,
+            "alpn": alpn_val,
+            "path": path_val,
+            "host": host_val or sni,
+            "headerType": header_type,
+            "serviceName": obj.get("path", ""),
+            "seed": obj.get("path", ""),
+        }
+
+        config = VlessConfigParser._base_config(local_port)
+        config["outbounds"][0].update({
+            "protocol": "vmess",
+            "settings": {"vnext": [{"address": host, "port": port, "users": users}]},
+            "streamSettings": VlessConfigParser._build_stream(params),
+        })
+        return json.dumps(config), name
+
+    @staticmethod
+    def _parse_trojan(uri_str, local_port):
+        r = VlessConfigParser._parse_std_uri(uri_str)
+        if not r:
+            return None, None
+        password = urllib.parse.unquote(r["user"])
+        params = r["params"]
+        if not params.get("security"):
+            params["security"] = "tls"
+        if not params.get("sni"):
+            params["sni"] = r["host"]
+
+        config = VlessConfigParser._base_config(local_port)
+        config["outbounds"][0].update({
+            "protocol": "trojan",
+            "settings": {"servers": [{"address": r["host"], "port": r["port"], "password": password}]},
+            "streamSettings": VlessConfigParser._build_stream(params),
+        })
+        return json.dumps(config), r["name"]
+
+    @staticmethod
+    def _parse_ss(uri_str, local_port):
+        try:
+            body = uri_str[5:]
+            name = Z("vless_node_default")
+            if "#" in body:
+                body, frag = body.split("#", 1)
+                name = _clean_vless_name(frag) or Z("vless_node_default")
+            body = body.strip()
+
+            method = ""
+            password = ""
+            host = ""
+            port = 0
+
+            if "@" in body:
+                user_part, server_part = body.split("@", 1)
+                server_part = server_part.split("?", 1)[0].strip().rstrip("/")
+                try:
+                    user_part = user_part.replace("-", "+").replace("_", "/")
+                    miss = len(user_part) % 4
+                    if miss:
+                        user_part += "=" * (4 - miss)
+                    decoded = base64.b64decode(user_part, validate=False).decode("utf-8", errors="ignore")
+                    if ":" in decoded:
+                        method, password = decoded.split(":", 1)
+                    else:
+                        method = decoded
+                except:
+                    if ":" in user_part:
+                        method, password = user_part.split(":", 1)
+                    else:
+                        return None, None
+                if ":" not in server_part:
+                    return None, None
+                host, port_str = server_part.rsplit(":", 1)
+                port = int(port_str)
+            else:
+                try:
+                    b64 = body.replace("-", "+").replace("_", "/")
+                    miss = len(b64) % 4
+                    if miss:
+                        b64 += "=" * (4 - miss)
+                    decoded = base64.b64decode(b64, validate=False).decode("utf-8", errors="ignore")
+                    if "@" not in decoded or ":" not in decoded:
+                        return None, None
+                    user_part, server_part = decoded.split("@", 1)
+                    if ":" in user_part:
+                        method, password = user_part.split(":", 1)
+                    if ":" in server_part:
+                        host, port_str = server_part.rsplit(":", 1)
+                        port = int(port_str)
+                except:
+                    return None, None
+
+            if not method or not host or not port:
+                return None, None
+
+            config = VlessConfigParser._base_config(local_port)
+            config["outbounds"][0].update({
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": host, "port": port,
+                                          "method": method, "password": password}]},
+                "streamSettings": {"network": "tcp", "security": "none"},
+            })
+            return json.dumps(config), name
+        except Exception:
+            return None, None
 
 class VlessCore:
     def __init__(self):
@@ -507,9 +829,105 @@ def _vless_apply_tg_proxy(port, enable):
             except:
                 ed.putString("proxy_user", ""); ed.putString("proxy_pass", "")
             ed.putString("proxy_secret", ""); ed.putBoolean("proxy_enabled", True)
+            try:
+                ed.putBoolean("proxy_enabled_calls", True)
+            except:
+                pass
+            try:
+                ed.putBoolean("proxy_calls_enabled", True)
+            except:
+                pass
+            try:
+                prefs_ro = MessagesController.getGlobalMainSettings()
+                backup_key = "exitfy_dbg_force_tcp_in_calls_backup"
+                if not prefs_ro.contains(backup_key):
+                    try:
+                        ed.putBoolean(backup_key, prefs_ro.getBoolean("dbg_force_tcp_in_calls", False))
+                    except:
+                        pass
+                ed.putBoolean("dbg_force_tcp_in_calls", True)
+            except:
+                pass
+
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if not prefs:
+                            continue
+                        p_calls_key = "exitfy_proxy_enabled_calls_backup_" + str(ac)
+                        p_tcp_key = "exitfy_dbg_force_tcp_in_calls_backup_" + str(ac)
+                        if not prefs.contains(p_calls_key):
+                            prefs.edit().putBoolean(p_calls_key, prefs.getBoolean("proxy_enabled_calls", False)).commit()
+                        if not prefs.contains(p_tcp_key):
+                            prefs.edit().putBoolean(p_tcp_key, prefs.getBoolean("dbg_force_tcp_in_calls", False)).commit()
+                        prefs.edit().putBoolean("proxy_enabled_calls", True).putBoolean("proxy_calls_enabled", True).putBoolean("dbg_force_tcp_in_calls", True).commit()
+                    except:
+                        pass
+            except:
+                pass
+
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if prefs:
+                            p2p_prev_key = "exitfy_p2p_backup_" + str(ac)
+                            current_p2p = prefs.getInt("calls_p2p", -1)
+                            if current_p2p != 2:
+                                prefs.edit().putInt(p2p_prev_key, current_p2p).putInt("calls_p2p", 2).commit()
+                    except:
+                        pass
+            except:
+                pass
         else:
             SharedConfig.proxyEnabled = False
             ed.putBoolean("proxy_enabled", False)
+            try:
+                prefs_ro = MessagesController.getGlobalMainSettings()
+                backup_key = "exitfy_dbg_force_tcp_in_calls_backup"
+                if prefs_ro.contains(backup_key):
+                    ed.putBoolean("dbg_force_tcp_in_calls", prefs_ro.getBoolean(backup_key, False))
+                    try:
+                        ed.remove(backup_key)
+                    except:
+                        pass
+            except:
+                pass
+
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if not prefs:
+                            continue
+                        p_calls_key = "exitfy_proxy_enabled_calls_backup_" + str(ac)
+                        p_tcp_key = "exitfy_dbg_force_tcp_in_calls_backup_" + str(ac)
+                        ed2 = prefs.edit()
+                        if prefs.contains(p_calls_key):
+                            ed2.putBoolean("proxy_enabled_calls", prefs.getBoolean(p_calls_key, False))
+                            ed2.remove(p_calls_key)
+                        if prefs.contains(p_tcp_key):
+                            ed2.putBoolean("dbg_force_tcp_in_calls", prefs.getBoolean(p_tcp_key, False))
+                            ed2.remove(p_tcp_key)
+                        ed2.commit()
+                    except:
+                        pass
+            except:
+                pass
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if prefs:
+                            p2p_prev_key = "exitfy_p2p_backup_" + str(ac)
+                            saved_p2p = prefs.getInt(p2p_prev_key, -1)
+                            if saved_p2p >= 0:
+                                prefs.edit().putInt("calls_p2p", saved_p2p).remove(p2p_prev_key).commit()
+                    except:
+                        pass
+            except:
+                pass
         try:
             ed.commit()
         except:
@@ -568,7 +986,7 @@ def _fetch_vless_nodes(url):
         r = requests.get(url2, timeout=15)
         if r.status_code != 200: return []
         text = r.text.strip()
-        if "vless://" not in text:
+        if all(s not in text for s in _PROXY_SCHEMES):
             try:
                 b64 = str(text or "").strip()
                 b64 = b64.replace("\n", "").replace("\r", "")
@@ -581,7 +999,12 @@ def _fetch_vless_nodes(url):
             except: pass
         nodes = []
         try:
-            links = re.findall(r"vless://[^\s]+", str(text or ""))
+            links = []
+            for scheme in _PROXY_SCHEMES:
+                try:
+                    links.extend(re.findall(re.escape(scheme) + r"[^\s]+", str(text or "")))
+                except:
+                    continue
         except:
             links = []
 
@@ -714,11 +1137,15 @@ def _fetch_vless_nodes(url):
 
         filtered = 0
         any_not_supported = False
+        seen_uris = set()
         for link in links:
             try:
-                link = str(link or "").strip()
-                if not link.startswith("vless://"):
+                link = _sanitize_vless_uri(str(link or "").strip())
+                if not _is_proxy_uri(link):
                     continue
+                if link in seen_uris:
+                    continue
+                seen_uris.add(link)
                 try:
                     low = link.lower()
                     if "@0.0.0.0:1" in low:
@@ -746,7 +1173,10 @@ class exitfyPlugin(BasePlugin):
         self._vless_port = 20808
         self._vless_running = False
         self._ping_event = threading.Event()
-
+        self._ping_stop = threading.Event()
+        self._health_stop = threading.Event()
+        self._health_fail_count = 0
+        self._last_clipboard_uri = ""
         self._chat_menu_item_id = "exitfy_settings_chat"
         self._drawer_menu_item_id = "exitfy_settings_drawer"
 
@@ -756,6 +1186,7 @@ class exitfyPlugin(BasePlugin):
 
         self._vpn_guard_stop = threading.Event()
         self._vpn_guard_was_active = False
+        self._vpn_guard_restore_state = None
 
         self._vless_data = self.get_setting("vless_data", {"manual": [], "subs": [], "active_uri": ""})
         self._vless_active_uri = self._vless_data.get("active_uri", "")
@@ -788,12 +1219,18 @@ class exitfyPlugin(BasePlugin):
                 threading.Thread(target=self._watchdog_loop, daemon=True).start()
         else:
             threading.Thread(target=self._vless_pinger_loop, daemon=True).start()
+            threading.Thread(target=self._vless_health_check_loop, daemon=True).start()
+            try:
+                self._install_clipboard_hook()
+            except:
+                pass
             if self.get_setting("vless_enabled", False) and self._vless_active_uri:
                 threading.Thread(target=self._vless_connect, daemon=True).start()
 
     def on_plugin_unload(self):
         self._watchdog_stop.set()
         self._ping_stop.set()
+        self._health_stop.set()
         self._vpn_guard_stop.set()
         self._vless_disconnect(silent=True)
         self._remove_menu_items()
@@ -836,7 +1273,6 @@ class exitfyPlugin(BasePlugin):
                             if total > 0:
                                 on_progress(float(done) / float(total))
                             else:
-                                # fallback if size unknown
                                 on_progress(0.0)
                         except:
                             pass
@@ -905,7 +1341,6 @@ class exitfyPlugin(BasePlugin):
 
         def set_progress(p):
             try:
-                # Spinner dialog: progress updates are optional.
                 return
             except:
                 pass
@@ -998,33 +1433,46 @@ class exitfyPlugin(BasePlugin):
 
     def _is_system_vpn_active(self):
         try:
-            ctx = ApplicationLoader.applicationContext
-            cm = ctx.getSystemService("connectivity")
-            if not cm:
-                return False
+            context = ApplicationLoader.applicationContext
+            cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            if cm:
+                try:
+                    networks = cm.getAllNetworks()
+                    for net in networks:
+                        caps = cm.getNetworkCapabilities(net)
+                        if caps and caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN):
+                            try:
+                                if caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET):
+                                    return True
+                            except:
+                                return True
+                except:
+                    pass
 
             try:
-                active = cm.getActiveNetwork()
-                caps = cm.getNetworkCapabilities(active) if active else None
-                if caps:
-                    try:
-                        from android.net import NetworkCapabilities
+                cm2 = context.getSystemService("connectivity")
+            except:
+                cm2 = None
+
+            if cm2:
+                try:
+                    active = cm2.getActiveNetwork()
+                    caps = cm2.getNetworkCapabilities(active) if active else None
+                    if caps:
                         return bool(caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
-                    except:
-                        pass
-            except:
-                pass
+                except:
+                    pass
 
-            try:
-                info = cm.getActiveNetworkInfo()
-                if info and info.isConnected():
-                    try:
-                        from android.net import ConnectivityManager
-                        return int(info.getType()) == int(ConnectivityManager.TYPE_VPN)
-                    except:
-                        pass
-            except:
-                pass
+                try:
+                    info = cm2.getActiveNetworkInfo()
+                    if info and info.isConnected():
+                        try:
+                            from android.net import ConnectivityManager
+                            return int(info.getType()) == int(ConnectivityManager.TYPE_VPN)
+                        except:
+                            pass
+                except:
+                    pass
         except:
             return False
         return False
@@ -1032,6 +1480,15 @@ class exitfyPlugin(BasePlugin):
     def _disable_plugin_due_to_vpn(self):
         try:
             mode = _to_int(self.get_setting("mode", 1), 1)
+
+            try:
+                self._vpn_guard_restore_state = {
+                    "mode": mode,
+                    "proxy_enabled": bool(self.get_setting("proxy_enabled", False)),
+                    "vless_enabled": bool(self.get_setting("vless_enabled", False)),
+                }
+            except:
+                self._vpn_guard_restore_state = None
 
             self._watchdog_stop.set()
             if mode == 1:
@@ -1057,6 +1514,40 @@ class exitfyPlugin(BasePlugin):
         except Exception as e:
             _log(f"vpn auto-disable error: {e}")
 
+    def _restore_plugin_after_vpn(self):
+        try:
+            st = getattr(self, "_vpn_guard_restore_state", None)
+            if not isinstance(st, dict):
+                return
+            mode = _to_int(st.get("mode", _to_int(self.get_setting("mode", 1), 1)), 1)
+            if mode == 1:
+                if bool(st.get("vless_enabled", False)):
+                    try:
+                        self.set_setting("vless_enabled", True, reload_settings=True)
+                    except:
+                        pass
+                    if self._vless_active_uri:
+                        threading.Thread(target=self._vless_connect, daemon=True).start()
+            else:
+                if bool(st.get("proxy_enabled", False)):
+                    try:
+                        self.set_setting("proxy_enabled", True, reload_settings=True)
+                    except:
+                        pass
+                    last_link = _pget_str("last_proxy_link", "")
+                    if last_link:
+                        info = _parse_link(last_link)
+                        if info:
+                            _apply_proxy_info(info)
+                    _set_tg_proxy_enabled(True)
+                    self._watchdog_stop.clear()
+                    threading.Thread(target=self._watchdog_loop, daemon=True).start()
+            self._vpn_guard_restore_state = None
+            run_on_ui_thread(self._reload_settings_ui)
+            _log("system VPN off -> plugin state restored")
+        except Exception as e:
+            _log(f"vpn restore error: {e}")
+
     def _vpn_guard_loop(self):
         while not self._vpn_guard_stop.is_set():
             try:
@@ -1068,7 +1559,9 @@ class exitfyPlugin(BasePlugin):
                         self._vpn_guard_was_active = True
                     self._disable_plugin_due_to_vpn()
                 elif not vpn_active:
-                    self._vpn_guard_was_active = False
+                    if self._vpn_guard_was_active:
+                        self._vpn_guard_was_active = False
+                        self._restore_plugin_after_vpn()
             except:
                 pass
 
@@ -1291,8 +1784,16 @@ class exitfyPlugin(BasePlugin):
         if not self._vless_data.get("manual") and not self._vless_data.get("subs"):
             items.append(Text(text=Z("vless_no_nodes")))
         else:
+            seen = set()
             if self._vless_data.get("manual"):
                 for node in self._vless_data["manual"]:
+                    try:
+                        u = _sanitize_vless_uri(node.get("uri", ""))
+                        if not u or u in seen:
+                            continue
+                        seen.add(u)
+                    except:
+                        pass
                     is_act = (node["uri"] == active)
                     ping = node.get("ping", -1)
                     ping_str = f" — {ping}ms" if ping > 0 else ""
@@ -1303,8 +1804,20 @@ class exitfyPlugin(BasePlugin):
             for sub in self._vless_data.get("subs", []):
                 nodes = sub.get("nodes", [])
                 if not nodes: continue
-                items.append(Header(text=f"{sub['name']} ({len(nodes)})"))
+                unique_nodes = []
                 for node in nodes:
+                    try:
+                        u = _sanitize_vless_uri(node.get("uri", ""))
+                        if not u or u in seen:
+                            continue
+                        seen.add(u)
+                        unique_nodes.append(node)
+                    except:
+                        unique_nodes.append(node)
+                if not unique_nodes:
+                    continue
+                items.append(Header(text=f"{sub['name']} ({len(unique_nodes)})"))
+                for node in unique_nodes:
                     is_act = (node["uri"] == active)
                     ping = node.get("ping", -1)
                     ping_str = f" — {ping}ms" if ping > 0 else ""
@@ -1429,7 +1942,9 @@ class exitfyPlugin(BasePlugin):
         _set_tg_proxy_enabled(False)
         if mode == 1:
             self._ping_stop.clear()
+            self._health_stop.clear()
             threading.Thread(target=self._vless_pinger_loop, daemon=True).start()
+            threading.Thread(target=self._vless_health_check_loop, daemon=True).start()
             if not self._vless_data.get("subs") and not self._vless_init_in_progress:
                 threading.Thread(target=self._init_default_vless_sub, daemon=True).start()
             if self.get_setting("vless_enabled", False) and self._vless_active_uri:
@@ -1513,13 +2028,15 @@ class exitfyPlugin(BasePlugin):
 
     def _apply_vless_custom_key(self):
         uri = getattr(self, "_vless_custom_key_buf", "").strip()
+        uri = _sanitize_vless_uri(uri)
         if not uri.startswith("vless://") or len(uri) < 20:
             run_on_ui_thread(lambda: BulletinHelper.show_error("Неверный vless:// ключ")); return
         conf, name = VlessConfigParser.parse(uri, 1080)
         if not conf:
             run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка парсинга ключа")); return
         manual = self._vless_data.get("manual", [])
-        if not any(n["uri"] == uri for n in manual):
+        k = _uri_dedup_key(uri)
+        if not any(_uri_dedup_key(n.get("uri", "")) == k for n in manual):
             manual.append({"name": name, "uri": uri, "ping": -1})
             self._vless_data["manual"] = manual
         self._vless_active_uri = uri
@@ -1759,6 +2276,40 @@ class exitfyPlugin(BasePlugin):
 
     def _vless_save_data(self):
         self._vless_data["active_uri"] = self._vless_active_uri
+
+        try:
+            def _dedup_nodes(nodes):
+                out = []
+                seen = set()
+                for n in (nodes or []):
+                    try:
+                        u0 = _sanitize_vless_uri(n.get("uri", ""))
+                        k = _uri_dedup_key(u0)
+                        if not u0 or not k:
+                            continue
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        nn = dict(n)
+                        nn["uri"] = u0
+                        out.append(nn)
+                    except:
+                        continue
+                return out
+
+            self._vless_data["manual"] = _dedup_nodes(self._vless_data.get("manual", []))
+            subs = []
+            for sub in (self._vless_data.get("subs", []) or []):
+                try:
+                    s2 = dict(sub)
+                    s2["nodes"] = _dedup_nodes(sub.get("nodes", []))
+                    subs.append(s2)
+                except:
+                    subs.append(sub)
+            self._vless_data["subs"] = subs
+        except:
+            pass
+
         self.set_setting("vless_data", self._vless_data)
 
     def _vless_connect(self):
@@ -1942,10 +2493,46 @@ class exitfyPlugin(BasePlugin):
                 for node in all_nodes:
                     if self._ping_stop.is_set(): break
                     try:
-                        part = node["uri"].replace("vless://", "")
-                        if "@" not in part: continue
-                        host_port = part.split("@", 1)[1].split("?", 1)[0].split("#", 1)[0]
-                        host, port = host_port.split(":", 1)
+                        u = _sanitize_vless_uri(node.get("uri", ""))
+                        host = None
+                        port = None
+                        if u.startswith("vless://") or u.startswith("trojan://"):
+                            r = VlessConfigParser._parse_std_uri(u)
+                            if r:
+                                host, port = r.get("host"), r.get("port")
+                        elif u.startswith("ss://"):
+                            body = u[5:].split("#", 1)[0]
+                            if "@" in body:
+                                server_part = body.split("@", 1)[1].split("?", 1)[0].strip().rstrip("/")
+                                if ":" in server_part:
+                                    host, port = server_part.rsplit(":", 1)
+                            else:
+                                try:
+                                    b64 = body.replace("-", "+").replace("_", "/")
+                                    miss = len(b64) % 4
+                                    if miss:
+                                        b64 += "=" * (4 - miss)
+                                    decoded = base64.b64decode(b64, validate=False).decode("utf-8", errors="ignore")
+                                    if "@" in decoded and ":" in decoded:
+                                        server_part = decoded.split("@", 1)[1]
+                                        if ":" in server_part:
+                                            host, port = server_part.rsplit(":", 1)
+                                except:
+                                    pass
+                        elif u.startswith("vmess://"):
+                            try:
+                                b64_part = u[8:].split("#", 1)[0].strip().replace("-", "+").replace("_", "/")
+                                miss = len(b64_part) % 4
+                                if miss:
+                                    b64_part += "=" * (4 - miss)
+                                raw = base64.b64decode(b64_part, validate=False)
+                                obj = json.loads(raw.decode("utf-8", errors="ignore"))
+                                host = obj.get("add")
+                                port = obj.get("port")
+                            except:
+                                pass
+                        if not host or not port:
+                            continue
                         start = time.time()
                         s = socket.create_connection((host, int(port)), timeout=1.5)
                         p = int((time.time() - start) * 1000); s.close()
@@ -1955,3 +2542,192 @@ class exitfyPlugin(BasePlugin):
                 if changed: self._vless_save_data()
             except: pass
             self._ping_event.wait(600)
+
+    def _vless_health_check_loop(self):
+        while not self._health_stop.is_set():
+            self._health_stop.wait(VLESS_HEALTH_INTERVAL_SEC)
+            if self._health_stop.is_set():
+                break
+            try:
+                mode = _to_int(self.get_setting("mode", 1), 1)
+                if mode != 1:
+                    self._health_fail_count = 0
+                    continue
+                if not self.get_setting("proxy_auto_switch", True):
+                    self._health_fail_count = 0
+                    continue
+                if not self.get_setting("vless_enabled", False):
+                    self._health_fail_count = 0
+                    continue
+                if not self._vless_running:
+                    self._health_fail_count = 0
+                    continue
+                port = self._vless_port
+                if not port:
+                    continue
+                alive = _check_vless_port(int(port), timeout=0.3)
+                if alive:
+                    self._health_fail_count = 0
+                    continue
+                self._health_fail_count += 1
+                if self._health_fail_count >= VLESS_HEALTH_FAIL_THRESHOLD:
+                    self._health_fail_count = 0
+                    self._vless_auto_switch_to_best()
+            except:
+                pass
+
+    def _vless_auto_switch_to_best(self):
+        try:
+            all_nodes = list(self._vless_data.get("manual", []))
+            for sub in self._vless_data.get("subs", []):
+                all_nodes.extend(sub.get("nodes", []))
+            if not all_nodes:
+                return
+            best = None
+            best_ping = 999999
+            for n in all_nodes:
+                try:
+                    p = int(n.get("ping", 999999))
+                except:
+                    p = 999999
+                if p <= 0 or p >= 9999:
+                    continue
+                if p < best_ping:
+                    best_ping = p
+                    best = n
+            if not best:
+                return
+            uri = str(best.get("uri", ""))
+            if not uri:
+                return
+            if uri == self._vless_active_uri:
+                return
+            self._vless_active_uri = uri
+            self._vless_data["active_uri"] = uri
+            self._vless_save_data()
+            if self.get_setting("vless_enabled", False):
+                threading.Thread(target=self._vless_connect, daemon=True).start()
+                run_on_ui_thread(self._reload_settings_ui)
+        except:
+            pass
+
+    def _install_clipboard_hook(self):
+        try:
+            plugin_ref = self
+            class _ClipboardHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        uris = plugin_ref._get_clipboard_proxy_uris()
+                        if not uris:
+                            return
+                        if uris[0] == getattr(plugin_ref, "_last_clipboard_uri", ""):
+                            return
+                        manual = plugin_ref._vless_data.get("manual", [])
+                        existing = set([str(n.get("uri", "")) for n in manual])
+                        new_uris = [u for u in uris if u not in existing]
+                        plugin_ref._last_clipboard_uri = uris[0]
+                        if not new_uris:
+                            return
+                        plugin_ref._show_clipboard_add_dialog(new_uris)
+                    except:
+                        pass
+
+            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+            if LaunchActivity:
+                for m in LaunchActivity.getDeclaredMethods():
+                    if m.getName() == "onResume" and len(m.getParameterTypes()) == 0:
+                        self.hook_method(m, _ClipboardHook())
+                        break
+        except:
+            pass
+
+    def _get_clipboard_proxy_uris(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            cm = ctx.getSystemService("clipboard")
+            if not cm or not cm.hasPrimaryClip():
+                return []
+            clip = cm.getPrimaryClip()
+            if not clip or clip.getItemCount() == 0:
+                return []
+            item = clip.getItemAt(0)
+            if not item:
+                return []
+            text = str(item.getText() or "")
+            if not text:
+                return []
+            found = []
+            for scheme in _PROXY_SCHEMES:
+                try:
+                    found.extend(re.findall(re.escape(scheme) + r"[^\s]+", text))
+                except:
+                    continue
+            out = []
+            for u in found:
+                su = _sanitize_vless_uri(u)
+                if su and _is_proxy_uri(su):
+                    out.append(su)
+            return out[:10]
+        except:
+            return []
+
+    def _show_clipboard_add_dialog(self, uris_or_uri):
+        if isinstance(uris_or_uri, str):
+            uris = [uris_or_uri]
+        else:
+            uris = list(uris_or_uri or [])
+        if not uris:
+            return
+        def _do():
+            try:
+                b = AlertDialogBuilder(get_last_fragment())
+                if len(uris) == 1:
+                    cfg, name = VlessConfigParser.parse(uris[0], 1080)
+                    if not name:
+                        name = Z("vless_node_default")
+                    short = uris[0][:60] + "..." if len(uris[0]) > 60 else uris[0]
+                    msg = f"{name}\n\n{short}"
+                    title = Z("vless_add_key")
+                else:
+                    title = Z("vless_add_key")
+                    lines = []
+                    for u in uris[:10]:
+                        _, n = VlessConfigParser.parse(u, 1080)
+                        n = n or Z("vless_node_default")
+                        lines.append("- " + n)
+                    msg = "\n".join(lines)
+
+                b.set_title(str(title))
+                b.set_message(str(msg))
+                def add_all(d=None, w=None):
+                    try:
+                        added = 0
+                        manual = self._vless_data.get("manual", [])
+                        existing = set([str(n.get("uri", "")) for n in manual])
+                        for u in uris:
+                            if u in existing:
+                                continue
+                            cfg, name = VlessConfigParser.parse(u, 1080)
+                            if not cfg:
+                                continue
+                            manual.append({"name": name or Z("vless_node_default"), "uri": u, "ping": -1})
+                            existing.add(u)
+                            added += 1
+                        self._vless_data["manual"] = manual
+                        self._vless_save_data()
+                        self._ping_event.set()
+                        run_on_ui_thread(self._reload_settings_ui)
+                        if added > 0:
+                            BulletinHelper.show_success(Z("refresh"))
+                    except:
+                        pass
+                    try:
+                        if d: d.dismiss()
+                    except:
+                        pass
+                b.set_positive_button(Z("btn_add") if "btn_add" in TRANSLATIONS else "OK", add_all)
+                b.set_negative_button(Z("btn_cancel"), lambda d, w: d.dismiss())
+                b.show()
+            except:
+                pass
+        run_on_ui_thread(_do)
