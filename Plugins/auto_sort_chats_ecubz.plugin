@@ -1,0 +1,284 @@
+import json
+import traceback
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_messages_controller, get_last_fragment
+from android_utils import run_on_ui_thread, log
+from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
+from hook_utils import find_class
+
+from org.telegram.messenger import UserConfig, MessagesController, DialogObject, ChatObject, NotificationCenter
+from org.telegram.tgnet import TLRPC
+
+__id__ = "auto_sort_chats_ecubz"
+__name__ = "🗂 Auto Sort Chats"
+__description__ = """RU: Автосортировка чатов по типу. Группирует: непрочитанные, личные, группы, каналы, боты и др.
+v1.4: Полная поддержка всех вкладок и папок. Оптимизировано.
+
+EN: Auto-sort chats by type. Groups: unread, private, groups, channels, bots, etc.
+v1.4: Full support for all tabs and folders. Optimized."""
+__author__ = "@eCubzPlugins - @eCubz"
+__version__ = "1.4"
+__min_version__ = "10.0.0"
+__icon__ = "eCubzPlugin/1"
+
+TYPE_UNREAD = "unread"
+TYPE_PRIVATE = "private"
+TYPE_GROUP = "group"
+TYPE_CHANNEL = "channel"
+TYPE_BOT = "bot"
+TYPE_ADMIN = "admin"
+TYPE_OWNER = "owner"
+TYPE_SECRET = "secret"
+TYPE_OTHER = "other"
+
+DEFAULT_ORDER = [
+    TYPE_UNREAD,
+    TYPE_OWNER,
+    TYPE_ADMIN,
+    TYPE_PRIVATE,
+    TYPE_BOT,
+    TYPE_GROUP,
+    TYPE_CHANNEL,
+    TYPE_SECRET,
+    TYPE_OTHER,
+]
+
+TYPE_LABELS = {
+    TYPE_UNREAD: "💬 Непрочитанные",
+    TYPE_PRIVATE: "👤 Личные чаты",
+    TYPE_GROUP: "👥 Группы",
+    TYPE_CHANNEL: "📢 Каналы",
+    TYPE_BOT: "🤖 Боты",
+    TYPE_ADMIN: "🛡 Администратор",
+    TYPE_OWNER: "👑 Владелец",
+    TYPE_SECRET: "🔐 Секретные",
+    TYPE_OTHER: "📎 Остальные",
+}
+
+def classify_dialog(dialog_id, mc):
+    try:
+        if DialogObject.isEncryptedDialog(dialog_id):
+            return TYPE_SECRET
+        if dialog_id > 0:
+            user = mc.getUser(dialog_id)
+            if user:
+                return TYPE_BOT if getattr(user, "bot", False) else TYPE_PRIVATE
+        elif dialog_id < 0:
+            chat = mc.getChat(-dialog_id)
+            if chat:
+                if getattr(chat, "creator", False): return TYPE_OWNER
+                if getattr(chat, "admin_rights", None): return TYPE_ADMIN
+                if ChatObject.isChannel(chat) and not getattr(chat, "megagroup", False):
+                    return TYPE_CHANNEL
+                return TYPE_GROUP
+    except Exception: pass
+    return TYPE_OTHER
+
+def is_dialog_unread(dialog):
+    try:
+        return (getattr(dialog, "unread_count", 0) > 0 or 
+                getattr(dialog, "unread_mark", False) or 
+                getattr(dialog, "unread_mentions_count", 0) > 0)
+    except Exception: return False
+
+class SortHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self._is_sorting = False
+
+    def after_hooked_method(self, param):
+        if self._is_sorting or not self.plugin.get_setting("enabled", True):
+            return
+        
+        self._is_sorting = True
+        try:
+            mc = param.thisObject
+            if not mc: return
+
+            order = self.plugin._get_type_order()
+            enabled_types = self.plugin._get_enabled_types()
+            type_prio_map = {t: i for i, t in enumerate(order) if t in enabled_types}
+            max_prio = len(order)
+            has_unread_sort = TYPE_UNREAD in enabled_types
+            unread_prio = type_prio_map.get(TYPE_UNREAD, max_prio)
+
+            # Reflection fields
+            f_all = mc.getClass().getDeclaredField("allDialogs")
+            f_all.setAccessible(True)
+            main_list = f_all.get(mc)
+            
+            f_dbf = mc.getClass().getDeclaredField("dialogsByFolder")
+            f_dbf.setAccessible(True)
+            dbf_map = f_dbf.get(mc) # SparseArray
+            
+            f_filters = mc.getClass().getDeclaredField("dialogFilters")
+            f_filters.setAccessible(True)
+            filters_list = f_filters.get(mc)
+
+            class_cache = {}
+            from java.util import ArrayList as JArrayList
+
+            def process_list(j_list):
+                if not j_list or j_list.size() < 2: return
+                
+                arr = j_list.toArray()
+                python_items = list(arr)
+                
+                pinned = []
+                unpinned = []
+                sort_keys = {}
+
+                for d in python_items:
+                    if d is None: continue
+                    if isinstance(d, TLRPC.TL_dialogFolder) or getattr(d, "pinned", False):
+                        pinned.append(d)
+                    else:
+                        unpinned.append(d)
+                        dtype = class_cache.get(d.id)
+                        if dtype is None:
+                            dtype = classify_dialog(d.id, mc)
+                            class_cache[d.id] = dtype
+                        
+                        p = type_prio_map.get(dtype, max_prio)
+                        if has_unread_sort and is_dialog_unread(d):
+                            p = min(p, unread_prio)
+                        
+                        sort_keys[id(d)] = (p, -getattr(d, "last_message_date", 0))
+
+                if not unpinned: return
+                unpinned.sort(key=lambda x: sort_keys[id(x)])
+
+                j_list.clear()
+                new_list = JArrayList()
+                for d in pinned: new_list.add(d)
+                for d in unpinned: new_list.add(d)
+                j_list.addAll(new_list)
+
+            # 1. Sort global list
+            process_list(main_list)
+
+            # 2. Sort dialogsByFolder (the actual source for tabs)
+            if dbf_map:
+                for i in range(dbf_map.size()):
+                    process_list(dbf_map.valueAt(i))
+
+            # 3. Sort dialogFilters (custom folders)
+            if filters_list:
+                for i in range(filters_list.size()):
+                    df = filters_list.get(i)
+                    if df and df.dialogs:
+                        process_list(df.dialogs)
+
+        except Exception:
+            log(f"[AutoSort] Error: {traceback.format_exc()}")
+        finally:
+            self._is_sorting = False
+
+class AutoSortPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hook = None
+
+    def on_plugin_load(self):
+        self._apply_hook()
+        log("[AutoSort] Plugin loaded v1.4")
+
+    def on_plugin_unload(self):
+        if self._hook:
+            self.unhook_method(self._hook)
+            self._hook = None
+            self._force_resort()
+
+    def _apply_hook(self):
+        try:
+            mc_class = find_class("org.telegram.messenger.MessagesController")
+            lsa_class = find_class("androidx.collection.LongSparseArray")
+            method = mc_class.getClass().getDeclaredMethod("sortDialogs", lsa_class)
+            self._hook = self.hook_method(method, SortHook(self))
+        except Exception:
+            log(f"[AutoSort] Hook error: {traceback.format_exc()}")
+
+    def _force_resort(self):
+        try:
+            mc = MessagesController.getInstance(UserConfig.selectedAccount)
+            mc.sortDialogs(None)
+            NotificationCenter.getInstance(UserConfig.selectedAccount).postNotificationName(NotificationCenter.dialogsNeedReload)
+        except Exception: pass
+
+    def _get_type_order(self):
+        try:
+            saved = self.get_setting("type_order", "")
+            if saved:
+                order = json.loads(saved)
+                if isinstance(order, list) and len(order) > 0:
+                    for t in DEFAULT_ORDER:
+                        if t not in order: order.append(t)
+                    return order
+        except Exception: pass
+        return list(DEFAULT_ORDER)
+
+    def _get_enabled_types(self):
+        return {t for t in DEFAULT_ORDER if self.get_setting(f"type_{t}", True)}
+
+    def create_settings(self):
+        enabled = self.get_setting("enabled", True)
+        order = self._get_type_order()
+        items = [
+            Header(text="🗂 Автосортировка (v1.4 - Full Tab Support)"),
+            Switch(key="enabled", text="Включить сортировку", default=True, icon="msg_customize", on_change=lambda v: self._on_setting_change(v)),
+        ]
+        if enabled:
+            items.append(Divider(text="Приоритеты"))
+            for t in order:
+                items.append(Switch(key=f"type_{t}", text=TYPE_LABELS.get(t, t), default=True, on_change=lambda v: self._on_setting_change(v)))
+            items.append(Divider())
+            items.append(Text(text="📋 Изменить порядок типов", icon="msg_customize", on_click=lambda _: self._show_reorder_dialog()))
+        
+        items.extend([
+            Divider(text="Инструкция"),
+            Text(text="• v1.4 теперь сортирует ВСЕ вкладки", icon="msg_info"),
+            Text(text="• Работает максимально быстро", icon="msg_info"),
+        ])
+        return items
+
+    def _on_setting_change(self, v):
+        self._force_resort()
+        run_on_ui_thread(lambda: self._refresh_ui(), delay=300)
+
+    def _refresh_ui(self):
+        try:
+            from com.exteragram.messenger.plugins import PluginsController
+            PluginsController.getInstance().loadPluginSettings(self.id)
+        except Exception: pass
+
+    def _show_reorder_dialog(self):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity(): return
+            order = self._get_type_order()
+            items = [f"{i+1}. {TYPE_LABELS.get(t, t)}" for i, t in enumerate(order)]
+            def on_select(d, idx):
+                d.dismiss()
+                self._show_move_dialog(order[idx])
+            builder = AlertDialogBuilder(frag.getParentActivity())
+            builder.set_title("Порядок типов").set_items(items, on_select).set_negative_button("Закрыть", None).show()
+        except Exception: pass
+
+    def _show_move_dialog(self, t):
+        try:
+            frag = get_last_fragment()
+            if not frag or not frag.getParentActivity(): return
+            def on_select(d, idx):
+                d.dismiss()
+                order = self._get_type_order()
+                i = order.index(t)
+                if idx == 0 and i > 0: order[i], order[i-1] = order[i-1], order[i]
+                elif idx == 1 and i < len(order)-1: order[i], order[i+1] = order[i+1], order[i]
+                self.set_setting("type_order", json.dumps(order))
+                self._force_resort()
+                run_on_ui_thread(lambda: self._show_reorder_dialog(), delay=300)
+            builder = AlertDialogBuilder(frag.getParentActivity())
+            builder.set_title(TYPE_LABELS.get(t, t)).set_items(["⬆️ Поднять", "⬇️ Опустить"], on_select).set_negative_button("Назад", None).show()
+        except Exception: pass
