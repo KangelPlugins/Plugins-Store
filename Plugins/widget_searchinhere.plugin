@@ -1,0 +1,948 @@
+import os
+import json
+import random
+import time
+import threading
+import urllib.parse
+import weakref
+from urllib.request import Request, urlopen
+
+from java import dynamic_proxy, jint
+from java.lang import Class as JClass
+from java.util import Locale
+
+from android.graphics import BitmapFactory, PorterDuff, PorterDuffColorFilter
+from android.graphics.drawable import GradientDrawable
+from android.view import Gravity, KeyEvent, MotionEvent, View, ViewOutlineProvider
+from android.view.inputmethod import EditorInfo
+from android.widget import ImageView, LinearLayout, TextView
+
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment, get_messages_controller
+
+
+__id__ = "searchinhere"
+__name__ = "SearchInHere"
+__description__ = "Turns the dialogs search bar into a quick web search tool. Enable it from the [widget](https://t.me/exteraSettings?s=pillStack) and run internet searches straight from the chat list without opening another app.\n\n• Powered by [Dotted Plugins](https://t.me/exteraDevPlugins)"
+__author__ = "@AGeekApple"
+__version__ = "1.0.0"
+__min_version__ = "12.2.10"
+__icon__ = "ApplePlugins/29"
+
+SEARCH_WIDGET_PILL_ID = 1777
+GEEKSTATS_BASE = "https://geekstats.meyankut.workers.dev"
+GEEKSTATS_INGEST_URL = "{0}/v1/ingest".format(GEEKSTATS_BASE)
+GEEKSTATS_INGEST_TOKEN = ""
+ABOUT_AVATAR_URL = "https://t.me/i/userpic/320/AGeekApple.jpg"
+ABOUT_POST_URL = "https://t.me/ApplesBio/4"
+CORE = "https://coreupdates.meyankut.workers.dev"
+EXTENDED_ICON_URL_DARK = "{0}/extended_white.png".format(CORE)
+EXTENDED_ICON_URL_LIGHT = "{0}/extended_dark.png".format(CORE)
+_CACHE_DIR = os.path.expanduser("~/.searchinhere_cache")
+ABOUT_AVATAR_CACHE_FILE = os.path.join(_CACHE_DIR, "searchinhere_about_avatar.jpg")
+EXTENDED_ICON_CACHE_FILE_DARK = os.path.join(_CACHE_DIR, "searchinhere_extended_icon_dark.png")
+EXTENDED_ICON_CACHE_FILE_LIGHT = os.path.join(_CACHE_DIR, "searchinhere_extended_icon_light.png")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+TRANSLATIONS = {
+    "search_hint_internet": {
+        "en": "Search the web here",
+        "pt": "Pesquisar na web aqui",
+        "ru": "Искать в интернете",
+    },
+    "bulletin_mode_on": {
+        "en": "Web search mode enabled.",
+        "pt": "Modo de pesquisa na web ativado.",
+        "ru": "Режим веб-поиска включён.",
+    },
+    "bulletin_mode_off": {
+        "en": "Web search mode disabled.",
+        "pt": "Modo de pesquisa na web desativado.",
+        "ru": "Режим веб-поиска отключён.",
+    },
+    "pill_title": {
+        "en": "Search",
+        "pt": "Pesquisar",
+        "ru": "Поиск",
+    },
+    "menu_settings": {
+        "en": "Settings",
+        "pt": "Configuracoes",
+        "ru": "Настройки",
+    },
+    "menu_about": {
+        "en": "About",
+        "pt": "Sobre",
+        "ru": "О проекте",
+    },
+    "about_desc": {
+        "en": "Thanks for using my plugins.\n\nSearchInHere is a simple way to search the web in a few taps without leaving the app.",
+        "pt": "Obrigado por usar meus plugins.\n\nSearchInHere e uma forma simples de pesquisar na web com apenas alguns toques sem precisar sair do aplicativo.",
+        "ru": "Спасибо, что пользуетесь моими плагинами.\n\nSearchInHere это простой способ искать в интернете в пару нажатий, не выходя из приложения.",
+    },
+    "about_button": {
+        "en": "Say hello",
+        "pt": "Diga ola",
+        "ru": "Поздороваться",
+    },
+}
+
+class SIHDialogsCreateHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            frag = param.thisObject
+            run_on_ui_thread(lambda: self.plugin._attach_or_refresh(frag))
+        except Exception as e:
+            self.plugin._trace("createView hook error: {0}".format(e))
+
+
+class SIHDialogsResumeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            frag = param.thisObject
+            run_on_ui_thread(lambda: self.plugin._attach_or_refresh(frag))
+        except Exception as e:
+            self.plugin._trace("onResume hook error: {0}".format(e))
+
+
+class SIHDialogsPauseHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            run_on_ui_thread(self.plugin._detach_state)
+        except Exception as e:
+            self.plugin._trace("onPause hook error: {0}".format(e))
+
+
+class SearchInHerePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hooks = []
+        self._enabled = False
+        self._fragment_ref = None
+        self._edit_ref = None
+        self._attached_edit = None
+        self._editor_proxy = None
+        self._touch_proxy = None
+        self._touch_edit = None
+        self._native_watcher = None
+        self._native_watcher_removed = False
+        self._native_hint_text = None
+        self._native_hint_color = None
+        self._active_pills = weakref.WeakSet()
+        self._telemetry_install_id = ""
+        self.PillRegistry = find_class("com.exteragram.messenger.pillstack.core.PillRegistry")
+        self.PillInfo = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillInfo")
+        self.PillCreator = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator")
+        self.PillStackConfig = find_class("com.exteragram.messenger.pillstack.core.PillStackConfig")
+        self.WeatherPill = find_class("com.exteragram.messenger.pillstack.ui.pills.weather.WeatherPill")
+
+    def on_plugin_load(self):
+        self._enabled = bool(self.get_setting("searchinhere_enabled", False))
+        self._trace("plugin load")
+        self._setup_hooks()
+        self._register_widget_pill()
+        self._ensure_about_assets()
+        self._telemetry_maybe_send_install()
+
+    def on_plugin_unload(self):
+        self._trace("plugin unload")
+        try:
+            for h in list(self._hooks):
+                try:
+                    self.unhook_method(h)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._hooks = []
+        try:
+            if self._edit_ref is not None and self._native_watcher is not None and bool(self._native_watcher_removed):
+                self._edit_ref.addTextChangedListener(self._native_watcher)
+                self._native_watcher_removed = False
+        except Exception:
+            pass
+        run_on_ui_thread(self._detach_state)
+
+    def _trace(self, msg):
+        try:
+            log("[SearchInHere] {0}".format(msg))
+        except Exception:
+            pass
+
+    def _telemetry_install_id_get(self):
+        try:
+            if self._telemetry_install_id:
+                return str(self._telemetry_install_id)
+            cached = str(self.get_setting("searchinhere_stats_install_id", "") or "").strip()
+            if cached:
+                self._telemetry_install_id = cached
+                return cached
+            sid = "sih_{0:x}{1:x}".format(int(time.time() * 1000), random.randint(0, 0xFFFFFF))
+            self.set_setting("searchinhere_stats_install_id", sid)
+            self._telemetry_install_id = sid
+            return sid
+        except Exception:
+            return "sih_unknown"
+
+    def _telemetry_app_snapshot(self):
+        out = {
+            "app_id": "unknown",
+            "app_variant": "unknown",
+            "app_version": "unknown",
+            "plugin_version": str(__version__),
+            "mode": "searchinhere",
+        }
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                return out
+            pkg = str(ctx.getPackageName() or "unknown").strip() or "unknown"
+            out["app_id"] = pkg
+            low = pkg.lower()
+            if "ayu" in low:
+                out["app_variant"] = "ayugram"
+            elif "extera" in low:
+                out["app_variant"] = "exteragram"
+            else:
+                out["app_variant"] = "applegram" # who knows?? 
+            try:
+                pm = ctx.getPackageManager()
+                pi = pm.getPackageInfo(pkg, 0)
+                out["app_version"] = str(getattr(pi, "versionName", "") or getattr(pi, "versionCode", "unknown"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return out
+
+    def _telemetry_maybe_send_install(self):
+        try:
+            snap = self._telemetry_app_snapshot()
+            signature = "{0}|{1}|{2}|{3}".format(
+                str(__version__),
+                str(snap.get("app_id", "unknown")),
+                str(snap.get("app_variant", "unknown")),
+                str(snap.get("app_version", "unknown")),
+            )
+            prev = str(self.get_setting("searchinhere_stats_install_signature_v1", "") or "").strip()
+            if prev == signature:
+                return
+            self.set_setting("searchinhere_stats_install_signature_v1", signature)
+            payload = {
+                "plugin": str(__id__),
+                "install_id": self._telemetry_install_id_get(),
+                "mode": "searchinhere",
+                "app": snap,
+                "events": [
+                    {
+                        "ts": int(time.time()),
+                        "event": "install",
+                        "feature": "",
+                        "count": 1,
+                    }
+                ],
+            }
+            self._telemetry_send_async(payload)
+        except Exception as e:
+            self._trace("stats install prepare fail: {0}".format(e))
+
+    def _telemetry_send_async(self, payload):
+        def _worker():
+            try:
+                raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+                headers = {
+                    "Content-Type": "application/json",
+                    "User-Agent": "SearchInHere/{0}".format(str(__version__)),
+                }
+                token = str(GEEKSTATS_INGEST_TOKEN or "").strip()
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+                req = Request(GEEKSTATS_INGEST_URL, data=raw, headers=headers, method="POST")
+                with urlopen(req, timeout=10) as resp:
+                    try:
+                        resp.read()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self._trace("stats send fail: {0}".format(e))
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            _worker()
+
+    def _tr(self, key):
+        try:
+            lang = str(Locale.getDefault().getLanguage() or "en").lower()
+        except Exception:
+            lang = "en"
+        table = TRANSLATIONS.get(key, {})
+        return table.get(lang) or table.get("en") or key
+
+    def _setup_hooks(self):
+        try:
+            dialogs_cls = JClass.forName("org.telegram.ui.DialogsActivity")
+        except Exception as e:
+            self._trace("DialogsActivity resolve fail: {0}".format(e))
+            return
+
+        try:
+            ctx_cls = find_class("android.content.Context")
+            m = dialogs_cls.getDeclaredMethod("createView", ctx_cls)
+            m.setAccessible(True)
+            self._hooks.append(self.hook_method(m, SIHDialogsCreateHook(self)))
+        except Exception as e:
+            self._trace("hook createView fail: {0}".format(e))
+
+        try:
+            m = dialogs_cls.getDeclaredMethod("onResume")
+            m.setAccessible(True)
+            self._hooks.append(self.hook_method(m, SIHDialogsResumeHook(self)))
+        except Exception as e:
+            self._trace("hook onResume fail: {0}".format(e))
+
+        try:
+            m = dialogs_cls.getDeclaredMethod("onPause")
+            m.setAccessible(True)
+            self._hooks.append(self.hook_method(m, SIHDialogsPauseHook(self)))
+        except Exception as e:
+            self._trace("hook onPause fail: {0}".format(e))
+
+    def _register_widget_pill(self):
+        try:
+            if not self.PillRegistry or not self.PillInfo or not self.PillCreator or not self.WeatherPill:
+                self._trace("pill classes unavailable")
+                return
+            plugin = self
+            tag_key = jint(0x53494850)
+
+            class SearchCreator(dynamic_proxy(self.PillCreator)):
+                def create(self_obj, context, resourcesProvider):
+                    try:
+                        pill = plugin.WeatherPill(context, resourcesProvider)
+                        pill.setTag(tag_key, jint(SEARCH_WIDGET_PILL_ID))
+                        plugin._active_pills.add(pill)
+                        plugin._update_pill_ui(pill)
+                        return pill
+                    except Exception as e:
+                        plugin._trace("pill create fail: {0}".format(e))
+                        return None
+
+            ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                return
+            res = ctx.getResources()
+            icon_res = res.getIdentifier("msg_language_solar", "drawable", ctx.getPackageName())
+            pill_info = self.PillInfo(
+                jint(SEARCH_WIDGET_PILL_ID),
+                self._tr("pill_title"),
+                jint(icon_res),
+                jint(-11565578),
+                jint(-13276952),
+                SearchCreator()
+            )
+            try:
+                self.PillRegistry.register(pill_info)
+            except Exception:
+                pass
+
+            class GetIdHook(MethodHook):
+                def before_hooked_method(self_obj, param):
+                    try:
+                        tag = param.thisObject.getTag(tag_key)
+                        if tag and int(tag) == SEARCH_WIDGET_PILL_ID:
+                            plugin._active_pills.add(param.thisObject)
+                            param.setResult(jint(SEARCH_WIDGET_PILL_ID))
+                    except Exception:
+                        pass
+
+            class InteractionHook(MethodHook):
+                def before_hooked_method(self_obj, param):
+                    try:
+                        tag = param.thisObject.getTag(tag_key)
+                        if not tag or int(tag) != SEARCH_WIDGET_PILL_ID:
+                            return
+                        plugin._active_pills.add(param.thisObject)
+                        method_name = param.method.getName()
+                        if method_name == "onPillClicked":
+                            plugin._toggle()
+                            param.setResult(None)
+                        elif method_name == "onPillLongClicked":
+                            plugin._show_pill_menu(param.thisObject)
+                            param.setResult(True)
+                        elif method_name in ["onUpdateData", "setData"]:
+                            plugin._update_pill_ui(param.thisObject)
+                            param.setResult(None)
+                    except Exception:
+                        pass
+
+            self.hook_all_methods(self.WeatherPill, "getPillId", GetIdHook())
+            self.hook_all_methods(self.WeatherPill, "onPillClicked", InteractionHook())
+            self.hook_all_methods(self.WeatherPill, "onPillLongClicked", InteractionHook())
+            self.hook_all_methods(self.WeatherPill, "onUpdateData", InteractionHook())
+            self.hook_all_methods(self.WeatherPill, "setData", InteractionHook())
+            self._ensure_widget_pill_enabled()
+        except Exception as e:
+            self._trace("register widget pill fail: {0}".format(e))
+
+    def _ensure_widget_pill_enabled(self):
+        try:
+            if self.PillStackConfig is None:
+                return
+            active = self.PillStackConfig.activePills
+            found = False
+            for i in range(active.size()):
+                if int(active.get(i)) == int(SEARCH_WIDGET_PILL_ID):
+                    found = True
+                    break
+            if not found:
+                active.add(jint(SEARCH_WIDGET_PILL_ID))
+                self.PillStackConfig.savePillsLayout()
+                run_on_ui_thread(self.PillStackConfig.notifySettingsChanged)
+        except Exception as e:
+            self._trace("ensure widget pill fail: {0}".format(e))
+
+    def _is_dialogs(self, frag):
+        try:
+            return frag is not None and "DialogsActivity" in str(frag.getClass().getName() or "")
+        except Exception:
+            return False
+
+    def _attach_or_refresh(self, frag):
+        if not self._is_dialogs(frag):
+            self._detach_state()
+            return
+        self._fragment_ref = frag
+        try:
+            fragment_search = get_private_field(frag, "fragmentSearchField")
+        except Exception:
+            fragment_search = None
+        if fragment_search is None:
+            return
+        try:
+            edit = getattr(fragment_search, "editText", None)
+        except Exception:
+            edit = None
+        if edit is None:
+            return
+
+        self._edit_ref = edit
+        self._capture_native_style(edit)
+        self._apply_hint(edit)
+        self._apply_native_search_mode(edit, frag)
+        self._wire_editor_action(edit)
+        self._wire_touch_action(edit)
+        if self._enabled:
+            self._hide_native_results(frag)
+
+    def _detach_state(self):
+        self._fragment_ref = None
+        self._edit_ref = None
+        self._attached_edit = None
+        self._editor_proxy = None
+        self._touch_edit = None
+        self._touch_proxy = None
+
+    def _capture_native_style(self, edit):
+        try:
+            if self._native_hint_text is None:
+                h = edit.getHint()
+                if h is not None:
+                    self._native_hint_text = str(h)
+            if self._native_hint_color is None:
+                self._native_hint_color = int(edit.getCurrentHintTextColor())
+        except Exception:
+            pass
+
+    def _apply_hint(self, edit):
+        try:
+            hint = self._tr("search_hint_internet") if self._enabled else (self._native_hint_text or "Search Chats")
+            edit.setHint(hint)
+            try:
+                active_color = int(Theme.getColor(Theme.key_featuredStickers_addButton))
+            except Exception:
+                active_color = 0xFF3DA5FF
+            color = active_color if self._enabled else (self._native_hint_color if self._native_hint_color is not None else active_color)
+            try:
+                edit.setHintTextColor(int(color))
+            except Exception:
+                pass
+            try:
+                edit.setContentDescription(hint)
+            except Exception:
+                pass
+        except Exception as e:
+            self._trace("apply hint fail: {0}".format(e))
+
+    def _update_all_pills(self):
+        for pill in list(self._active_pills):
+            try:
+                self._update_pill_ui(pill)
+            except Exception:
+                pass
+
+    def _update_pill_ui(self, pill):
+        try:
+            tv = get_private_field(pill, "textView")
+        except Exception:
+            tv = None
+        try:
+            iv = get_private_field(pill, "iconView")
+        except Exception:
+            iv = None
+        try:
+            bg = pill.getBackground()
+        except Exception:
+            bg = None
+
+        try:
+            active_color = int(Theme.getColor(Theme.key_featuredStickers_addButton))
+        except Exception:
+            active_color = 0xFF3DA5FF
+        try:
+            inactive_color = int(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        except Exception:
+            inactive_color = 0xFF8793A1
+        tint = active_color if self._enabled else inactive_color
+
+        try:
+            if tv is not None:
+                tv.setText(self._tr("pill_title"))
+                tv.setTextColor(int(tint))
+        except Exception:
+            pass
+
+        try:
+            if iv is not None:
+                ctx = pill.getContext()
+                res = ctx.getResources()
+                icon_res = res.getIdentifier("device_web_chrome", "drawable", ctx.getPackageName())
+                if icon_res != 0:
+                    iv.setImageResource(icon_res)
+                iv.setColorFilter(PorterDuffColorFilter(int(tint), PorterDuff.Mode.SRC_IN))
+                lp = iv.getLayoutParams()
+                if lp is not None:
+                    lp.width = int(AndroidUtilities.dp(24))
+                    lp.height = int(AndroidUtilities.dp(24))
+                    iv.setLayoutParams(lp)
+                iv.setPadding(0, 0, 0, 0)
+        except Exception:
+            pass
+
+        try:
+            if bg is not None:
+                bg = bg.mutate()
+                if self._enabled:
+                    bg.setColorFilter(PorterDuffColorFilter(int(active_color), PorterDuff.Mode.MULTIPLY))
+                    pill.setAlpha(1.0)
+                else:
+                    bg.clearColorFilter()
+                    pill.setAlpha(0.9)
+        except Exception:
+            pass
+
+    def _toggle(self):
+        try:
+            self._set_enabled(not self._enabled, True)
+        except Exception as e:
+            self._trace("toggle fail: {0}".format(e))
+
+    def _set_enabled(self, enabled, show_bulletin):
+        self._enabled = bool(enabled)
+        self.set_setting("searchinhere_enabled", self._enabled)
+        self._update_all_pills()
+        try:
+            if self._edit_ref is not None:
+                self._apply_hint(self._edit_ref)
+            if self._fragment_ref is not None and self._edit_ref is not None:
+                self._apply_native_search_mode(self._edit_ref, self._fragment_ref)
+                if self._enabled:
+                    self._hide_native_results(self._fragment_ref)
+        except Exception as e:
+            self._trace("set enabled apply fail: {0}".format(e))
+        if show_bulletin:
+            try:
+                from ui.bulletin import BulletinHelper
+                BulletinHelper.show_info(self._tr("bulletin_mode_on") if self._enabled else self._tr("bulletin_mode_off"))
+            except Exception:
+                pass
+
+    def _wire_editor_action(self, edit):
+        try:
+            if self._attached_edit is edit and self._editor_proxy is not None:
+                return
+        except Exception:
+            pass
+        listener_cls = find_class("android.widget.TextView$OnEditorActionListener")
+        if listener_cls is None:
+            return
+        plugin = self
+
+        class _EditorListener(dynamic_proxy(listener_cls)):
+            def onEditorAction(self, v, actionId, event):
+                try:
+                    if not plugin._enabled:
+                        return False
+                    aid = int(actionId)
+                    search_action = aid in (EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE, EditorInfo.IME_ACTION_GO)
+                    enter_key = False
+                    try:
+                        if event is not None:
+                            enter_key = int(event.getKeyCode()) == KeyEvent.KEYCODE_ENTER
+                    except Exception:
+                        pass
+                    if (not search_action) and (not enter_key):
+                        return False
+                    txt = v.getText() if v is not None else None
+                    query = str(txt.toString() or "").strip() if txt is not None else ""
+                    if not query:
+                        return False
+                    plugin._open_url(query)
+                    return True
+                except Exception as e:
+                    plugin._trace("editor action fail: {0}".format(e))
+                    return False
+
+        try:
+            self._editor_proxy = _EditorListener()
+            edit.setOnEditorActionListener(self._editor_proxy)
+            self._attached_edit = edit
+        except Exception as e:
+            self._trace("setOnEditorActionListener fail: {0}".format(e))
+
+    def _wire_touch_action(self, edit):
+        try:
+            if self._touch_edit is edit and self._touch_proxy is not None:
+                return
+        except Exception:
+            pass
+        listener_cls = find_class("android.view.View$OnTouchListener")
+        if listener_cls is None:
+            return
+        plugin = self
+
+        class _TouchListener(dynamic_proxy(listener_cls)):
+            def onTouch(self, v, event):
+                try:
+                    if not plugin._enabled:
+                        return False
+                    action = int(event.getAction()) if event is not None else -1
+                    if action in (MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP):
+                        plugin._hide_native_results(plugin._fragment_ref)
+                        try:
+                            AndroidUtilities.runOnUIThread(lambda: plugin._hide_native_results(plugin._fragment_ref), 40)
+                            AndroidUtilities.runOnUIThread(lambda: plugin._hide_native_results(plugin._fragment_ref), 140)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return False
+
+        try:
+            self._touch_proxy = _TouchListener()
+            edit.setOnTouchListener(self._touch_proxy)
+            self._touch_edit = edit
+        except Exception as e:
+            self._trace("setOnTouchListener fail: {0}".format(e))
+
+    def _hide_native_results(self, frag):
+        try:
+            if not self._enabled or frag is None:
+                return
+            svp = get_private_field(frag, "searchViewPager")
+        except Exception:
+            svp = None
+        if svp is None:
+            return
+        try:
+            svp.clear()
+        except Exception:
+            pass
+        try:
+            svp.setAlpha(0.0)
+        except Exception:
+            pass
+        try:
+            svp.setVisibility(View.GONE)
+        except Exception:
+            pass
+
+    def _open_url(self, query):
+        try:
+            q = str(query or "").strip()
+            if not q:
+                return
+            if q.startswith("http://") or q.startswith("https://"):
+                url = q
+            else:
+                url = None
+                try:
+                    search_engine_cls = find_class("org.telegram.ui.web.SearchEngine")
+                    if search_engine_cls is not None:
+                        current = search_engine_cls.getCurrent()
+                        if current is not None:
+                            url = current.getSearchURL(q)
+                except Exception as e:
+                    self._trace("native search engine fail: {0}".format(e))
+                if not url:
+                    url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
+            browser_cls = find_class("org.telegram.messenger.browser.Browser")
+            ctx = ApplicationLoader.applicationContext
+            if browser_cls is None or ctx is None:
+                return
+            run_on_ui_thread(lambda: browser_cls.openUrl(ctx, url))
+        except Exception as e:
+            self._trace("open url fail: {0}".format(e))
+
+    def _apply_native_search_mode(self, edit, frag):
+        try:
+            if self._native_watcher is None:
+                try:
+                    self._native_watcher = get_private_field(frag, "fragmentSearchFieldWatcher")
+                except Exception:
+                    self._native_watcher = None
+            watcher = self._native_watcher
+            if watcher is None:
+                return
+            if self._enabled:
+                if not self._native_watcher_removed:
+                    try:
+                        edit.removeTextChangedListener(watcher)
+                        self._native_watcher_removed = True
+                    except Exception:
+                        pass
+                try:
+                    watcher.toggleSearch(False)
+                except Exception:
+                    pass
+            else:
+                if self._native_watcher_removed:
+                    try:
+                        edit.addTextChangedListener(watcher)
+                        self._native_watcher_removed = False
+                    except Exception:
+                        pass
+        except Exception as e:
+            self._trace("apply native search mode fail: {0}".format(e))
+
+    def _show_pill_menu(self, pill):
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            ItemOptions = find_class("org.telegram.ui.Components.ItemOptions")
+            if ItemOptions is None:
+                return
+            ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                return
+            res = ctx.getResources()
+            pkg = ctx.getPackageName()
+            icon_settings = res.getIdentifier("msg_settings", "drawable", pkg)
+            icon_about = res.getIdentifier("msg_info", "drawable", pkg)
+            options = ItemOptions.makeOptions(fragment, pill)
+
+            class _SettingsRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def run(self_obj):
+                    self._present_browser_settings()
+
+            class _AboutRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def run(self_obj):
+                    self._show_about_sheet()
+
+            options.add(jint(icon_settings), self._tr("menu_settings"), _SettingsRunnable())
+            options.add(jint(icon_about), self._tr("menu_about"), _AboutRunnable())
+            options.setDrawScrim(False).setDimAlpha(jint(0)).show()
+        except Exception as e:
+            self._trace("show pill menu fail: {0}".format(e))
+
+    def _present_browser_settings(self):
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                return
+            WebBrowserSettings = find_class("org.telegram.ui.web.WebBrowserSettings")
+            if WebBrowserSettings is None:
+                return
+            frag.presentFragment(WebBrowserSettings(None))
+        except Exception as e:
+            self._trace("open browser settings fail: {0}".format(e))
+
+    def _download_asset(self, url, out_path):
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=12) as resp:
+                data = resp.read()
+            if not data:
+                return
+            with open(out_path, "wb") as f:
+                f.write(data)
+        except Exception:
+            pass
+
+    def _ensure_about_assets(self):
+        def worker():
+            try:
+                if not os.path.exists(ABOUT_AVATAR_CACHE_FILE):
+                    self._download_asset(ABOUT_AVATAR_URL, ABOUT_AVATAR_CACHE_FILE)
+                if not os.path.exists(EXTENDED_ICON_CACHE_FILE_DARK):
+                    self._download_asset(EXTENDED_ICON_URL_DARK, EXTENDED_ICON_CACHE_FILE_DARK)
+                if not os.path.exists(EXTENDED_ICON_CACHE_FILE_LIGHT):
+                    self._download_asset(EXTENDED_ICON_URL_LIGHT, EXTENDED_ICON_CACHE_FILE_LIGHT)
+            except Exception:
+                pass
+        try:
+            import threading
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            worker()
+
+    def _show_about_sheet(self):
+        try:
+            frag = get_last_fragment()
+            ctx = frag.getParentActivity() if frag and frag.getParentActivity() else None
+            if ctx is None:
+                return
+            self._ensure_about_assets()
+
+            sheet = BottomSheet(ctx, True)
+            outer = LinearLayout(ctx)
+            outer.setOrientation(LinearLayout.VERTICAL)
+            outer.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(12))
+
+            root = LinearLayout(ctx)
+            root.setOrientation(LinearLayout.VERTICAL)
+            root.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12))
+            try:
+                root_bg = GradientDrawable()
+                root_bg.setCornerRadius(float(AndroidUtilities.dp(14)))
+                root_bg.setColor(int(Theme.getColor(Theme.key_dialogBackground)))
+                root.setBackground(root_bg)
+            except Exception:
+                pass
+
+            row = LinearLayout(ctx)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            row.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(8), AndroidUtilities.dp(8), AndroidUtilities.dp(8))
+
+            avatar = ImageView(ctx)
+            try:
+                avatar.setScaleType(ImageView.ScaleType.CENTER_CROP)
+                av_bg = GradientDrawable()
+                av_bg.setCornerRadius(float(AndroidUtilities.dp(14)))
+                av_bg.setColor(0x00000000)
+                avatar.setBackground(av_bg)
+                avatar.setClipToOutline(True)
+                avatar.setOutlineProvider(ViewOutlineProvider.BACKGROUND)
+                if os.path.exists(ABOUT_AVATAR_CACHE_FILE):
+                    bmp = BitmapFactory.decodeFile(ABOUT_AVATAR_CACHE_FILE)
+                    if bmp is not None:
+                        avatar.setImageBitmap(bmp)
+                avatar.setCameraDistance(float(AndroidUtilities.dp(800)))
+                avatar.setAlpha(0.0)
+                avatar.setTranslationY(float(AndroidUtilities.dp(26)))
+                avatar.setRotationY(-120.0)
+            except Exception:
+                pass
+            row.addView(avatar, LinearLayout.LayoutParams(AndroidUtilities.dp(72), AndroidUtilities.dp(72)))
+
+            desc = TextView(ctx)
+            desc.setText(self._tr("about_desc"))
+            desc.setTextSize(15)
+            try:
+                desc.setTextColor(int(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText)))
+            except Exception:
+                pass
+            lp_desc = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+            lp_desc.leftMargin = AndroidUtilities.dp(10)
+            row.addView(desc, lp_desc)
+            root.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+            actions = LinearLayout(ctx)
+            actions.setOrientation(LinearLayout.HORIZONTAL)
+            actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL)
+            lp_actions = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp_actions.topMargin = AndroidUtilities.dp(10)
+
+            ext = ImageView(ctx)
+            try:
+                ext.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+                is_dark = bool(Theme.isCurrentThemeDark())
+                icon_path = EXTENDED_ICON_CACHE_FILE_DARK if is_dark else EXTENDED_ICON_CACHE_FILE_LIGHT
+                if os.path.exists(icon_path):
+                    bmp_ext = BitmapFactory.decodeFile(icon_path)
+                    if bmp_ext is not None:
+                        ext.setImageBitmap(bmp_ext)
+                ext.setPadding(AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4))
+            except Exception:
+                pass
+            lp_ext = LinearLayout.LayoutParams(AndroidUtilities.dp(36), AndroidUtilities.dp(36))
+            lp_ext.rightMargin = AndroidUtilities.dp(8)
+            actions.addView(ext, lp_ext)
+
+            btn = TextView(ctx)
+            btn.setText(self._tr("about_button"))
+            btn.setGravity(Gravity.CENTER)
+            btn.setTextSize(16)
+            try:
+                btn.setTextColor(int(Theme.getColor(Theme.key_featuredStickers_buttonText)))
+                btn_bg = GradientDrawable()
+                btn_bg.setCornerRadius(float(AndroidUtilities.dp(12)))
+                btn_bg.setColor(int(Theme.getColor(Theme.key_featuredStickers_addButton)))
+                btn.setBackground(btn_bg)
+                btn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(10), AndroidUtilities.dp(12), AndroidUtilities.dp(10))
+            except Exception:
+                pass
+            actions.addView(btn, LinearLayout.LayoutParams(AndroidUtilities.dp(140), LinearLayout.LayoutParams.WRAP_CONTENT))
+            root.addView(actions, lp_actions)
+
+            class _OpenApple(dynamic_proxy(View.OnClickListener)):
+                def onClick(self_obj, v):
+                    try:
+                        get_messages_controller().openByUserName("AGeekApple", get_last_fragment(), 1)
+                    except Exception:
+                        self._open_url("https://t.me/AGeekApple")
+                    try:
+                        sheet.dismiss()
+                    except Exception:
+                        pass
+
+            class _OpenPost(dynamic_proxy(View.OnClickListener)):
+                def onClick(self_obj, v):
+                    try:
+                        self._open_url(ABOUT_POST_URL)
+                    except Exception:
+                        pass
+
+            btn.setOnClickListener(_OpenApple())
+            ext.setOnClickListener(_OpenPost())
+
+            outer.addView(root, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            sheet.setCustomView(outer)
+            sheet.show()
+            try:
+                avatar.post(lambda: avatar.animate().translationY(0.0).alpha(1.0).rotationY(0.0).setDuration(620).start())
+            except Exception:
+                try:
+                    avatar.animate().translationY(0.0).alpha(1.0).rotationY(0.0).setDuration(620).start()
+                except Exception:
+                    pass
+        except Exception as e:
+            self._trace("show about fail: {0}".format(e))
+
+
+plugin = SearchInHerePlugin()
