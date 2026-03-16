@@ -1,0 +1,555 @@
+__id__ = "quick_select"
+__name__ = "Quick Select"
+__description__ = "Ускоряет автоматическую прокрутку чата с несколькими вариантами выбора и снимает лимит на выделение сообщений."
+__version__ = "1.0.0"
+__author__ = "@JavaScript_XD"
+__icon__ = "mostusefulstick_by_fStikBot/28"
+__min_version__ = "11.12.0"
+
+import math
+from typing import Any
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook, MethodReplacement
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field, set_private_field
+from java import jclass
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Switch, Text
+from org.telegram.messenger import AndroidUtilities
+
+
+# Selection-limit lifting was implemented from scratch after studying
+# the approach used in noForwardLimit.plugin by @zwylair.
+
+
+class MultiSelectRunHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin._inject_extra_scroll(param.thisObject)
+
+
+class UnlimitedSelectionHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._prepare_unlimited_selection(param)
+
+    def after_hooked_method(self, param):
+        self.plugin._finalize_unlimited_selection(param)
+
+
+class ClearSelectionStateHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, _param):
+        self.plugin._clear_unlimited_selection_state()
+
+
+class LimitReachedReplacement(MethodReplacement):
+    def replace_hooked_method(self, _param):
+        return False
+
+
+class Plugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._integer_class = jclass("java.lang.Integer")
+        self._unhooks = []
+        self._multiselect_runner_class = None
+        self._chat_activity_class = None
+        self._chat_multiselect_class = None
+        self._selected_messages = {0: {}, 1: {}}
+        self._selection_dialog_id = None
+        self._unlimited_mode_active = False
+        self._update_action_mode_title_method = None
+
+    def on_plugin_load(self):
+        try:
+            self._multiselect_runner_class = find_class("org.telegram.ui.Components.RecyclerListView$6")
+            self._chat_activity_class = find_class("org.telegram.ui.ChatActivity")
+            self._chat_multiselect_class = find_class("org.telegram.ui.ChatActivity$11")
+
+            if not self._multiselect_runner_class:
+                raise RuntimeError("RecyclerListView$6 class not found.")
+            if not self._chat_activity_class:
+                raise RuntimeError("ChatActivity class not found.")
+            if not self._chat_multiselect_class:
+                raise RuntimeError("ChatActivity$11 class not found.")
+
+            self._add_unhooks(
+                self.hook_all_methods(
+                    self._multiselect_runner_class,
+                    "run",
+                    MultiSelectRunHook(self),
+                )
+            )
+            self._add_unhooks(
+                self.hook_all_methods(
+                    self._chat_activity_class,
+                    "addToSelectedMessages",
+                    UnlimitedSelectionHook(self),
+                )
+            )
+            self._add_unhooks(
+                self.hook_all_methods(
+                    self._chat_activity_class,
+                    "hideActionMode",
+                    ClearSelectionStateHook(self),
+                )
+            )
+            self._add_unhooks(
+                self.hook_all_methods(
+                    self._chat_multiselect_class,
+                    "limitReached",
+                    LimitReachedReplacement(),
+                )
+            )
+            self._update_action_mode_title_method = self._chat_activity_class.getDeclaredMethod("updateActionModeTitle")
+            self._update_action_mode_title_method.setAccessible(True)
+        except Exception as error:
+            self.log(f"Quick Select load error: {error}")
+
+    def on_plugin_unload(self):
+        for unhook in self._unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks.clear()
+        self._clear_unlimited_selection_state()
+
+    def create_settings(self):
+        return [
+            Header(text="Quick Select"),
+            Switch(
+                key="enabled",
+                text="Ускорять выделение",
+                default=True,
+                subtext="Добавляет extra scroll во время drag-select в чате.",
+                icon="msg_settings",
+            ),
+            Input(
+                key="speed_multiplier",
+                text="Множитель скорости",
+                default="4.0",
+                subtext="1.0 = как было. Большие значения теперь реально ускоряют сильнее.",
+                icon="msg_text",
+            ),
+            Input(
+                key="min_step",
+                text="Минимальный шаг",
+                default="12",
+                subtext="Нижний порог extra-scroll в px за один tick.",
+                icon="msg_text",
+            ),
+            Input(
+                key="max_step_per_call",
+                text="Макс. шаг за вызов",
+                default="64",
+                subtext="Лимит одного extra-scroll вызова. Для очень больших скоростей используется turbo-repeat.",
+                icon="msg_text",
+            ),
+            Input(
+                key="max_repeat_calls",
+                text="Turbo repeat cap",
+                default="10",
+                subtext="Сколько extra-scroll вызовов можно сделать за один tick. Это убирает потолок скорости на 10x, 25x и выше.",
+                icon="msg_text",
+            ),
+            Input(
+                key="base_tick_dp",
+                text="Базовый tick (dp)",
+                default="3.0",
+                subtext="Штатный размер scroll tick. Можно поднять, если хочется ещё агрессивнее.",
+                icon="msg_text",
+            ),
+            Divider(),
+            Switch(
+                key="remove_selection_limit",
+                text="Убрать лимит выбора",
+                default=True,
+                subtext="Позволяет выделять больше 100 сообщений в одном режиме выбора.",
+                icon="msg_settings",
+            ),
+            Divider(),
+            Header(text="Как настроить"),
+            Text(
+                text="Открыть понятную инструкцию",
+                icon="msg_info",
+                accent=True,
+                on_click=self._show_tuning_guide,
+            ),
+            Text(
+                text="Показать текущие значения",
+                icon="msg_info",
+                accent=True,
+                on_click=self._show_status,
+            ),
+            Text(
+                text="Сбросить к рекомендованным",
+                icon="msg_settings",
+                on_click=self._reset_defaults,
+            ),
+        ]
+
+    def _inject_extra_scroll(self, runner):
+        if not self.get_setting("enabled", True):
+            return
+
+        try:
+            recycler = get_private_field(runner, "this$0")
+        except Exception:
+            return
+
+        if not recycler:
+            return
+
+        try:
+            is_running = bool(get_private_field(recycler, "multiselectScrollRunning"))
+            listener = get_private_field(recycler, "multiSelectionListener")
+        except Exception:
+            return
+
+        if not is_running or not listener:
+            return
+
+        try:
+            listener_name = str(listener.getClass().getName())
+        except Exception:
+            listener_name = ""
+
+        if listener_name != "org.telegram.ui.ChatActivity$11":
+            return
+
+        try:
+            to_top = bool(get_private_field(recycler, "multiselectScrollToTop"))
+        except Exception:
+            to_top = False
+
+        extra_step = self._get_extra_step()
+        if extra_step <= 0:
+            return
+
+        delta = -extra_step if to_top else extra_step
+        try:
+            for _ in range(self._get_repeat_calls()):
+                listener.scrollBy(int(delta))
+        except Exception as error:
+            self.log(f"Quick Select extra scroll error: {error}")
+
+    def _get_extra_step(self):
+        try:
+            base_step = int(AndroidUtilities.dp(self._get_base_tick_dp()))
+        except Exception:
+            base_step = 3
+
+        multiplier = self._get_speed_multiplier()
+        if multiplier <= 1.0:
+            return 0
+
+        desired_total_extra = int(round(base_step * (multiplier - 1.0)))
+        if desired_total_extra <= 0:
+            return 0
+
+        min_step = self._get_min_step()
+        max_step = self._get_max_step_per_call()
+        repeat_calls = self._get_repeat_calls()
+
+        extra = int(math.ceil(float(desired_total_extra) / float(repeat_calls)))
+
+        if min_step > 0 and extra < min_step:
+            extra = min_step
+        if max_step > 0 and extra > max_step:
+            extra = max_step
+        if extra < 0:
+            extra = 0
+
+        return extra
+
+    def _get_repeat_calls(self):
+        try:
+            base_step = int(AndroidUtilities.dp(self._get_base_tick_dp()))
+        except Exception:
+            base_step = 3
+
+        multiplier = self._get_speed_multiplier()
+        if multiplier <= 1.0:
+            return 1
+
+        desired_total_extra = int(round(base_step * (multiplier - 1.0)))
+        max_step = self._get_max_step_per_call()
+        repeat_cap = self._get_max_repeat_calls()
+
+        if desired_total_extra <= 0:
+            return 1
+        if max_step <= 0:
+            return 1
+
+        repeats = int(math.ceil(float(desired_total_extra) / float(max_step)))
+        if repeats < 1:
+            repeats = 1
+        if repeats > repeat_cap:
+            repeats = repeat_cap
+        return repeats
+
+    def _prepare_unlimited_selection(self, param):
+        if not self.get_setting("remove_selection_limit", True):
+            return
+
+        try:
+            chat_activity = param.thisObject
+            message_object = param.args[0]
+            dialog_id = int(get_private_field(chat_activity, "dialog_id"))
+            selected_index = self._get_selected_array_index(chat_activity, message_object)
+            selected_messages_ids = get_private_field(chat_activity, "selectedMessagesIds")
+        except Exception:
+            return
+
+        self._ensure_selection_owner(dialog_id)
+
+        try:
+            current_total = int(selected_messages_ids[0].size()) + int(selected_messages_ids[1].size())
+        except Exception:
+            current_total = 0
+
+        if not self._unlimited_mode_active:
+            if current_total < 95:
+                return
+            self._seed_local_selection_from_java(selected_messages_ids)
+            self._unlimited_mode_active = True
+
+        try:
+            selected_messages_ids[selected_index] = chat_activity.SparseArrayWithTouch()
+            set_private_field(chat_activity, "selectedMessagesIds", selected_messages_ids)
+        except Exception as error:
+            self.log(f"Quick Select prepare unlimited selection error: {error}")
+
+    def _finalize_unlimited_selection(self, param):
+        if not self.get_setting("remove_selection_limit", True) or not self._unlimited_mode_active:
+            return
+
+        try:
+            chat_activity = param.thisObject
+            message_object = param.args[0]
+            selected_index = self._get_selected_array_index(chat_activity, message_object)
+            selected_messages_ids = get_private_field(chat_activity, "selectedMessagesIds")
+            selected_sparse = selected_messages_ids[selected_index]
+        except Exception:
+            return
+
+        local_store = self._selected_messages[selected_index]
+
+        try:
+            for i in reversed(range(selected_sparse.size())):
+                message_id = int(selected_sparse.keyAt(i))
+                message_obj = selected_sparse.get(message_id)
+                if message_id in local_store:
+                    local_store.pop(message_id, None)
+                else:
+                    local_store[message_id] = message_obj
+
+            selected_sparse.clear()
+            for message_id, message_obj in local_store.items():
+                selected_sparse.put(int(message_id), message_obj)
+        except Exception as error:
+            self.log(f"Quick Select finalize unlimited selection error: {error}")
+            return
+
+        self._refresh_selection_ui(chat_activity)
+
+    def _seed_local_selection_from_java(self, selected_messages_ids):
+        self._selected_messages = {0: {}, 1: {}}
+        for selected_index in (0, 1):
+            try:
+                selected_sparse = selected_messages_ids[selected_index]
+            except Exception:
+                continue
+            try:
+                for i in range(selected_sparse.size()):
+                    message_id = int(selected_sparse.keyAt(i))
+                    message_obj = selected_sparse.get(message_id)
+                    self._selected_messages[selected_index][message_id] = message_obj
+            except Exception as error:
+                self.log(f"Quick Select seed selection error: {error}")
+
+    def _refresh_selection_ui(self, chat_activity):
+        total_count = len(self._selected_messages[0]) + len(self._selected_messages[1])
+
+        try:
+            current_chat = get_private_field(chat_activity, "currentChat")
+            chat_mode = int(get_private_field(chat_activity, "chatMode"))
+        except Exception:
+            current_chat = None
+            chat_mode = 0
+
+        cant_forward = 0
+        cant_delete = 0
+        is_schedule_mode = chat_mode == 1
+
+        for store in self._selected_messages.values():
+            for message_obj in store.values():
+                try:
+                    if not message_obj.canForwardMessage():
+                        cant_forward += 1
+                except Exception:
+                    pass
+                try:
+                    if not message_obj.canDeleteMessage(is_schedule_mode, current_chat):
+                        cant_delete += 1
+                except Exception:
+                    pass
+
+        try:
+            set_private_field(chat_activity, "cantForwardMessagesCount", self._integer_class.valueOf(cant_forward))
+            set_private_field(chat_activity, "cantDeleteMessagesCount", self._integer_class.valueOf(cant_delete))
+        except Exception:
+            pass
+
+        if total_count <= 0:
+            return
+
+        try:
+            self._update_action_mode_title_method.invoke(chat_activity)
+        except Exception as error:
+            self.log(f"Quick Select update action mode error: {error}")
+
+    def _get_selected_array_index(self, chat_activity, message_object):
+        current_dialog_id = int(get_private_field(chat_activity, "dialog_id"))
+        return int(message_object.getDialogId() != current_dialog_id)
+
+    def _ensure_selection_owner(self, dialog_id: int):
+        if self._selection_dialog_id is None:
+            self._selection_dialog_id = dialog_id
+            return
+        if self._selection_dialog_id != dialog_id:
+            self._clear_unlimited_selection_state()
+            self._selection_dialog_id = dialog_id
+
+    def _clear_unlimited_selection_state(self):
+        self._selected_messages = {0: {}, 1: {}}
+        self._selection_dialog_id = None
+        self._unlimited_mode_active = False
+
+    def _show_status(self, _view):
+        total_extra = self._get_extra_step() * self._get_repeat_calls()
+        text = (
+            f"x{self._get_speed_multiplier():.2f}, "
+            f"min {self._get_min_step()} px, "
+            f"per-call {self._get_max_step_per_call()} px, "
+            f"repeat {self._get_repeat_calls()}, "
+            f"total ~{total_extra} px, "
+            f"limit {'off' if self.get_setting('remove_selection_limit', True) else 'on'}"
+        )
+        BulletinHelper.show_info(text, get_last_fragment())
+
+    def _show_tuning_guide(self, _view):
+        fragment = get_last_fragment()
+        if not fragment:
+            BulletinHelper.show_error("Не удалось открыть инструкцию.")
+            return
+
+        def _show():
+            try:
+                activity = fragment.getParentActivity()
+                if not activity:
+                    BulletinHelper.show_error("Активность настроек не найдена.", fragment)
+                    return
+
+                builder = AlertDialogBuilder(activity)
+                builder.set_title("Как настроить Quick Select")
+                builder.set_message(
+                    "1. Сначала меняй только 'Множитель скорости'. Если уже хорошо, остальное не трогай.\n\n"
+                    "2. Если 10.0, 20.0 и 25.0 кажутся почти одинаковыми, подними 'Turbo repeat cap'. "
+                    "Он снимает потолок скорости.\n\n"
+                    "3. Если чат улетает слишком резко, уменьши 'Макс. шаг за вызов'. "
+                    "Это делает каждую отдельную прокрутку мягче.\n\n"
+                    "4. Если даже большие значения слабые, подними 'Базовый tick (dp)'. "
+                    "Это увеличивает базовую силу ускорения.\n\n"
+                    "Готовые варианты:\n"
+                    "Нормально: x4.0 / 64 / 10 / 3.0\n"
+                    "Быстро: x10.0 / 96 / 12 / 3.0\n"
+                    "Жестко: x25.0 / 128 / 16 / 4.5\n\n"
+                    "Порядок полей такой:\n"
+                    "Множитель / Макс. шаг / Turbo repeat / Базовый tick"
+                )
+                builder.set_positive_button("Понял", lambda dialog, which: dialog.dismiss())
+                builder.show()
+            except Exception as error:
+                self.log(f"Quick Select guide dialog error: {error}")
+                BulletinHelper.show_error("Не удалось открыть инструкцию.", fragment)
+
+        run_on_ui_thread(_show)
+
+    def _reset_defaults(self, _view):
+        defaults = {
+            "enabled": True,
+            "speed_multiplier": "4.0",
+            "min_step": "12",
+            "max_step_per_call": "64",
+            "max_repeat_calls": "10",
+            "base_tick_dp": "3.0",
+            "remove_selection_limit": True,
+        }
+
+        def _apply():
+            self.import_settings(defaults, reload_settings=True)
+            BulletinHelper.show_success("Quick Select: значения сброшены.", get_last_fragment())
+
+        run_on_ui_thread(_apply, 16)
+
+    def _add_unhooks(self, unhooks: Any):
+        if not unhooks:
+            return
+        if isinstance(unhooks, list):
+            self._unhooks.extend(unhooks)
+        else:
+            self._unhooks.append(unhooks)
+
+    def _parse_int(self, value, default: int, minimum: int, maximum: int):
+        try:
+            parsed = int(float(str(value).strip().replace(",", ".")))
+        except Exception:
+            return default
+
+        if parsed < minimum:
+            return default
+        if maximum > 0 and parsed > maximum:
+            return maximum
+        return parsed
+
+    def _parse_float(self, value, default: float, minimum: float, maximum: float):
+        try:
+            parsed = float(str(value).strip().replace(",", "."))
+        except Exception:
+            return default
+
+        if parsed < minimum:
+            return default
+        if maximum > 0 and parsed > maximum:
+            return maximum
+        return parsed
+
+    def _get_speed_multiplier(self):
+        return self._parse_float(self.get_setting("speed_multiplier", "4.0"), 4.0, 0.2, 50.0)
+
+    def _get_min_step(self):
+        return self._parse_int(self.get_setting("min_step", "12"), 12, 0, 500)
+
+    def _get_max_step_per_call(self):
+        max_step = self._parse_int(self.get_setting("max_step_per_call", "64"), 64, 1, 4000)
+        min_step = self._get_min_step()
+        if max_step < min_step and min_step > 0:
+            return min_step
+        return max_step
+
+    def _get_max_repeat_calls(self):
+        return self._parse_int(self.get_setting("max_repeat_calls", "10"), 10, 1, 64)
+
+    def _get_base_tick_dp(self):
+        return self._parse_float(self.get_setting("base_tick_dp", "3.0"), 3.0, 0.5, 40.0)
