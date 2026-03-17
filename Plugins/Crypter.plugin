@@ -1,0 +1,414 @@
+__id__ = "Crypter"
+__name__ = "Crypter"
+__description__ = "Простенький шифратор текста с паролем. Пример: .cip [пароль] [текст] \n update: улучшено шифрование, исправлены настройки"
+__author__ = "@MRDimons"
+__version__ = "2.0"
+__min_version__ = "11.12.0"
+__icon__ = "AnimatedEmojies/16"
+
+import re
+import base64
+import secrets
+import hashlib
+import hmac
+import time
+from datetime import datetime
+from typing import Optional, Tuple
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from ui.settings import Header, Switch, Input, Divider
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
+from java import jclass
+
+from android.content import ClipboardManager, ClipData, Context
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.Components import EditTextBoldCursor
+from android.text import InputType
+from android.widget import LinearLayout
+from android.view import ViewGroup
+
+
+class CryptoUtils:
+    @staticmethod
+    def derive_keys(password: str, salt: bytes) -> Tuple[bytes, bytes]:
+        raw = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000, dklen=64)
+        return raw[:32], raw[32:]
+
+    @staticmethod
+    def encrypt(plaintext: str, password: str) -> str:
+        try:
+            timestamp = str(int(time.time()))
+            data_to_encrypt = f"{plaintext}|||{timestamp}"
+            salt = secrets.token_bytes(16)
+            key_xor, key_hmac = CryptoUtils.derive_keys(password, salt)
+            data_bytes = data_to_encrypt.encode('utf-8')
+            encrypted = bytearray()
+            for i, b in enumerate(data_bytes):
+                encrypted.append(b ^ key_xor[i % len(key_xor)])
+            mac = hmac.new(key_hmac, salt + bytes(encrypted), hashlib.sha256).digest()
+            result = salt + mac + bytes(encrypted)
+            return base64.urlsafe_b64encode(result).decode('utf-8')
+        except Exception as e:
+            raise Exception(f"Ошибка шифрования: {str(e)}")
+
+    @staticmethod
+    def decrypt(encrypted_text: str, password: str) -> Tuple[bool, str, Optional[str]]:
+        try:
+            data = base64.urlsafe_b64decode(encrypted_text.encode('utf-8'))
+            if len(data) <= 48:
+                return False, "Ошибка дешифрования", None
+            salt = data[:16]
+            mac = data[16:48]
+            cipher = data[48:]
+            key_xor, key_hmac = CryptoUtils.derive_keys(password, salt)
+            expected = hmac.new(key_hmac, salt + cipher, hashlib.sha256).digest()
+            if not hmac.compare_digest(mac, expected):
+                return False, "Неверный пароль или данные повреждены", None
+            decrypted = bytearray()
+            for i, b in enumerate(cipher):
+                decrypted.append(b ^ key_xor[i % len(key_xor)])
+            text = decrypted.decode('utf-8')
+            if '|||' in text:
+                original, ts = text.rsplit('|||', 1)
+                return True, original, ts
+            return True, text, None
+        except Exception:
+            return False, "Ошибка дешифрования", None
+
+    @staticmethod
+    def detect_encrypted(text: str) -> bool:
+        try:
+            clean = text.strip()
+            if clean.startswith("🔐 "):
+                clean = clean[2:].strip()
+            if not clean:
+                return False
+            if any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=" for c in clean):
+                return False
+            pad = (-len(clean)) % 4
+            decoded = base64.urlsafe_b64decode(clean + "=" * pad)
+            return len(decoded) > 16
+        except Exception:
+            return False
+
+
+class CrypterPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.set_setting('enabled', self.get_setting('enabled', True), reload_settings=False)
+        self.set_setting('auto_detect', self.get_setting('auto_detect', True), reload_settings=False)
+        self.set_setting('show_encrypted_icon', self.get_setting('show_encrypted_icon', True), reload_settings=False)
+        self.set_setting('custom_command', self.get_setting('custom_command', '.cip'), reload_settings=False)
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="🔓 Расшифровать",
+            icon="msg_lock_solar",
+            on_click=self._handle_decrypt_menu
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="🔐 Быстрое шифрование",
+            icon="msg_lock_solar",
+            on_click=self._handle_quick_encrypt
+        ))
+
+    def create_settings(self):
+        return [
+            Header(text="Настройки шифрования"),
+            Switch(
+                key="enabled",
+                text="Включить плагин",
+                subtext="Активировать шифрование/дешифрование",
+                default=True
+            ),
+            Divider(),
+            Switch(
+                key="auto_detect",
+                text="Автоопределение",
+                subtext="Автоматически определять зашифрованные сообщения",
+                default=True
+            ),
+            Switch(
+                key="show_encrypted_icon",
+                text="Показывать иконку 🔐",
+                subtext="Добавлять значок замка к зашифрованным сообщениям",
+                default=True
+            ),
+            Divider(),
+            Input(
+                key="custom_command",
+                text="Пользовательская команда",
+                default=".cip",
+                subtext="Можно изменить на .encrypt, .шифр и т.д."
+            ),
+            Divider(text="Использование: [команда] [пароль] [текст]. Пример: .cip мойпароль секретное сообщение")
+        ]
+
+    def _extract_password_and_text(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        cmd_match = re.match(r'^(\.\w+)\s+', text)
+        if not cmd_match:
+            return None, None
+        rest = text[len(cmd_match.group(1)):].strip()
+        quoted = re.findall(r'"([^"]*)"', rest)
+        if len(quoted) >= 2:
+            return quoted[0], quoted[1]
+        words = rest.split()
+        if len(words) >= 2:
+            return words[0], ' '.join(words[1:])
+        return None, None
+
+    def on_send_message_hook(self, account, params):
+        if not hasattr(params, "message") or not isinstance(params.message, str) or not self.get_setting("enabled", True):
+            return HookResult()
+
+        message = params.message.strip()
+        custom_command = self.get_setting("custom_command", ".cip")
+
+        if message.lower().startswith(custom_command.lower() + " "):
+            try:
+                password, plaintext = self._extract_password_and_text(message)
+                if not password or not plaintext:
+                    BulletinHelper.show_error("Используйте формат: .cip пароль \"текст\" или .cip пароль текст")
+                    return HookResult(strategy=HookStrategy.CANCEL)
+
+                encrypted = CryptoUtils.encrypt(plaintext, password)
+                params.message = f"🔐 {encrypted}" if self.get_setting("show_encrypted_icon", True) else encrypted
+                BulletinHelper.show_success("Сообщение зашифровано!")
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            except Exception as e:
+                BulletinHelper.show_error(str(e))
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+        if self.get_setting("auto_detect", True) and CryptoUtils.detect_encrypted(message) and self.get_setting("show_encrypted_icon", True) and not message.startswith("🔐"):
+            params.message = f"🔐 {message}"
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        return HookResult()
+
+    def _handle_decrypt_menu(self, context):
+        try:
+            msg_obj = context.get("message")
+            if not msg_obj:
+                BulletinHelper.show_error("Не удалось получить сообщение")
+                return
+
+            raw_text = getattr(msg_obj, 'messageText', getattr(msg_obj, 'text', ''))
+            if not raw_text:
+                BulletinHelper.show_error("Не удалось получить текст сообщения")
+                return
+
+            clean = str(raw_text).strip()
+            if clean.startswith("🔐 "):
+                clean = clean[2:].strip()
+
+            if not CryptoUtils.detect_encrypted(clean):
+                BulletinHelper.show_error("Это сообщение не зашифровано")
+                return
+
+            self._current_encrypted_text = clean
+            run_on_ui_thread(self._show_password_dialog)
+        except Exception as e:
+            BulletinHelper.show_error(f"Ошибка: {str(e)}")
+
+    def _show_password_dialog(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment or not hasattr(fragment, 'getParentActivity'):
+                BulletinHelper.show_error("Не удалось открыть диалог")
+                return
+
+            context = fragment.getParentActivity()
+            encrypted_text = getattr(self, '_current_encrypted_text', '')
+
+            if not encrypted_text:
+                BulletinHelper.show_error("Нет текста для расшифровки")
+                return
+
+            builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            builder.set_title("🔓 Расшифровать сообщение")
+            builder.set_message("Введите пароль для расшифровки:")
+
+            edit_text = EditTextBoldCursor(context)
+            edit_text.setHint("Пароль")
+            edit_text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD)
+            edit_text.setSingleLine(True)
+
+            try:
+                from org.telegram.ui.ActionBar import Theme
+                from android.graphics.drawable import ColorDrawable
+                from android.content.res import ColorStateList
+                from android.graphics import Color
+                edit_text.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                edit_text.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+                edit_text.setLineColors(Theme.getColor(Theme.key_dialogInputField), Theme.getColor(Theme.key_dialogInputFieldActivated), Theme.getColor(Theme.key_text_RedBold))
+                edit_text.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                edit_text.setBackground(ColorDrawable(0))
+                edit_text.setBackgroundTintList(ColorStateList.valueOf(Color.TRANSPARENT))
+            except:
+                pass
+
+            padding_h = AndroidUtilities.dp(20)
+            padding_v = AndroidUtilities.dp(12)
+            edit_text.setPadding(padding_h, padding_v, padding_h, padding_v)
+            builder.set_view(edit_text)
+
+            def on_decrypt(dialog_builder, which):
+                password = str(edit_text.getText())
+                if not password:
+                    BulletinHelper.show_error("Введите пароль")
+                    return
+
+                success, decrypted, timestamp = CryptoUtils.decrypt(encrypted_text, password)
+
+                if success:
+                    result_builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+                    result_builder.set_title("✅ Расшифрованный текст")
+                    msg = decrypted
+                    if timestamp:
+                        dt = datetime.fromtimestamp(int(timestamp))
+                        msg += f"\n\n🕐 Зашифровано: {dt.strftime('%d.%m.%Y %H:%M')}"
+                    result_builder.set_message(msg)
+
+                    def copy_to_clipboard(dialog, which_button):
+                        try:
+                            clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                            clip = ClipData.newPlainText("Расшифрованный текст", decrypted)
+                            clipboard.setPrimaryClip(clip)
+                            BulletinHelper.show_success("Скопировано в буфер обмена")
+                        except:
+                            BulletinHelper.show_error("Ошибка копирования")
+
+                    result_builder.set_positive_button("Копировать", copy_to_clipboard)
+                    result_builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+                    result_builder.show()
+                else:
+                    BulletinHelper.show_error(decrypted)
+
+                dialog_builder.dismiss()
+
+            builder.set_positive_button("Расшифровать", on_decrypt)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+
+            def focus_edit():
+                edit_text.requestFocus()
+                imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                if imm:
+                    imm.showSoftInput(edit_text, 0)
+
+            run_on_ui_thread(lambda: edit_text.post(focus_edit))
+        except Exception as e:
+            BulletinHelper.show_error(f"Ошибка: {str(e)}")
+
+    def _handle_quick_encrypt(self, context):
+        def show_encrypt_dialog():
+            try:
+                fragment = get_last_fragment()
+                if not fragment or not hasattr(fragment, 'getParentActivity'):
+                    BulletinHelper.show_error("Не удалось открыть диалог")
+                    return
+
+                context = fragment.getParentActivity()
+                builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+                builder.set_title("🔐 Шифрование сообщения")
+
+                layout = LinearLayout(context)
+                layout.setOrientation(LinearLayout.VERTICAL)
+                lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                lp.setMargins(AndroidUtilities.dp(20), 0, AndroidUtilities.dp(20), 0)
+                layout.setLayoutParams(lp)
+
+                password_input = EditTextBoldCursor(context)
+                password_input.setHint("Пароль")
+                password_input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD)
+                password_input.setSingleLine(True)
+
+                text_input = EditTextBoldCursor(context)
+                text_input.setHint("Текст для шифрования")
+                text_input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+                text_input.setMinLines(3)
+                text_input.setMaxLines(5)
+
+                try:
+                    from org.telegram.ui.ActionBar import Theme
+                    from android.graphics.drawable import ColorDrawable
+                    from android.content.res import ColorStateList
+                    from android.graphics import Color
+
+                    for edit in [password_input, text_input]:
+                        edit.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                        edit.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+                        edit.setLineColors(Theme.getColor(Theme.key_dialogInputField), Theme.getColor(Theme.key_dialogInputFieldActivated), Theme.getColor(Theme.key_text_RedBold))
+                        edit.setCursorColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                        edit.setBackground(ColorDrawable(0))
+                        edit.setBackgroundTintList(ColorStateList.valueOf(Color.TRANSPARENT))
+
+                        pad_h = AndroidUtilities.dp(16)
+                        pad_v = AndroidUtilities.dp(12)
+                        edit.setPadding(pad_h, pad_v, pad_h, pad_v)
+
+                        le = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        le.setMargins(0, AndroidUtilities.dp(8), 0, AndroidUtilities.dp(8))
+                        edit.setLayoutParams(le)
+                except:
+                    pass
+
+                layout.addView(password_input)
+                layout.addView(text_input)
+                builder.set_view(layout)
+
+                def encrypt_action(dialog_builder, which):
+                    password = str(password_input.getText())
+                    plaintext = str(text_input.getText())
+
+                    if not password or not plaintext:
+                        BulletinHelper.show_error("Заполните все поля")
+                        return
+
+                    try:
+                        encrypted = CryptoUtils.encrypt(plaintext, password)
+                        clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                        encrypted_text = f"🔐 {encrypted}" if self.get_setting("show_encrypted_icon", True) else encrypted
+                        clip = ClipData.newPlainText("Зашифрованное сообщение", encrypted_text)
+                        clipboard.setPrimaryClip(clip)
+                        BulletinHelper.show_success("Текст зашифрован и скопирован в буфер обмена")
+                    except Exception as e:
+                        BulletinHelper.show_error(f"Ошибка шифрования: {str(e)}")
+
+                    dialog_builder.dismiss()
+
+                builder.set_positive_button("Зашифровать", encrypt_action)
+                builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+                builder.show()
+
+                def focus_password():
+                    password_input.requestFocus()
+                    imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                    if imm:
+                        imm.showSoftInput(password_input, 0)
+
+                run_on_ui_thread(lambda: password_input.post(focus_password))
+            except Exception as e:
+                BulletinHelper.show_error(f"Ошибка: {str(e)}")
+
+        run_on_ui_thread(show_encrypt_dialog)
+
+    def on_setting_updated(self, key: str, value):
+        super().on_setting_updated(key, value)
+        if key == "custom_command" and value:
+            BulletinHelper.show_success(f"Команда изменена на: {value}")
+
+
+def encrypt_text(text: str, password: str) -> str:
+    return CryptoUtils.encrypt(text, password)
+
+
+def decrypt_text(encrypted: str, password: str) -> Tuple[bool, str]:
+    success, decrypted, _ = CryptoUtils.decrypt(encrypted, password)
+    return success, decrypted
