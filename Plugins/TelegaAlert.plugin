@@ -1,0 +1,604 @@
+__id__ = "telega_lookup_alert"
+__name__ = "Telega Alert"
+__description__ = "АЛЕРТ ТЕЛЕГА ЮЗЕР ДЕТЕКТЕД🚨🚨🚨"
+__author__ = "@AltyPlugins"
+__version__ = "1.0.0"
+__icon__ = "telega_me/9"
+__min_version__ = "11.12.0"
+
+import json
+import time
+
+import requests
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, run_on_queue
+from com.exteragram.messenger.api.dto import BadgeDTO
+from hook_utils import find_class, get_private_field
+from org.telegram.messenger import DialogObject, MediaDataController, UserConfig, UserObject
+from org.telegram.tgnet import TLRPC
+
+try:
+    from java import dynamic_proxy, jclass
+except Exception:
+    dynamic_proxy = None
+    jclass = None
+
+try:
+    ViewOnClickListener = jclass("android.view.View$OnClickListener") if jclass is not None else None
+except Exception:
+    ViewOnClickListener = None
+
+
+CALLS_BASE_URL = "https://calls.okcdn.ru"
+CALLS_API_KEY = "CHKIPMKGDIHBABABA"
+SESSION_DATA = '{"device_id":"telega_alert","version":2,"client_version":"android_8","client_type":"SDK_ANDROID"}'
+LOOKUP_CACHE_TTL_SECONDS = 6 * 60 * 60
+LOOKUP_CACHE_KEY = "telega_lookup_cache_v1"
+ALERT_SHOWN_KEY = "telega_alert_shown_v1"
+BADGE_DOC_ID_KEY = "telega_badge_doc_id_v1"
+BADGE_DOCUMENT_ID = 5373294809337332962
+BADGE_PACK_NAME = "telega_me"
+BADGE_PACK_INDEX = 8
+
+
+def _now_ts():
+    return int(time.time())
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _get_attr(obj, *names):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(value):
+            try:
+                return value()
+            except Exception:
+                continue
+        return value
+    return None
+
+
+def _user_id(user):
+    return _safe_int(_get_attr(user, "id", "f1643id"), 0)
+
+
+def _document_id(document):
+    return _safe_int(_get_attr(document, "id", "f1488id"), 0)
+
+
+def _is_same_user(chat_activity, user_id):
+    user = _chat_user(chat_activity)
+    return user is not None and _user_id(user) == int(user_id)
+
+
+def _chat_user(chat_activity):
+    user = _get_attr(chat_activity, "getCurrentUser", "currentUser")
+    if user is not None:
+        return user
+    return get_private_field(chat_activity, "currentUser")
+
+
+def _chat_account(chat_activity):
+    value = _get_attr(chat_activity, "getCurrentAccount", "currentAccount")
+    if value is None:
+        value = get_private_field(chat_activity, "currentAccount")
+    if value is None:
+        value = _get_attr(UserConfig, "selectedAccount")
+    return _safe_int(value, 0)
+
+
+def _chat_avatar_container(chat_activity):
+    value = _get_attr(chat_activity, "avatarContainer")
+    if value is not None:
+        return value
+    return get_private_field(chat_activity, "avatarContainer")
+
+
+def _is_private_human_user(user):
+    if user is None:
+        return False
+    if _user_id(user) <= 0:
+        return False
+    try:
+        if UserObject.isUserSelf(user) or UserObject.isReplyUser(user):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+class _ChatResumeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._on_chat_resume(param.thisObject)
+        except Exception as exc:
+            self.plugin.log(f"Chat resume hook error: {exc}")
+
+
+class _ChatUpdateTitleHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            animate = bool(param.args[0]) if param.args and len(param.args) > 0 else False
+            self.plugin._on_chat_title_updated(param.thisObject, animate)
+        except Exception as exc:
+            self.plugin.log(f"Chat title hook error: {exc}")
+
+
+class _ProfileUpdateHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            animate = bool(param.args[0]) if param.args and len(param.args) > 0 else False
+            self.plugin._on_profile_updated(param.thisObject, animate)
+        except Exception as exc:
+            self.plugin.log(f"Profile hook error: {exc}")
+
+
+class TelegaAlertPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._lookup_cache = {}
+        self._alert_shown = {}
+        self._badge_doc_id = 0
+        self._lookups_inflight = set()
+        self._badge_resolve_inflight = False
+        self._click_listeners = {}
+
+    def on_plugin_load(self):
+        self._lookup_cache = self._load_json_setting(LOOKUP_CACHE_KEY)
+        self._alert_shown = self._load_json_setting(ALERT_SHOWN_KEY)
+        self._badge_doc_id = _safe_int(self.get_setting(BADGE_DOC_ID_KEY, BADGE_DOCUMENT_ID), BADGE_DOCUMENT_ID)
+
+        chat_activity_cls = find_class("org.telegram.ui.ChatActivity")
+        if not chat_activity_cls:
+            self.log("ChatActivity class not found")
+            return
+        profile_activity_cls = find_class("org.telegram.ui.ProfileActivity")
+
+        self.hook_all_methods(chat_activity_cls, "onResume", _ChatResumeHook(self))
+        self.hook_all_methods(chat_activity_cls, "updateTitle", _ChatUpdateTitleHook(self))
+        if profile_activity_cls:
+            self.hook_all_methods(profile_activity_cls, "updateProfileData", _ProfileUpdateHook(self))
+        self._ensure_badge_doc_id_loaded(_safe_int(_get_attr(UserConfig, "selectedAccount"), 0))
+
+    def on_plugin_unload(self):
+        self._lookups_inflight.clear()
+        self._badge_resolve_inflight = False
+        self._click_listeners.clear()
+
+    def _load_json_setting(self, key):
+        raw = self.get_setting(key, "{}")
+        try:
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_json_setting(self, key, value):
+        try:
+            self.set_setting(key, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        except Exception as exc:
+            self.log(f"Failed to save {key}: {exc}")
+
+    def _cache_get(self, user_id):
+        item = self._lookup_cache.get(str(int(user_id)))
+        if not isinstance(item, dict):
+            return None
+        checked_at = _safe_int(item.get("checked_at"), 0)
+        if checked_at <= 0 or (_now_ts() - checked_at) > LOOKUP_CACHE_TTL_SECONDS:
+            return None
+        return bool(item.get("value"))
+
+    def _cache_set(self, user_id, value):
+        self._lookup_cache[str(int(user_id))] = {"value": bool(value), "checked_at": _now_ts()}
+        self._save_json_setting(LOOKUP_CACHE_KEY, self._lookup_cache)
+
+    def _alert_was_shown(self, user_id):
+        return bool(self._alert_shown.get(str(int(user_id))))
+
+    def _mark_alert_shown(self, user_id):
+        self._alert_shown[str(int(user_id))] = True
+        self._save_json_setting(ALERT_SHOWN_KEY, self._alert_shown)
+
+    def _set_badge_doc_id(self, document_id):
+        document_id = _safe_int(document_id, 0)
+        if document_id <= 0:
+            return
+        if document_id == self._badge_doc_id:
+            return
+        self._badge_doc_id = document_id
+        self.set_setting(BADGE_DOC_ID_KEY, str(document_id))
+
+    def _on_chat_resume(self, chat_activity):
+        user = _chat_user(chat_activity)
+        if not _is_private_human_user(user):
+            return
+
+        user_id = _user_id(user)
+        cached = self._cache_get(user_id)
+        if cached is True:
+            if not self._alert_was_shown(user_id):
+                self._show_first_time_alert(chat_activity, user_id)
+            self._ensure_badge_doc_id_loaded(_chat_account(chat_activity))
+            self._apply_badge(chat_activity, False)
+            return
+        if cached is False:
+            return
+
+        self._start_lookup(chat_activity, _chat_account(chat_activity), user_id)
+
+    def _on_chat_title_updated(self, chat_activity, animate):
+        user = _chat_user(chat_activity)
+        if not _is_private_human_user(user):
+            return
+        if self._cache_get(_user_id(user)) is True:
+            self._apply_badge(chat_activity, animate)
+
+    def _start_lookup(self, chat_activity, account, user_id):
+        key = str(int(user_id))
+        if key in self._lookups_inflight:
+            return
+        self._lookups_inflight.add(key)
+
+        def worker():
+            try:
+                is_telega = self._lookup_is_telega_user(user_id)
+                if is_telega is None:
+                    return
+                self._cache_set(user_id, is_telega)
+                if is_telega:
+                    self._ensure_badge_doc_id_loaded(account)
+                    run_on_ui_thread(lambda: self._handle_positive_lookup(chat_activity, user_id))
+                    run_on_ui_thread(self._refresh_visible_badges)
+            finally:
+                self._lookups_inflight.discard(key)
+
+        run_on_queue(worker)
+
+    def _start_lookup_refresh_only(self, account, user_id):
+        key = str(int(user_id))
+        if key in self._lookups_inflight:
+            return
+        self._lookups_inflight.add(key)
+
+        def worker():
+            try:
+                is_telega = self._lookup_is_telega_user(user_id)
+                if is_telega is None:
+                    return
+                self._cache_set(user_id, is_telega)
+                if is_telega:
+                    self._ensure_badge_doc_id_loaded(account)
+                    run_on_ui_thread(self._refresh_visible_badges)
+            finally:
+                self._lookups_inflight.discard(key)
+
+        run_on_queue(worker)
+
+    def _lookup_is_telega_user(self, user_id):
+        try:
+            auth = requests.post(
+                f"{CALLS_BASE_URL}/api/auth/anonymLogin",
+                data={
+                    "application_key": CALLS_API_KEY,
+                    "session_data": SESSION_DATA,
+                },
+                headers={"Accept": "application/json"},
+                timeout=12,
+            )
+            auth.raise_for_status()
+            auth_json = auth.json()
+            session_key = str(auth_json.get("session_key") or "").strip()
+            if not session_key:
+                self.log("Telega lookup: no session_key returned")
+                return None
+
+            lookup = requests.post(
+                f"{CALLS_BASE_URL}/api/vchat/getOkIdsByExternalIds",
+                data={
+                    "application_key": CALLS_API_KEY,
+                    "session_key": session_key,
+                    "externalIds": '[{"id":"%s","ok_anonym":false}]' % int(user_id),
+                },
+                headers={"Accept": "application/json"},
+                timeout=12,
+            )
+            lookup.raise_for_status()
+            lookup_json = lookup.json()
+            ids = lookup_json.get("ids") or []
+            target = str(int(user_id))
+            for item in ids:
+                external = item.get("external_user_id") or {}
+                if str(external.get("id") or "") == target:
+                    return True
+            return False
+        except Exception as exc:
+            self.log(f"Telega lookup failed for {user_id}: {exc}")
+            return None
+
+    def _handle_positive_lookup(self, chat_activity, user_id):
+        if not _is_same_user(chat_activity, user_id):
+            return
+        if not self._alert_was_shown(user_id):
+            self._show_first_time_alert(chat_activity, user_id)
+        self._apply_badge(chat_activity, False)
+
+    def _show_first_time_alert(self, chat_activity, user_id):
+        activity = _get_attr(chat_activity, "getParentActivity")
+        if activity is None:
+            return
+        self._mark_alert_shown(user_id)
+        from ui.alert import AlertDialogBuilder
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Внимание")
+        builder.set_message("Этот собеседник пользуется Telega.")
+        builder.set_positive_button("Понятно", lambda bld, _which: bld.dismiss())
+        builder.show()
+
+    def _show_compromised_alert(self, chat_activity):
+        activity = _get_attr(chat_activity, "getParentActivity")
+        if activity is None:
+            return
+        from ui.alert import AlertDialogBuilder
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Внимание")
+        builder.set_message("Переписка с данным пользователем может быть скомпрометирована")
+        builder.set_positive_button("Понятно", lambda bld, _which: bld.dismiss())
+        builder.show()
+
+    def _ensure_badge_doc_id_loaded(self, account):
+        if self._badge_doc_id > 0 or self._badge_resolve_inflight:
+            return
+        self._badge_resolve_inflight = True
+        account = _safe_int(account, 0)
+
+        def worker():
+            try:
+                controller = MediaDataController.getInstance(account)
+                sticker_set = controller.getStickerSetByName(BADGE_PACK_NAME)
+                if sticker_set is None:
+                    try:
+                        controller.loadStickersByEmojiOrName(BADGE_PACK_NAME, False, True)
+                    except Exception as exc:
+                        self.log(f"Failed to request badge pack: {exc}")
+                    for _ in range(20):
+                        time.sleep(0.35)
+                        sticker_set = controller.getStickerSetByName(BADGE_PACK_NAME)
+                        if sticker_set is not None:
+                            break
+                document_id = self._extract_badge_document_id(sticker_set)
+                if document_id > 0:
+                    self._set_badge_doc_id(document_id)
+                    run_on_ui_thread(self._refresh_visible_badges)
+            finally:
+                self._badge_resolve_inflight = False
+
+        run_on_queue(worker)
+
+    def _extract_badge_document_id(self, sticker_set):
+        if sticker_set is None:
+            return 0
+        try:
+            documents = getattr(sticker_set, "documents", None)
+            if documents is None:
+                return 0
+            size = documents.size()
+            if BADGE_PACK_INDEX < 0 or BADGE_PACK_INDEX >= size:
+                return 0
+            document = documents.get(BADGE_PACK_INDEX)
+            return _document_id(document)
+        except Exception as exc:
+            self.log(f"Badge pack parse failed: {exc}")
+            return 0
+
+    def _refresh_visible_badges(self):
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        try:
+            class_name = str(fragment.getClass().getName() or "")
+        except Exception:
+            class_name = ""
+        if class_name.endswith(".ChatActivity"):
+            user = _chat_user(fragment)
+            if not _is_private_human_user(user):
+                return
+            if self._cache_get(_user_id(user)) is True:
+                self._apply_badge(fragment, False)
+            return
+        if class_name.endswith(".ProfileActivity"):
+            self._apply_profile_badge(fragment, False)
+
+    def _apply_badge(self, chat_activity, animate):
+        if self._badge_doc_id <= 0:
+            return False
+
+        user = _chat_user(chat_activity)
+        if not _is_private_human_user(user):
+            return False
+        user_id = _user_id(user)
+        if self._cache_get(user_id) is not True:
+            return False
+
+        avatar_container = _chat_avatar_container(chat_activity)
+        if avatar_container is None:
+            return False
+
+        title_view = _get_attr(avatar_container, "getTitleTextView")
+        if title_view is None:
+            return False
+
+        title_text = _get_attr(title_view, "getText")
+        if title_text is None:
+            title_text = UserObject.getUserName(user)
+
+        badge = BadgeDTO(int(self._badge_doc_id), None)
+        emoji_status = _get_attr(user, "emoji_status")
+        avatar_container.setTitle(
+            title_text,
+            bool(_get_attr(user, "scam")),
+            bool(_get_attr(user, "fake")),
+            bool(_get_attr(user, "verified")),
+            bool(_get_attr(user, "premium")),
+            badge,
+            emoji_status,
+            bool(animate),
+        )
+
+        title_view = _get_attr(avatar_container, "getTitleTextView")
+        if title_view is None:
+            return True
+
+        key = f"chat:{user_id}"
+        self._click_listeners.pop(key, None)
+        title_view.setRightDrawableOnClick(None)
+        title_view.setRightDrawable2OnClick(None)
+
+        listener = self._make_click_listener(key, chat_activity)
+        title_view.setRightDrawableOnClick(listener)
+        title_view.setRightDrawable2OnClick(listener)
+        return True
+
+    def _on_profile_updated(self, profile_activity, animate):
+        user = self._profile_user(profile_activity)
+        if not _is_private_human_user(user):
+            return
+        user_id = _user_id(user)
+        cached = self._cache_get(user_id)
+        if cached is True:
+            self._apply_profile_badge(profile_activity, animate)
+            return
+        if cached is None:
+            self._start_lookup_refresh_only(self._profile_account(profile_activity), user_id)
+
+    def _profile_user_id(self, profile_activity):
+        user_id = _safe_int(_get_attr(profile_activity, "userId"), 0)
+        if user_id <= 0:
+            user_id = _safe_int(get_private_field(profile_activity, "userId"), 0)
+        if user_id > 0:
+            return user_id
+        dialog_id = _safe_int(_get_attr(profile_activity, "getDialogId"), 0)
+        return dialog_id if dialog_id > 0 else 0
+
+    def _profile_account(self, profile_activity):
+        account = _safe_int(_get_attr(profile_activity, "currentAccount", "getCurrentAccount"), 0)
+        if account <= 0 and account != 0:
+            account = 0
+        try:
+            reflected = get_private_field(profile_activity, "currentAccount")
+            if reflected is not None:
+                account = _safe_int(reflected, account)
+        except Exception:
+            pass
+        return account
+
+    def _profile_user(self, profile_activity):
+        user_id = self._profile_user_id(profile_activity)
+        if user_id <= 0:
+            return None
+        try:
+            messages_controller = _get_attr(profile_activity, "getMessagesController")
+            if messages_controller is None:
+                return None
+            return messages_controller.getUser(user_id)
+        except Exception:
+            return None
+
+    def _profile_name_text_view(self, profile_activity, index):
+        try:
+            name_views = get_private_field(profile_activity, "nameTextView")
+            if name_views is None:
+                return None
+            return name_views[index]
+        except Exception:
+            return None
+
+    def _profile_badge_drawable(self, profile_activity, badge, animate, index):
+        try:
+            for method in profile_activity.getClass().getDeclaredMethods():
+                if str(method.getName() or "") != "getBadgeDrawable":
+                    continue
+                params = method.getParameterTypes()
+                if params is None or len(params) != 3:
+                    continue
+                method.setAccessible(True)
+                return method.invoke(profile_activity, badge, bool(animate), int(index))
+        except Exception as exc:
+            self.log(f"Profile badge invoke failed: {exc}")
+        return None
+
+    def _apply_profile_badge(self, profile_activity, animate):
+        if self._badge_doc_id <= 0:
+            return False
+
+        user = self._profile_user(profile_activity)
+        if not _is_private_human_user(user):
+            return False
+        user_id = _user_id(user)
+        if self._cache_get(user_id) is not True:
+            return False
+
+        badge = BadgeDTO(int(self._badge_doc_id), None)
+        listener = lambda _view, profile_activity=profile_activity: self._show_compromised_alert(profile_activity)
+
+        applied = False
+        for index in (0, 1):
+            name_view = self._profile_name_text_view(profile_activity, index)
+            if name_view is None:
+                continue
+            drawable = self._profile_badge_drawable(profile_activity, badge, animate, index)
+            if drawable is None:
+                continue
+            try:
+                key = f"profile:{user_id}:{index}"
+                self._click_listeners.pop(key, None)
+                name_view.setRightDrawable2(drawable)
+                name_view.setRightDrawableOnClick(None)
+                name_view.setRightDrawable2OnClick(self._make_click_listener(key, profile_activity))
+                applied = True
+            except Exception as exc:
+                self.log(f"Profile badge apply failed: {exc}")
+        return applied
+
+    def _make_click_listener(self, key, host):
+        if dynamic_proxy is not None and ViewOnClickListener is not None:
+            plugin = self
+
+            class _Listener(dynamic_proxy(ViewOnClickListener)):
+                def onClick(self, _view):
+                    plugin._show_compromised_alert(host)
+
+            listener = _Listener()
+        else:
+            listener = lambda _view, host=host: self._show_compromised_alert(host)
+        self._click_listeners[key] = listener
+        return listener
+
+    def _badge_is_primary(self, user):
+        emoji_status = _get_attr(user, "emoji_status")
+        try:
+            has_emoji_status = DialogObject.getEmojiStatusDocumentId(emoji_status) != 0
+        except Exception:
+            has_emoji_status = False
+        return bool(_get_attr(user, "premium")) and not has_emoji_status
