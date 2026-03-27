@@ -1,0 +1,1138 @@
+__id__ = "safesend"
+__name__ = "SafeSend"
+__description__ = "🇷🇺 Защита от случайной отправки личных данных: предупреждает о рисках, маскирует текст и учитывает белый список\n🇬🇧 Guard against accidental private data leaks: warns about risks, masks text and respects your whitelist"
+__author__ = "@nokirby"
+__version__ = "2.0"
+__icon__ = "liseke/2"
+__min_version__ = "11.12.0"
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from hook_utils import find_class
+from client_utils import send_message, get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from android_utils import run_on_ui_thread
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import re, os, tempfile, time
+
+
+DEFAULTS = {
+    "enabled": True,
+    "scan_email": True,
+    "scan_phone": True,
+    "scan_card": True,
+    "scan_iban": True,
+    "scan_geo": True,
+    "scan_addr": False,
+    "scan_links": True,
+    "cleanLinks": False,
+    "resolve_shorteners": False,
+    "mask_keep": 4,
+    "strip_exif": True,
+    "recMode": 0,
+    "whitelist_peers": "",
+}
+
+RE_EMAIL   = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+RE_PHONE   = re.compile(r"(?:\+?\d[\s\-\(\)]?){6,}\d")
+RE_CC      = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+RE_IBAN    = re.compile(r"\b[A-Z]{2}[0-9A-Z]{13,34}\b")
+RE_COORDS  = re.compile(r"\b([\-+]?\d{1,2}\.\d{3,}),\s*([\-+]?\d{1,3}\.\d{3,})\b")
+RE_ADDR    = re.compile(r"\b(?:ул\.|улица|проспект|пр-т|пр-т\.|дом|д\.)\s*[^\n,]{2,}", re.I)
+RE_URL     = re.compile(r"https?://[^\s)>\]]+")
+SHORTENERS = {"t.co","bit.ly","tinyurl.com","goo.gl","ow.ly","buff.ly","t.ly","is.gd","s.id"}
+SOFT_HYPHEN = "\u00ad"
+MktQ = {"dclid", "gclid", "gbraid", "wbraid"}
+SocQ = {"fbclid", "igsh", "igshid"}
+MailQ = {"mc_cid", "mc_eid", "mkt_tok", "ml_subscriber", "ml_subscriber_hash"}
+RefQ = {"feature", "mibextid", "ref", "ref_src", "ref_url", "source", "src"}
+ShareQ = {
+    "_r", "is_from_webapp", "sender_device", "sender_web_id",
+    "share_app_id", "share_iid", "share_link_id", "si",
+    "tt_content_id", "tt_from", "tt_medium", "tt_network", "tt_webid"
+}
+BadQ = MktQ | SocQ | MailQ | RefQ | ShareQ
+RiskNames = {
+    "email": "Email",
+    "phone": "Телефон",
+    "card": "Банковская карта",
+    "iban": "IBAN счет",
+    "geo": "Координаты",
+    "addr": "Адрес",
+    "link": "Подозрительная ссылка",
+}
+
+def _has_puny(host: str) -> bool:
+    return "xn--" in host.lower()
+
+def _luhn_ok(number: str) -> bool:
+    digits = [int(d) for d in re.sub(r"\D","", number)]
+    if len(digits) < 12:
+        return False
+    s = 0
+    alt = False
+    for d in reversed(digits):
+        if alt:
+            dbl = d * 2
+            s += dbl - 9 if dbl > 9 else dbl
+        else:
+            s += d
+        alt = not alt
+    return s % 10 == 0
+
+def _mask_digits(s: str, keep: int = 4) -> str:
+    idxs = [i for i, ch in enumerate(s) if ch.isdigit()]
+    cutoff = max(0, len(idxs) - keep)
+    out = list(s)
+    for j, pos in enumerate(idxs):
+        if j < cutoff:
+            out[pos] = "•"
+    return "".join(out)
+
+def asInt(v, d: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+def normWl(v: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    for p in (
+        "https://t.me/",
+        "http://t.me/",
+        "https://telegram.me/",
+        "http://telegram.me/",
+    ):
+        if low.startswith(p):
+            s = s[len(p):]
+            s = s.split("?", 1)[0].split("#", 1)[0].strip("/")
+            if "/" in s:
+                s = s.split("/", 1)[0]
+            break
+    if s.startswith("@"):
+        s = s[1:]
+    low = s.lower()
+    if low.startswith("id:"):
+        s = s[3:].strip()
+    return s.strip().lower()
+
+def splitWl(v: str):
+    return [t for t in (normWl(x) for x in re.split(r"[,;\n]+", str(v or ""))) if t]
+
+def getFld(obj, name, d=None):
+    if obj is None:
+        return d
+    try:
+        cls = obj.getClass()
+        while cls is not None:
+            try:
+                fld = cls.getDeclaredField(name)
+                fld.setAccessible(True)
+                return fld.get(obj)
+            except Exception:
+                cls = cls.getSuperclass()
+    except Exception:
+        pass
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return d
+
+def setFld(obj, name, val):
+    if obj is None:
+        return False
+    try:
+        cls = obj.getClass()
+        while cls is not None:
+            try:
+                fld = cls.getDeclaredField(name)
+                fld.setAccessible(True)
+                fld.set(obj, val)
+                return True
+            except Exception:
+                cls = cls.getSuperclass()
+    except Exception:
+        pass
+    try:
+        setattr(obj, name, val)
+        return True
+    except Exception:
+        return False
+
+def callJava(m, obj, args=None):
+    m.setAccessible(True)
+    if args is None:
+        return m.invoke(obj, None)
+    vals = [a for a in args]
+    if not vals:
+        return m.invoke(obj, None)
+    return m.invoke(obj, vals)
+
+def safeCall(obj, name, *args):
+    try:
+        getattr(obj, name)(*args)
+        return True
+    except Exception:
+        return False
+
+def _scan_text(text: str, cfg: dict):
+    findings = []
+    redacted = text
+    keep = max(0, asInt(cfg.get("mask_keep", 4), 4))
+    if cfg.get("scan_email"):
+        for m in RE_EMAIL.findall(text):
+            findings.append(("email", m))
+            redacted = redacted.replace(m, "***@***")
+    if cfg.get("scan_phone"):
+        for m in RE_PHONE.findall(text):
+            if len(re.sub(r"\D","", m)) >= 10:
+                findings.append(("phone", m))
+                redacted = redacted.replace(m, _mask_digits(m, keep))
+    if cfg.get("scan_card"):
+        for m in RE_CC.findall(text):
+            if _luhn_ok(m):
+                findings.append(("card", m))
+                redacted = redacted.replace(m, _mask_digits(m, keep))
+    if cfg.get("scan_iban"):
+        for m in RE_IBAN.findall(text):
+            findings.append(("iban", m))
+            redacted = redacted.replace(m, m[:4] + " " + "•"*8 + " ...")
+    if cfg.get("scan_geo"):
+        for m in RE_COORDS.findall(text):
+            val = ",".join(m)
+            findings.append(("geo", val))
+            redacted = redacted.replace(val, "⟨coords hidden⟩")
+    if cfg.get("scan_addr"):
+        for m in RE_ADDR.findall(text):
+            findings.append(("addr", m))
+            redacted = redacted.replace(m, "⟨addr hidden⟩")
+    if cfg.get("scan_links"):
+        for url in RE_URL.findall(text):
+            try:
+                host = re.sub(r"^https?://","", url).split("/")[0]
+                if host in SHORTENERS or _has_puny(host):
+                    findings.append(("link", url))
+                    redacted = redacted.replace(url, "⟨link hidden⟩")
+            except Exception:
+                pass
+    return findings, redacted
+
+class _PhotoPrepareHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+    def before_hooked_method(self, param):
+        try:
+            if not self.p.get_setting("strip_exif", True):
+                return
+            path = None
+            for a in param.args:
+                try:
+                    if a is None:
+                        continue
+                    if a.getClass().getName() == "java.lang.String":
+                        s = str(a)
+                        if s.lower().endswith((".jpg", ".jpeg", ".png")) and os.path.exists(s):
+                            path = s
+                            break
+                except Exception:
+                    continue
+            if not path:
+                return
+            from android.graphics import BitmapFactory, Bitmap
+            from java.io import FileOutputStream
+            bmp = BitmapFactory.decodeFile(path)
+            if bmp is None:
+                return
+            tmp = os.path.join(tempfile.gettempdir(), f"safesend_{abs(hash(path))}" + (".png" if path.lower().endswith(".png") else ".jpg"))
+            fos = FileOutputStream(tmp)
+            try:
+                if tmp.lower().endswith(".png"):
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                else:
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 92, fos)
+            finally:
+                try:
+                    fos.close()
+                except Exception:
+                    pass
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
+            for i, a in enumerate(param.args):
+                try:
+                    if a is not None and a.getClass().getName() == "java.lang.String" and str(a) == path:
+                        param.args[i] = tmp
+                except Exception:
+                    pass
+        except Exception as e:
+            self.p.log(f"SafeSend EXIF error: {e}")
+
+class RecRunHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+    def before_hooked_method(self, param):
+        try:
+            view = getFld(param.thisObject, "this$0")
+            if view is None:
+                return
+            wasCalled = bool(getFld(view, "calledRecordRunnable", False))
+            wasRec = bool(getFld(view, "recordingAudioVideo", False))
+            setFld(view, "calledRecordRunnable", True)
+            setFld(view, "recordAudioVideoRunnableStarted", False)
+            self.p.guardRec(param, view, bool(view.isInVideoMode()), "run", wasCalled, wasRec)
+        except Exception as e:
+            self.p.log(f"SafeSend rec run error: {e}")
+
+class RecCamHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+    def before_hooked_method(self, param):
+        try:
+            view = param.thisObject
+            self.p.guardRec(param, view, True, "cam", False, bool(getFld(view, "recordingAudioVideo", False)))
+        except Exception as e:
+            self.p.log(f"SafeSend rec cam error: {e}")
+
+class PrevUrlHook(MethodHook):
+    def __init__(self, plugin):
+        self.p = plugin
+    def before_hooked_method(self, param):
+        try:
+            if not self.p.get_setting("cleanLinks", False):
+                return
+            from java.lang import CharSequence, Thread
+            from java.util import ArrayList
+            ok = False
+            for el in Thread.currentThread().getStackTrace()[2:]:
+                if (
+                    el.getClassName().startswith("org.telegram.messenger.DispatchQueue")
+                    and el.getMethodName() == "run"
+                ):
+                    ok = True
+                    break
+            if not ok:
+                return
+            items = ArrayList()
+            changed = 0
+            for seq in param.args[1].toArray():
+                if not isinstance(seq, CharSequence):
+                    items.add(seq)
+                    continue
+                src = str(seq)
+                dst = self.p.cleanUrl(src)
+                if dst != src:
+                    changed += 1
+                items.add(dst)
+            if changed > 0:
+                param.args[1] = items
+        except Exception as e:
+            self.p.log(f"SafeSend prev url error: {e}")
+
+class SafeSendGuard(BasePlugin):
+    ttMirror = "tnktok.com"
+    ytWatchQs = {"v", "list", "t", "start", "index"}
+    ytPathQs = {"list", "t", "start", "index"}
+    igQs = {"img_index"}
+    fbStoryQs = {"story_fbid", "id", "substory_index"}
+    rdBadQs = {"rdt", "share_id"}
+    amzBadQs = {
+        "ascsubtag", "camp", "creative", "linkcode", "pd_rd_r",
+        "pd_rd_w", "pd_rd_wg", "pf_rd_p", "pf_rd_r", "psc",
+        "smid", "tag"
+    }
+    aliBadQs = {
+        "aff_fcid", "aff_fsk", "aff_platform", "aff_trace_key",
+        "algo_exp_id", "algo_pvid", "browser_id", "biztype",
+        "cv", "dp", "gatewayadapt", "mall_affr", "scm",
+        "scm_id", "scm-url", "social_params", "spm", "srcsns",
+        "spreadtype", "terminal_id", "tt"
+    }
+    def on_plugin_load(self):
+        for k, v in DEFAULTS.items():
+            if self.get_setting(k, None) is None:
+                self.set_setting(k, v)
+        self._bypass_next = False
+        self.recRunPass = None
+        self.recCamPass = None
+        self.recMute = None
+        self.add_on_send_message_hook()
+        try:
+            smh_class = find_class("org.telegram.messenger.SendMessagesHelper")
+            methods = smh_class.getClass().getDeclaredMethods()
+            hooked = 0
+            ph = _PhotoPrepareHook(self)
+            for m in methods:
+                try:
+                    if m.getName() == "prepareSendingPhoto":
+                        m.setAccessible(True)
+                        self.hook_method(m, ph)
+                        hooked += 1
+                except Exception:
+                    continue
+            self.log(f"SafeSend: hooked photo methods = {hooked}")
+        except Exception as e:
+            self.log(f"SafeSend: photo hook failed: {e}")
+        self.hookRec()
+        self.hookClean()
+    def hookRec(self):
+        try:
+            runClass = find_class("org.telegram.ui.Components.ChatActivityEnterView$8")
+            if runClass:
+                runMethod = self.getMeth(runClass, "run", 0)
+                if runMethod:
+                    self.hook_method(runMethod, RecRunHook(self))
+        except Exception as e:
+            self.log(f"SafeSend: rec run hook failed: {e}")
+        try:
+            ChatActivityEnterView = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            if ChatActivityEnterView:
+                camMethod = self.getMeth(ChatActivityEnterView, "openCamera", 1)
+                if camMethod:
+                    self.hook_method(camMethod, RecCamHook(self))
+        except Exception as e:
+            self.log(f"SafeSend: rec cam hook failed: {e}")
+    def getMeth(self, klass, name, argc=None):
+        try:
+            methods = klass.getClass().getDeclaredMethods()
+            for m in methods:
+                try:
+                    if m.getName() != name:
+                        continue
+                    if argc is not None and len(m.getParameterTypes()) != argc:
+                        continue
+                    m.setAccessible(True)
+                    return m
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+    def hookClean(self):
+        try:
+            textUtils = find_class("android.text.TextUtils")
+            if textUtils:
+                joinMethod = None
+                for m in textUtils.getClass().getDeclaredMethods():
+                    try:
+                        if m.getName() != "join":
+                            continue
+                        types = m.getParameterTypes()
+                        if len(types) != 2:
+                            continue
+                        if "Iterable" not in str(types[1].getName()):
+                            continue
+                        m.setAccessible(True)
+                        joinMethod = m
+                        break
+                    except Exception:
+                        continue
+                if joinMethod:
+                    self.hook_method(joinMethod, PrevUrlHook(self))
+        except Exception as e:
+            self.log(f"SafeSend: clean hook failed: {e}")
+    def getMc(self, account):
+        try:
+            if not getattr(self, "mcClass", None):
+                self.mcClass = find_class("org.telegram.messenger.MessagesController")
+            if self.mcClass:
+                return self.mcClass.getInstance(asInt(account, 0))
+        except Exception:
+            pass
+        return None
+    def getPeerTags(self, account, peer):
+        tags = set()
+        pid = asInt(peer, 0)
+        if not pid:
+            return tags
+        tags.add(str(pid).lower())
+        mc = self.getMc(account)
+        if not mc:
+            return tags
+        try:
+            if pid > 0:
+                user = mc.getUser(pid)
+                if user:
+                    uname = getattr(user, "username", None)
+                    if uname:
+                        tags.add(str(uname).strip().lower())
+                    name = " ".join(
+                        p for p in (
+                            str(getattr(user, "first_name", "") or "").strip(),
+                            str(getattr(user, "last_name", "") or "").strip(),
+                        )
+                        if p
+                    ).strip()
+                    if name:
+                        tags.add(name.lower())
+            else:
+                chat = mc.getChat(-pid)
+                if chat:
+                    uname = getattr(chat, "username", None)
+                    if uname:
+                        tags.add(str(uname).strip().lower())
+                    title = str(getattr(chat, "title", "") or "").strip()
+                    if title:
+                        tags.add(title.lower())
+        except Exception:
+            pass
+        return tags
+    def _peer_whitelisted(self, account, peer) -> bool:
+        wl = self.get_setting("whitelist_peers", "")
+        if not wl:
+            return False
+        tags = self.getPeerTags(account, peer)
+        if not tags:
+            return False
+        for t in splitWl(wl):
+            if t in tags:
+                return True
+        return False
+    def getRecMode(self):
+        mode = asInt(self.get_setting("recMode", 0), 0)
+        if mode < 0:
+            return 0
+        if mode > 2:
+            return 2
+        return mode
+    def getRecPeer(self, view):
+        return asInt(getFld(view, "dialog_id", 0), 0)
+    def getRecAcct(self, view):
+        return asInt(getFld(view, "currentAccount", 0), 0)
+    def recSlot(self, kind):
+        return "recCamPass" if kind == "cam" else "recRunPass"
+    def clearRecPass(self, kind):
+        setattr(self, self.recSlot(kind), None)
+    def setRecPass(self, kind, acct, peer):
+        setattr(self, self.recSlot(kind), {
+            "acct": asInt(acct, 0),
+            "peer": asInt(peer, 0),
+            "at": time.monotonic(),
+        })
+    def takeRecPass(self, kind, acct, peer):
+        item = getattr(self, self.recSlot(kind), None)
+        if not item:
+            return False
+        if time.monotonic() - float(item.get("at", 0.0)) > 8.0:
+            self.clearRecPass(kind)
+            return False
+        if item.get("acct") != asInt(acct, 0) or item.get("peer") != asInt(peer, 0):
+            return False
+        self.clearRecPass(kind)
+        return True
+    def setRecMute(self, acct, peer, sec=1.2):
+        self.recMute = {
+            "acct": asInt(acct, 0),
+            "peer": asInt(peer, 0),
+            "to": time.monotonic() + float(sec),
+        }
+    def clearRecMute(self):
+        self.recMute = None
+    def hasRecMute(self, acct, peer):
+        item = self.recMute
+        if not item:
+            return False
+        if time.monotonic() > float(item.get("to", 0.0)):
+            self.clearRecMute()
+            return False
+        return (
+            item.get("acct") == asInt(acct, 0)
+            and item.get("peer") == asInt(peer, 0)
+        )
+    def getAct(self):
+        fragment = get_last_fragment()
+        if not fragment:
+            return None
+        try:
+            return fragment.getParentActivity()
+        except Exception:
+            return None
+    def flatText(self, text):
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+    def clipText(self, text, limit=120):
+        out = self.flatText(text)
+        if len(out) <= limit:
+            return out
+        return out[:max(1, limit - 1)].rstrip() + "…"
+    def mkDlg(self, activity, title, msg):
+        b = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        b.set_title(title)
+        b.set_message(str(msg or ""))
+        safeCall(b, "set_message_text_view_clickable", False)
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            safeCall(b, "set_dialog_button_color_key", Theme.key_dialogButton)
+        except Exception:
+            pass
+        safeCall(b, "set_blurred_background", True)
+        safeCall(b, "set_dim_enabled", True)
+        return b
+    def showDlg(self, title, msg, bind):
+        def show():
+            activity = self.getAct()
+            if not activity:
+                BulletinHelper.show_error("SafeSend: нет активного экрана для диалога")
+                return
+            b = self.mkDlg(activity, title, msg)
+            bind(b)
+            dlg = b.show()
+            if not safeCall(dlg, "set_cancelable", True):
+                safeCall(b, "set_cancelable", True)
+            if not safeCall(dlg, "set_canceled_on_touch_outside", True):
+                safeCall(b, "set_canceled_on_touch_outside", True)
+        try:
+            run_on_ui_thread(show)
+        except Exception:
+            BulletinHelper.show_error("SafeSend: ошибка показа диалога")
+    def sendText(self, peer, msg, replyMsg=None, replyTop=None, bypass=False):
+        if bypass:
+            self._bypass_next = True
+        data = {"peer": peer, "message": msg}
+        if replyMsg:
+            data["replyToMsg"] = replyMsg
+        if replyTop:
+            data["replyToTopMsg"] = replyTop
+        send_message(data)
+    def countRisks(self, findings):
+        kinds = {}
+        for kind, _ in findings:
+            kinds[kind] = kinds.get(kind, 0) + 1
+        return kinds
+    def buildRiskMsg(self, findings, msg, redacted):
+        risks = "\n".join(
+            f"• {RiskNames.get(kind, kind)}: {count} шт."
+            for kind, count in self.countRisks(findings).items()
+        )
+        return (
+            "SafeSend нашёл возможные личные данные.\n\n"
+            f"Риски:\n{risks}\n\n"
+            f"Как есть:\n{self.clipText(msg, 120)}\n\n"
+            f"После маскировки:\n{self.clipText(redacted, 120)}"
+        )
+    def runRec(self, kind, acct, peer, method, obj, args=None):
+        try:
+            self.setRecPass(kind, acct, peer)
+            if kind == "run":
+                self.setRecMute(acct, peer)
+            return callJava(method, obj, args)
+        except Exception as e:
+            self.clearRecPass(kind)
+            if kind != "cam":
+                self.clearRecMute()
+            self.log(f"SafeSend rec resume error: {e}")
+            try:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("SafeSend: не удалось продолжить запись"))
+            except Exception:
+                pass
+    def showRecStop(self, kind):
+        msg = f"SafeSend: запись {kind} разрешена только в чатах из белого списка"
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(msg))
+        except Exception:
+            pass
+    def showRecAsk(self, kind, onOk):
+        msg = (
+            "Чат не входит в белый список SafeSend.\n\n"
+            f"Начать запись {kind} только в этом чате?"
+        )
+        def bind(b):
+            def ok(dlg, _which):
+                dlg.dismiss()
+                onOk()
+            b.set_positive_button("Начать", ok)
+            b.set_negative_button("Отмена", lambda dlg, _which: dlg.dismiss())
+        self.showDlg("Запись вне белого списка", msg, bind)
+    def getRecFlow(self, view, src, acct, peer, wasCalled, wasRec):
+        if self.takeRecPass(src, acct, peer):
+            return "pass"
+        if src == "run" and wasCalled:
+            return "drop"
+        if src == "cam" and wasRec:
+            return "drop"
+        if src == "run":
+            if self.hasRecMute(acct, peer):
+                return "drop"
+            if bool(getFld(view, "recordingAudioVideo", False)):
+                return "drop"
+        return ""
+    def resumeRec(self, src, acct, peer, isVideo, param):
+        if isVideo and src != "cam":
+            self.setRecPass("cam", acct, peer)
+        self.runRec(src, acct, peer, param.method, param.thisObject, param.args)
+    def guardRec(self, param, view, isVideo, src, wasCalled=False, wasRec=False):
+        if not self.get_setting("enabled", True):
+            return
+        mode = self.getRecMode()
+        if mode <= 0:
+            return
+        acct = self.getRecAcct(view)
+        peer = self.getRecPeer(view)
+        if not peer:
+            return
+        flow = self.getRecFlow(view, src, acct, peer, wasCalled, wasRec)
+        if flow == "pass":
+            return
+        if flow == "drop":
+            param.setResult(None)
+            return
+        if self._peer_whitelisted(acct, peer):
+            return
+        msgKind = "кружка" if isVideo else "голосового сообщения"
+        if mode >= 2:
+            self.showRecStop(msgKind)
+            param.setResult(None)
+            return
+        self.showRecAsk(msgKind, lambda: self.resumeRec(src, acct, peer, isVideo, param))
+        param.setResult(None)
+    def isBadQ(self, key):
+        k = str(key or "").strip().lower()
+        if not k:
+            return False
+        return k.startswith("utm_") or k in BadQ
+    def dropQs(self, query, extra=()):
+        deny = {str(k).lower() for k in extra}
+        return urlencode(
+            [
+                (k, v) for k, v in parse_qsl(str(query or ""), keep_blank_values=True)
+                if not self.isBadQ(k) and str(k).lower() not in deny
+            ],
+            doseq=True
+        )
+    def hostLow(self, host):
+        return str(host or "").split(":", 1)[0].lower()
+    def hostRoot(self, host):
+        low = self.hostLow(host)
+        for prefix in ("www.", "m.", "mobile."):
+            if low.startswith(prefix):
+                return low[len(prefix):]
+        return low
+    def keepQs(self, query, keep):
+        allow = {str(k).lower() for k in keep}
+        return urlencode(
+            [(k, v) for k, v in parse_qsl(str(query or ""), keep_blank_values=True) if str(k).lower() in allow],
+            doseq=True
+        )
+    def normPath(self, path):
+        return re.split(r"[?#]", str(path or ""), 1)[0]
+    def isTtHost(self, host):
+        low = self.hostLow(host)
+        return low == "tiktok.com" or low.endswith(".tiktok.com")
+    def isYtHost(self, host):
+        root = self.hostRoot(host)
+        return root == "youtu.be" or root.endswith("youtube.com")
+    def isIgHost(self, host):
+        return self.hostRoot(host).endswith("instagram.com")
+    def isXHost(self, host):
+        root = self.hostRoot(host)
+        return root == "x.com" or root == "twitter.com"
+    def isFbHost(self, host):
+        root = self.hostRoot(host)
+        return root == "facebook.com" or root == "fb.com"
+    def isRdHost(self, host):
+        low = self.hostLow(host)
+        return low == "redd.it" or low == "reddit.com" or low.endswith(".reddit.com")
+    def isAmzHost(self, host):
+        low = self.hostLow(host)
+        return low in ("a.co", "amzn.to") or low.startswith("amazon.") or ".amazon." in low
+    def isAliHost(self, host):
+        low = self.hostLow(host)
+        return low == "aliexpress.com" or low.endswith(".aliexpress.com")
+    def ttHost(self, host):
+        low = self.hostLow(host)
+        if low == "tiktok.com":
+            return self.ttMirror
+        head = low.rsplit("tiktok.com", 1)[0]
+        return f"{head}{self.ttMirror}"
+    def ttPick(self, host, path):
+        clean = self.normPath(path)
+        if not clean:
+            return clean
+        parts = [p for p in clean.split("/") if p]
+        if not parts:
+            return clean
+        if str(host or "").startswith(("vt.", "vm.")):
+            return f"/{parts[0]}"
+        if parts[0].startswith("@") and len(parts) >= 3 and parts[1] == "video" and parts[2].isdigit():
+            return "/" + "/".join(parts[:3])
+        if parts[0] == "video" and len(parts) >= 2 and parts[1].isdigit():
+            return "/" + "/".join(parts[:2])
+        return clean
+    def packUrl(self, scheme, host, path, query="", frag=""):
+        return urlunsplit((str(scheme or ""), str(host or ""), str(path or ""), str(query or ""), str(frag or "")))
+    def amzItem(self, path):
+        clean = self.normPath(path)
+        m = re.search(r"/(?:gp/(?:product|aw/d)|dp|[^/]+/dp)/([A-Z0-9]{10})(?:[/?]|$)", clean, re.I)
+        if not m:
+            return ""
+        return f"/dp/{m.group(1).upper()}"
+    def aliItem(self, path):
+        clean = self.normPath(path)
+        m = re.search(r"/item/(\d+)\.html(?:[/?]|$)", clean, re.I)
+        if m:
+            return f"/item/{m.group(1)}.html"
+        m = re.search(r"/i/(\d+)\.html(?:[/?]|$)", clean, re.I)
+        if m:
+            return f"/i/{m.group(1)}.html"
+        return ""
+    def cleanYt(self, scheme, host, path, query, frag):
+        clean = self.normPath(path)
+        if self.hostRoot(host) == "youtu.be":
+            return self.packUrl(scheme, host, clean, self.keepQs(query, self.ytPathQs), frag)
+        if clean == "/watch":
+            return self.packUrl(scheme, host, clean, self.keepQs(query, self.ytWatchQs), frag)
+        return self.packUrl(scheme, host, clean, self.keepQs(query, self.ytPathQs), frag)
+    def cleanIg(self, scheme, host, path, query, frag):
+        return self.packUrl(scheme, host, self.normPath(path), self.keepQs(query, self.igQs), frag)
+    def cleanX(self, scheme, host, path, _query, frag):
+        return self.packUrl(scheme, host, self.normPath(path), "", frag)
+    def cleanFb(self, scheme, host, path, query, frag):
+        clean = self.normPath(path)
+        if clean == "/story.php":
+            return self.packUrl(scheme, host, clean, self.keepQs(query, self.fbStoryQs), frag)
+        return self.packUrl(scheme, host, clean, self.dropQs(query), frag)
+    def cleanRd(self, scheme, host, path, query, frag):
+        return self.packUrl(scheme, host, self.normPath(path), self.dropQs(query, self.rdBadQs), frag)
+    def cleanAmz(self, scheme, host, path, query, frag):
+        item = self.amzItem(path)
+        if item:
+            return self.packUrl(scheme, host, item, "", "")
+        clean = self.normPath(path)
+        if clean == "/s":
+            return self.packUrl(scheme, host, clean, self.keepQs(query, {"k", "i", "node", "page", "rh"}), frag)
+        return self.packUrl(scheme, host, clean, self.dropQs(query, self.amzBadQs), frag)
+    def cleanAli(self, scheme, host, path, query, frag):
+        item = self.aliItem(path)
+        if item:
+            return self.packUrl(scheme, host, item, self.keepQs(query, {"sku_id"}), frag)
+        return self.packUrl(scheme, host, self.normPath(path), self.dropQs(query, self.aliBadQs), frag)
+    def svcCleaners(self):
+        return (
+            (self.isYtHost, self.cleanYt),
+            (self.isIgHost, self.cleanIg),
+            (self.isXHost, self.cleanX),
+            (self.isFbHost, self.cleanFb),
+            (self.isRdHost, self.cleanRd),
+            (self.isAmzHost, self.cleanAmz),
+            (self.isAliHost, self.cleanAli),
+        )
+    def cleanUrl(self, url):
+        try:
+            raw = str(url or "").strip()
+            if not raw:
+                return raw
+            parts = urlsplit(raw)
+            if not parts.scheme or not parts.netloc:
+                return raw
+            host = str(parts.netloc or "")
+            path = str(parts.path or "")
+            query = self.dropQs(parts.query)
+            frag = str(parts.fragment or "")
+            if self.isTtHost(host):
+                return self.packUrl("https", self.ttHost(host), self.ttPick(host.lower(), path), query, frag)
+            for isHost, clean in self.svcCleaners():
+                if isHost(host):
+                    return clean(parts.scheme, host, path, parts.query, frag)
+            return self.packUrl(parts.scheme, host, path, query, frag)
+        except Exception as e:
+            self.log(f"SafeSend clean url error: {e}")
+            return url
+    def cleanMsg(self, msg):
+        text = RE_URL.sub(" ", str(msg or ""))
+        text = re.sub(r" ([,\.!?])", r"\1", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        return text
+    def iterEnts(self, ents):
+        if ents is None:
+            return []
+        try:
+            return list(ents.toArray())
+        except Exception:
+            try:
+                return list(ents)
+            except Exception:
+                return []
+    def isUrlEnt(self, ent):
+        if ent is None:
+            return False
+        try:
+            name = ent.getClass().getSimpleName()
+        except Exception:
+            name = ent.__class__.__name__
+        return name in ("TL_messageEntityUrl", "TL_messageEntityTextUrl")
+    def dropUrlEnts(self, params):
+        ents = getattr(params, "entities", None)
+        if self.entSize(ents) <= 0:
+            return True
+        items = self.iterEnts(ents)
+        if not items or any(not self.isUrlEnt(ent) for ent in items):
+            return False
+        try:
+            ents.clear()
+        except Exception:
+            params.entities = None
+        return True
+    def canCleanLinks(self, params):
+        if not self.get_setting("cleanLinks", False):
+            return None
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return None
+        if not self.dropUrlEnts(params):
+            return None
+        return msg
+    def utf16Len(self, s):
+        return len(str(s or "").encode("utf-16-le")) // 2
+    def entSize(self, ents):
+        if ents is None:
+            return 0
+        try:
+            return int(ents.size())
+        except Exception:
+            try:
+                return len(ents)
+            except Exception:
+                return 0
+    def buildTextUrls(self, params, clean, fixed):
+        from java.util import ArrayList
+        from org.telegram.tgnet import TLRPC
+        text = clean + (SOFT_HYPHEN * len(fixed))
+        ents = getattr(params, "entities", None)
+        if ents is None:
+            ents = ArrayList()
+            params.entities = ents
+        base = self.utf16Len(text) - len(fixed)
+        for i, url in enumerate(fixed):
+            ent = TLRPC.TL_messageEntityTextUrl()
+            ent.offset = base + i
+            ent.length = 1
+            ent.url = url
+            ents.add(ent)
+        params.message = text
+    def applyLinks(self, params):
+        msg = self.canCleanLinks(params)
+        if msg is None:
+            return None
+        urls = [m.group(0) for m in RE_URL.finditer(msg)]
+        if not urls:
+            return None
+        fixed = [self.cleanUrl(url) for url in urls]
+        self.buildTextUrls(params, self.cleanMsg(msg), fixed)
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
+    def on_send_message_hook(self, account, params):
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+        if self._bypass_next:
+            self._bypass_next = False
+            return HookResult()
+        if msg.startswith(".safesend"):
+            parts = msg.strip().split()
+            if len(parts) >= 2 and parts[1] in ("on", "off"):
+                self.set_setting("enabled", parts[1] == "on")
+                BulletinHelper.show_info(f"SafeSend: {parts[1]}")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            BulletinHelper.show_info("Использование: .safesend on|off")
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if not self.get_setting("enabled", True):
+            return HookResult()
+        if self._peer_whitelisted(account, getattr(params, "peer", None)):
+            return HookResult()
+        cfg = {k: self.get_setting(k, v) for k, v in DEFAULTS.items()}
+        findings, redacted = _scan_text(msg, cfg)
+        if not findings:
+            linkRes = self.applyLinks(params)
+            if linkRes is not None:
+                return linkRes
+            return HookResult()
+        messageText = self.buildRiskMsg(findings, msg, redacted)
+
+        peer = getattr(params, "peer", None)
+        reply_to_msg = getattr(params, "replyToMsg", None)
+        reply_to_top_msg = getattr(params, "replyToTopMsg", None)
+        def bind(b):
+            def sendRaw(dlg, _which):
+                dlg.dismiss()
+                self.sendText(peer, msg, reply_to_msg, reply_to_top_msg, True)
+            def sendMask(dlg, _which):
+                dlg.dismiss()
+                self.sendText(peer, redacted, reply_to_msg, reply_to_top_msg)
+            b.set_positive_button("Замаскировать", sendMask)
+            b.set_negative_button("Отправить как есть", sendRaw)
+            b.set_neutral_button("Отмена", lambda dlg, _which: dlg.dismiss())
+            b.make_button_red(b.BUTTON_NEGATIVE)
+        self.showDlg("Проверь отправку", messageText, bind)
+        return HookResult(strategy=HookStrategy.CANCEL)
+    def getUi(self):
+        try:
+            from ui.settings import Header, Switch, Input, Divider, Text, Selector
+            return Header, Switch, Input, Divider, Text, Selector
+        except Exception as e:
+            self.log(f"SafeSend: error importing settings: {e}")
+            return None
+    def getUiParts(self):
+        ui = self.getUi()
+        if not ui:
+            return (None,) * 6
+        return ui
+    def mkScan(self):
+        Header, Switch, Input, Divider, Text, Selector = self.getUiParts()
+        if Header is None:
+            return []
+        return [
+            Header(text="Личные данные"),
+            Switch(
+                key="scan_email",
+                text="Email адреса",
+                subtext="Проверять почтовые адреса",
+                default=DEFAULTS["scan_email"],
+                icon="msg_email"
+            ),
+            Switch(
+                key="scan_phone",
+                text="Номера телефонов",
+                subtext="Проверять телефоны",
+                default=DEFAULTS["scan_phone"],
+                icon="msg_calls"
+            ),
+            Switch(
+                key="scan_card",
+                text="Банковские карты",
+                subtext="Проверка по алгоритму Luhn",
+                default=DEFAULTS["scan_card"],
+                icon="msg_money"
+            ),
+            Switch(
+                key="scan_iban",
+                text="IBAN счета",
+                subtext="Международные банковские счета",
+                default=DEFAULTS["scan_iban"],
+                icon="msg_ton"
+            ),
+            Divider(),
+            Header(text="Геолокация"),
+            Switch(
+                key="scan_geo",
+                text="GPS координаты",
+                subtext="Широта и долгота",
+                default=DEFAULTS["scan_geo"],
+                icon="msg_location"
+            ),
+            Switch(
+                key="scan_addr",
+                text="Физические адреса",
+                subtext="Улицы и дома, работает неидеально",
+                default=DEFAULTS["scan_addr"],
+                icon="msg_map"
+            ),
+            Divider(),
+            Header(text="Ссылки"),
+            Switch(
+                key="scan_links",
+                text="Подозрительные ссылки",
+                subtext="Punycode и сокращатели",
+                default=DEFAULTS["scan_links"],
+                icon="msg_link"
+            ),
+            Switch(
+                key="cleanLinks",
+                text="Cleaner ссылок",
+                subtext="Прятать URL и чистить UTM, fbclid, igsh, ref",
+                default=DEFAULTS["cleanLinks"],
+                icon="msg_link2"
+            ),
+        ]
+    def mkPriv(self):
+        Header, Switch, Input, Divider, Text, Selector = self.getUiParts()
+        if Header is None:
+            return []
+        return [
+            Header(text="Маскирование"),
+            Input(
+                key="mask_keep",
+                text="Цифр оставлять",
+                subtext="Количество последних цифр у телефона и карты",
+                default=str(DEFAULTS["mask_keep"]),
+                icon="msg_edit"
+            ),
+            Divider(),
+            Header(text="Фото"),
+            Switch(
+                key="strip_exif",
+                text="Удалять EXIF из фото",
+                subtext="Убирать метаданные с геолокацией перед отправкой",
+                default=DEFAULTS["strip_exif"],
+                icon="msg_photo"
+            ),
+        ]
+    def mkRec(self):
+        Header, Switch, Input, Divider, Text, Selector = self.getUiParts()
+        if Header is None:
+            return []
+        return [
+            Selector(
+                key="recMode",
+                text="Режим защиты",
+                default=DEFAULTS["recMode"],
+                items=[
+                    "Выкл",
+                    "Warn",
+                    "Hard",
+                ],
+            ),
+            Divider(text="Warn: спросить перед записью вне белого списка"),
+            Divider(text="Hard: блокировать запись вне белого списка"),
+        ]
+    def mkWl(self):
+        Header, Switch, Input, Divider, Text, Selector = self.getUiParts()
+        if Header is None:
+            return []
+        return [
+            Input(
+                key="whitelist_peers",
+                text="Чаты",
+                default=DEFAULTS["whitelist_peers"],
+                icon="msg_groups"
+            ),
+            Divider(text="Форматы: ID, @user, t.me/name, имя"),
+            Divider(text="Через запятую, ; или новую строку"),
+            Divider(text="Список действует и для Warn/Hard режима ГС и кружков"),
+        ]
+    def create_settings(self):
+        Header, Switch, Input, Divider, Text, Selector = self.getUiParts()
+        if Header is None:
+            return []
+        try:
+            return [
+                Header(text="SafeSend Guard"),
+                Text(
+                    text="Что проверять",
+                    icon="msg_block",
+                    create_sub_fragment=self.mkScan
+                ),
+                Text(
+                    text="Маскирование и фото",
+                    icon="msg_photo",
+                    create_sub_fragment=self.mkPriv
+                ),
+                Text(
+                    text="ГС и кружки",
+                    icon="msg_calls",
+                    create_sub_fragment=self.mkRec
+                ),
+                Text(
+                    text="Белый список",
+                    icon="msg_groups",
+                    create_sub_fragment=self.mkWl
+                )
+            ]
+        except Exception as e:
+            self.log(f"SafeSend: error creating settings: {e}")
+            return []
+    def on_plugin_unload(self):
+        try:
+            self.remove_hook("on_send_message_hook")
+        except Exception:
+            pass
