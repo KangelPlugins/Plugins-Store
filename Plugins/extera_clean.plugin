@@ -1,0 +1,2811 @@
+__id__ = "extera_clean"
+__name__ = "exteraClean"
+__description__ = "Массовая очистка неактивных и бесполезных чатов"
+__author__ = "@etopizdesblin & @plugin_ai"
+__version__ = "1.0.1"
+__icon__ = "msg_delete"
+__min_version__ = "12.1.1"
+
+import threading
+import time
+import traceback
+import math
+
+from java import dynamic_proxy, jclass
+from android.content.res import ColorStateList
+from android.graphics import Color, Typeface
+from android.graphics.drawable import ColorDrawable, GradientDrawable, RippleDrawable
+from android.text import TextUtils
+from android.util import TypedValue
+from android.view import Gravity, View, ViewGroup
+from android.widget import FrameLayout, HorizontalScrollView, LinearLayout, ScrollView, TextView
+
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment
+from hook_utils import find_class
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text, Divider
+
+from org.telegram.messenger import (
+    AccountInstance, AndroidUtilities, ChatObject, DialogObject,
+    MessagesController, MessagesStorage, UserConfig, UserObject
+)
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui import LaunchActivity
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import LayoutHelper, LineProgressView
+
+Long             = jclass("java.lang.Long")
+RunnableClass    = jclass("java.lang.Runnable")
+OnTouchClass     = jclass("android.view.View$OnTouchListener")
+HandlerClass     = jclass("android.os.Handler")
+LooperClass      = jclass("android.os.Looper")
+
+MENU_ITEM_ID          = "extera_clean_dashboard"
+DEFAULT_INACTIVE_DAYS = 90
+GROUPS_LIMIT          = 500
+
+# ── Статусы (русские) ─────────────────────────────────────────────────────────
+ST_DELETED    = "Удалён"
+ST_INACTIVE   = "Заброшен"
+ST_RESTRICTED = "Ограничен"
+STATUS_ORDER  = {ST_DELETED: 0, ST_RESTRICTED: 1, ST_INACTIVE: 2}
+
+# ── Вкладки фильтра ───────────────────────────────────────────────────────────
+FILTER_SPECS = [
+    ("all",        "Все"),
+    ("deleted",    "Удалённые"),
+    ("inactive",   "Заброшенные"),
+    ("restricted", "Ограниченные"),
+]
+
+# Авторы (отображается в подвале окна)
+AUTHORS_LINE = "@etopizdesblin & @plugin_ai"
+
+
+class ExteraClean(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._sheet            = None
+        self._menu_item_id     = None
+        self._views            = {}
+        self._items            = []       # кэш — живёт между навигациями
+        self._selected         = set()
+        self._cached_result    = None
+        self._status_filter    = "all"
+        self._load_token       = 0
+        self._batch_token      = 0
+        self._monitor_token    = 0
+        self._is_batch_running = False
+        self._loading          = False
+        self._excl_select_mode = False
+        self._excl_marked      = set()
+        self._sheet_touch_gate = {}
+        self._row_refs         = {}
+        # Рендер-токен: отменяет устаревшие отложенные render_items
+        self._render_token     = 0
+        self._render_handler   = None
+        self._render_batch_size = 8
+        self._render_next_index = 0
+        self._render_footer_added = False
+        self._visible_items    = []
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Жизненный цикл плагина
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _dbg(self, msg):
+        log(f"[exteraClean] {msg}")
+
+    def on_plugin_load(self):
+        self._ensure_defaults()
+        self._register_menu_item()
+        self._dbg("загружен")
+
+    def on_plugin_unload(self):
+        self._batch_token   += 1
+        self._monitor_token += 1
+        self._render_token  += 1
+        self._dismiss_sheet()
+        self._unregister_menu_item()
+        self._dbg("выгружен")
+
+    def create_settings(self):
+        return [
+            Header(text="exteraClean"),
+            Text(
+                text="Открыть панель очистки",
+                icon="msg_delete",
+                accent=True,
+                on_click=self.open_dashboard,
+            ),
+            Divider(),
+            Header(text="Категории диалогов"),
+            Switch(
+                key="include_personal",
+                text="Включать личные чаты",
+                subtext="Заброшенные личные диалоги будут попадать в список",
+                default=True,
+                icon="msg_persons",
+            ),
+            Switch(
+                key="include_bots",
+                text="Включать ботов",
+                subtext="Боты без активности появятся в списке очистки",
+                default=False,
+                icon="msg_bot",
+            ),
+            Switch(
+                key="include_restricted",
+                text="Включать ограниченные чаты",
+                subtext="Группы и каналы со статусом Restricted / Kicked",
+                default=True,
+                icon="msg_permissions",
+            ),
+            Divider(),
+            Header(text="Параметры"),
+            Text(
+                text=self._inactive_caption(),
+                icon="msg_clock2",
+                on_click=self._cycle_inactive_threshold,
+            ),
+            Text(
+                text="Управление исключениями",
+                icon="msg_permissions",
+                on_click=self._open_exclusions_sheet,
+            ),
+        ]
+
+    def _ensure_defaults(self):
+        defs = {
+            "include_personal":   True,
+            "include_bots":       False,
+            "include_restricted": True,
+            "inactive_days":      DEFAULT_INACTIVE_DAYS,
+            "excluded_dialog_ids": "",
+        }
+        for k, v in defs.items():
+            if self.get_setting(k) is None:
+                self.set_setting(k, v)
+
+    def _inactive_caption(self):
+        days = int(self.get_setting("inactive_days", DEFAULT_INACTIVE_DAYS) or DEFAULT_INACTIVE_DAYS)
+        return f"Порог заброшенности: {days} дней"
+
+    def _cycle_inactive_threshold(self, *_):
+        values = [30, 90, 180, 365]
+        cur = int(self.get_setting("inactive_days", DEFAULT_INACTIVE_DAYS) or DEFAULT_INACTIVE_DAYS)
+        try:
+            idx = values.index(cur)
+        except ValueError:
+            idx = 1
+        new_val = values[(idx + 1) % len(values)]
+        self.set_setting("inactive_days", int(new_val), True)
+        BulletinHelper.show_success(f"exteraClean: порог — {new_val} дней")
+        if self._sheet is not None:
+            self._refresh_async()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Пункт меню в боковой панели
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _register_menu_item(self):
+        try:
+            self._menu_item_id = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                text="exteraClean",
+                on_click=lambda *a, **k: self.open_dashboard(*a, **k),
+                item_id=MENU_ITEM_ID,
+                icon="msg_delete",
+                subtext="Очистка диалогов",
+                priority=175,
+            ))
+        except Exception as e:
+            self._dbg(f"menu register error: {e}")
+
+    def _unregister_menu_item(self):
+        iid = self._menu_item_id or MENU_ITEM_ID
+        try:
+            self.remove_menu_item(iid)
+        except Exception:
+            pass
+        self._menu_item_id = None
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Управление листом (BottomSheet)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _dismiss_sheet(self):
+        try:
+            if self._sheet is not None:
+                self._sheet.dismiss()
+        except Exception:
+            pass
+        self._sheet  = None
+        self._views  = {}
+        self._row_refs = {}
+        self._reset_render_state()
+        self._visible_items = []
+
+    def _release_sheet_refs(self):
+        """Тихая очистка UI-ссылок без dismiss()."""
+        self._sheet  = None
+        self._views  = {}
+        self._row_refs = {}
+        self._reset_render_state()
+        self._visible_items = []
+
+    def _get_frag_activity(self):
+        frag = get_last_fragment()
+        if frag is None:
+            try:
+                frag = LaunchActivity.getSafeLastFragment()
+            except Exception:
+                pass
+        activity = None
+        if frag is not None:
+            try:
+                activity = frag.getParentActivity()
+            except Exception:
+                pass
+        if activity is None:
+            try:
+                activity = LaunchActivity.instance
+            except Exception:
+                pass
+        return frag, activity
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Открытие дашборда
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def open_dashboard(self, *_):
+        try:
+            frag, activity = self._get_frag_activity()
+            if activity is None:
+                BulletinHelper.show_error("exteraClean: нет активности")
+                return
+            self._dismiss_sheet()
+            self._build_sheet(frag, activity)
+            if self._items and self._cached_result is not None:
+                self._update_dashboard(self._cached_result)
+                self._schedule_render_items(delay_ms=0)
+                self._set_subtitle(
+                    f"Кэш: {len(self._items)} кандидатов  •  нажми «Обновить» для пересканирования")
+                self._set_progress("Кэш", f"{len(self._items)} кандидатов", 0.0)
+            else:
+                self._refresh_async()
+        except Exception as e:
+            self._dbg(f"open_dashboard error: {e}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("exteraClean: ошибка открытия")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Построение BottomSheet
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _build_sheet(self, frag, activity):
+        self._dbg("build_sheet start")
+        sheet = BottomSheet(activity, False)
+        sheet.setApplyTopPadding(False)
+        sheet.setApplyBottomPadding(False)
+
+        # Запрещаем автозакрытие свайпом — управляем сами через touch policy
+        try:
+            sheet.setCanDismissWithSwipe(False)
+        except Exception:
+            pass
+
+        # ── Корень ────────────────────────────────────────────────────────────
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(self._dp(16), self._dp(8), self._dp(16), 0)
+        root.setBackground(self._sheet_bg())
+
+        # ── Ручка-индикатор ───────────────────────────────────────────────────
+        handle = View(activity)
+        handle.setBackground(self._pill(
+            self._with_alpha(self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY), 0x65)))
+        h_lp = LinearLayout.LayoutParams(self._dp(40), self._dp(4))
+        h_lp.gravity = Gravity.CENTER_HORIZONTAL
+        h_lp.setMargins(0, self._dp(6), 0, self._dp(16))
+        root.addView(handle, h_lp)
+
+        # ── Заголовок ─────────────────────────────────────────────────────────
+        hdr = LinearLayout(activity)
+        hdr.setOrientation(LinearLayout.VERTICAL)
+        root.addView(hdr, _lp(-1, -2))
+
+        title_tv = self._make_tv(activity, "exteraClean", 21, bold=True,
+                                 color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        hdr.addView(title_tv, _lp(-1, -2))
+
+        subtitle_tv = self._make_tv(activity, "Сканирую базу диалогов\u2026", 12,
+                                    color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        subtitle_lp = _lp(-1, -2)
+        subtitle_lp.topMargin = self._dp(3)
+        hdr.addView(subtitle_tv, subtitle_lp)
+
+        self._vspace(root, activity, 10)
+        root.addView(self._divider(activity), _lp(-1, self._dp(1)))
+        self._vspace(root, activity, 12)
+
+        # ── Метрические карточки ──────────────────────────────────────────────
+        dash = LinearLayout(activity)
+        dash.setOrientation(LinearLayout.HORIZONTAL)
+        root.addView(dash, _lp(-1, -2))
+
+        card_grp = self._metric_card(activity, "Группы и каналы", "0/500", 0.0, "нет данных")
+        dash.addView(card_grp["root"], LinearLayout.LayoutParams(0, -2, 1.0))
+        dash.addView(View(activity), LinearLayout.LayoutParams(self._dp(10), 1))
+        card_cnd = self._metric_card(activity, "Кандидаты", "0", 0.0, "ничего не найдено")
+        dash.addView(card_cnd["root"], LinearLayout.LayoutParams(0, -2, 1.0))
+
+        self._vspace(root, activity, 14)
+
+        # ── Фильтр-чипы ───────────────────────────────────────────────────────
+        chips_row = LinearLayout(activity)
+        chips_row.setOrientation(LinearLayout.HORIZONTAL)
+        chips_row.setGravity(Gravity.CENTER_VERTICAL)
+        root.addView(chips_row, _lp(-1, -2))
+
+        filter_buttons = {}
+        for idx, (f_key, label) in enumerate(FILTER_SPECS):
+            chip = self._chip(activity, label, active=(f_key == "all"))
+            chip.setOnClickListener(OnClickListener(
+                lambda _v, k=f_key: self._set_filter(k)))
+            lp = _lp(-2, -2)
+            if idx > 0:
+                lp.leftMargin = self._dp(7)
+            chips_row.addView(chip, lp)
+            filter_buttons[f_key] = chip
+
+        self._vspace(root, activity, 10)
+
+        # ── Строка «Выбрать все / Снять все» ──────────────────────────────────
+        sel_row = LinearLayout(activity)
+        sel_row.setOrientation(LinearLayout.HORIZONTAL)
+        sel_row.setGravity(Gravity.CENTER_VERTICAL)
+        root.addView(sel_row, _lp(-1, -2))
+
+        sel_all = self._action_btn(activity, "Выбрать всё", filled=False, small=True)
+        sel_all.setOnClickListener(OnClickListener(lambda _v: self._select_filtered(True)))
+        sel_row.addView(sel_all, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        desel = self._action_btn(activity, "Снять выбор", filled=False, small=True)
+        desel.setOnClickListener(OnClickListener(lambda _v: self._select_filtered(False)))
+        d_lp = LinearLayout.LayoutParams(0, -2, 1.0)
+        d_lp.leftMargin = self._dp(8)
+        sel_row.addView(desel, d_lp)
+
+        self._vspace(root, activity, 8)
+
+        # ── Строка «Обновить / Удалить» ───────────────────────────────────────
+        act_row = LinearLayout(activity)
+        act_row.setOrientation(LinearLayout.HORIZONTAL)
+        act_row.setGravity(Gravity.CENTER_VERTICAL)
+        root.addView(act_row, _lp(-1, -2))
+
+        refresh_btn = self._action_btn(activity, "Обновить", filled=False)
+        refresh_btn.setOnClickListener(OnClickListener(lambda _v: self._refresh_async()))
+        act_row.addView(refresh_btn, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        clean_btn = self._action_btn(activity, "Удалить выбранные", filled=True, danger=True)
+        clean_btn.setOnClickListener(OnClickListener(lambda _v: self._confirm_cleanup()))
+        cl_lp = LinearLayout.LayoutParams(0, -2, 1.5)
+        cl_lp.leftMargin = self._dp(8)
+        act_row.addView(clean_btn, cl_lp)
+
+        self._vspace(root, activity, 6)
+
+        # ── Счётчик ───────────────────────────────────────────────────────────
+        counter_tv = self._make_tv(activity, "0 выбрано", 12,
+                                   color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        root.addView(counter_tv, _lp(-1, -2))
+
+        self._vspace(root, activity, 4)
+
+        # ── Прогресс-бар ──────────────────────────────────────────────────────
+        acc = self._accent()
+        progress = LineProgressView(activity)
+        progress.setBackColor(self._with_alpha(self._color(Theme.key_divider, Color.GRAY), 0x44))
+        progress.setProgressColor(acc)
+        progress.setProgress(0.0, False)
+        pr_lp = _lp(-1, self._dp(3))
+        pr_lp.bottomMargin = self._dp(2)
+        root.addView(progress, pr_lp)
+
+        prog_title = self._make_tv(activity, "Готово к очистке", 12, bold=True,
+                                   color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        root.addView(prog_title, _lp(-1, -2))
+
+        prog_sub = self._make_tv(activity, "Выбери диалоги и подтверди действие", 11,
+                                 color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        ps_lp = _lp(-1, -2)
+        ps_lp.topMargin = self._dp(2)
+        ps_lp.bottomMargin = self._dp(8)
+        root.addView(prog_sub, ps_lp)
+
+        root.addView(self._divider(activity), _lp(-1, self._dp(1)))
+        self._vspace(root, activity, 8)
+
+        # ── Прокручиваемый список ─────────────────────────────────────────────
+        scroll = ScrollView(activity)
+        scroll.setFillViewport(True)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.setOverScrollMode(2)
+        scroll.setBackground(self._solid(Color.TRANSPARENT))
+        try:
+            scroll.setNestedScrollingEnabled(True)
+        except Exception:
+            pass
+        try:
+            scroll.setDescendantFocusability(ViewGroup.FOCUS_BEFORE_DESCENDANTS)
+        except Exception:
+            pass
+
+        list_wrap = LinearLayout(activity)
+        list_wrap.setOrientation(LinearLayout.VERTICAL)
+        list_wrap.setPadding(0, self._dp(2), 0, 0)
+        scroll.addView(list_wrap, LayoutHelper.createFrame(-1, -2))
+
+        try:
+            screen_h = int(activity.getResources().getDisplayMetrics().heightPixels)
+        except Exception:
+            screen_h = self._dp(760)
+        # Чуть больше высоты — меньше вероятность обрезки последних карточек
+        scroll_h = max(self._dp(200), min(self._dp(360), int(screen_h * 0.36)))
+        root.addView(scroll, LayoutHelper.createLinear(-1, scroll_h))
+
+        # ── Подвал с авторами ─────────────────────────────────────────────────
+        self._vspace(root, activity, 6)
+        authors_tv = self._make_tv(
+            activity, AUTHORS_LINE, 11,
+            color=self._with_alpha(self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY), 0x80))
+        authors_tv.setGravity(Gravity.CENTER_HORIZONTAL)
+        authors_lp = _lp(-1, -2)
+        authors_lp.bottomMargin = self._dp(10)
+        root.addView(authors_tv, authors_lp)
+
+        self._install_touch_policy(sheet, scroll, handle)
+        self._install_lazy_list_loading(scroll)
+        sheet.setCustomView(root)
+        sheet.show()
+
+        # dismiss-listener: данные не трогаем
+        try:
+            ODL = find_class("android.content.DialogInterface$OnDismissListener")
+            if ODL is not None:
+                pr = self
+                class _DL(dynamic_proxy(ODL)):
+                    def onDismiss(self, d):
+                        try:
+                            pr._release_sheet_refs()
+                        except Exception:
+                            pass
+                sheet.setOnDismissListener(_DL())
+        except Exception as e:
+            self._dbg(f"dismiss listener error: {e}")
+
+        self._sheet = sheet
+        self._views = {
+            "root": root, "scroll": scroll,
+            "fragment": frag, "activity": activity,
+            "title": title_tv, "subtitle": subtitle_tv,
+            "list": list_wrap, "counter": counter_tv,
+            "prog_title": prog_title,
+            "prog_sub":   prog_sub,
+            "progress":   progress,
+            "clean_btn":  clean_btn,
+            "refresh_btn": refresh_btn,
+            "card_groups": card_grp,
+            "card_candidates": card_cnd,
+            "filter_buttons": filter_buttons,
+        }
+        self._set_filter("all", rerender=False)
+        self._render_placeholder("Сканирую базу диалогов\u2026")
+        self._dbg("build_sheet done")
+
+    def _floating_panel(self, activity):
+        """Плавающая нижняя панель — эффект «жидкого стекла»."""
+        panel = LinearLayout(activity)
+        panel.setOrientation(LinearLayout.VERTICAL)
+        panel.setPadding(self._dp(14), self._dp(12), self._dp(14), self._dp(14))
+        panel.setBackground(self._glass_bg())
+
+        prog_title = self._make_tv(activity, "Готово к очистке", 13, bold=True,
+                                   color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        panel.addView(prog_title, _lp(-1, -2))
+
+        prog_sub = self._make_tv(activity, "Выбери диалоги и подтверди действие", 11,
+                                 color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        ps_lp = _lp(-1, -2)
+        ps_lp.topMargin = self._dp(2)
+        ps_lp.bottomMargin = self._dp(8)
+        panel.addView(prog_sub, ps_lp)
+
+        acc = self._accent()
+        progress = LineProgressView(activity)
+        progress.setBackColor(self._with_alpha(self._color(Theme.key_divider, Color.GRAY), 0x44))
+        progress.setProgressColor(acc)
+        progress.setProgress(0.0, False)
+        pr_lp = _lp(-1, self._dp(3))
+        pr_lp.bottomMargin = self._dp(12)
+        panel.addView(progress, pr_lp)
+
+        btn_row = LinearLayout(activity)
+        btn_row.setOrientation(LinearLayout.HORIZONTAL)
+        btn_row.setGravity(Gravity.CENTER_VERTICAL)
+        panel.addView(btn_row, _lp(-1, -2))
+
+        refresh_btn = self._action_btn(activity, "↻  Обновить", filled=False)
+        btn_row.addView(refresh_btn, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        clean_btn = self._action_btn(activity, "🗑  Удалить выбранные", filled=True, danger=True)
+        cl_lp = LinearLayout.LayoutParams(0, -2, 1.5)
+        cl_lp.leftMargin = self._dp(8)
+        btn_row.addView(clean_btn, cl_lp)
+
+        return {
+            "root": panel,
+            "prog_title": prog_title,
+            "prog_sub": prog_sub,
+            "progress": progress,
+            "refresh_btn": refresh_btn,
+            "clean_btn": clean_btn,
+        }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Сканирование
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _refresh_async(self):
+        if self._loading or self._is_batch_running:
+            return
+        self._load_token += 1
+        token = self._load_token
+        self._loading = True
+        self._render_placeholder("Сканирую базу диалогов…")
+        self._set_subtitle("Проверяю диалоги и локальную базу данных")
+        self._set_progress("Сканирование", "Подбираю кандидатов…", 0.08)
+
+        def worker():
+            try:
+                result = self._collect_candidates()
+            except Exception as e:
+                self._dbg(f"collect error: {e}")
+                result = {"items": [], "counts": {}, "groups_used": 0,
+                          "groups_limit": GROUPS_LIMIT, "errors": [str(e)]}
+
+            def apply():
+                if token != self._load_token:
+                    return
+                self._loading = False
+                prev_sel = set(self._selected)
+                self._items = result.get("items", []) or []
+                self._cached_result = result
+                new_ids = {x["id"] for x in self._items}
+                self._selected = prev_sel & new_ids
+                self._update_dashboard(result)
+                total = len(self._items)
+                if total:
+                    self._set_subtitle(f"Найдено {total} кандидатов — выбери, что очистить")
+                    self._set_progress("Готово к очистке", f"Найдено {total} кандидатов", 0.0)
+                else:
+                    self._set_subtitle("Кандидаты не найдены")
+                    self._set_progress("Готово к очистке", "Нечего удалять по текущим фильтрам", 0.0)
+                # Отложенный рендер — не замораживает UI
+                self._schedule_render_items(delay_ms=30)
+
+            run_on_ui_thread(apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _collect_candidates(self):
+        account    = self._current_account()
+        ctrl       = MessagesController.getInstance(account)
+        ucfg       = UserConfig.getInstance(account)
+        self_id    = int(ucfg.getClientUserId())
+        now_ts     = int(time.time())
+
+        inactive_days = int(
+            self.get_setting("inactive_days", DEFAULT_INACTIVE_DAYS) or DEFAULT_INACTIVE_DAYS)
+        inactive_sec  = max(1, inactive_days) * 86400
+
+        # Читаем настройки фильтров
+        incl_personal  = bool(self.get_setting("include_personal",  True))
+        incl_bots      = bool(self.get_setting("include_bots",      False))
+        incl_restr     = bool(self.get_setting("include_restricted", True))
+        excluded_ids   = self._get_excluded_ids()
+
+        # ── Получаем список диалогов ──────────────────────────────────────────
+        # Пробуем allDialogs (ArrayList) — надёжнее чем dialogs_dict
+        all_dlgs = []
+        try:
+            ad = ctrl.getAllDialogs()
+            if ad is not None:
+                for i in range(int(ad.size())):
+                    d = ad.get(i)
+                    if d is not None:
+                        all_dlgs.append(d)
+        except Exception:
+            pass
+        # Запасной вариант: dialogs_dict (SparseArray)
+        if not all_dlgs:
+            try:
+                dd = ctrl.dialogs_dict
+                if dd is not None:
+                    for i in range(int(dd.size())):
+                        d = dd.valueAt(i)
+                        if d is not None:
+                            all_dlgs.append(d)
+            except Exception:
+                pass
+
+        total = len(all_dlgs)
+        self._dbg(f"collect: total dialogs={total} "
+                  f"incl_personal={incl_personal} incl_bots={incl_bots} "
+                  f"incl_restr={incl_restr} inactive_days={inactive_days}")
+
+        # Первый проход: собираем id с отсутствующей датой
+        missing      = []
+        groups_used  = 0
+        for dlg in all_dlgs:
+            did = self._safe_long(getattr(dlg, "id", 0), 0)
+            if not did or did == self_id or did in excluded_ids:
+                continue
+            if self._is_encrypted(did):
+                continue
+            if self._safe_int(getattr(dlg, "last_message_date", 0), 0) <= 0:
+                missing.append(did)
+            if did < 0:
+                groups_used += 1
+
+        dates_db = self._load_dates_from_db(account, missing)
+
+        items  = []
+        counts = {ST_DELETED: 0, ST_INACTIVE: 0, ST_RESTRICTED: 0}
+
+        for dlg in all_dlgs:
+            did = self._safe_long(getattr(dlg, "id", 0), 0)
+            if not did or did == self_id or self._is_encrypted(did):
+                continue
+            if did in excluded_ids:
+                continue
+
+            last_date = self._safe_int(getattr(dlg, "last_message_date", 0), 0)
+            if last_date <= 0:
+                last_date = self._safe_int(dates_db.get(did, 0), 0)
+            inactive = (last_date > 0) and ((now_ts - last_date) >= inactive_sec)
+
+            item = None
+
+            if did > 0:
+                # ── Личный диалог / бот / удалённый аккаунт ──────────────────
+                try:
+                    user = ctrl.getUser(Long.valueOf(did))
+                except Exception:
+                    user = None
+                if user is None or self._is_self_user(user):
+                    continue
+
+                is_deleted = self._is_deleted_user(user)
+                is_bot     = self._is_bot_user(user)
+
+                if is_deleted:
+                    # Удалённые аккаунты — попадают ВСЕГДА независимо от тумблеров
+                    item = self._make_item(dlg, did, "user",
+                                          self._user_name(user),
+                                          ST_DELETED, last_date, "delete_dm")
+                elif is_bot:
+                    # Бот — только если тумблер «Боты» включён и диалог неактивен
+                    if incl_bots and inactive:
+                        item = self._make_item(dlg, did, "bot",
+                                               self._user_name(user),
+                                               ST_INACTIVE, last_date, "delete_dm")
+                else:
+                    # Обычный личный диалог — только если тумблер «Лички» включён и неактивен
+                    if incl_personal and inactive:
+                        item = self._make_item(dlg, did, "user",
+                                               self._user_name(user),
+                                               ST_INACTIVE, last_date, "delete_dm")
+            else:
+                # ── Группа / канал ────────────────────────────────────────────
+                chat_id = -did
+                try:
+                    chat = ctrl.getChat(Long.valueOf(chat_id))
+                except Exception:
+                    chat = None
+                if chat is None:
+                    continue
+                if getattr(chat, "migrated_to", None) is not None:
+                    continue
+
+                restricted = self._is_restricted_chat(chat)
+                is_ch      = self._is_channel_or_mega(chat)
+
+                if incl_restr and restricted:
+                    dtype = "channel" if is_ch else "group"
+                    item  = self._make_item(dlg, did, dtype,
+                                            self._chat_name(chat),
+                                            ST_RESTRICTED, last_date, "leave_and_delete")
+                elif inactive:
+                    dtype = "channel" if is_ch else "group"
+                    item  = self._make_item(dlg, did, dtype,
+                                            self._chat_name(chat),
+                                            ST_INACTIVE, last_date, "leave_and_delete")
+
+            if item is None:
+                continue
+            counts[item["status"]] = counts.get(item["status"], 0) + 1
+            items.append(item)
+
+        items.sort(key=lambda x: (STATUS_ORDER.get(x["status"], 9),
+                                  x["last_date"] or 0,
+                                  x["title"].lower()))
+        self._dbg(f"collect done candidates={len(items)} "
+                  f"deleted={counts[ST_DELETED]} "
+                  f"inactive={counts[ST_INACTIVE]} "
+                  f"restricted={counts[ST_RESTRICTED]}")
+        return {
+            "items": items, "counts": counts,
+            "groups_used": groups_used, "groups_limit": GROUPS_LIMIT,
+            "errors": [],
+        }
+
+    def _make_item(self, dlg, did, dtype, title, status, last_date, action):
+        return {
+            "id": int(did), "type": dtype,
+            "title": str(title or "Без названия"),
+            "status": status,
+            "last_date": int(last_date or 0),
+            "last_date_text": self._fmt_date(last_date),
+            "action": action,
+            "unread": self._safe_int(getattr(dlg, "unread_count", 0), 0),
+        }
+
+    def _load_dates_from_db(self, account, dialog_ids):
+        if not dialog_ids:
+            return {}
+        dates = {}
+        storage = MessagesStorage.getInstance(account)
+        try:
+            def task():
+                db = storage.getDatabase()
+                for i in range(0, len(dialog_ids), 160):
+                    chunk = dialog_ids[i:i + 160]
+                    sql = "SELECT did, date FROM dialogs WHERE did IN (%s)" % \
+                          ",".join(str(self._safe_long(x, 0)) for x in chunk)
+                    cur = db.queryFinalized(sql, [])
+                    try:
+                        while cur.next():
+                            d = self._safe_long(cur.longValue(0), 0)
+                            v = self._safe_int(cur.intValue(1), 0)
+                            if d and v > 0:
+                                dates[d] = v
+                    finally:
+                        cur.dispose()
+            self._run_storage_task(storage, task)
+        except Exception as e:
+            self._dbg(f"db error: {e}")
+        return dates
+
+    def _run_storage_task(self, storage, func):
+        CDL = jclass("java.util.concurrent.CountDownLatch")
+        latch = CDL(1)
+        box = {}
+        class SR(dynamic_proxy(RunnableClass)):
+            def run(self):
+                try:
+                    box["v"] = func()
+                except Exception as e:
+                    box["e"] = e
+                finally:
+                    latch.countDown()
+        storage.getStorageQueue().postRunnable(SR())
+        getattr(latch, "await")()
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Классификаторы
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _is_channel_or_mega(self, chat):
+        """Возвращает True для каналов и мегагрупп (supergroup)."""
+        try:
+            return bool(ChatObject.isChannel(chat))
+        except Exception:
+            pass
+        try:
+            # Fallback: проверяем поле megagroup / broadcast
+            return bool(getattr(chat, "megagroup", False)) or bool(getattr(chat, "broadcast", False))
+        except Exception:
+            return False
+
+    def _is_encrypted(self, did):
+        try:
+            return bool(DialogObject.isEncryptedDialog(did))
+        except Exception:
+            return False
+
+    def _is_self_user(self, user):
+        try:
+            return bool(UserObject.isUserSelf(user))
+        except Exception:
+            return False
+
+    def _is_bot_user(self, user):
+        try:
+            return bool(getattr(user, "bot", False))
+        except Exception:
+            return False
+
+    def _is_deleted_user(self, user):
+        try:
+            if bool(UserObject.isDeleted(user)):
+                return True
+        except Exception:
+            pass
+        try:
+            if bool(getattr(user, "deleted", False)):
+                return True
+        except Exception:
+            pass
+        first = str(getattr(user, "first_name", "") or "")
+        return "удал" in first.lower()
+
+    def _is_restricted_chat(self, chat):
+        for a in ("left", "kicked", "deactivated"):
+            try:
+                if bool(getattr(chat, a, False)):
+                    return True
+            except Exception:
+                pass
+        banned = getattr(chat, "banned_rights", None)
+        if banned is not None:
+            for a in ("view_messages", "send_messages", "send_media",
+                      "send_stickers", "send_gifs", "send_games", "send_inline",
+                      "embed_links", "send_polls", "pin_messages",
+                      "invite_users", "change_info"):
+                try:
+                    if bool(getattr(banned, a, False)):
+                        return True
+                except Exception:
+                    pass
+        return False
+
+    def _user_name(self, user):
+        try:
+            n = str(UserObject.getUserName(user) or "").strip()
+            if n:
+                return n
+        except Exception:
+            pass
+        first = str(getattr(user, "first_name", "") or "").strip()
+        last  = str(getattr(user, "last_name",  "") or "").strip()
+        uname = str(getattr(user, "username",   "") or "").strip()
+        return (first + " " + last).strip() or uname or "Пользователь"
+
+    def _chat_name(self, chat):
+        return str(getattr(chat, "title", "") or "").strip() or "Чат"
+
+    def _chat_type(self, chat):
+        try:
+            return "channel" if ChatObject.isChannel(chat) else "group"
+        except Exception:
+            return "group"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Дашборд-карточки
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _update_dashboard(self, result):
+        gu = int(result.get("groups_used", 0) or 0)
+        gl = int(result.get("groups_limit", GROUPS_LIMIT) or GROUPS_LIMIT)
+        tc = len(result.get("items", []) or [])
+        gr = 0.0 if gl <= 0 else max(0.0, min(1.0, gu / gl))
+        cr = 0.0 if tc <= 0 else max(0.0, min(1.0, tc / 100.0))
+        c  = result.get("counts", {}) or {}
+        self._upd_metric(self._views.get("card_groups"),
+                         f"{gu}/{gl}", gr, f"{max(0, gl - gu)} слотов свободно")
+        self._upd_metric(self._views.get("card_candidates"),
+                         str(tc), cr,
+                         f"Удалён {c.get(ST_DELETED,0)}  "
+                         f"•  Заброшен {c.get(ST_INACTIVE,0)}  "
+                         f"•  Ограничен {c.get(ST_RESTRICTED,0)}")
+
+    def _metric_card(self, ctx, title, value, ratio, subtitle):
+        """
+        Карточка метрики: фон отличается от фона шторки для контраста.
+        Используем windowBackgroundGray (слегка сдвинутый) с чётким
+        контрастным текстом — работает на светлой и тёмной теме.
+        """
+        ratio = max(0.0, min(1.0, float(ratio or 0.0)))
+
+        base    = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        is_dark = self._is_dark(base)
+
+        # Фон: чуть темнее/светлее основного — хорошо отличим на обеих темах
+        if is_dark:
+            card_fill = self._blend(base, Color.WHITE, 0.07)
+        else:
+            card_fill = self._blend(base, Color.BLACK, 0.06)
+
+        # Акцентная рамка — цвет зависит от заполненности
+        acc_stroke = self._metric_stroke_color(ratio)
+        stroke_a   = self._with_alpha(acc_stroke, 0xCC)
+
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(self._dp(14), self._dp(12), self._dp(14), self._dp(12))
+        root.setBackground(self._rounded(card_fill, 16, stroke_a, 1))
+
+        # Цвета текста — всегда контрастны к card_fill
+        txt_primary  = self._color(Theme.key_windowBackgroundWhiteBlackText, Color.BLACK)
+        txt_secondary = self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY)
+
+        t = self._make_tv(ctx, title, 11, color=txt_secondary)
+        root.addView(t, _lp(-1, -2))
+
+        v = self._make_tv(ctx, value, 22, bold=True, color=txt_primary)
+        v_lp = _lp(-1, -2)
+        v_lp.topMargin = self._dp(2)
+        v_lp.bottomMargin = self._dp(6)
+        root.addView(v, v_lp)
+
+        prog = LineProgressView(ctx)
+        prog.setBackColor(self._with_alpha(txt_secondary, 0x44))
+        prog.setProgressColor(acc_stroke)
+        prog.setProgress(ratio, False)
+        root.addView(prog, _lp(-1, self._dp(3)))
+
+        sub = self._make_tv(ctx, subtitle, 10, color=txt_secondary)
+        s_lp = _lp(-1, -2)
+        s_lp.topMargin = self._dp(6)
+        root.addView(sub, s_lp)
+
+        return {"root": root, "value": v, "progress": prog, "subtitle": sub,
+                "txt_primary": txt_primary, "txt_secondary": txt_secondary,
+                "card_fill": card_fill, "is_dark": is_dark}
+
+    def _metric_stroke_color(self, ratio):
+        """Цвет акцента рамки и прогресса карточки метрики."""
+        ratio = max(0.0, min(1.0, float(ratio or 0.0)))
+        if ratio >= 0.9:
+            return Color.parseColor("#D84B43")
+        if ratio >= 0.6:
+            return Color.parseColor("#E09B2A")
+        return self._accent()
+
+    def _upd_metric(self, card, value, ratio, subtitle):
+        if not card:
+            return
+        try:
+            card["value"].setText(str(value))
+            card["subtitle"].setText(str(subtitle))
+            ratio = max(0.0, min(1.0, float(ratio or 0.0)))
+            card["progress"].setProgress(ratio, True)
+            acc_stroke = self._metric_stroke_color(ratio)
+            card["progress"].setProgressColor(acc_stroke)
+            # Обновляем рамку карточки под новый ratio
+            stroke_a  = self._with_alpha(acc_stroke, 0xCC)
+            card["root"].setBackground(self._rounded(card["card_fill"], 16, stroke_a, 1))
+        except Exception:
+            pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Фильтрация и рендер списка
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _filtered_items(self):
+        f = self._status_filter
+        if f == "all":
+            return list(self._items)
+        if f == "deleted":
+            return [x for x in self._items if x["status"] == ST_DELETED]
+        if f == "inactive":
+            return [x for x in self._items if x["status"] == ST_INACTIVE]
+        if f == "restricted":
+            return [x for x in self._items if x["status"] == ST_RESTRICTED]
+        return list(self._items)
+
+    def _set_filter(self, key, rerender=True):
+        self._status_filter = str(key or "all")
+        for k, v in (self._views.get("filter_buttons") or {}).items():
+            self._apply_chip_state(v, k == self._status_filter)
+        if rerender:
+            # Переключение вкладок — мгновенно, без задержки
+            self._schedule_render_items(delay_ms=0)
+
+    def _schedule_render_items(self, delay_ms=0):
+        """
+        Откладывает вызов _render_items на delay_ms миллисекунд.
+        Использует _render_token для отмены устаревших вызовов.
+        Предотвращает «деревянность» UI при быстром переключении вкладок.
+        """
+        self._render_token += 1
+        token = self._render_token
+        pr    = self
+
+        if delay_ms <= 0:
+            run_on_ui_thread(lambda: pr._render_items() if token == pr._render_token else None)
+        else:
+            try:
+                handler = self._main_handler()
+                class _R(dynamic_proxy(RunnableClass)):
+                    def run(self_r):
+                        if token != pr._render_token:
+                            return
+                        try:
+                            pr._render_items()
+                        except Exception as e:
+                            pr._dbg(f"scheduled render error: {e}")
+                handler.postDelayed(_R(), delay_ms)
+            except Exception:
+                run_on_ui_thread(lambda: pr._render_items() if token == pr._render_token else None)
+
+    def _reset_render_state(self):
+        self._render_token += 1
+        self._render_next_index = 0
+        self._render_footer_added = False
+        self._visible_items = []
+        self._row_refs = {}
+
+    def _render_placeholder(self, text):
+        wrap = self._views.get("list")
+        if wrap is None:
+            return
+        wrap.removeAllViews()
+        self._row_refs = {}
+        self._visible_items = []
+        tv = self._make_tv(wrap.getContext(), str(text or "Пусто"), 14,
+                           color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        tv.setGravity(Gravity.CENTER_HORIZONTAL)
+        tv.setPadding(self._dp(12), self._dp(36), self._dp(12), self._dp(36))
+        wrap.addView(tv, _lp(-1, -2))
+        self._update_counter()
+
+    def _render_items(self):
+        wrap = self._views.get("list")
+        if wrap is None:
+            return
+        visible = self._filtered_items()
+        self._visible_items = visible
+        wrap.removeAllViews()
+        self._row_refs = {}
+        if not visible:
+            self._render_placeholder("По этому фильтру ничего не найдено")
+            return
+        ctx = wrap.getContext()
+        self._update_counter()
+        self._render_items_batch(wrap, ctx, visible, 0, self._render_token)
+
+    def _render_items_batch(self, wrap, ctx, visible, start, token):
+        if wrap is None or token != self._render_token:
+            return
+        if self._views.get("list") is not wrap:
+            return
+        total = len(visible)
+        batch = total if total <= self._render_batch_size else self._render_batch_size
+        end = min(total, start + batch)
+        for idx in range(start, end):
+            item = visible[idx]
+            row = self._build_row(ctx, item)
+            lp = _lp(-1, -2)
+            if idx > 0:
+                lp.topMargin = self._dp(9)
+            wrap.addView(row, lp)
+        if end >= total:
+            spacer = View(ctx)
+            wrap.addView(spacer, _lp(-1, self._dp(80)))
+            self._update_counter()
+            return
+
+        pr = self
+        try:
+            handler = self._main_handler()
+            class _Next(dynamic_proxy(RunnableClass)):
+                def run(self_r):
+                    if token != pr._render_token:
+                        return
+                    try:
+                        pr._render_items_batch(wrap, ctx, visible, end, token)
+                    except Exception as e:
+                        pr._dbg(f"render batch error: {e}")
+            handler.postDelayed(_Next(), 12)
+        except Exception:
+            run_on_ui_thread(lambda: pr._render_items_batch(wrap, ctx, visible, end, token))
+
+    def _install_lazy_list_loading(self, scroll):
+        """
+        Compat helper for older builds of this plugin.
+        The actual row virtualization here is handled by `_render_items_batch`,
+        so this method only installs a lightweight scroll listener when the
+        runtime supports it and otherwise safely degrades to a no-op.
+        """
+        if scroll is None:
+            return
+        try:
+            pr = self
+            OSL = find_class("android.view.View$OnScrollChangeListener")
+            if OSL is None or not hasattr(scroll, "setOnScrollChangeListener"):
+                return
+
+            class _SL(dynamic_proxy(OSL)):
+                def onScrollChange(self, v, scrollX, scrollY, oldScrollX, oldScrollY):
+                    try:
+                        pr._sheet_touch_gate["scroll_y"] = int(scrollY)
+                    except Exception:
+                        pass
+
+            scroll.setOnScrollChangeListener(_SL())
+        except Exception as e:
+            self._dbg(f"lazy list listener skipped: {e}")
+
+    # ── Карточка диалога ───────────────────────────────────────────────────────
+
+    def _build_row(self, ctx, item):
+        did      = int(item["id"])
+        selected = did in self._selected
+
+        # Карточка — фон windowBackgroundWhite с чёткой контрастной обводкой
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(self._dp(12), self._dp(11), self._dp(10), self._dp(11))
+        row.setBackground(self._card_bg(item["status"], selected))
+
+        # Чекбокс
+        cb = self._toggle_view(ctx, selected, item["status"])
+        cb_lp = LinearLayout.LayoutParams(self._dp(26), self._dp(26))
+        cb_lp.rightMargin = self._dp(10)
+        cb_lp.gravity = Gravity.CENTER_VERTICAL
+        row.addView(cb, cb_lp)
+
+        # Иконка типа
+        ico = self._make_tv(ctx, self._type_icon(item), 17)
+        i_lp = _lp(-2, -2)
+        i_lp.rightMargin = self._dp(8)
+        i_lp.gravity = Gravity.CENTER_VERTICAL
+        row.addView(ico, i_lp)
+
+        # Текстовый блок
+        content = LinearLayout(ctx)
+        content.setOrientation(LinearLayout.VERTICAL)
+        row.addView(content, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        # Строка 1: название + бейдж
+        top = LinearLayout(ctx)
+        top.setOrientation(LinearLayout.HORIZONTAL)
+        top.setGravity(Gravity.CENTER_VERTICAL)
+        content.addView(top, _lp(-1, -2))
+
+        name_tv = self._make_tv(ctx, item["title"], 14, bold=True,
+                                color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        name_tv.setSingleLine(True)
+        name_tv.setEllipsize(TextUtils.TruncateAt.END)
+        top.addView(name_tv, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        badge = self._badge(ctx, item["status"])
+        badge_lp = _lp(-2, -2)
+        badge_lp.leftMargin = self._dp(6)
+        top.addView(badge, badge_lp)
+
+        # Строка 2: дата
+        date_tv = self._make_tv(ctx, f"💬  {item['last_date_text']}", 11,
+                                color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        d_lp = _lp(-1, -2)
+        d_lp.topMargin = self._dp(3)
+        content.addView(date_tv, d_lp)
+
+        # Строка 3: действие
+        unread = int(item.get("unread", 0) or 0)
+        action = "Удаление диалога" if item.get("action") == "delete_dm" else "Выход и удаление"
+        footer_text = f"{action}  •  {unread} непрочитанных" if unread > 0 else action
+        act_tv = self._make_tv(ctx, footer_text, 11,
+                               color=self._with_alpha(
+                                   self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY), 0xAA))
+        a_lp = _lp(-1, -2)
+        a_lp.topMargin = self._dp(1)
+        content.addView(act_tv, a_lp)
+
+        # Кнопка «Открыть»
+        open_btn = self._mini_btn(ctx, "Открыть")
+        ob_lp = _lp(-2, -2)
+        ob_lp.leftMargin = self._dp(10)
+        ob_lp.gravity = Gravity.CENTER_VERTICAL
+        row.addView(open_btn, ob_lp)
+
+        def toggle(_v=None):
+            self._toggle_item(did)
+
+        row.setOnClickListener(OnClickListener(toggle))
+        cb.setOnClickListener(OnClickListener(toggle))
+        open_btn.setOnClickListener(
+            OnClickListener(lambda _v, d=did: self._open_chat(d)))
+
+        self._row_refs[did] = {"row": row, "checkbox": cb, "status": item["status"]}
+        return row
+
+    # ── Выбор и счётчик ────────────────────────────────────────────────────────
+
+    def _select_filtered(self, sel):
+        if self._is_batch_running:
+            return
+        ids = [int(x["id"]) for x in (self._visible_items or self._filtered_items())]
+        if sel:
+            self._selected.update(ids)
+        else:
+            for d in ids:
+                self._selected.discard(d)
+        for d in ids:
+            self._apply_row_sel(d)
+        self._update_counter()
+
+    def _toggle_item(self, did):
+        if self._is_batch_running:
+            return
+        if did in self._selected:
+            self._selected.discard(did)
+        else:
+            self._selected.add(did)
+        self._apply_row_sel(did)
+        self._update_counter()
+
+    def _apply_row_sel(self, did):
+        ref = self._row_refs.get(int(did))
+        if not ref:
+            return
+        checked = int(did) in self._selected
+        try:
+            ref["row"].setBackground(self._card_bg(ref["status"], checked))
+        except Exception:
+            pass
+        try:
+            cb = ref["checkbox"]
+            cb.setText("✓" if checked else "")
+            acc = self._status_accent(ref["status"])
+            if checked:
+                cb.setTextColor(Color.WHITE)
+                cb.setBackground(self._rounded(acc, 13))
+            else:
+                base   = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+                stroke = self._blend(base, acc, 0.30 if not self._is_dark(base) else 0.45)
+                fill   = self._blend(base, acc, 0.07 if not self._is_dark(base) else 0.14)
+                cb.setTextColor(Color.TRANSPARENT)
+                cb.setBackground(self._rounded(fill, 13, stroke, 1))
+        except Exception:
+            pass
+
+    def _update_counter(self):
+        tv  = self._views.get("counter")
+        btn = self._views.get("clean_btn")
+        visible = self._visible_items if self._visible_items is not None else self._filtered_items()
+        sel_vis = sum(1 for x in visible if int(x["id"]) in self._selected)
+        sel_tot = len(self._selected)
+        if tv:
+            tv.setText(f"Выбрано {sel_tot}  •  в фильтре {sel_vis}/{len(visible)}")
+        if btn:
+            label = f"🗑  Удалить ({sel_tot})" if sel_tot > 0 else "🗑  Удалить выбранные"
+            btn.setText(label)
+            en = sel_tot > 0 and not self._is_batch_running
+            btn.setEnabled(en)
+            btn.setAlpha(1.0 if en else 0.50)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Очистка
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _confirm_cleanup(self):
+        if self._is_batch_running:
+            return
+        items = [x for x in self._items if int(x["id"]) in self._selected]
+        if not items:
+            BulletinHelper.show_error("exteraClean: ничего не выбрано")
+            return
+        self._show_confirm(len(items))
+
+    def _show_confirm(self, count):
+        activity = self._views.get("activity")
+        if activity is None:
+            return
+
+        sheet = BottomSheet(activity, False)
+        sheet.setApplyTopPadding(False)
+        sheet.setApplyBottomPadding(False)
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(self._dp(16), self._dp(14), self._dp(16), self._dp(18))
+        root.setBackground(self._sheet_bg())
+
+        hd_lp = LinearLayout.LayoutParams(self._dp(40), self._dp(4))
+        hd_lp.gravity = Gravity.CENTER_HORIZONTAL
+        hd_lp.setMargins(0, self._dp(6), 0, self._dp(16))
+        hd = View(activity)
+        hd.setBackground(self._pill(
+            self._with_alpha(self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY), 0x60)))
+        root.addView(hd, hd_lp)
+
+        t = self._make_tv(activity, "⚠️  Подтверждение удаления", 19, bold=True,
+                          color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        root.addView(t, _lp(-1, -2))
+
+        m = self._make_tv(activity,
+                          f"Будет удалено / покинуто {count} диалогов.\n"
+                          f"Это действие нельзя отменить.", 14,
+                          color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        m_lp = _lp(-1, -2)
+        m_lp.topMargin = self._dp(8)
+        m_lp.bottomMargin = self._dp(18)
+        root.addView(m, m_lp)
+
+        row = LinearLayout(activity)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        root.addView(row, _lp(-1, -2))
+
+        cancel = self._action_btn(activity, "Отмена", filled=False)
+        row.addView(cancel, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        confirm = self._action_btn(activity, f"Удалить {count}", filled=True, danger=True)
+        c_lp = LinearLayout.LayoutParams(0, -2, 1.2)
+        c_lp.leftMargin = self._dp(8)
+        row.addView(confirm, c_lp)
+
+        cancel.setOnClickListener(OnClickListener(lambda _v: sheet.dismiss()))
+        confirm.setOnClickListener(
+            OnClickListener(lambda _v: self._do_cleanup_from_confirm(sheet)))
+
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _do_cleanup_from_confirm(self, csheet):
+        try:
+            csheet.dismiss()
+        except Exception:
+            pass
+        items = [x for x in self._items if int(x["id"]) in self._selected]
+        if not items:
+            BulletinHelper.show_error("exteraClean: список пуст")
+            return
+        self._start_cleanup(items)
+
+    def _start_cleanup(self, items):
+        if self._is_batch_running:
+            return
+        self._is_batch_running = True
+        self._batch_token += 1
+        token = self._batch_token
+        total = len(items)
+        self._set_progress("Очистка запущена", f"0 / {total}", 0.01)
+        self._update_counter()
+        rb = self._views.get("refresh_btn")
+        if rb:
+            rb.setEnabled(False)
+            rb.setAlpha(0.55)
+
+        def worker():
+            account = self._current_account()
+            ctrl    = MessagesController.getInstance(account)
+            conn_mgr = ctrl.getConnectionsManager(account)
+            self_id = int(UserConfig.getInstance(account).getClientUserId())
+            cleaned = 0
+            errors  = []
+
+            for idx, item in enumerate(items, 1):
+                if token != self._batch_token:
+                    return
+
+                did   = int(item["id"])
+                title = item.get("title") or "Чат"
+                dtype = item.get("type", "")
+                ok    = False
+
+                try:
+                    if did > 0:
+                        # ── Личный диалог / бот / удалённый аккаунт ──────────
+                        # deleteDialog(dialogId, folderId) — удаляет из списка
+                        # и отправляет TL_messages_deleteHistory на сервер
+                        try:
+                            ctrl.deleteDialog(did, 0)
+                            ok = True
+                        except Exception as e1:
+                            self._dbg(f"deleteDialog DM {title}: {e1}")
+                            # Запасной вариант: через TL напрямую
+                            try:
+                                peer = ctrl.getInputPeer(did)
+                                req  = TLRPC.TL_messages_deleteHistory()
+                                req.peer   = peer
+                                req.max_id = 0
+                                req.revoke = False
+                                conn_mgr.sendRequest(req, None)
+                                ok = True
+                            except Exception as e2:
+                                self._dbg(f"deleteHistory DM {title}: {e2}")
+                                errors.append(f"{title}: {e1}; {e2}")
+                    else:
+                        # ── Группа / канал ────────────────────────────────────
+                        chat_id = -did
+                        chat    = None
+                        try:
+                            chat = ctrl.getChat(Long.valueOf(chat_id))
+                        except Exception:
+                            pass
+
+                        is_channel = self._is_channel_or_mega(chat) if chat else False
+
+                        if is_channel:
+                            # ── Канал / супергруппа: TL_channels_leaveChannel ─
+                            try:
+                                req = TLRPC.TL_channels_leaveChannel()
+                                # Строим InputChannel
+                                try:
+                                    req.channel = ctrl.getInputChannel(Long.valueOf(chat_id))
+                                except Exception:
+                                    inp_ch = TLRPC.TL_inputChannel()
+                                    inp_ch.channel_id  = chat_id
+                                    inp_ch.access_hash = self._safe_long(
+                                        getattr(chat, "access_hash", 0), 0)
+                                    req.channel = inp_ch
+                                conn_mgr.sendRequest(req, None)
+                                # Удаляем из локального списка
+                                try:
+                                    ctrl.deleteDialog(did, 0)
+                                except Exception:
+                                    pass
+                                ok = True
+                            except Exception as e1:
+                                self._dbg(f"leaveChannel {title}: {e1}")
+                                # Fallback: deleteDialog
+                                try:
+                                    ctrl.deleteDialog(did, 0)
+                                    ok = True
+                                except Exception as e2:
+                                    self._dbg(f"deleteDialog channel {title}: {e2}")
+                                    errors.append(f"{title}: {e1}; {e2}")
+                        else:
+                            # ── Обычная группа: TL_messages_deleteChatUser ────
+                            try:
+                                req = TLRPC.TL_messages_deleteChatUser()
+                                req.chat_id  = chat_id
+                                req.user_id  = ctrl.getInputUser(Long.valueOf(self_id))
+                                req.revoke_history = False
+                                conn_mgr.sendRequest(req, None)
+                                try:
+                                    ctrl.deleteDialog(did, 0)
+                                except Exception:
+                                    pass
+                                ok = True
+                            except Exception as e1:
+                                self._dbg(f"deleteChatUser {title}: {e1}")
+                                # Fallback: deleteDialog
+                                try:
+                                    ctrl.deleteDialog(did, 0)
+                                    ok = True
+                                except Exception as e2:
+                                    self._dbg(f"deleteDialog group {title}: {e2}")
+                                    errors.append(f"{title}: {e1}; {e2}")
+
+                except Exception as e:
+                    self._dbg(f"cleanup unexpected {title}: {e}\n{traceback.format_exc()}")
+                    errors.append(f"{title}: {e}")
+
+                if ok:
+                    cleaned += 1
+
+                prog = float(idx) / float(max(1, total))
+                def _step(i=idx, n=title, p=prog):
+                    self._set_progress("Идёт очистка", f"{i} / {total}  •  {n}", p)
+                run_on_ui_thread(_step)
+
+                # Задержка между запросами — защита от флудвейта Telegram
+                time.sleep(0.35)
+
+            def _done():
+                if token != self._batch_token:
+                    return
+                self._is_batch_running = False
+                self._set_progress("Очистка завершена", f"Обработано {cleaned}/{total}", 1.0)
+                if errors:
+                    BulletinHelper.show_error(
+                        f"exteraClean: завершено с ошибками ({cleaned}/{total})")
+                else:
+                    BulletinHelper.show_success(
+                        f"exteraClean: очищено {cleaned} диалогов")
+                self._selected = set()
+                rb2 = self._views.get("refresh_btn")
+                if rb2:
+                    rb2.setEnabled(True)
+                    rb2.setAlpha(1.0)
+                self._refresh_async()
+
+            run_on_ui_thread(_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_progress(self, title, subtitle, val):
+        for k, v in [("prog_title", title), ("prog_sub", subtitle)]:
+            tv = self._views.get(k)
+            if tv:
+                try:
+                    tv.setText(str(v or ""))
+                except Exception:
+                    pass
+        p = self._views.get("progress")
+        if p:
+            try:
+                p.setProgress(max(0.0, min(1.0, float(val or 0.0))), True)
+            except Exception:
+                pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Навигация: открыть чат и монитор возврата
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _open_chat(self, did):
+        self._dbg(f"open_chat did={did}")
+        frag = self._views.get("fragment")
+        if frag is None:
+            frag, _ = self._get_frag_activity()
+        if frag is None:
+            BulletinHelper.show_error("Не удалось открыть диалог")
+            return
+        try:
+            Bundle    = find_class("android.os.Bundle")
+            ChatActCl = find_class("org.telegram.ui.ChatActivity")
+            if Bundle is None or ChatActCl is None:
+                raise RuntimeError("не найдены классы чата")
+            did = int(did)
+            if DialogObject.isEncryptedDialog(did):
+                args = Bundle()
+                args.putInt("enc_id", int(DialogObject.getEncryptedChatId(did)))
+                target = ChatActCl(args)
+            else:
+                try:
+                    target = ChatActCl.of(did)
+                except Exception:
+                    args = Bundle()
+                    if did > 0:
+                        args.putLong("user_id", did)
+                    else:
+                        args.putLong("chat_id", -did)
+                    target = ChatActCl(args)
+
+            pr = self
+
+            def present():
+                pr._dismiss_sheet()
+
+                # Открываем чат
+                opened = False
+                try:
+                    frag.presentFragment(target)
+                    opened = True
+                except Exception:
+                    pass
+                if not opened:
+                    try:
+                        LaunchActivity.instance.getActionBarLayout().presentFragment(target)
+                        opened = True
+                    except Exception as e:
+                        pr._dbg(f"presentFragment error: {e}")
+
+            run_on_ui_thread(present)
+        except Exception as e:
+            self._dbg(f"open_chat error: {e}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("Не удалось открыть диалог")
+
+    def _stack_size(self):
+        try:
+            layout = LaunchActivity.instance.getActionBarLayout()
+            return int(layout.getFragmentStack().size())
+        except Exception:
+            return -1
+
+    def _start_nav_monitor(self, hidden_sheet, pre_depth):
+        """
+        Восстанавливает шторку только когда глубина стека
+        вернулась к pre_depth — т.е. пользователь вышел из чата полностью.
+        Переходы внутри чата (профиль, медиа, комменты) не триггерят show().
+        """
+        self._monitor_token += 1
+        token = self._monitor_token
+        pr    = self
+
+        try:
+            handler = HandlerClass(LooperClass.getMainLooper())
+        except Exception as e:
+            self._dbg(f"nav_monitor: no Handler: {e}")
+            return
+
+        MAX = 900   # ≈ 5 минут
+        ticks = [0]
+
+        class Poll(dynamic_proxy(RunnableClass)):
+            def run(self_r):
+                if token != pr._monitor_token:
+                    return
+                ticks[0] += 1
+                if ticks[0] > MAX:
+                    _restore()
+                    return
+                try:
+                    cur = pr._stack_size()
+                except Exception as e:
+                    pr._dbg(f"nav_monitor stack error: {e}")
+                    _restore()
+                    return
+
+                if cur < 0:
+                    # Fallback по имени класса
+                    try:
+                        cf = get_last_fragment()
+                        if cf is not None:
+                            cls = str(cf.getClass().getSimpleName())
+                            if "ChatActivity" not in cls:
+                                _restore()
+                                return
+                    except Exception:
+                        _restore()
+                        return
+                    handler.postDelayed(self_r, 350)
+                    return
+
+                if cur <= pre_depth:
+                    pr._dbg(f"nav_monitor: restore (depth {cur} <= {pre_depth})")
+                    _restore()
+                else:
+                    handler.postDelayed(self_r, 350)
+
+        def _restore():
+            if token != pr._monitor_token:
+                return
+            ok = False
+            try:
+                hidden_sheet.show()
+                ok = True
+            except Exception as e:
+                pr._dbg(f"nav_monitor: show() error: {e}")
+                try:
+                    win = hidden_sheet.getWindow()
+                    if win:
+                        win.getDecorView().setVisibility(View.VISIBLE)
+                        ok = True
+                except Exception:
+                    pass
+            if ok:
+                try:
+                    pr._force_redraw()
+                except Exception as e:
+                    pr._dbg(f"nav_monitor: redraw error: {e}")
+
+        handler.postDelayed(Poll(), 750)
+
+    def _force_redraw(self):
+        """Принудительная перерисовка после hide/show без артефактов."""
+        self._schedule_render_items(delay_ms=50)
+        for key in ("root", "scroll", "list"):
+            v = self._views.get(key)
+            if v is None:
+                continue
+            try:
+                v.requestLayout()
+            except Exception:
+                pass
+            try:
+                v.invalidate()
+            except Exception:
+                pass
+        root = self._views.get("root")
+        if root:
+            try:
+                root.postInvalidateOnAnimation()
+            except Exception:
+                pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Исключения
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_excluded_ids(self):
+        raw = self.get_setting("excluded_dialog_ids", "") or ""
+        if isinstance(raw, (list, tuple, set)):
+            values = raw
+        else:
+            values = str(raw).split(",")
+        result = set()
+        for v in values:
+            d = self._safe_long(v, 0)
+            if d:
+                result.add(d)
+        return result
+
+    def _set_excluded_ids(self, ids, reload=False):
+        self.set_setting(
+            "excluded_dialog_ids",
+            ",".join(str(x) for x in ids if x),
+            reload)
+
+    def _iter_dialog_filters(self, ctrl):
+        filters = None
+        try:
+            filters = ctrl.getDialogFilters()
+        except Exception:
+            filters = getattr(ctrl, "dialogFilters", None)
+        if filters is None:
+            return []
+        out = []
+        try:
+            total = int(filters.size()) if hasattr(filters, "size") else len(filters)
+        except Exception:
+            total = 0
+        if total > 0:
+            for i in range(total):
+                try:
+                    out.append(filters.get(i) if hasattr(filters, "get") else filters[i])
+                except Exception:
+                    pass
+            return out
+        try:
+            for f in filters:
+                out.append(f)
+        except Exception:
+            pass
+        return out
+
+    def _dialog_filter_name(self, dialog_filter):
+        try:
+            return str(getattr(dialog_filter, "name", "") or "").strip()
+        except Exception:
+            return ""
+
+    def _dialog_filters_catalog(self, ctrl):
+        filters = []
+        names = {}
+        for dialog_filter in self._iter_dialog_filters(ctrl):
+            fid = self._safe_int(getattr(dialog_filter, "id", 0), 0)
+            name = self._dialog_filter_name(dialog_filter)
+            if not fid or not name:
+                continue
+            filters.append(dialog_filter)
+            names[fid] = name
+        self._dbg(
+            f"_dialog_filters_catalog total={len(filters)} "
+            f"names={[(self._safe_int(getattr(f, 'id', 0), 0), self._dialog_filter_name(f)) for f in filters]}"
+        )
+        return filters, names
+
+    def _selector_filter_groups(self, items):
+        groups = {"all": list(items)}
+        for item in items:
+            for fid in item.get("folder_ids", []) or []:
+                fid = self._safe_int(fid, 0)
+                if not fid:
+                    continue
+                groups.setdefault(f"folder:{fid}", []).append(item)
+        return groups
+
+    def _filter_label(self, specs, key):
+        for spec_key, label in specs or []:
+            if spec_key == key:
+                return str(label or "")
+        return "Все"
+
+    def _visible_selector_items(self, filter_groups, filter_key):
+        groups = filter_groups or {}
+        if filter_key == "all":
+            return list(groups.get("all", []))
+        return list(groups.get(filter_key, []))
+
+    def _dialog_item_folders_text(self, item):
+        names = [str(x).strip() for x in (item.get("folder_names") or []) if str(x).strip()]
+        if not names:
+            return ""
+        return "Папки: " + ", ".join(names)
+
+    def _selector_subtitle(self, item, footer_text=None):
+        parts = [str(footer_text or self._dtype_label(item.get("type", "")))]
+        folders_text = self._dialog_item_folders_text(item)
+        if folders_text:
+            parts.append(folders_text)
+        return "  •  ".join(x for x in parts if x)
+
+    def _get_dialog(self, ctrl, did, dialog=None):
+        if dialog is not None:
+            return dialog
+        did = self._safe_long(did, 0)
+        if not did:
+            return None
+        try:
+            if hasattr(ctrl, "getDialog"):
+                dlg = ctrl.getDialog(JLong.valueOf(int(did)))
+                if dlg is not None:
+                    return dlg
+        except Exception:
+            pass
+        try:
+            dialogs = getattr(ctrl, "dialogs_dict", None)
+            if dialogs is not None:
+                try:
+                    return dialogs.get(JLong.valueOf(int(did)))
+                except Exception:
+                    return dialogs.get(did)
+        except Exception:
+            pass
+        return None
+
+    def _open_exclusions_sheet(self, *_):
+        _, activity = self._get_frag_activity()
+        if activity is None:
+            BulletinHelper.show_error("Нет активности")
+            return
+        account = self._current_account()
+
+        sheet = BottomSheet(activity, False)
+        sheet.setApplyTopPadding(False)
+        sheet.setApplyBottomPadding(False)
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(16))
+        root.setBackground(self._sheet_bg())
+
+        self._add_handle(root, activity)
+
+        title = self._make_tv(activity, "Исключения", 19, bold=True,
+                              color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        root.addView(title, _lp(-1, -2))
+
+        sub = self._make_tv(activity, "Эти диалоги не попадут в список очистки", 12,
+                            color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        s_lp = _lp(-1, -2)
+        s_lp.topMargin = self._dp(3)
+        s_lp.bottomMargin = self._dp(12)
+        root.addView(sub, s_lp)
+
+        cscroll = HorizontalScrollView(activity)
+        cscroll.setHorizontalScrollBarEnabled(False)
+        cscroll.setOverScrollMode(2)
+        chips_host = LinearLayout(activity)
+        chips_host.setOrientation(LinearLayout.HORIZONTAL)
+        cscroll.addView(chips_host, LayoutHelper.createFrame(-2, -2))
+        root.addView(cscroll, LayoutHelper.createLinear(-1, -2, 0.0, 0, 0, 0, 10))
+
+        cnt_tv = self._make_tv(activity, "", 12,
+                               color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        cnt_tv.setPadding(0, 0, 0, self._dp(8))
+        root.addView(cnt_tv, _lp(-1, -2))
+
+        scroll = ScrollView(activity)
+        scroll.setFillViewport(True)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.setOverScrollMode(2)
+        host = LinearLayout(activity)
+        host.setOrientation(LinearLayout.VERTICAL)
+        scroll.addView(host, LayoutHelper.createFrame(-1, -2))
+        root.addView(scroll, LayoutHelper.createLinear(-1, self._dp(280)))
+
+        actions = LinearLayout(activity)
+        actions.setOrientation(LinearLayout.HORIZONTAL)
+        actions.setGravity(Gravity.CENTER_VERTICAL)
+        a_lp = _lp(-1, -2)
+        a_lp.topMargin = self._dp(12)
+        root.addView(actions, a_lp)
+
+        add_btn = self._action_btn(activity, "Добавить", filled=True)
+        actions.addView(add_btn, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        del_btn = self._action_btn(activity, "Удалить выбранные", filled=False)
+        dl_lp = LinearLayout.LayoutParams(0, -2, 1.2)
+        dl_lp.leftMargin = self._dp(8)
+        actions.addView(del_btn, dl_lp)
+
+        cur_flt = {"v": "all"}
+        state = {"ready": False, "items": [], "specs": [("all", "Все")], "groups": {"all": []}}
+        ctrl = MessagesController.getInstance(account)
+        dialog_filters, filter_names = self._dialog_filters_catalog(ctrl)
+
+        def rebuild_items():
+            items = []
+            for did in sorted(self._get_excluded_ids()):
+                item = self._selector_item(
+                    account,
+                    did,
+                    dialog=self._get_dialog(ctrl, did),
+                    dialog_filters=dialog_filters,
+                    filter_names=filter_names)
+                if item is not None:
+                    items.append(item)
+            items.sort(key=lambda x: str(x.get("title") or "").lower())
+            groups = self._selector_filter_groups(items)
+            specs = self._folder_specs(account, items, dialog_filters=dialog_filters, filter_groups=groups)
+            state["items"] = items
+            state["groups"] = groups
+            state["specs"] = specs
+            state["ready"] = True
+            valid_keys = {k for k, _ in specs}
+            if cur_flt["v"] not in valid_keys:
+                self._dbg(f"exclusions filter reset -> all (missing {cur_flt['v']})")
+                cur_flt["v"] = "all"
+            self._dbg(
+                f"exclusions rebuild items={len(items)} folders={max(0, len(specs) - 1)} "
+                f"active={cur_flt['v']} [{self._filter_label(specs, cur_flt['v'])}]")
+
+        def visible_items():
+            return self._visible_selector_items(state["groups"], cur_flt["v"])
+
+        def render_chips():
+            chips_host.removeAllViews()
+            specs = state["specs"]
+            self._dbg(f"exclusions render_chips active={cur_flt['v']} specs={specs}")
+            for idx, (k, lbl) in enumerate(specs):
+                chip = self._chip(activity, lbl, active=(k == cur_flt["v"]))
+                chip.setOnClickListener(OnClickListener(lambda _v, kk=k: on_flt(kk)))
+                lp = _lp(-2, -2)
+                if idx > 0:
+                    lp.leftMargin = self._dp(8)
+                chips_host.addView(chip, lp)
+
+        def sync_actions():
+            if not self._excl_select_mode:
+                del_btn.setText("Удалить выбранные")
+            elif self._excl_marked:
+                del_btn.setText(f"Удалить ({len(self._excl_marked)})")
+            else:
+                del_btn.setText("Отменить выбор")
+            del_btn.setAlpha(1.0)
+
+        def render(rebuild=False, chips=False):
+            if rebuild or not state["ready"]:
+                rebuild_items()
+                chips = True
+            if chips:
+                render_chips()
+            host.removeAllViews()
+            sync_actions()
+            items = state["items"]
+            vis = visible_items()
+            cnt_tv.setText(
+                f"Фильтр: {self._filter_label(state['specs'], cur_flt['v'])}  •  "
+                f"исключено {len(items)}  •  показано {len(vis)}")
+            if not items:
+                tv = self._make_tv(activity, "Список исключений пуст", 14,
+                                   color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+                tv.setGravity(Gravity.CENTER_HORIZONTAL)
+                tv.setPadding(self._dp(12), self._dp(36), self._dp(12), self._dp(36))
+                host.addView(tv, _lp(-1, -2))
+                return
+            for idx, item in enumerate(vis):
+                did = int(item["id"])
+                checked = did in self._excl_marked
+                row = self._selector_row(
+                    activity, item, checked,
+                    footer_text="Исключён из очистки",
+                    on_click=(lambda d=did: self._toggle_excl(d, render))
+                             if self._excl_select_mode else None)
+                lp = _lp(-1, -2)
+                if idx > 0:
+                    lp.topMargin = self._dp(8)
+                host.addView(row, lp)
+
+        def on_flt(k):
+            cur_flt["v"] = k
+            self._dbg(f"exclusions filter -> {k} [{self._filter_label(state['specs'], k)}]")
+            render(chips=True)
+
+        def on_add(_v=None):
+            try:
+                sheet.dismiss()
+            except Exception:
+                pass
+            run_on_ui_thread(lambda: self._open_picker_sheet(), 120)
+
+        def on_del(_v=None):
+            if not self._excl_select_mode:
+                self._excl_select_mode = True
+                self._excl_marked = set()
+                self._dbg("exclusions select_mode -> on")
+                render()
+                return
+            if not self._excl_marked:
+                self._excl_select_mode = False
+                self._dbg("exclusions select_mode -> off (empty selection)")
+                render()
+                return
+            exc = self._get_excluded_ids()
+            for d in list(self._excl_marked):
+                exc.discard(int(d))
+            cnt = len(self._excl_marked)
+            self._excl_marked = set()
+            self._excl_select_mode = False
+            self._set_excluded_ids(exc, True)
+            BulletinHelper.show_success(f"Убрано исключений: {cnt}")
+            if self._sheet:
+                self._refresh_async()
+            render(rebuild=True, chips=True)
+
+        add_btn.setOnClickListener(OnClickListener(on_add))
+        del_btn.setOnClickListener(OnClickListener(on_del))
+        self._install_touch_policy(sheet, scroll, [title, sub])
+        sheet.setCustomView(root)
+        sheet.show()
+        render(rebuild=True, chips=True)
+
+    def _toggle_excl(self, did, render_fn):
+        if did in self._excl_marked:
+            self._excl_marked.discard(int(did))
+        else:
+            self._excl_marked.add(int(did))
+        self._dbg(f"exclusions marked={len(self._excl_marked)} last={did}")
+        render_fn()
+
+    def _open_picker_sheet(self):
+        _, activity = self._get_frag_activity()
+        if activity is None:
+            return
+        account     = self._current_account()
+        excl        = self._get_excluded_ids()
+        items       = self._all_selector_items(account, excl)
+        ctrl        = MessagesController.getInstance(account)
+        dialog_filters, _ = self._dialog_filters_catalog(ctrl)
+        flt_groups  = self._selector_filter_groups(items)
+        flt_specs   = self._folder_specs(account, items, dialog_filters=dialog_filters, filter_groups=flt_groups)
+        selected    = set()
+        cur_flt     = {"v": "all"}
+
+        sheet = BottomSheet(activity, False)
+        sheet.setApplyTopPadding(False)
+        sheet.setApplyBottomPadding(False)
+
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(16))
+        root.setBackground(self._sheet_bg())
+
+        self._add_handle(root, activity)
+
+        title = self._make_tv(activity, "Добавить в исключения", 19, bold=True,
+                              color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        root.addView(title, _lp(-1, -2))
+
+        sub = self._make_tv(activity, "Выбери диалоги, группы или каналы", 12,
+                            color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        s_lp = _lp(-1, -2)
+        s_lp.topMargin = self._dp(3)
+        s_lp.bottomMargin = self._dp(10)
+        root.addView(sub, s_lp)
+
+        cscroll = HorizontalScrollView(activity)
+        cscroll.setHorizontalScrollBarEnabled(False)
+        cscroll.setOverScrollMode(2)
+        chips_host = LinearLayout(activity)
+        chips_host.setOrientation(LinearLayout.HORIZONTAL)
+        cscroll.addView(chips_host, LayoutHelper.createFrame(-2, -2))
+        root.addView(cscroll, LayoutHelper.createLinear(-1, -2, 0.0, 0, 0, 0, 10))
+
+        cnt_tv = self._make_tv(activity, "", 12,
+                               color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        cnt_tv.setPadding(0, 0, 0, self._dp(8))
+        root.addView(cnt_tv, _lp(-1, -2))
+
+        scroll = ScrollView(activity)
+        scroll.setFillViewport(True)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.setOverScrollMode(2)
+        host = LinearLayout(activity)
+        host.setOrientation(LinearLayout.VERTICAL)
+        scroll.addView(host, LayoutHelper.createFrame(-1, -2))
+        root.addView(scroll, LayoutHelper.createLinear(-1, self._dp(340)))
+
+        act_row = LinearLayout(activity)
+        act_row.setOrientation(LinearLayout.HORIZONTAL)
+        act_row.setGravity(Gravity.CENTER_VERTICAL)
+        act_row.setPadding(0, self._dp(12), 0, 0)
+        root.addView(act_row, _lp(-1, -2))
+
+        back_btn = self._action_btn(activity, "Назад", filled=False)
+        act_row.addView(back_btn, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        add_btn = self._action_btn(activity, "Добавить", filled=True)
+        ab_lp = LinearLayout.LayoutParams(0, -2, 1.0)
+        ab_lp.leftMargin = self._dp(8)
+        act_row.addView(add_btn, ab_lp)
+
+        def visible():
+            return self._visible_selector_items(flt_groups, cur_flt["v"])
+
+        def render_chips():
+            chips_host.removeAllViews()
+            self._dbg(f"picker render_chips active={cur_flt['v']} specs={flt_specs}")
+            for idx, (k, lbl) in enumerate(flt_specs):
+                chip = self._chip(activity, lbl, active=(k == cur_flt["v"]))
+                chip.setOnClickListener(OnClickListener(lambda _v, kk=k: on_flt(kk)))
+                lp = _lp(-2, -2)
+                if idx > 0:
+                    lp.leftMargin = self._dp(8)
+                chips_host.addView(chip, lp)
+
+        def render_rows():
+            vis = visible()
+            host.removeAllViews()
+            cnt_tv.setText(
+                f"Фильтр: {self._filter_label(flt_specs, cur_flt['v'])}  •  "
+                f"выбрано {len(selected)}  •  показано {len(vis)}")
+            if not vis:
+                tv = self._make_tv(activity, "Нет диалогов под этот фильтр", 14,
+                                   color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+                tv.setGravity(Gravity.CENTER_HORIZONTAL)
+                tv.setPadding(self._dp(12), self._dp(36), self._dp(12), self._dp(36))
+                host.addView(tv, _lp(-1, -2))
+            else:
+                for idx, it in enumerate(vis):
+                    d = int(it["id"])
+                    row = self._selector_row(activity, it, d in selected,
+                                             on_click=lambda dd=d: toggle(dd))
+                    lp = _lp(-1, -2)
+                    if idx > 0:
+                        lp.topMargin = self._dp(8)
+                    host.addView(row, lp)
+            lbl = f"Добавить ({len(selected)})" if selected else "Добавить"
+            add_btn.setText(lbl)
+            add_btn.setEnabled(bool(selected))
+            add_btn.setAlpha(1.0 if selected else 0.55)
+
+        def on_flt(k):
+            cur_flt["v"] = k
+            self._dbg(f"picker filter -> {k} [{self._filter_label(flt_specs, k)}]")
+            render_chips()
+            render_rows()
+
+        def toggle(did):
+            if did in selected:
+                selected.discard(int(did))
+            else:
+                selected.add(int(did))
+            render_rows()
+
+        def on_back(_v=None):
+            try:
+                sheet.dismiss()
+            except Exception:
+                pass
+
+        def on_add(_v=None):
+            if not selected:
+                return
+            exc = self._get_excluded_ids()
+            exc.update(int(x) for x in selected)
+            self._set_excluded_ids(exc, True)
+            try:
+                sheet.dismiss()
+            except Exception:
+                pass
+            BulletinHelper.show_success(f"Добавлено в исключения: {len(selected)}")
+            if self._sheet:
+                self._refresh_async()
+
+        back_btn.setOnClickListener(OnClickListener(on_back))
+        add_btn.setOnClickListener(OnClickListener(on_add))
+        self._install_touch_policy(sheet, scroll, [title, sub])
+        sheet.setCustomView(root)
+        sheet.show()
+        self._dbg(
+            f"picker init items={len(items)} folders={max(0, len(flt_specs) - 1)} "
+            f"active={cur_flt['v']} [{self._filter_label(flt_specs, cur_flt['v'])}]")
+        render_chips()
+        render_rows()
+
+    def _selector_item(self, account, did, dialog=None, dialog_filters=None, filter_names=None):
+        ctrl = MessagesController.getInstance(account)
+        acci = AccountInstance.getInstance(account)
+        did  = self._safe_long(did, 0)
+        if not did:
+            return None
+        dialog = self._get_dialog(ctrl, did, dialog)
+        if did > 0:
+            try:
+                user = ctrl.getUser(Long.valueOf(did))
+            except Exception:
+                user = None
+            if user is None:
+                return None
+            folders = self._dialog_folder_ids(ctrl, acci, did, dialog, dialog_filters=dialog_filters)
+            return {"id": int(did), "type": "user",
+                    "title": self._user_name(user),
+                    "folder_ids": folders,
+                    "folder_names": self._dialog_folder_names(folders, filter_names)}
+        else:
+            try:
+                chat = ctrl.getChat(Long.valueOf(-did))
+            except Exception:
+                chat = None
+            if chat is None:
+                return None
+            folders = self._dialog_folder_ids(ctrl, acci, did, dialog, dialog_filters=dialog_filters)
+            return {"id": int(did), "type": self._chat_type(chat),
+                    "title": self._chat_name(chat),
+                    "folder_ids": folders,
+                    "folder_names": self._dialog_folder_names(folders, filter_names)}
+
+    def _all_selector_items(self, account, excl):
+        ctrl    = MessagesController.getInstance(account)
+        ucfg    = UserConfig.getInstance(account)
+        self_id = int(ucfg.getClientUserId())
+        dialog_filters, filter_names = self._dialog_filters_catalog(ctrl)
+        all_dlgs = []
+        try:
+            ad = ctrl.getAllDialogs()
+            if ad is not None:
+                for i in range(int(ad.size())):
+                    d = ad.get(i)
+                    if d is not None:
+                        all_dlgs.append(d)
+        except Exception:
+            pass
+        if not all_dlgs:
+            dialogs = ctrl.dialogs_dict
+            total = int(dialogs.size()) if dialogs is not None else 0
+            for i in range(total):
+                dlg = dialogs.valueAt(i)
+                if dlg is not None:
+                    all_dlgs.append(dlg)
+        items   = []
+        for dlg in all_dlgs:
+            did = self._safe_long(getattr(dlg, "id", 0), 0)
+            if not did or did == self_id or did in excl:
+                continue
+            if self._is_encrypted(did):
+                continue
+            item = self._selector_item(
+                account,
+                did,
+                dialog=dlg,
+                dialog_filters=dialog_filters,
+                filter_names=filter_names)
+            if item:
+                items.append(item)
+        items.sort(key=lambda x: x["title"].lower())
+        self._dbg(
+            f"_all_selector_items total={len(items)} excluded={len(excl)} "
+            f"folders={max(0, len(self._folder_specs(account, items, dialog_filters=dialog_filters, filter_groups=self._selector_filter_groups(items))) - 1)}")
+        return items
+
+    def _folder_specs(self, account, items, dialog_filters=None, filter_groups=None):
+        specs = [("all", "Все")]
+        try:
+            ctrl = MessagesController.getInstance(account)
+            filters = dialog_filters or self._iter_dialog_filters(ctrl)
+            groups = filter_groups or self._selector_filter_groups(items)
+            for f in filters:
+                name = self._dialog_filter_name(f)
+                if not name:
+                    continue
+                fid = self._safe_int(getattr(f, "id", 0), 0)
+                count = len(groups.get(f"folder:{fid}", [])) if fid else 0
+                specs.append((f"folder:{fid}", f"{name} ({count})"))
+        except Exception:
+            pass
+        self._dbg(f"_folder_specs total_items={len(items)} specs={specs}")
+        return specs
+
+    def _dialog_folder_ids(self, ctrl, account_instance, did, dialog=None, dialog_filters=None):
+        out = []
+        try:
+            dialog = self._get_dialog(ctrl, did, dialog)
+            did_value = JLong.valueOf(int(did))
+            for f in (dialog_filters or self._iter_dialog_filters(ctrl)):
+                name = self._dialog_filter_name(f)
+                if not name:
+                    continue
+                try:
+                    if dialog is not None:
+                        included = bool(f.includesDialog(account_instance, did_value, dialog))
+                    else:
+                        included = bool(f.includesDialog(account_instance, did_value))
+                except Exception:
+                    included = False
+                if included:
+                    out.append(self._safe_int(getattr(f, "id", 0), 0))
+        except Exception as e:
+            self._dbg(f"_dialog_folder_ids error did={did} err={e}")
+        return out
+
+    def _dialog_folder_names(self, folder_ids, filter_names=None):
+        names = []
+        mapping = filter_names or {}
+        for fid in folder_ids or []:
+            name = str(mapping.get(self._safe_int(fid, 0), "") or "").strip()
+            if name:
+                names.append(name)
+        return names
+
+    def _selector_row(self, ctx, item, checked, footer_text=None, on_click=None):
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(self._dp(12), self._dp(10), self._dp(12), self._dp(10))
+        row.setBackground(self._card_bg("", checked))
+
+        cb = self._toggle_view(ctx, checked, "")
+        cb_lp = LinearLayout.LayoutParams(self._dp(26), self._dp(26))
+        cb_lp.rightMargin = self._dp(10)
+        cb_lp.gravity = Gravity.CENTER_VERTICAL
+        row.addView(cb, cb_lp)
+
+        content = LinearLayout(ctx)
+        content.setOrientation(LinearLayout.VERTICAL)
+        row.addView(content, LinearLayout.LayoutParams(0, -2, 1.0))
+
+        nm = self._make_tv(ctx, str(item.get("title") or ""), 14, bold=True,
+                           color=self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+        nm.setSingleLine(True)
+        nm.setEllipsize(TextUtils.TruncateAt.END)
+        content.addView(nm, _lp(-1, -2))
+
+        ft_text = self._selector_subtitle(item, footer_text=footer_text)
+        ft = self._make_tv(ctx, ft_text, 11,
+                           color=self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY))
+        ft.setSingleLine(True)
+        ft.setEllipsize(TextUtils.TruncateAt.END)
+        f_lp = _lp(-1, -2)
+        f_lp.topMargin = self._dp(2)
+        content.addView(ft, f_lp)
+
+        if on_click:
+            row.setOnClickListener(OnClickListener(lambda _v: on_click()))
+        return row
+
+    def _dtype_label(self, t):
+        return {"channel": "Канал", "group": "Группа",
+                "user": "Личный диалог", "bot": "Бот"}.get(t, "Диалог")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Вспомогательные UI-виджеты
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _make_tv(self, ctx, text, sp, bold=False, color=None):
+        tv = TextView(ctx)
+        tv.setText(str(text or ""))
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, sp)
+        tv.setTypeface(Typeface.DEFAULT_BOLD if bold else Typeface.DEFAULT)
+        if color is not None:
+            tv.setTextColor(self._safe_color(color, Color.WHITE))
+        return tv
+
+    def _badge(self, ctx, status):
+        labels = {
+            ST_DELETED:    "🚫 Удалён",
+            ST_INACTIVE:   "💤 Заброшен",
+            ST_RESTRICTED: "⚠️ Ограничен",
+        }
+        tv = self._make_tv(ctx, labels.get(status, status), 10, bold=True, color=Color.WHITE)
+        tv.setSingleLine(True)
+        tv.setPadding(self._dp(9), self._dp(4), self._dp(9), self._dp(4))
+        tv.setBackground(self._status_bg(status))
+        return tv
+
+    def _toggle_view(self, ctx, checked, status):
+        tv = TextView(ctx)
+        tv.setGravity(Gravity.CENTER)
+        tv.setSingleLine(True)
+        tv.setIncludeFontPadding(False)
+        tv.setText("✓" if checked else "")
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        tv.setTypeface(Typeface.DEFAULT_BOLD)
+        acc = self._status_accent(status)
+        if checked:
+            tv.setTextColor(Color.WHITE)
+            tv.setBackground(self._ripple(self._rounded(acc, 13), acc, 13))
+        else:
+            base   = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+            stroke = self._blend(base, acc, 0.30 if not self._is_dark(base) else 0.45)
+            fill   = self._blend(base, acc, 0.07 if not self._is_dark(base) else 0.14)
+            tv.setTextColor(Color.TRANSPARENT)
+            tv.setBackground(self._ripple(self._rounded(fill, 13, stroke, 1), acc, 13))
+        return tv
+
+    def _chip(self, ctx, text, active=False):
+        tv = self._make_tv(ctx, str(text), 12)
+        tv.setGravity(Gravity.CENTER)
+        tv.setPadding(self._dp(14), self._dp(7), self._dp(14), self._dp(7))
+        self._apply_chip_state(tv, active)
+        return tv
+
+    def _apply_chip_state(self, view, active):
+        base = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        acc  = self._accent()
+        if active:
+            view.setTextColor(Color.WHITE)
+            view.setTypeface(Typeface.DEFAULT_BOLD)
+            view.setBackground(self._ripple(self._rounded(acc, 50), Color.WHITE, 50))
+        else:
+            stroke = self._with_alpha(self._color(Theme.key_divider, Color.GRAY), 0x99)
+            fill   = self._blend(base, acc, 0.07 if not self._is_dark(base) else 0.15)
+            view.setTextColor(self._color(Theme.key_windowBackgroundWhiteBlackText, Color.WHITE))
+            view.setTypeface(Typeface.DEFAULT)
+            view.setBackground(self._ripple(self._rounded(fill, 50, stroke, 1), acc, 50))
+
+    def _action_btn(self, ctx, text, filled=True, danger=False, small=False):
+        tv = self._make_tv(ctx, str(text), 12 if small else 13, bold=True)
+        tv.setSingleLine(True)
+        tv.setEllipsize(TextUtils.TruncateAt.END)
+        tv.setGravity(Gravity.CENTER)
+        pad_h = self._dp(12 if small else 16)
+        pad_v = self._dp(8 if small else 11)
+        tv.setPadding(pad_h, pad_v, pad_h, pad_v)
+        # Явно разрешаем клики — на некоторых TextView по умолчанию отключено
+        tv.setClickable(True)
+        tv.setFocusable(True)
+        surface = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        acc     = self._accent()
+        if danger:
+            acc = Color.parseColor("#D64545")
+        if filled:
+            tv.setTextColor(Color.WHITE)
+            tv.setBackground(self._ripple(self._rounded(acc, 50), Color.WHITE, 50))
+        else:
+            fill   = self._blend(surface, acc, 0.09 if not self._is_dark(surface) else 0.18)
+            stroke = self._blend(surface, acc, 0.32 if not self._is_dark(surface) else 0.48)
+            tv.setTextColor(acc)
+            tv.setBackground(self._ripple(self._rounded(fill, 50, stroke, 1), acc, 50))
+        return tv
+
+    def _mini_btn(self, ctx, text):
+        tv = self._make_tv(ctx, str(text), 11, bold=True)
+        tv.setSingleLine(True)
+        tv.setGravity(Gravity.CENTER)
+        tv.setPadding(self._dp(12), self._dp(7), self._dp(12), self._dp(7))
+        surface = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        acc     = self._accent()
+        fill    = self._blend(surface, acc, 0.10 if not self._is_dark(surface) else 0.20)
+        stroke  = self._blend(surface, acc, 0.35 if not self._is_dark(surface) else 0.50)
+        tv.setTextColor(acc)
+        tv.setBackground(self._ripple(self._rounded(fill, 50, stroke, 1), acc, 50))
+        return tv
+
+    def _add_handle(self, parent, ctx):
+        hd = View(ctx)
+        hd.setBackground(self._pill(
+            self._with_alpha(self._color(Theme.key_windowBackgroundWhiteGrayText2, Color.GRAY), 0x60)))
+        lp = LinearLayout.LayoutParams(self._dp(40), self._dp(4))
+        lp.gravity = Gravity.CENTER_HORIZONTAL
+        lp.setMargins(0, self._dp(6), 0, self._dp(14))
+        parent.addView(hd, lp)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Drawable и цветовые хелперы
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _accent(self):
+        return self._color(
+            getattr(Theme, "key_featuredStickers_addButton",
+                    Theme.key_windowBackgroundWhiteBlueButton), 0xFF4C7DFF)
+
+    def _sheet_bg(self):
+        base   = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        stroke = self._with_alpha(self._color(Theme.key_divider, Color.GRAY), 0x55)
+        return self._rounded(base, 28, stroke, 1)
+
+    def _glass_bg(self):
+        base    = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        is_dark = self._is_dark(base)
+        fill   = self._blend(base, self._accent(), 0.05 if not is_dark else 0.10)
+        stroke = self._with_alpha(self._color(Theme.key_divider, Color.GRAY), 0x88)
+        return self._rounded(fill, 22, stroke, 1)
+
+    def _card_bg(self, status, selected):
+        """
+        Карточка чата: фон windowBackgroundWhite + чёткая контрастная обводка.
+        Обводка толщиной 1.5dp гарантирует читаемость на светлой и тёмной теме.
+        """
+        base    = self._color(Theme.key_windowBackgroundWhite, Color.WHITE)
+        is_dark = self._is_dark(base)
+        acc     = self._status_accent(status) if status else self._accent()
+
+        if selected:
+            fill   = self._blend(base, acc, 0.16 if not is_dark else 0.24)
+            # Выбранная карточка: акцентная обводка
+            stroke = self._blend(base, acc, 0.65 if not is_dark else 0.75)
+            sw     = self._dp_f(1.5)
+        else:
+            fill   = base
+            # Обычная: тёмная обводка на светлой теме, светлая на тёмной
+            if is_dark:
+                stroke = self._with_alpha(Color.WHITE, 0x20)
+            else:
+                stroke = self._with_alpha(Color.BLACK, 0x14)
+            sw = self._dp_f(1.5)
+
+        d = GradientDrawable()
+        d.setShape(GradientDrawable.RECTANGLE)
+        d.setCornerRadius(float(self._dp(16)))
+        d.setColor(self._safe_color(fill, Color.WHITE))
+        d.setStroke(int(sw), self._safe_color(stroke, 0))
+        return d
+
+    def _metric_bg(self, ratio):
+        ratio = max(0.0, min(1.0, float(ratio or 0.0)))
+        if ratio >= 0.9:
+            c1, c2 = Color.parseColor("#B84040"), Color.parseColor("#8B2424")
+        elif ratio >= 0.6:
+            c1, c2 = Color.parseColor("#B07A20"), Color.parseColor("#7A5010")
+        else:
+            c1, c2 = Color.parseColor("#2D8C60"), Color.parseColor("#1A6044")
+        return self._grad_bg(c1, c2, 18)
+
+    def _status_bg(self, status):
+        acc  = self._status_accent(status)
+        fill = self._blend(acc, Color.WHITE, 0.10 if self._is_dark(acc) else 0.0)
+        return self._rounded(fill, 20)
+
+    def _status_accent(self, status):
+        if status == ST_DELETED:
+            return Color.parseColor("#D84B43")
+        if status == ST_RESTRICTED:
+            return Color.parseColor("#E09B2A")
+        return Color.parseColor("#4A84F6")   # ST_INACTIVE / default
+
+    def _grad_bg(self, c1, c2, radius_dp):
+        c1 = self._safe_color(c1, Color.GRAY)
+        return self._rounded(c1, radius_dp)
+
+    def _rounded(self, fill, radius_dp=18, stroke=0, stroke_width=1):
+        d = GradientDrawable()
+        d.setShape(GradientDrawable.RECTANGLE)
+        d.setCornerRadius(float(self._dp(radius_dp)))
+        d.setColor(self._safe_color(fill, Color.WHITE))
+        if stroke:
+            d.setStroke(self._dp(stroke_width), self._safe_color(stroke, 0))
+        return d
+
+    def _pill(self, color):
+        d = GradientDrawable()
+        d.setShape(GradientDrawable.RECTANGLE)
+        d.setCornerRadius(999.0)
+        d.setColor(self._safe_color(color, Color.GRAY))
+        return d
+
+    def _ripple(self, content, ripple_color, radius_dp):
+        try:
+            rc  = self._safe_color(ripple_color, Color.WHITE)
+            csl = ColorStateList.valueOf(self._with_alpha(rc, 0x55))
+            mask = self._rounded(Color.WHITE, radius_dp)
+            return RippleDrawable(csl, content, mask)
+        except Exception:
+            return content
+
+    def _solid(self, color):
+        return ColorDrawable(self._safe_color(color, Color.TRANSPARENT))
+
+    def _divider(self, ctx):
+        v  = View(ctx)
+        v.setBackgroundColor(self._with_alpha(self._color(Theme.key_divider, Color.GRAY), 0x55))
+        lp = LinearLayout.LayoutParams(-1, self._dp(1))
+        lp.topMargin = lp.bottomMargin = self._dp(8)
+        v.setLayoutParams(lp)
+        return v
+
+    def _vspace(self, parent, ctx, dp):
+        parent.addView(View(ctx), LinearLayout.LayoutParams(-1, self._dp(dp)))
+
+    def _type_icon(self, item):
+        t = item.get("type", "")
+        if t == "channel":
+            return "📢"
+        if t == "group":
+            return "👥"
+        if t == "bot":
+            return "🤖"
+        if t == "user":
+            return "🚫" if item.get("status") == ST_DELETED else "👤"
+        return "💬"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Вспомогательные: subtitle, прогресс
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _set_subtitle(self, text):
+        v = self._views.get("subtitle")
+        if v:
+            try:
+                v.setText(str(text or ""))
+            except Exception:
+                pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Touch-политика
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _install_touch_policy(self, sheet, scroll, handle_view=None):
+        """
+        Исправленная touch-политика:
+        - На ScrollView всегда блокируем перехват родителя → скролл вверх
+          не закрывает шторку.
+        - Закрыть шторку можно только через ручку (handle_view) или нажав
+          вне шторки. setCanDismissWithSwipe(False) уже вызван выше.
+        """
+        gate = self._sheet_touch_gate
+        gate.clear()
+        gate["handle_dragging"] = False
+
+        def at_top():
+            try:
+                return scroll.getScrollY() <= 0
+            except Exception:
+                return True
+
+        class ScrollTL(dynamic_proxy(OnTouchClass)):
+            def onTouch(_s, view, ev):
+                try:
+                    a = int(ev.getActionMasked())
+                except Exception:
+                    try:
+                        a = int(ev.getAction())
+                    except Exception:
+                        a = 0
+                # При любом касании на списке — запрещаем родителю перехватывать
+                if a in (0, 2):
+                    try:
+                        parent = view.getParent()
+                        if parent is not None:
+                            parent.requestDisallowInterceptTouchEvent(True)
+                    except Exception:
+                        pass
+                return False
+
+        class HandleTL(dynamic_proxy(OnTouchClass)):
+            def onTouch(_s, view, ev):
+                try:
+                    a = int(ev.getActionMasked())
+                except Exception:
+                    try:
+                        a = int(ev.getAction())
+                    except Exception:
+                        a = 0
+                # На ручке — разрешаем родителю, чтобы пользователь мог закрыть свайпом
+                if a == 0:
+                    gate["handle_dragging"] = True
+                    try:
+                        parent = view.getParent()
+                        if parent is not None:
+                            parent.requestDisallowInterceptTouchEvent(False)
+                    except Exception:
+                        pass
+                elif a in (1, 3):
+                    gate["handle_dragging"] = False
+                return False
+
+        try:
+            scroll.setOnTouchListener(ScrollTL())
+        except Exception:
+            pass
+
+        if handle_view is not None:
+            try:
+                handle_view.setOnTouchListener(HandleTL())
+            except Exception:
+                pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Учётная запись и математика
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _current_account(self):
+        frag = self._views.get("fragment")
+        if frag is not None:
+            try:
+                return int(frag.getCurrentAccount())
+            except Exception:
+                pass
+        try:
+            return int(UserConfig.selectedAccount)
+        except Exception:
+            return 0
+
+    def _dp(self, value):
+        try:
+            return int(AndroidUtilities.dp(float(value)))
+        except Exception:
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+    def _dp_f(self, value):
+        try:
+            return float(AndroidUtilities.dp(float(value)))
+        except Exception:
+            return float(value)
+
+    def _safe_color(self, value, fallback):
+        try:
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                value = fallback
+            value = int(value)
+        except Exception:
+            value = int(fallback)
+        if value > 0x7FFFFFFF:
+            value -= 0x100000000
+        if value < -0x80000000:
+            value = -0x80000000
+        return int(value)
+
+    def _color(self, key, fallback=0):
+        try:
+            return self._safe_color(Theme.getColor(key), fallback)
+        except Exception:
+            return self._safe_color(fallback, 0)
+
+    def _blend(self, c1, c2, amount):
+        c1 = self._safe_color(c1, Color.WHITE)
+        c2 = self._safe_color(c2, c1)
+        amount = max(0.0, min(1.0, float(amount)))
+        inv = 1.0 - amount
+        return Color.argb(
+            self._ch(Color.alpha(c1) * inv + Color.alpha(c2) * amount),
+            self._ch(Color.red(c1)   * inv + Color.red(c2)   * amount),
+            self._ch(Color.green(c1) * inv + Color.green(c2) * amount),
+            self._ch(Color.blue(c1)  * inv + Color.blue(c2)  * amount),
+        )
+
+    def _with_alpha(self, color, alpha):
+        color = self._safe_color(color, Color.WHITE)
+        alpha = max(0, min(255, int(alpha)))
+        return Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
+
+    def _is_dark(self, color):
+        color = self._safe_color(color, Color.WHITE)
+        lum = (0.2126 * Color.red(color) +
+               0.7152 * Color.green(color) +
+               0.0722 * Color.blue(color)) / 255.0
+        return lum < 0.42
+
+    def _safe_int(self, value, fallback=0):
+        try:
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                return int(fallback)
+            return int(value)
+        except Exception:
+            return int(fallback)
+
+    def _safe_long(self, value, fallback=0):
+        try:
+            return int(value)
+        except Exception:
+            return int(fallback)
+
+    def _safe_float(self, value, fallback=0.0):
+        try:
+            v = float(value)
+        except Exception:
+            return float(fallback)
+        return float(fallback) if (math.isnan(v) or math.isinf(v)) else v
+
+    def _ch(self, value):
+        v = self._safe_float(value, 0.0)
+        return 0 if v < 0 else (255 if v > 255 else int(round(v)))
+
+    def _fmt_date(self, ts):
+        ts = self._safe_int(ts, 0)
+        if ts <= 0:
+            return "нет данных"
+        try:
+            return time.strftime("%d.%m.%Y", time.localtime(ts))
+        except Exception:
+            return str(ts)
+
+    def _main_handler(self):
+        if self._render_handler is None:
+            self._render_handler = HandlerClass(LooperClass.getMainLooper())
+        return self._render_handler
+
+
+# ── Глобальный хелпер: создание LayoutParams без Gravity/weight ──────────────
+
+def _lp(w, h):
+    return LinearLayout.LayoutParams(w, h)
