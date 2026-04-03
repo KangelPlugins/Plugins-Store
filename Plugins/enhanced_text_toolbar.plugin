@@ -1,0 +1,1181 @@
+from base_plugin import BasePlugin, MethodHook
+from java.lang import System
+from java import jclass, dynamic_proxy
+from android.view import View, Gravity, ViewGroup
+from android.widget import FrameLayout, LinearLayout, HorizontalScrollView, TextView, ImageView
+from android.graphics import PorterDuff, PorterDuffColorFilter, Typeface, Rect
+from android.graphics.drawable import GradientDrawable, ColorDrawable
+from android.util import TypedValue
+from android.content import Context
+from android.os import Handler, Looper
+from android.view.inputmethod import InputMethodManager
+from android import R
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import ChatActivityEnterView, LayoutHelper
+from org.telegram.ui.Stories.recorder import CaptionContainerView
+from ui.settings import Header, Switch as UiSwitch, Text, Divider, Selector
+from hook_utils import get_private_field
+from client_utils import get_last_fragment
+import time
+from functools import lru_cache
+from dataclasses import dataclass
+from typing import Optional, Any
+from pathlib import Path
+from collections import namedtuple
+
+# Plugin Metadata
+__id__ = "enhanced_text_toolbar"
+__name__ = "Enhanced Text Toolbar"
+__version__ = "6.4.0"
+__description__ = "Enhanced Text Toolbar with useful options"
+__author__ = "@chestertech & @useful_plugins"
+__icon__ = "VoiceToText7/5"
+__min_version__ = "12.2.0"
+__settings__ = True
+
+# Global state
+LAST_TEXT = None
+BounceableImageView = CaptionContainerView.BounceableImageView
+
+class Config:
+    HIDDEN = 0
+    COLLAPSED = 1
+    VISIBLE = 2
+    SINGLE_SET = [HIDDEN, VISIBLE]
+    SET = [HIDDEN, COLLAPSED, VISIBLE]
+    
+    TOOLBAR_HEIGHT_DP = 48
+    BUTTON_SIZE_DP = 48
+    CORNER_RADIUS_DP = 24
+    
+    SCROLL_THRESHOLD = 50
+    LEFT_MULTIPLIER = 2
+    SCROLL_DELTA_THRESHOLD = 20
+    HIDE_DELAY_MS = 1000
+    
+    DEFAULT_MAX_LINES = 5
+    EXPANDED_MAX_LINES = 50
+    EXPANDED_MIN_LINES = 5
+    MIN_EDIT_TEXT_HEIGHT_DP = 100
+    MAX_EDIT_TEXT_HEIGHT_DP = 1200
+    AUTO_COLLAPSE_TEXT_LENGTH = 200
+    
+    MIN_TIME_BETWEEN_UPDATES = 0.05
+    KEYBOARD_VISIBILITY_THRESHOLD = 150
+    KEYBOARD_HEIGHT_CHANGE_THRESHOLD = 100
+    
+    KEYBOARD_ANIMATION_DELAY_MS = 350
+
+class Cache:
+    dp = lru_cache(128)(AndroidUtilities.dp)
+    
+    @staticmethod
+    @lru_cache(64)
+    def icon(name: str) -> int:
+        try:
+            ctx = get_last_fragment().getContext()
+            res = ctx.getResources()
+            return res.getIdentifier(name, "drawable", ctx.getPackageName())
+        except Exception:
+            return 0
+    
+    @staticmethod
+    @lru_cache(64)
+    def color(name: str) -> int:
+        color_id = Cache._color_id(name)
+        return Theme.getColor(color_id) if color_id else 0xFF000000
+    
+    @staticmethod
+    @lru_cache(32)
+    def _color_id(name: str) -> int:
+        try:
+            from org.telegram.ui.ActionBar import ThemeColors
+            method = ThemeColors.getClass().getDeclaredMethod("createColorKeysStringMap")
+            method.setAccessible(True)
+            colors_map = method.invoke(None)
+            value = colors_map.get(name)
+            return int(value) if value is not None else 0
+        except Exception:
+            return 0
+    
+    @classmethod
+    def clear_all(cls):
+        cls.dp.cache_clear()
+        cls.icon.cache_clear()
+        cls.color.cache_clear()
+        cls._color_id.cache_clear()
+
+def create_runnable(callback):
+    class R(dynamic_proxy(jclass("java.lang.Runnable"))):
+        def __init__(self):
+            super().__init__()
+            self.callback = callback
+        def run(self):
+            if self.callback:
+                self.callback()
+    return R()
+
+def create_click_listener(callback):
+    class ClickListener(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+        def __init__(self, callback_func):
+            super().__init__()
+            self.callback_func = callback_func
+        def onClick(self, view):
+            if self.callback_func:
+                self.callback_func(view)
+    return ClickListener(callback)
+
+def create_scroll_listener(callback):
+    class ScrollListener(dynamic_proxy(jclass("android.view.View$OnScrollChangeListener"))):
+        def __init__(self, callback_func):
+            super().__init__()
+            self.callback_func = callback_func
+        def onScrollChange(self, v, scrollX, scrollY, oldScrollX, oldScrollY):
+            if self.callback_func:
+                self.callback_func(v, scrollX, scrollY, oldScrollX, oldScrollY)
+    return ScrollListener(callback)
+
+def create_layout_listener(callback):
+    class LayoutListener(dynamic_proxy(jclass("android.view.ViewTreeObserver$OnGlobalLayoutListener"))):
+        def __init__(self, callback_func):
+            super().__init__()
+            self.callback_func = callback_func
+        def onGlobalLayout(self):
+            if self.callback_func:
+                self.callback_func()
+    return LayoutListener(callback)
+
+class RecyclerScrollListener(dynamic_proxy(jclass("android.view.View$OnScrollChangeListener"))):
+    def __init__(self, manager):
+        super().__init__()
+        self.manager = manager
+    
+    def onScrollChange(self, v, scrollX, scrollY, oldScrollX, oldScrollY):
+        dy = scrollY - oldScrollY
+        if abs(dy) > Config.SCROLL_DELTA_THRESHOLD:
+            self.manager._toggle_enter_view(False)
+            if self.manager.scroll_handler:
+                self.manager.scroll_handler.removeCallbacksAndMessages(None)
+                self.manager.scroll_handler.postDelayed(
+                    create_runnable(lambda: self.manager._toggle_enter_view(True)),
+                    Config.HIDE_DELAY_MS
+                )
+
+@dataclass(frozen=True)
+class LayoutState:
+    keyboard_visible: bool
+    should_expand: bool
+    screen_height: int
+    
+    def __eq__(self, other):
+        if not isinstance(other, LayoutState):
+            return False
+        return (
+            self.keyboard_visible == other.keyboard_visible and
+            self.should_expand == other.should_expand and
+            abs(self.screen_height - other.screen_height) < Config.KEYBOARD_HEIGHT_CHANGE_THRESHOLD
+        )
+
+class LayoutController:
+    def __init__(self, manager):
+        self.manager = manager
+        self._current_state: Optional[LayoutState] = None
+        self._destroyed = False
+        self._last_update_time = 0.0
+        self._layout_listener = None
+    
+    def install(self, enter_view):
+        if self._destroyed or not enter_view:
+            return False
+        root_view = enter_view.getRootView()
+        if not root_view:
+            return False
+        observer = root_view.getViewTreeObserver()
+        if observer and observer.isAlive():
+            self._layout_listener = create_layout_listener(self._on_global_layout)
+            observer.addOnGlobalLayoutListener(self._layout_listener)
+            return True
+        return False
+    
+    def _on_global_layout(self):
+        if (self._destroyed or not self.manager or not self.manager.enter_view or
+            not self.manager.enter_view.isAttachedToWindow()):
+            return
+        self._process_update()
+    
+    def trigger_update(self):
+        if self._destroyed:
+            return
+        current_time = time.time()
+        if current_time - self._last_update_time >= Config.MIN_TIME_BETWEEN_UPDATES:
+            self._last_update_time = current_time
+            self._process_update()
+    
+    def _process_update(self):
+        state = self._get_current_state()
+        if state and state != self._current_state:
+            self._current_state = state
+            self.manager._keyboard_visible = state.keyboard_visible
+            self._apply_layout(state)
+    
+    def _get_current_state(self) -> Optional[LayoutState]:
+        try:
+            root_view = self.manager.enter_view.getRootView()
+            if not root_view:
+                return None
+            rect = Rect()
+            root_view.getWindowVisibleDisplayFrame(rect)
+            screen_height = root_view.getHeight()
+            keyboard_height = screen_height - rect.bottom
+            keyboard_visible = keyboard_height > Config.KEYBOARD_VISIBILITY_THRESHOLD
+            should_expand = self.manager._should_expand_input()
+            return LayoutState(keyboard_visible, should_expand, screen_height)
+        except Exception:
+            return None
+    
+    def _apply_layout(self, state: LayoutState):
+        if not self.manager.edit_text:
+            return
+        try:
+            available_height = self.manager._calculate_available_height(state.keyboard_visible)
+            
+            if state.should_expand != self.manager.input_expanded:
+                self._update_expansion(state.should_expand, available_height)
+            
+            if state.should_expand:
+                et_params = self.manager.edit_text.getLayoutParams()
+                if et_params and isinstance(et_params, ViewGroup.LayoutParams):
+                    if et_params.height != available_height:
+                        et_params.height = available_height
+                        self.manager.edit_text.setLayoutParams(et_params)
+            else:
+                et_params = self.manager.edit_text.getLayoutParams()
+                if et_params and isinstance(et_params, ViewGroup.LayoutParams):
+                    if et_params.height != ViewGroup.LayoutParams.WRAP_CONTENT:
+                        et_params.height = ViewGroup.LayoutParams.WRAP_CONTENT
+                        self.manager.edit_text.setLayoutParams(et_params)
+            
+            current_max = self.manager.edit_text.getMaxHeight()
+            if current_max != available_height:
+                self.manager.edit_text.setMaxHeight(available_height)
+            
+            self.manager.edit_text.requestLayout()
+            self.manager.edit_text.invalidate()
+            self.manager.enter_view.requestLayout()
+            self.manager.enter_view.invalidate()
+        except Exception:
+            pass
+    
+    def _update_expansion(self, should_expand: bool, available_height: int):
+        self.manager.input_expanded = should_expand
+        if should_expand:
+            self.manager.edit_text.setMaxLines(Config.EXPANDED_MAX_LINES)
+            self.manager.edit_text.setMinLines(Config.EXPANDED_MIN_LINES)
+        else:
+            self.manager.edit_text.setMaxLines(self.manager.original_max_lines)
+            self.manager.edit_text.setMinLines(1)
+    
+    def destroy(self):
+        self._destroyed = True
+        self._current_state = None
+        self._layout_listener = None
+        self.manager = None
+
+class TextWatcherProxy(dynamic_proxy(jclass("android.text.TextWatcher"))):
+    def __init__(self, manager):
+        super().__init__()
+        self.manager = manager
+        self._update_pending = False
+    
+    def beforeTextChanged(self, s, start, count, after):
+        pass
+    
+    def onTextChanged(self, s, start, before, count):
+        pass
+    
+    def afterTextChanged(self, editable):
+        if not self.manager or not self.manager.edit_text:
+            return
+        text_length = len(editable.toString()) if editable else 0
+        if self.manager.char_counter and self.manager._get_setting("show_char_counter", False):
+            self.manager.char_counter.setText(str(text_length))
+        if not self._update_pending:
+            self._update_pending = True
+            self.manager.edit_text.post(create_runnable(self._update_line_count))
+    
+    def _update_line_count(self):
+        self._update_pending = False
+        if not self.manager or not self.manager.edit_text:
+            return
+        try:
+            should_expand = self.manager._should_expand_input()
+            if should_expand != self.manager.input_expanded:
+                if self.manager._layout_controller:
+                    self.manager._layout_controller.trigger_update()
+        except Exception:
+            pass
+
+class CommandHandler:
+    def __init__(self, manager):
+        self.m = manager
+        et = manager.edit_text
+        fmt_methods = [
+            "makeSelectedRegular", "makeSelectedBold", "makeSelectedItalic",
+            "makeSelectedMono", "makeSelectedStrike", "makeSelectedUnderline",
+            "makeSelectedUrl"
+        ]
+        self.cmd = {
+            0: lambda: et.append("@"),
+            40: self._repeat,
+            50: self._toggle_kbd,
+            **{i+11: lambda m=m: getattr(et, m)() for i, m in enumerate(fmt_methods)},
+            18: lambda: et.makeSelectedQuote(True),
+            19: lambda: et.makeSelectedSpoiler(),
+            21: et.selectAll,
+            22: lambda: et.setSelection(0),
+            23: lambda: et.setSelection(et.getText().length()),
+            24: lambda: self._clip('copy'),
+            25: lambda: self._clip('cut'),
+            26: lambda: self._clip('paste'),
+            27: lambda: et.onTextContextMenuItem(R.id.undo),
+            28: lambda: et.onTextContextMenuItem(R.id.redo),
+        }
+    
+    def dispatch(self, cmd_id):
+        if cmd_id in self.cmd:
+            self.cmd[cmd_id]()
+    
+    def _clip(self, action: str):
+        et = self.m.edit_text
+        start = et.getSelectionStart()
+        end = et.getSelectionEnd()
+        if action in ('copy', 'cut'):
+            if start == end:
+                return
+            text = et.getText().subSequence(start, end).toString()
+            AndroidUtilities.addToClipboard(text)
+            if action == 'cut':
+                et.getText().delete(start, end)
+        elif action == 'paste':
+            ctx = self.m.enter_view.getContext()
+            clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            if clipboard and clipboard.hasPrimaryClip():
+                clip = clipboard.getPrimaryClip()
+                if clip and clip.getItemCount() > 0:
+                    pasted = clip.getItemAt(0).coerceToText(ctx)
+                    if pasted:
+                        et.getText().replace(start, end, pasted)
+                        et.setSelection(start + len(pasted))
+    
+    def _repeat(self):
+        global LAST_TEXT
+        if LAST_TEXT:
+            self.m.edit_text.setText(LAST_TEXT)
+            self.m.edit_text.setSelection(len(LAST_TEXT))
+    
+    def _toggle_kbd(self):
+        ctx = self.m.enter_view.getContext()
+        imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE)
+        if self.m._keyboard_visible:
+            imm.hideSoftInputFromWindow(self.m.edit_text.getWindowToken(), 0)
+        else:
+            self.m.edit_text.requestFocus()
+            imm.showSoftInput(self.m.edit_text, InputMethodManager.SHOW_IMPLICIT)
+        
+        Handler(Looper.getMainLooper()).postDelayed(
+            create_runnable(lambda: self._force_layout_update()),
+            Config.KEYBOARD_ANIMATION_DELAY_MS
+        )
+    
+    def _force_layout_update(self):
+        if self.m._layout_controller:
+            self.m._layout_controller._current_state = None
+            self.m._layout_controller.trigger_update()
+
+TOOLBAR_STRUCTURE = [
+    (0, "mentionbutton"),
+    'divider',
+    (10, "msg_text_outlined", [
+        {'text': 'A', 'style': Typeface.NORMAL, 'id': 11},
+        {'text': 'B', 'style': Typeface.BOLD, 'id': 12},
+        {'text': 'I', 'style': Typeface.ITALIC, 'id': 13},
+        {'text': 'M', 'style': Typeface.NORMAL, 'id': 14},
+        {'text': 'S', 'style': Typeface.NORMAL, 'id': 15},
+        {'text': 'U', 'style': Typeface.NORMAL, 'id': 16},
+        {'icon': 'msg_link', 'id': 17},
+        {'icon': 'menu_select_quote', 'id': 18},
+        {'icon': 'msg_spoiler', 'id': 19}
+    ]),
+    'divider',
+    (20, "msg_edit", [
+        {'text': '✔', 'style': Typeface.BOLD, 'id': 21},
+        {'icon': 'attach_arrow_left', 'id': 22},
+        {'icon': 'attach_arrow_right', 'id': 23},
+        {'icon': 'msg_copy', 'id': 24},
+        {'text': '✂', 'style': Typeface.NORMAL, 'id': 25},
+        {'text': '⎘', 'style': Typeface.NORMAL, 'id': 26},
+        {'text': '↶', 'style': Typeface.NORMAL, 'id': 27},
+        {'text': '↷', 'style': Typeface.NORMAL, 'id': 28}
+    ]),
+    'divider',
+    (40, "msg_retry"),
+    'divider',
+    (50, "input_keyboard"),
+    'divider'
+]
+
+class ToolbarManager:
+    def __init__(self, enter_view, plugin):
+        self.enter_view = enter_view
+        self.plugin = plugin
+        self.edit_text = None
+        self.toolbar_container = None
+        self.items_layout = None
+        self.scroll_view = None
+        self.char_counter = None
+        self.original_margin = 0
+        self.original_max_lines = Config.DEFAULT_MAX_LINES
+        self.input_expanded = False
+        self._keyboard_visible = False
+        self._cached_section_width = 0
+        self._cached_content_width = 0
+        self._cached_action_bar_bottom = 0
+        self._action_bar_cache_valid = False
+        self.scroll_handler = None
+        self.scroll_listener_recycler = None
+        self.chat_list_view = None
+        self._wrapper_view = None
+        self._main_container = None
+        self._original_padding_bottom = 0
+        self._original_edit_text_background = None
+        self.command_handler = None
+        self.text_watcher = None
+        self._layout_controller = None
+        self.button_groups = {}
+        self._infinite_scroll_enabled = True
+        self._scrolling_adjustment = False
+    
+    def _get_setting(self, key, default):
+        try:
+            return self.plugin.get_setting(key, default)
+        except Exception:
+            return default
+    
+    def install(self):
+        if not self._validate():
+            return False
+        self._init_components()
+        self._attach_toolbar()
+        self._attach_listeners()
+        if self._get_setting("scroll_hide", True):
+            self._start_scroll_monitoring()
+        return True
+    
+    def _validate(self):
+        self.edit_text = get_private_field(self.enter_view, "messageEditText")
+        if not self.edit_text or not self.edit_text.isEnabled():
+            return False
+        try:
+            self.original_max_lines = self.edit_text.getMaxLines()
+        except:
+            self.original_max_lines = Config.DEFAULT_MAX_LINES
+        return True
+    
+    def _init_components(self):
+        self._infinite_scroll_enabled = self._get_setting("infinite_scroll", True)
+        self.command_handler = CommandHandler(self)
+        self.toolbar_container = self._create_toolbar()
+        self._layout_controller = LayoutController(self)
+    
+    def _attach_toolbar(self):
+        et_params = self.edit_text.getLayoutParams()
+        if isinstance(et_params, ViewGroup.MarginLayoutParams):
+            self.original_margin = et_params.bottomMargin
+            et_params.bottomMargin = self.original_margin + Cache.dp(Config.TOOLBAR_HEIGHT_DP)
+            self.edit_text.setLayoutParams(et_params)
+        params = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            Cache.dp(Config.TOOLBAR_HEIGHT_DP)
+        )
+        params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL
+        self.enter_view.addView(self.toolbar_container, 0, params)
+    
+    def _attach_listeners(self):
+        self.text_watcher = TextWatcherProxy(self)
+        self.edit_text.addTextChangedListener(self.text_watcher)
+        self._layout_controller.install(self.enter_view)
+        Handler(Looper.getMainLooper()).postDelayed(
+            create_runnable(self._update_action_bar_cache),
+            500
+        )
+    
+    def _should_expand_input(self):
+        try:
+            line_count = self.edit_text.getLineCount()
+            text_length = len(self.edit_text.getText().toString())
+            return (line_count > self.original_max_lines or
+                   text_length > Config.AUTO_COLLAPSE_TEXT_LENGTH)
+        except Exception:
+            return False
+    
+    def _get_action_bar_bottom(self) -> int:
+        if self._action_bar_cache_valid and 50 < self._cached_action_bar_bottom < 500:
+            return self._cached_action_bar_bottom
+        fragment = self.enter_view.getParentFragment()
+        if fragment and hasattr(fragment, 'getActionBar'):
+            ab = fragment.getActionBar()
+            if ab and ab.isAttachedToWindow():
+                ab_height = ab.getHeight()
+                if ab_height > 0:
+                    ab_location = [0, 0]
+                    ab.getLocationOnScreen(ab_location)
+                    bottom = ab_location[1] + ab_height
+                    if 50 < bottom < 500:
+                        self._cached_action_bar_bottom = bottom
+                        self._action_bar_cache_valid = True
+                        return bottom
+    
+    def _calculate_available_height(self, keyboard_visible):
+        try:
+            root_view = self.enter_view.getRootView()
+            if not root_view:
+                return Cache.dp(600)
+            rect = Rect()
+            root_view.getWindowVisibleDisplayFrame(rect)
+            action_bar_bottom = self._get_action_bar_bottom()
+            available = rect.bottom - action_bar_bottom
+            available -= Cache.dp(Config.TOOLBAR_HEIGHT_DP)
+            if self.original_margin > 0:
+                available -= self.original_margin
+            available -= Cache.dp(8)
+            min_h = Cache.dp(Config.MIN_EDIT_TEXT_HEIGHT_DP)
+            max_h = Cache.dp(Config.MAX_EDIT_TEXT_HEIGHT_DP)
+            return max(min_h, min(available, max_h))
+        except Exception:
+            return Cache.dp(600)
+    
+    def _update_action_bar_cache(self):
+        try:
+            fragment = self.enter_view.getParentFragment()
+            if not fragment or not hasattr(fragment, 'getActionBar'):
+                self._action_bar_cache_valid = False
+                return
+            ab = fragment.getActionBar()
+            if not ab or not ab.isAttachedToWindow():
+                self._action_bar_cache_valid = False
+                return
+            ab_height = ab.getHeight()
+            if ab_height <= 0:
+                self._action_bar_cache_valid = False
+                return
+            ab_location = [0, 0]
+            ab.getLocationOnScreen(ab_location)
+            bottom = ab_location[1] + ab_height
+            self._cached_action_bar_bottom = bottom
+            self._action_bar_cache_valid = True
+        except Exception:
+            self._action_bar_cache_valid = False
+    
+    def _create_toolbar(self):
+        main = LinearLayout(self.enter_view.getContext())
+        main.setOrientation(LinearLayout.HORIZONTAL)
+        main.setGravity(Gravity.CENTER_VERTICAL)
+        bg_color = Cache.color("chat_messagePanelBackground")
+        gd = GradientDrawable()
+        gd.setColor(bg_color)
+        r = Cache.dp(Config.CORNER_RADIUS_DP)
+        gd.setCornerRadii([0, 0, 0, 0, r, r, r, r])
+        selector = Theme.createSelectorDrawable(
+            Cache._color_id("listSelectorSDK21"), 1
+        )
+        main.setBackground(selector)
+        if self._get_setting("show_char_counter", False):
+            self._create_char_counter(main)
+        self._create_scroll_container(main)
+        if self._infinite_scroll_enabled:
+            Handler(Looper.getMainLooper()).postDelayed(
+                create_runnable(self._setup_infinite_scroll),
+                200
+            )
+        return main
+    
+    def _create_char_counter(self, container):
+        self.char_counter = TextView(self.enter_view.getContext())
+        self.char_counter.setText("0")
+        self.char_counter.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13)
+        self.char_counter.setTypeface(None, Typeface.BOLD)
+        self.char_counter.setTextColor(Cache.color("chat_messagePanelText"))
+        self.char_counter.setGravity(Gravity.TOP | Gravity.START)
+        self.char_counter.setPadding(
+            Cache.dp(12), Cache.dp(7),
+            Cache.dp(8), 0
+        )
+        container.addView(
+            self.char_counter,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.MATCH_PARENT
+        )
+    
+    def _create_scroll_container(self, container):
+        scroll = HorizontalScrollView(self.enter_view.getContext())
+        scroll.setHorizontalScrollBarEnabled(False)
+        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER)
+        self.scroll_view = scroll
+        items = LinearLayout(self.enter_view.getContext())
+        items.setOrientation(LinearLayout.HORIZONTAL)
+        self.items_layout = items
+        
+        if not self._infinite_scroll_enabled:
+            self._add_divider()
+        
+        if self._infinite_scroll_enabled:
+            for copy_num in range(4):
+                self._add_all_buttons()
+        else:
+            self._add_all_buttons()
+            self._add_divider()
+        
+        scroll.addView(items, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        scroll_params = LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.MATCH_PARENT
+        )
+        scroll_params.weight = 1
+        container.addView(scroll, scroll_params)
+    
+    def _add_all_buttons(self):
+        for item in TOOLBAR_STRUCTURE:
+            if item == 'divider':
+                self._add_divider()
+            elif isinstance(item, tuple):
+                self._add_button(*item)
+    
+    def _add_button(self, item_id, icon, sub_items=None):
+        if item_id % 10 == 0 and self.plugin.get_set(item_id) == Config.HIDDEN:
+            return
+        ic = self._create_icon_view({'icon': icon, 'id': item_id})
+        if not ic:
+            return
+        click_listener = create_click_listener(self._on_button_click)
+        ic.setOnClickListener(click_listener)
+        ic.setTag(item_id)
+        params = LayoutHelper.createLinear(
+            Config.BUTTON_SIZE_DP,
+            Config.BUTTON_SIZE_DP,
+            Gravity.CENTER_VERTICAL
+        )
+        self.items_layout.addView(ic, params)
+        group_info = {'main': ic, 'subs': []}
+        if sub_items:
+            is_collapsed = (item_id % 10 == 0 and
+                          self.plugin.get_set(item_id) == Config.COLLAPSED)
+            for sub_spec in sub_items:
+                sub_id = sub_spec.get('id', 0)
+                if sub_id == 0:
+                    continue
+                sub_view = self._create_icon_view(sub_spec)
+                if sub_view:
+                    sub_view.setOnClickListener(click_listener)
+                    sub_view.setTag(sub_id)
+                    sub_view.setVisibility(View.GONE if is_collapsed else View.VISIBLE)
+                    self.items_layout.addView(sub_view, params)
+                    group_info['subs'].append(sub_view)
+            self.button_groups[item_id] = group_info
+    
+    def _create_icon_view(self, icon_spec):
+        context = self.enter_view.getContext()
+        icon_color = Cache.color("chat_messagePanelIcons")
+        if 'text' in icon_spec:
+            view = TextView(context)
+            view.setText(icon_spec.get('text', ''))
+            view.setTypeface(None, icon_spec.get('style', Typeface.NORMAL))
+            view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18)
+            view.setGravity(Gravity.CENTER)
+            view.setTextColor(icon_color)
+            return view
+        elif 'icon' in icon_spec:
+            view = BounceableImageView(context, 0.1)
+            icon_id = Cache.icon(icon_spec['icon'])
+            view.setImageResource(icon_id)
+            view.setScaleType(ImageView.ScaleType.CENTER)
+            selector = Theme.createSelectorDrawable(
+                Cache._color_id("listSelectorSDK21"), 1
+            )
+            view.setBackground(selector)
+            view.setColorFilter(PorterDuffColorFilter(
+                icon_color, PorterDuff.Mode.MULTIPLY
+            ))
+            return view
+        return None
+    
+    def _add_divider(self):
+        divider = View(self.items_layout.getContext())
+        divider.setBackgroundColor(Cache.color("divider"))
+        self.items_layout.addView(divider, LayoutHelper.createLinear(
+            2, -1, Gravity.CENTER_VERTICAL, 4, 8, 4, 8
+        ))
+    
+    def _on_button_click(self, view):
+        if not view or not hasattr(view, 'getTag'):
+            return
+        item_id = view.getTag()
+        if item_id % 10 == 0 and item_id in self.plugin.buttons:
+            ButtonConfig = namedtuple('ButtonConfig', ['set_type', 'icon'])
+            cfg = self.plugin.buttons[item_id]
+            if cfg.set_type == Config.SET:
+                self._toggle_group(item_id)
+                self._scroll_to_view(view)
+                return
+        self.command_handler.dispatch(item_id)
+    
+    def _toggle_group(self, item_id):
+        is_collapsed = self.plugin.update_collapsed(item_id)
+        visibility = View.GONE if is_collapsed else View.VISIBLE
+        if item_id in self.button_groups:
+            group_info = self.button_groups[item_id]
+            for sub_view in group_info.get('subs', []):
+                if sub_view:
+                    sub_view.setVisibility(visibility)
+            self.items_layout.requestLayout()
+            self.items_layout.post(create_runnable(self._update_scroll_dimensions))
+    
+    def _setup_infinite_scroll(self):
+        if not self._infinite_scroll_enabled or not self.items_layout or self._cached_section_width > 0:
+            return
+        self._update_scroll_dimensions()
+        scroll_listener = create_scroll_listener(self._on_scroll)
+        self.scroll_view.setOnScrollChangeListener(scroll_listener)
+    
+    def _update_scroll_dimensions(self):
+        if not self.items_layout:
+            return
+        self.items_layout.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(
+                Cache.dp(Config.TOOLBAR_HEIGHT_DP),
+                View.MeasureSpec.EXACTLY
+            )
+        )
+        w = self.items_layout.getMeasuredWidth()
+        if w <= 0:
+            return
+        if self._infinite_scroll_enabled:
+            self._cached_section_width = w // 4
+            self._cached_content_width = w
+            initial_scroll = self._cached_section_width * Config.LEFT_MULTIPLIER
+            self.scroll_view.scrollTo(initial_scroll, 0)
+        else:
+            self._cached_section_width = w
+            self._cached_content_width = w
+            self.scroll_view.scrollTo(0, 0)
+    
+    def _on_scroll(self, v, scrollX, scrollY, oldScrollX, oldScrollY):
+        if self._scrolling_adjustment:
+            return
+        if not self._infinite_scroll_enabled or not self._cached_section_width:
+            return
+        section_width = self._cached_section_width
+        visible_width = self.scroll_view.getWidth()
+        if visible_width <= 0:
+            return
+        content_width = self._cached_content_width
+        self._scrolling_adjustment = True
+        try:
+            if scrollX < Config.SCROLL_THRESHOLD:
+                target = section_width * Config.LEFT_MULTIPLIER + scrollX
+                if abs(self.scroll_view.getScrollX() - target) > 5:
+                    self.scroll_view.scrollTo(target, scrollY)
+            elif scrollX + visible_width > content_width - Config.SCROLL_THRESHOLD:
+                target = section_width * Config.LEFT_MULTIPLIER + (scrollX - content_width)
+                if abs(self.scroll_view.getScrollX() - target) > 5:
+                    self.scroll_view.scrollTo(target, scrollY)
+        finally:
+            self._scrolling_adjustment = False
+    
+    def _scroll_to_view(self, v):
+        if not v or not self._cached_section_width:
+            return
+        left = v.getLeft()
+        right = v.getRight()
+        scrollX = self.scroll_view.getScrollX()
+        visible_width = self.scroll_view.getWidth()
+        if not self._infinite_scroll_enabled:
+            if right > scrollX + visible_width or left < scrollX:
+                new_scroll = left - Cache.dp(20)
+                new_scroll = max(0, min(new_scroll, self._cached_content_width - visible_width))
+                self.scroll_view.smoothScrollTo(new_scroll, 0)
+            return
+        if right > scrollX + visible_width or left < scrollX:
+            new_scroll = left - Cache.dp(20)
+            if new_scroll < 0:
+                new_scroll += self._cached_section_width * 2
+            elif new_scroll > self._cached_content_width - visible_width:
+                new_scroll -= self._cached_section_width * 2
+            new_scroll = max(0, min(new_scroll, self._cached_content_width - visible_width))
+            self.scroll_view.smoothScrollTo(new_scroll, 0)
+    
+    def _find_chat_list_view(self):
+        if self.chat_list_view and self.chat_list_view.isAttachedToWindow():
+            return self.chat_list_view
+        try:
+            fragment = self.enter_view.getParentFragment()
+            if not fragment:
+                return None
+            chat_list = get_private_field(fragment, "chatListView")
+            if chat_list and chat_list.isAttachedToWindow():
+                self.chat_list_view = chat_list
+                return chat_list
+            fragment_view = fragment.getFragmentView()
+            if fragment_view:
+                for idx in [1, 2]:
+                    if fragment_view.getChildCount() > idx:
+                        candidate = fragment_view.getChildAt(idx)
+                        cls_name = candidate.getClass().getName()
+                        if "$18" in cls_name or "$20" in cls_name:
+                            if (hasattr(candidate, "getAdapter") and callable(getattr(candidate, "getAdapter", None)) and
+                                hasattr(candidate, "scrollToPosition") and callable(getattr(candidate, "scrollToPosition", None))):
+                                adapter = getattr(candidate, "getAdapter", lambda: None)()
+                                if adapter is not None and getattr(adapter, "getItemCount", lambda: 0)() > 0:
+                                    self.chat_list_view = candidate
+                                    return candidate
+        except Exception:
+            pass
+        return None
+    
+    def _attach_scroll_listener(self):
+        chat_list_view = self._find_chat_list_view()
+        if not chat_list_view:
+            return False
+        self.scroll_listener_recycler = RecyclerScrollListener(self)
+        chat_list_view.setOnScrollChangeListener(self.scroll_listener_recycler)
+        return True
+    
+    def _start_scroll_monitoring(self):
+        Handler(Looper.getMainLooper()).postDelayed(
+            create_runnable(self._delayed_attach_scroll_listener),
+            200
+        )
+    
+    def _delayed_attach_scroll_listener(self):
+        if self._attach_scroll_listener():
+            self.scroll_handler = Handler(Looper.getMainLooper())
+            return True
+        return False
+    
+    def _toggle_enter_view(self, show: bool):
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+        fragment_view = fragment.getFragmentView()
+        if not fragment_view:
+            return
+        chat_list_view = self._find_chat_list_view()
+        if not chat_list_view:
+            return
+        if self._wrapper_view is None or self._main_container is None:
+            for i in range(fragment_view.getChildCount()):
+                child = fragment_view.getChildAt(i)
+                cls_name = child.getClass().getName()
+                if "ChatInputViewsContainer$2" in cls_name:
+                    self._wrapper_view = child
+                elif "ChatInputViewsContainer" in cls_name and "$" not in cls_name:
+                    self._main_container = child
+        if not show:
+            if self._original_padding_bottom == 0:
+                self._original_padding_bottom = chat_list_view.getPaddingBottom()
+            chat_list_view.setPadding(
+                chat_list_view.getPaddingLeft(),
+                chat_list_view.getPaddingTop(),
+                chat_list_view.getPaddingRight(),
+                0
+            )
+            if self._wrapper_view:
+                self._wrapper_view.setVisibility(View.GONE)
+            if self._main_container:
+                self._main_container.setVisibility(View.GONE)
+            if self.edit_text:
+                if self._original_edit_text_background is None:
+                    self._original_edit_text_background = self.edit_text.getBackground()
+                self.edit_text.setBackground(ColorDrawable(0x00000000))
+                self.edit_text.setAlpha(0.0)
+                self.edit_text.setEnabled(False)
+                self.edit_text.setFocusable(False)
+                self.edit_text.setFocusableInTouchMode(False)
+        else:
+            Handler(Looper.getMainLooper()).postDelayed(
+                create_runnable(lambda: self._show_all(chat_list_view)),
+                300
+            )
+    
+    def _show_all(self, chat_list_view):
+        try:
+            safe_cleanup(chat_list_view, 'setPadding',
+                chat_list_view.getPaddingLeft(),
+                chat_list_view.getPaddingTop(),
+                chat_list_view.getPaddingRight(),
+                self._original_padding_bottom or Cache.dp(150))
+            if self._wrapper_view:
+                self._wrapper_view.setVisibility(View.VISIBLE)
+            if self._main_container:
+                self._main_container.setVisibility(View.VISIBLE)
+            if self.edit_text:
+                if self._original_edit_text_background is not None:
+                    self.edit_text.setBackground(self._original_edit_text_background)
+                else:
+                    bg_color = Cache.color("chat_messagePanelBackground")
+                    self.edit_text.setBackground(Theme.createBackgroundDrawable(bg_color))
+                self.edit_text.setAlpha(1.0)
+                self.edit_text.setEnabled(True)
+                self.edit_text.setFocusable(True)
+                self.edit_text.setFocusableInTouchMode(True)
+                if self.enter_view.hasWindowFocus():
+                    self.edit_text.requestFocus()
+            if self.enter_view.isAttachedToWindow():
+                self.enter_view.requestLayout()
+                self.enter_view.invalidate()
+        except Exception:
+            pass
+    
+    def cleanup(self):
+        batch_cleanup([
+            (self._layout_controller, 'destroy'),
+            (self.edit_text, 'removeTextChangedListener', self.text_watcher),
+            (self.scroll_handler, 'removeCallbacksAndMessages', None),
+            (self.chat_list_view, 'setOnScrollChangeListener', None),
+            (self.enter_view, 'removeView', self.toolbar_container),
+        ])
+        if self.edit_text and self.original_margin > 0:
+            try:
+                et_params = self.edit_text.getLayoutParams()
+                if isinstance(et_params, ViewGroup.MarginLayoutParams):
+                    et_params.bottomMargin = self.original_margin
+                    self.edit_text.setLayoutParams(et_params)
+            except Exception:
+                pass
+        for attr in ['text_watcher', 'toolbar_container', 'items_layout',
+                    'scroll_view', 'char_counter', 'edit_text', 'command_handler',
+                    'button_groups', 'scroll_handler', 'scroll_listener_recycler',
+                    'chat_list_view', '_wrapper_view', '_main_container']:
+            setattr(self, attr, None)
+
+def safe_cleanup(obj: Any, method: Optional[str] = None, *args, **kwargs) -> None:
+    if obj is None:
+        return
+    if method and hasattr(obj, method):
+        try:
+            getattr(obj, method)(*args)
+        except Exception:
+            pass
+    for attr, value in kwargs.items():
+        try:
+            setattr(obj, attr, value)
+        except Exception:
+            pass
+
+def batch_cleanup(resources: list) -> None:
+    for resource in resources:
+        if not resource or resource[0] is None:
+            continue
+        obj = resource[0]
+        method = resource[1] if len(resource) > 1 else None
+        args = resource[2:] if len(resource) > 2 else []
+        kwargs = {}
+        filtered_args = []
+        for arg in args:
+            if isinstance(arg, dict):
+                kwargs.update(arg)
+            else:
+                filtered_args.append(arg)
+        safe_cleanup(obj, method, *filtered_args, **kwargs)
+
+class EnterViewInStoriesHook(MethodHook):
+    calling = False
+    
+    def before_hooked_method(self, param):
+        EnterViewInStoriesHook.calling = True
+    
+    def after_hooked_method(self, param):
+        EnterViewInStoriesHook.calling = False
+
+class OnSendHook(MethodHook):
+    def before_hooked_method(self, param):
+        global LAST_TEXT
+        et = get_private_field(param.thisObject, "messageEditText")
+        if et:
+            text = et.getText()
+            if text and text.toString().strip():
+                LAST_TEXT = text.toString()
+
+class EnterViewHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.managers = {}
+        self._last_cleanup = 0
+    
+    def after_hooked_method(self, param):
+        if EnterViewInStoriesHook.calling:
+            return
+        current_time = time.time()
+        if current_time - self._last_cleanup > 5:
+            self._cleanup_detached_managers()
+            self._last_cleanup = current_time
+        ev = param.thisObject
+        vid = System.identityHashCode(ev)
+        if vid in self.managers:
+            mgr = self.managers[vid]
+            if mgr.enter_view and mgr.enter_view.isAttachedToWindow():
+                return
+            else:
+                mgr.cleanup()
+                del self.managers[vid]
+        mgr = ToolbarManager(ev, self.plugin)
+        if mgr.install():
+            self.managers[vid] = mgr
+    
+    def _cleanup_detached_managers(self):
+        to_remove = []
+        for vid, mgr in self.managers.items():
+            if not mgr.enter_view or not mgr.enter_view.isAttachedToWindow():
+                mgr.cleanup()
+                to_remove.append(vid)
+        for vid in to_remove:
+            self.managers.pop(vid, None)
+    
+    def cleanup_all(self):
+        for vid, mgr in list(self.managers.items()):
+            try:
+                mgr.cleanup()
+            except Exception:
+                pass
+        self.managers.clear()
+
+ButtonConfig = namedtuple('ButtonConfig', ['set_type', 'icon'])
+
+class Plugin(BasePlugin):
+    buttons = {
+        0:  ButtonConfig(Config.SINGLE_SET, "mentionbutton"),
+        10: ButtonConfig(Config.SET, "msg_text_outlined"),
+        20: ButtonConfig(Config.SET, "msg_edit"),
+        40: ButtonConfig(Config.SINGLE_SET, "msg_retry"),
+        50: ButtonConfig(Config.SINGLE_SET, "input_keyboard")
+    }
+    
+    button_names = {
+        0: "Упомянуть",
+        10: "Форматирование",
+        20: "Управление текстом",
+        40: "Повторить сообщение",
+        50: "Показать/скрыть клавиатуру"
+    }
+    
+    sets = {
+        Config.HIDDEN: "Скрыть",
+        Config.COLLAPSED: "Свернуть",
+        Config.VISIBLE: "Показать"
+    }
+    
+    def __init__(self):
+        super().__init__()
+        self._collapse_states = {}
+        self._enter_view_hook = None
+    
+    def is_collapsed(self, id):
+        return self._collapse_states.get(id, True)
+    
+    def set_collapsed(self, id, value):
+        self._collapse_states[id] = value
+    
+    def update_collapsed(self, id):
+        new_val = not self.is_collapsed(id)
+        self.set_collapsed(id, new_val)
+        return new_val
+    
+    def get_set(self, id):
+        i = self.get_setting(f"set_{id}", Config.COLLAPSED)
+        if i == Config.VISIBLE and self.buttons[id].set_type == Config.SINGLE_SET:
+            return Config.COLLAPSED
+        return i
+    
+    def on_plugin_load(self):
+        cls = jclass("java.lang.Class")
+        try:
+            ev_class = cls.forName("org.telegram.ui.Components.ChatActivityEnterView")
+            ev_ctor = ev_class.getDeclaredConstructors()[1]
+            self._enter_view_hook = EnterViewHook(self)
+            self.hook_method(ev_ctor, self._enter_view_hook)
+        except Exception:
+            pass
+        try:
+            ev_class = cls.forName("org.telegram.ui.Components.ChatActivityEnterView")
+            methods = ev_class.getDeclaredMethods()
+            send_method = next((m for m in methods if m.getName() == "sendMessageInternal"), None)
+            if send_method:
+                self.hook_method(send_method, OnSendHook())
+        except Exception:
+            pass
+        try:
+            stories_class = cls.forName("org.telegram.ui.Stories.PeerStoriesView")
+            create_ev = stories_class.getDeclaredMethod("createEnterView")
+            self.hook_method(create_ev, EnterViewInStoriesHook())
+        except Exception:
+            pass
+    
+    def on_plugin_unload(self):
+        if self._enter_view_hook:
+            self._enter_view_hook.cleanup_all()
+        Cache.clear_all()
+    
+    def create_settings(self):
+        settings = [
+            Header(text="Настройки тулбара"),
+            UiSwitch(
+                key="infinite_scroll",
+                text="Бесконечный скролл кнопок",
+                default=True,
+                icon="msg_repeat"
+            ),
+            UiSwitch(
+                key="scroll_hide",
+                text="Автоскрытие при прокрутке",
+                default=False,
+                icon="msg_scrollup"
+            ),
+            Divider(),
+            Header(text="Счетчик символов"),
+            UiSwitch(
+                key="show_char_counter",
+                text="Показывать счетчик символов",
+                default=False,
+                icon="msg_numbers"
+            ),
+            Divider(),
+            Header(text="Кнопки тулбара")
+        ]
+        for num, cfg in self.buttons.items():
+            settings.append(
+                Selector(
+                    key=f"set_{num}",
+                    text=self.button_names[num],
+                    default=Config.COLLAPSED,
+                    items=[self.sets[n] for n in cfg.set_type],
+                    icon=cfg.icon
+                )
+            )
+        settings.extend([
+            Divider(),
+            Header(text="Информация"),
+            Text(text=f"Версия плагина: {__version__}", icon="msg_info"),
+            Text(text=f"Автор: {__author__}", icon="msg_user"),
+            Divider(),
+            Header(text="Что нового в v6.4.0"),
+            Text(text="🗑️ Удалено всё логирование", icon="msg_check"),
+            Text(text="⚡ Улучшена производительность", icon="msg_check"),
+            Text(text="🛡️ Исправлен RecursionError", icon="msg_check"),
+        ])
+        return settings
+
+def create_plugin():
+    return Plugin()
