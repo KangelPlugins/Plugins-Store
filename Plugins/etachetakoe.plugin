@@ -1,297 +1,1040 @@
 __id__ = "proxy_tools"
 __name__ = "Proxy Tools"
-__description__ = "Оптимизация прокси: импорт из буфера, резолв доменов, префикс dd, очистка и экспорт."
-__version__ = "1.0.1"
+__description__ = (
+    "Переработанный менеджер прокси.\n\n"
+    "**Основные возможности:**\n"
+    "• Кастомные названия с поддержкой параметра &title= в ссылках;\n"
+    "• Закрепы прокси вверху списка;\n"
+    "• Отображение гео-флагов и провайдеров;\n"
+    "• Метки SOCKS5 / MTProto;\n"
+    "• Импорт/Экспорт списков, удаление нерабочих и дубликатов;\n"
+    "• Оптимизация (замена доменов на IP и добавление dd).\n\n"
+    "> Все встроено в основное меню прокси."
+)
+__version__ = "1.1.0"
 __author__ = "@yzewe"
 __icon__ = "jibunNacho/12"
+__min_version__ = "11.12.0"
 
 import urllib.parse
 import re
 import socket
 import threading
 import requests
+import json
+import string
+import os
+import time
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
-from base_plugin import BasePlugin
-from ui.settings import Header, Text, Divider
+from base_plugin import BasePlugin, MethodHook
 from ui.bulletin import BulletinHelper
-from ui.alert import AlertDialogBuilder
 from android_utils import run_on_ui_thread, log
-from client_utils import send_message, get_user_config, get_last_fragment
+from client_utils import send_message, send_document, get_user_config
+from hook_utils import get_private_field
+from file_utils import get_plugins_dir, write_file
 
-from org.telegram.messenger import SharedConfig, NotificationCenter, ApplicationLoader
+from org.telegram.messenger import NotificationCenter, ApplicationLoader
 from org.telegram.tgnet import TLRPC
-from android.content import Context
-from java import jclass
+from java import jclass, dynamic_proxy
+from java.lang import Integer, Long, String
+
+class GenericClickListener(dynamic_proxy(jclass("android.view.View$OnClickListener"))):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+    def onClick(self, v):
+        try: self.callback(v)
+        except Exception as e: log(f"Click error: {e}")
 
 class ProxyToolsPlugin(BasePlugin):
     
-    def create_settings(self):
-        return [
-            Header(text="Импорт"),
-            Text(
-                text="Импорт из буфера обмена",
-                icon="msg_download",
-                on_click=self._import_from_clipboard
-            ),
+    def on_plugin_load(self):
+        self.editor_name_inputs = {}
+        self.ip_data = {}
+        self.pending_lookups = set()
+        self.proxy_names = {}
+        self.pinned_proxies = {}
+        self._batch_lock = threading.Lock()
+        
+        self.last_proxy_uri = ""
+        
+        self.load_settings_data()
+        
+        self.hook_uri_parse()
+        self.hook_show_proxy_alert()
+        self.hook_proxy_list_ui()
+        self.hook_proxy_cells()
+        self.hook_proxy_editor_ui()
+        self.hook_proxy_export()
 
-            Header(text="Оптимизация"),
-            Text(
-                text="Оптимизировать (IP Resolve + dd)",
-                icon="msg_edit",
-                on_click=self._start_optimization
-            ),
-            
-            Header(text="Очистка"),
-            Text(
-                text="Удалить дубликаты",
-                icon="msg_clear",
-                on_click=self._remove_duplicates
-            ),
-            Text(
-                text="Удалить нерабочие",
-                icon="msg_block",
-                on_click=self._start_dead_cleanup
-            ),
+    def _get_proxy_key(self, p):
+        if not p: return ""
+        try: return f"{p.address}:{p.port}"
+        except: return f"{p.get('host')}:{p.get('port')}"
 
-            Header(text="Экспорт"),
-            Text(
-                text="Экспортировать в Избранное",
-                icon="msg_share",
-                on_click=self._export_proxies
-            )
-        ]
-
-    def _import_from_clipboard(self, view):
+    def load_settings_data(self):
         try:
-            ctx = ApplicationLoader.applicationContext
-            clipboard = ctx.getSystemService("clipboard")
-            
-            if not clipboard or not clipboard.hasPrimaryClip():
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Буфер обмена пуст"))
-                return
-                
-            clip = clipboard.getPrimaryClip()
-            if clip.getItemCount() == 0:
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Буфер обмена пуст"))
-                return
-                
-            text = str(clip.getItemAt(0).getText() or "")
-            if not text:
-                run_on_ui_thread(lambda: BulletinHelper.show_error("В буфере нет текста"))
-                return
-
-            text = text.replace("tg://", " tg://").replace("https://t.me/", " https://t.me/").replace("http://t.me/", " http://t.me/")
-
-            links = []
-            links.extend(re.findall(r"(tg://[^\s\"'<>]+)", text))
-            links.extend(re.findall(r"(https?://t\.me/[^\s\"'<>]+)", text))
-
-            if not links:
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Прокси-ссылки не найдены в тексте"))
-                return
-
-            added_count = 0
-            ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
-            
-            for link in links:
-                if "proxy?" in link or "socks?" in link:
-                    link = link.replace("https://t.me/", "tg://").replace("http://t.me/", "tg://")
-                    
-                    parsed = urllib.parse.urlsplit(link.replace("tg://", "http://"))
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    
-                    server = qs.get("server", [""])[0]
-                    port = qs.get("port", ["0"])[0]
-                    secret = qs.get("secret", [""])[0]
-                    user = qs.get("user", [""])[0]
-                    password = qs.get("pass", [""])[0]
-
-                    if server and port.isdigit():
-                        try:
-                            proxy_object = ProxyInfo(server, int(port), user, password, secret)
-                            SharedConfig.addProxy(proxy_object)
-                            added_count += 1
-                        except Exception as e:
-                            log(f"ProxyTools: Failed to add proxy {server}:{port} - {e}")
-                            pass
-
-            if added_count > 0:
-                SharedConfig.saveProxyList()
-                run_on_ui_thread(lambda: self._notify_ui(f"Успешно импортировано: {added_count} шт."))
+            self.proxy_names = json.loads(self.get_setting("proxy_names", "{}"))
+            self.ip_data = json.loads(self.get_setting("ip_data_cache", "{}"))
+            pinned = json.loads(self.get_setting("pinned_proxies", "{}"))
+            if isinstance(pinned, list):
+                self.pinned_proxies = {k: True for k in pinned}
             else:
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Валидные прокси не найдены"))
+                self.pinned_proxies = pinned
+        except: pass
 
+    def save_settings_data(self):
+        self.set_setting("proxy_names", json.dumps(self.proxy_names))
+        self.set_setting("ip_data_cache", json.dumps(self.ip_data))
+        self.set_setting("pinned_proxies", json.dumps(self.pinned_proxies))
+
+    def hook_uri_parse(self):
+        try:
+            UriCls = jclass("java.lang.Class").forName("android.net.Uri")
+            class UriParseHook(MethodHook):
+                def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+                def after_hooked_method(self, param):
+                    plugin = self.plugin_ref()
+                    if not plugin: return
+                    uri_str = str(param.args[0])
+                    if "proxy?" in uri_str or "socks?" in uri_str:
+                        plugin.last_proxy_uri = uri_str
+            for m in UriCls.getDeclaredMethods():
+                if m.getName() == "parse" and len(m.getParameterTypes()) == 1:
+                    self.hook_method(m, UriParseHook(weakref.ref(self)))
+        except Exception as e: log(f"URI hook error: {e}")
+
+    def hook_show_proxy_alert(self):
+        try:
+            AUClass = jclass("java.lang.Class").forName("org.telegram.messenger.AndroidUtilities")
+            class ShowProxyAlertHook(MethodHook):
+                def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+                def before_hooked_method(self, param):
+                    plugin = self.plugin_ref()
+                    if not plugin: return
+                    
+                    types = param.method.getParameterTypes()
+                    if len(types) != 6: return
+                    
+                    activity = param.args[0]
+                    address = str(param.args[1] or "")
+                    port_str = str(param.args[2] or "")
+                    user = str(param.args[3] or "")
+                    password = str(param.args[4] or "")
+                    secret = str(param.args[5] or "")
+
+                    if not address or not port_str: return
+
+                    title = ""
+                    uri = plugin.last_proxy_uri
+                    if uri and address in uri and port_str in uri:
+                        parsed = urllib.parse.urlsplit(uri.replace("tg://", "http://").replace("https://t.me/", "http://"))
+                        q = urllib.parse.parse_qs(parsed.query)
+                        title = urllib.parse.unquote(q.get("title", [""])[0])
+
+                    proxy = {
+                        "host": address,
+                        "port": int(port_str),
+                        "user": user,
+                        "password": password,
+                        "secret": secret
+                    }
+
+                    param.setResult(None)
+                    run_on_ui_thread(lambda: plugin._show_proxy_bottom_sheet(activity, proxy, title))
+
+            for m in AUClass.getDeclaredMethods():
+                if m.getName() == "showProxyAlert":
+                    self.hook_method(m, ShowProxyAlertHook(weakref.ref(self)))
         except Exception as e:
-            log(f"ProxyTools Import Error: {e}")
-            run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка при импорте"))
+            log(f"Hook showProxyAlert error: {e}")
 
-    def _start_optimization(self, view):
-        BulletinHelper.show_success("Начинаем оптимизацию...")
-        threading.Thread(target=self._optimize_proxies_bg, daemon=True).start()
+    def _show_proxy_bottom_sheet(self, activity, proxy, title):
+        Context = activity
+        BottomSheetBuilder = jclass("org.telegram.ui.ActionBar.BottomSheet$Builder")
+        bs = BottomSheetBuilder(Context, False)
+        bs.setApplyTopPadding(True)
 
-    def _is_ip_address(self, address):
-        address = str(address).strip()
-        if not address: return False
-        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", address) or ":" in address: return True
-        return False
+        LinearLayoutClass = jclass("android.widget.LinearLayout")
+        container = LinearLayoutClass(Context)
+        container.setOrientation(1)
 
-    def _resolve_domain(self, domain):
-        try:
-            ip = socket.gethostbyname(domain)
-            if ip and ip != domain: return ip
-        except Exception: pass
-        try:
-            resp = requests.get(f"http://ip-api.com/json/{domain}", timeout=5).json()
-            if resp.get("status") == "success" and resp.get("query"): return resp.get("query")
-        except Exception: pass
-        return domain
+        TextViewClass = jclass("android.widget.TextView")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
 
-    def _optimize_proxies_bg(self):
-        try:
-            SharedConfig.loadProxyList()
-            proxies = SharedConfig.proxyList
-            if not proxies or proxies.size() == 0: return
+        title_tv = TextViewClass(Context)
+        title_tv.setText("Прокси-сервер")
+        title_tv.setTextSize(1, 20.0)
+        title_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        title_tv.setTypeface(AndroidUtilities.bold())
+        title_tv.setPadding(AndroidUtilities.dp(21), AndroidUtilities.dp(16), AndroidUtilities.dp(21), AndroidUtilities.dp(8))
+        container.addView(title_tv)
 
-            modified = 0
-            for i in range(proxies.size()):
-                p = proxies.get(i)
-                changed = False
-                
-                if hasattr(p, "secret") and p.secret:
-                    secret = str(p.secret).strip()
-                    if not (secret.startswith("dd") or secret.startswith("ee")):
-                        p.secret = "dd" + secret
-                        changed = True
-                        
-                address = str(p.address).strip()
-                if not self._is_ip_address(address):
-                    new_ip = self._resolve_domain(address)
-                    if new_ip != address:
-                        p.address = new_ip
-                        changed = True
-                
-                if changed: modified += 1
+        TableViewClass = jclass("org.telegram.ui.Components.TableView")
+        table = TableViewClass(Context, None)
+
+        table.addRow("Сервер", proxy["host"])
+        table.addRow("Порт", str(proxy["port"]))
+        
+        if title:
+            table.addRow("Название", title)
             
-            if modified > 0:
-                SharedConfig.saveProxyList()
-                run_on_ui_thread(lambda: self._notify_ui(f"Успешно оптимизировано: {modified} шт."))
+        if proxy["secret"]:
+            table.addRow("Ключ", proxy["secret"])
+        elif proxy["user"]:
+            table.addRow("Логин", proxy["user"])
+            table.addRow("Пароль", "••••••")
+
+        status_tv_ref = [None]
+        row_status = table.addRow("Статус", "Проверить", status_tv_ref)
+        status_tv = status_tv_ref[0]
+
+        if status_tv:
+            status_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            
+        row_status.setBackground(Theme.getSelectorDrawable(False))
+
+        container.addView(table, LayoutHelper.createLinear(-1, -2, 21, 8, 21, 0))
+
+        TextInfoPrivacyCell = jclass("org.telegram.ui.Cells.TextInfoPrivacyCell")
+        footer = TextInfoPrivacyCell(Context)
+        footer.setText("Этот прокси-сервер может показывать канал спонсора в списке Ваших чатов. Это не раскрывает Ваш трафик.")
+        container.addView(footer)
+
+        btn = TextViewClass(Context)
+        btn.setText("Подключить прокси")
+        btn.setGravity(17)
+        btn.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+        btn.setTextSize(1, 14.0)
+        btn.setTypeface(AndroidUtilities.bold())
+        
+        bg_drawable = Theme.createSimpleSelectorRoundRectDrawable(
+            AndroidUtilities.dp(8), 
+            Theme.getColor(Theme.key_featuredStickers_addButton), 
+            Theme.getColor(Theme.key_featuredStickers_addButtonPressed)
+        )
+        btn.setBackground(bg_drawable)
+        container.addView(btn, LayoutHelper.createLinear(-1, 48, 16, 16, 16, 16))
+
+        bs.setCustomView(container)
+        sheet = bs.create()
+        
+        sheet_ref = weakref.ref(sheet)
+        plugin_ref = weakref.ref(self)
+        status_tv_wref = weakref.ref(status_tv) if status_tv else None
+
+        def connect_proxy(v):
+            s = sheet_ref()
+            if s: s.dismiss()
+            p = plugin_ref()
+            if not p: return
+            if title:
+                p.proxy_names[f"{proxy['host']}:{proxy['port']}"] = title
+                p.save_settings_data()
+            p._enable_proxy_now(proxy)
+
+        btn.setOnClickListener(GenericClickListener(connect_proxy))
+
+        def do_ping(v):
+            p = plugin_ref()
+            if not p: return
+            tv = status_tv_wref() if status_tv_wref else None
+            if tv:
+                tv.setText("Проверка...")
+                tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            
+            def task():
+                p_inner = plugin_ref()
+                if not p_inner: return
+                ms = p_inner._tcp_ping(proxy["host"], proxy["port"])
+                def ui():
+                    tv_inner = status_tv_wref() if status_tv_wref else None
+                    if not tv_inner: return
+                    if ms >= 0:
+                        tv_inner.setText(f"{ms} мс")
+                        tv_inner.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGreenText))
+                    else:
+                        tv_inner.setText("Недоступен")
+                        tv_inner.setTextColor(Theme.getColor(Theme.key_text_RedRegular))
+                run_on_ui_thread(ui)
+            threading.Thread(target=task, daemon=True).start()
+
+        row_status.setOnClickListener(GenericClickListener(do_ping))
+        do_ping(None)
+        sheet.show()
+
+    def _enable_proxy_now(self, proxy):
+        try:
+            host = proxy.get("host")
+            port = int(proxy.get("port") or 0)
+            user = proxy.get("user") or ""
+            password = proxy.get("password") or ""
+            secret = proxy.get("secret") or ""
+
+            SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+            ProxyInfoClass = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+
+            existing = None
+            if SharedConfig.proxyList:
+                for i in range(SharedConfig.proxyList.size()):
+                    p = SharedConfig.proxyList.get(i)
+                    if str(p.address) == host and int(p.port) == port:
+                        existing = p; break
+
+            if existing:
+                info = existing
+                if secret: info.secret = secret
+                else: info.username = user; info.password = password
             else:
-                run_on_ui_thread(lambda: BulletinHelper.show_success("Все прокси уже идеальны!"))
+                info = ProxyInfoClass(host, port, user, password, secret)
+                SharedConfig.addProxy(info)
+
+            SharedConfig.currentProxy = info
+            SharedConfig.saveProxyList()
+
+            MessagesController = jclass("org.telegram.messenger.MessagesController")
+            prefs = MessagesController.getGlobalMainSettings()
+            editor = prefs.edit()
+            editor.putBoolean("proxy_enabled", True)
+            editor.putString("proxy_ip", host)
+            editor.putInt("proxy_port", port)
+            if secret:
+                editor.putString("proxy_secret", secret)
+                editor.remove("proxy_user")
+                editor.remove("proxy_pass")
+            else:
+                editor.remove("proxy_secret")
+                if user: editor.putString("proxy_user", user)
+                else:    editor.remove("proxy_user")
+                if password: editor.putString("proxy_pass", password)
+                else:        editor.remove("proxy_pass")
+            editor.apply()
+
+            ConnectionsManager = jclass("org.telegram.tgnet.ConnectionsManager")
+            ConnectionsManager.setProxySettings(True, host, port, user, password, secret)
+
+            BulletinHelper.show_success("Прокси подключен")
+            self._safe_refresh()
         except Exception as e:
-            log(f"ProxyTools Optimize Error: {e}")
+            BulletinHelper.show_error(f"Ошибка: {e}")
 
-    def _remove_duplicates(self, view):
-        try:
-            SharedConfig.loadProxyList()
-            proxies = SharedConfig.proxyList
-            if not proxies or proxies.size() == 0: return
-
-            seen = set()
-            to_remove = []
-
-            for i in range(proxies.size()):
-                p = proxies.get(i)
-                key = f"{p.address}:{p.port}"
-                if key in seen:
-                    to_remove.append(p)
-                else:
-                    seen.add(key)
-
-            if not to_remove:
-                BulletinHelper.show_success("Дубликатов не найдено")
-                return
-
-            for p in to_remove:
-                SharedConfig.deleteProxy(p)
-                
-            self._notify_ui(f"Удалено дубликатов: {len(to_remove)}")
-        except Exception as e:
-            log(f"ProxyTools Duplicate Error: {e}")
-
-    def _start_dead_cleanup(self, view):
-        BulletinHelper.show_success("Проверяем доступность прокси (Ping)...")
-        threading.Thread(target=self._cleanup_dead_bg, daemon=True).start()
-
-    def _cleanup_dead_bg(self):
-        try:
-            SharedConfig.loadProxyList()
-            proxies = SharedConfig.proxyList
-            if not proxies or proxies.size() == 0: return
-
-            to_remove = []
-            
-            for i in range(proxies.size()):
-                p = proxies.get(i)
-                address = str(p.address)
-                port = int(p.port)
-                
-                if not self._is_ip_address(address):
-                    address = self._resolve_domain(address)
-
-                alive = False
+    def _tcp_ping(self, host, port, timeout=2.5):
+        best = -1
+        try: infos = socket.getaddrinfo(host, int(port), 0, socket.SOCK_STREAM)
+        except: infos = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (host, int(port)))]
+        for _ in range(2):
+            for family, socktype, proto, _, sockaddr in infos:
+                s = None
                 try:
-                    with socket.create_connection((address, port), timeout=1.5):
-                        alive = True
-                except Exception:
-                    pass
-                
-                if not alive:
-                    to_remove.append(p)
+                    s = socket.socket(family, socktype, proto)
+                    s.settimeout(timeout)
+                    t = time.perf_counter()
+                    s.connect(sockaddr)
+                    ms = int((time.perf_counter() - t) * 1000)
+                    if best < 0 or ms < best: best = ms
+                    if best < 100: break
+                except: pass
+                finally:
+                    if s:
+                        try: s.close()
+                        except: pass
+            if best >= 0 and best < 100: break
+        return best
 
-            if not to_remove:
-                run_on_ui_thread(lambda: BulletinHelper.show_success("Все прокси работают отлично!"))
-                return
-
-            for p in to_remove:
-                SharedConfig.deleteProxy(p)
-
-            run_on_ui_thread(lambda: self._notify_ui(f"Удалено нерабочих: {len(to_remove)}"))
-        except Exception as e:
-            log(f"ProxyTools Ping Error: {e}")
-
-    def _export_proxies(self, view):
+    def hook_proxy_export(self):
         try:
+            ProxyInfoCls = jclass("java.lang.Class").forName("org.telegram.messenger.SharedConfig$ProxyInfo")
+            class GetLinkHook(MethodHook):
+                def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+                def after_hooked_method(self, param):
+                    plugin = self.plugin_ref()
+                    if not plugin: return
+                    link = str(param.getResult() or "")
+                    if not link or "title=" in link: return
+                    
+                    info = param.thisObject
+                    key = plugin._get_proxy_key(info)
+                    name = plugin.proxy_names.get(key)
+                    
+                    if name:
+                        joiner = "&" if "?" in link else "?"
+                        new_link = f"{link}{joiner}title={urllib.parse.quote(name)}"
+                        param.setResult(String(new_link))
+                        
+            for m in ProxyInfoCls.getDeclaredMethods():
+                if m.getName() == "getLink":
+                    self.hook_method(m, GetLinkHook(weakref.ref(self)))
+        except Exception as e: log(f"ProxyInfo getLink hook error: {e}")
+
+        try:
+            QRCodeCls = jclass("java.lang.Class").forName("org.telegram.ui.Components.QRCodeBottomSheet")
+            class QRCodeHook(MethodHook):
+                def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+                def before_hooked_method(self, param):
+                    plugin = self.plugin_ref()
+                    if not plugin: return
+                    if len(param.args) > 2:
+                        link = str(param.args[2] or "")
+                        if "proxy?" in link or "socks?" in link:
+                            parsed = urllib.parse.urlsplit(link.replace("tg://", "http://").replace("https://t.me/", "http://"))
+                            q = urllib.parse.parse_qs(parsed.query)
+                            srv = q.get("server", [""])[0]
+                            port = q.get("port", ["0"])[0]
+                            
+                            if srv and port:
+                                key = f"{srv}:{port}"
+                                name = plugin.proxy_names.get(key)
+                                if name and "title=" not in link:
+                                    joiner = "&" if "?" in link else "?"
+                                    param.args[2] = String(f"{link}{joiner}title={urllib.parse.quote(name)}")
+                                    if len(param.args) > 1:
+                                        param.args[1] = String(f"{name} (QR)")
+                                        
+            for c in QRCodeCls.getDeclaredConstructors():
+                self.hook_method(c, QRCodeHook(weakref.ref(self)))
+        except Exception as e: log(f"QRCodeBottomSheet hook error: {e}")
+
+    def hook_proxy_editor_ui(self):
+        try:
+            EditorCls = jclass("java.lang.Class").forName("org.telegram.ui.ProxySettingsActivity")
+            BaseFragCls = jclass("java.lang.Class").forName("org.telegram.ui.ActionBar.BaseFragment")
+        except: return
+
+        class CreateHook(MethodHook):
+            def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+            def after_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin: return
+                act = param.thisObject
+                try:
+                    info = get_private_field(act, "currentProxyInfo")
+                    container = get_private_field(act, "linearLayout2")
+                    if not info or not container: return
+                    
+                    Theme = jclass("org.telegram.ui.ActionBar.Theme")
+                    Context = act.getParentActivity()
+                    L = jclass("org.telegram.ui.Components.LayoutHelper")
+                    AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+                    
+                    key = plugin._get_proxy_key(info)
+                    name = plugin.proxy_names.get(key, "")
+                    
+                    if name:
+                        actionBar = get_private_field(act, "actionBar")
+                        if actionBar: actionBar.setTitle(String(name))
+                    
+                    Field = jclass("org.telegram.ui.Components.EditTextBoldCursor")(Context)
+                    Field.setTextSize(1, 16)
+                    Field.setHintText("Название прокси (опционально)")
+                    Field.setBackgroundDrawable(None)
+                    Field.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(8))
+                    Field.setHintColor(Theme.getColor(Theme.key_windowBackgroundWhiteHintText))
+                    Field.setHeaderHintColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueHeader))
+                    Field.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                    Field.setTransformHintToHeader(True)
+                    Field.setLineColors(
+                        Theme.getColor(Theme.key_windowBackgroundWhiteInputField), 
+                        Theme.getColor(Theme.key_windowBackgroundWhiteInputFieldActivated), 
+                        Theme.getColor(Theme.key_text_RedRegular)
+                    )
+                    Field.setText(name)
+                    
+                    Wrap = jclass("android.widget.FrameLayout")(Context)
+                    Wrap.addView(Field, L.createFrame(-1, -1, 19, 21, 10, 21, 0))
+                    container.addView(Wrap, 0, L.createLinear(-1, 64))
+                    
+                    plugin.editor_name_inputs[act.hashCode()] = Field
+                    
+                    TextCheckCell = jclass("org.telegram.ui.Cells.TextCheckCell")(Context)
+                    is_pinned = key in plugin.pinned_proxies
+                    TextCheckCell.setTextAndCheck("Закрепить прокси", is_pinned, True)
+                    TextCheckCell.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+                    
+                    def toggle_pin(v):
+                        p = self.plugin_ref()
+                        if not p: return
+                        state = key in p.pinned_proxies
+                        v.setChecked(not state)
+                        if not state: p.pinned_proxies[key] = True
+                        else: p.pinned_proxies.pop(key, None)
+                        p.save_settings_data(); p._safe_refresh()
+                    
+                    TextCheckCell.setOnClickListener(GenericClickListener(toggle_pin))
+                    container.addView(TextCheckCell, 1, L.createLinear(-1, 50))
+                    
+                    paste_cell = get_private_field(act, "pasteCell")
+                    if paste_cell:
+                        field_ref = weakref.ref(Field)
+                        try:
+                            ViewCls = jclass("android.view.View")
+                            li_field = ViewCls.getDeclaredField("mListenerInfo")
+                            li_field.setAccessible(True)
+                            li = li_field.get(paste_cell)
+                            old_l = getattr(li, "mOnClickListener", None) if li else None
+                            
+                            def on_paste(v):
+                                if old_l: old_l.onClick(v)
+                                f = field_ref()
+                                if not f: return
+                                try:
+                                    clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+                                    if clip and clip.hasPrimaryClip():
+                                        text = str(clip.getPrimaryClip().getItemAt(0).getText() or "")
+                                        parsed = urllib.parse.urlsplit(text.replace("tg://", "http://").replace("https://t.me/", "http://"))
+                                        q = urllib.parse.parse_qs(parsed.query)
+                                        title = urllib.parse.unquote(q.get("title", [""])[0])
+                                        if title: f.setText(title)
+                                except: pass
+
+                            paste_cell.setOnClickListener(GenericClickListener(on_paste))
+                        except Exception as e: log(f"Paste hook error: {e}")
+                except Exception as e: log(f"Editor UI error: {e}")
+
+        class DestroyHook(MethodHook):
+            def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+            def before_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin: return
+                act = param.thisObject
+                if "ProxySettingsActivity" not in str(act.getClass().getSimpleName()): return
+                try:
+                    field = plugin.editor_name_inputs.pop(act.hashCode(), None)
+                    if not field: return
+                    info = get_private_field(act, "currentProxyInfo")
+                    if info and info.address:
+                        val = str(field.getText().toString()).strip()
+                        key = plugin._get_proxy_key(info)
+                        changed = False
+                        if val: 
+                            plugin.proxy_names[key] = val; changed = True
+                        elif key in plugin.proxy_names: 
+                            plugin.proxy_names.pop(key, None); changed = True
+                        if changed:
+                            plugin.save_settings_data(); plugin._safe_refresh()
+                except Exception as e: log(f"Editor Destroy error: {e}")
+
+        for m in EditorCls.getDeclaredMethods():
+            if m.getName() == "createView": self.hook_method(m, CreateHook(weakref.ref(self)))
+        for m in BaseFragCls.getDeclaredMethods():
+            if m.getName() == "onFragmentDestroy": self.hook_method(m, DestroyHook(weakref.ref(self)))
+
+    def hook_proxy_list_ui(self):
+        try:
+            ActivityCls = jclass("java.lang.Class").forName("org.telegram.ui.ProxyListActivity")
+            AdapterCls = jclass("java.lang.Class").forName("org.telegram.ui.ProxyListActivity$ListAdapter")
+        except: return
+
+        class FragmentCreateHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+                    if SharedConfig.proxyList:
+                        for i in range(SharedConfig.proxyList.size()):
+                            p = SharedConfig.proxyList.get(i)
+                            p.checking = False
+                            p.availableCheckTime = 0
+                except: pass
+
+        class UpdateRowsHook(MethodHook):
+            def __init__(self, plugin_ref):
+                self.plugin_ref = plugin_ref
+                self.hidden_proxies = []
+
+            def before_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin: return
+                strict = plugin.get_setting("strict_type", 0)
+                try:
+                    SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+                    global_list = SharedConfig.proxyList
+                    to_remove = []
+                    if strict > 0:
+                        for i in range(global_list.size()):
+                            p = global_list.get(i)
+                            is_mt = hasattr(p, "secret") and bool(p.secret)
+                            if (strict == 1 and is_mt) or (strict == 2 and not is_mt):
+                                to_remove.append(p)
+                        self.hidden_proxies = to_remove
+                        for p in to_remove: global_list.remove(p)
+                except: pass
+
+            def after_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                act = param.thisObject
+                if plugin:
+                    try:
+                        SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+                        current_key = plugin._get_proxy_key(SharedConfig.currentProxy) if SharedConfig.currentProxy else None
+                        proxy_list = get_private_field(act, "proxyList")
+                        if proxy_list and proxy_list.size() > 0:
+                            items = [proxy_list.get(i) for i in range(proxy_list.size())]
+                            items.sort(key=lambda p: (plugin._get_proxy_key(p) != current_key, plugin._get_proxy_key(p) not in plugin.pinned_proxies))
+                            proxy_list.clear()
+                            for i in items: proxy_list.add(i)
+                    except: pass
+
+                if self.hidden_proxies:
+                    try:
+                        SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+                        for p in self.hidden_proxies: SharedConfig.proxyList.add(p)
+                    except: pass
+                    finally: self.hidden_proxies = []
+
+        class GetItemCountHook(MethodHook):
+            def after_hooked_method(self, param):
+                param.setResult(Integer(int(param.getResult()) + 11))
+
+        class GetItemViewTypeHook(MethodHook):
+            def before_hooked_method(self, param):
+                act = get_private_field(param.thisObject, "this$0")
+                if not act: return
+                orig_count = int(get_private_field(act, "rowCount"))
+                pos = int(param.args[0])
+                if pos >= orig_count:
+                    cpos = pos - orig_count
+                    if cpos in (0, 3, 6): param.setResult(Integer(0))
+                    elif cpos in (1, 2): param.setResult(Integer(3))
+                    else: param.setResult(Integer(1))
+
+        class GetItemIdHook(MethodHook):
+            def before_hooked_method(self, param):
+                act = get_private_field(param.thisObject, "this$0")
+                if not act and int(param.args[0]) >= int(get_private_field(act, "rowCount")):
+                    param.setResult(Long(10000 + int(param.args[0])))
+
+        class BindHook(MethodHook):
+            def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+            def before_hooked_method(self, param):
+                act = get_private_field(param.thisObject, "this$0")
+                if act and int(param.args[1]) >= int(get_private_field(act, "rowCount")):
+                    param.setResult(None)
+
+            def after_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin: return
+                act = get_private_field(param.thisObject, "this$0")
+                if not act: return
+                orig_count = int(get_private_field(act, "rowCount"))
+                pos = int(param.args[1])
+                cell = param.args[0].itemView
+                
+                if pos >= orig_count:
+                    cpos = pos - orig_count
+                    context = cell.getContext()
+                    
+                    def apply_icon(tv_field_name, icon_name):
+                        try:
+                            tv = get_private_field(cell, tv_field_name)
+                            if not tv: return
+                            res_id = context.getResources().getIdentifier(icon_name, "drawable", context.getPackageName())
+                            if res_id == 0: return
+                            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+                            PorterDuffColorFilter = jclass("android.graphics.PorterDuffColorFilter")
+                            drawable = context.getResources().getDrawable(res_id).mutate()
+                            drawable.setColorFilter(PorterDuffColorFilter(Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon), jclass("android.graphics.PorterDuff").Mode.MULTIPLY))
+                            LocaleController = jclass("org.telegram.messenger.LocaleController")
+                            if LocaleController.isRTL: tv.setCompoundDrawablesWithIntrinsicBounds(None, None, drawable, None)
+                            else: tv.setCompoundDrawablesWithIntrinsicBounds(drawable, None, None, None)
+                            tv.setCompoundDrawablePadding(jclass("org.telegram.messenger.AndroidUtilities").dp(16))
+                        except: pass
+
+                    try:
+                        if cpos == 1:
+                            cell.setTextAndCheck("Флаги и Провайдеры (ISP)", plugin.get_setting("show_flags", True), True)
+                            apply_icon("textView", "msg_location")
+                        elif cpos == 2:
+                            cell.setTextAndCheck("Метки SOCKS5 / MTProto", plugin.get_setting("show_proxy_type", True), False)
+                            apply_icon("textView", "msg_info")
+                        elif cpos == 4:
+                            cell.setText("Импорт из буфера", True)
+                            apply_icon("textView", "msg_download")
+                        elif cpos == 5:
+                            cell.setText("Экспорт всех", False)
+                            apply_icon("textView", "msg_share")
+                        elif cpos == 7:
+                            cell.setText("Оптимизировать (IP + dd)", True)
+                            apply_icon("textView", "msg_speed")
+                        elif cpos == 8:
+                            cell.setText("Перепроверить пинг", True)
+                            apply_icon("textView", "msg_retry")
+                        elif cpos == 9:
+                            cell.setText("Удалить дубликаты", True)
+                            apply_icon("textView", "msg_clear")
+                        elif cpos == 10:
+                            cell.setText("Удалить нерабочие", False)
+                            apply_icon("textView", "msg_delete")
+                    except: pass
+                else:
+                    try:
+                        cell_name = str(cell.getClass().getSimpleName())
+                        if cell_name in ("TextSettingsCell", "TextCheckCell"):
+                            tv = get_private_field(cell, "textView")
+                            if tv: tv.setCompoundDrawablesWithIntrinsicBounds(None, None, None, None)
+                    except: pass
+
+        class CreateViewHook(MethodHook):
+            def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+            def after_hooked_method(self, param):
+                act = param.thisObject
+                try:
+                    lv = get_private_field(act, "listView")
+                    old_listener = get_private_field(lv, "onItemClickListener")
+                    if old_listener and "ProxyToolsListener" in str(old_listener.getClass().getName()): return
+
+                    L = jclass("org.telegram.ui.Components.RecyclerListView$OnItemClickListener")
+                    class ProxyToolsListener(dynamic_proxy(L)):
+                        def __init__(self, old, plugin_ref): 
+                            super().__init__()
+                            self.old = old
+                            self.plugin_ref = plugin_ref
+                        def onItemClick(self, view, pos):
+                            plugin = self.plugin_ref()
+                            if not plugin: return
+                            orig_count = int(get_private_field(act, "rowCount"))
+                            if pos >= orig_count:
+                                cpos = pos - orig_count
+                                if cpos == 1:
+                                    v = not plugin.get_setting("show_flags", True)
+                                    plugin.set_setting("show_flags", v)
+                                    view.setChecked(v); plugin._safe_refresh()
+                                elif cpos == 2:
+                                    v = not plugin.get_setting("show_proxy_type", True)
+                                    plugin.set_setting("show_proxy_type", v)
+                                    view.setChecked(v); plugin._safe_refresh()
+                                elif cpos == 4: plugin._import_from_clipboard()
+                                elif cpos == 5: plugin._export_proxies()
+                                elif cpos == 7: plugin._start_optimization()
+                                elif cpos == 8: plugin._ping_all()
+                                elif cpos == 9: plugin._remove_duplicates()
+                                elif cpos == 10: plugin._start_dead_cleanup()
+                            else:
+                                if self.old: self.old.onItemClick(view, pos)
+                    lv.setOnItemClickListener(ProxyToolsListener(old_listener, self.plugin_ref))
+                except: pass
+
+        for m in ActivityCls.getDeclaredMethods():
+            if m.getName() == "onFragmentCreate": self.hook_method(m, FragmentCreateHook())
+            elif m.getName() == "updateRows": self.hook_method(m, UpdateRowsHook(weakref.ref(self)))
+            elif m.getName() == "createView": self.hook_method(m, CreateViewHook(weakref.ref(self)))
+
+        for m in AdapterCls.getDeclaredMethods():
+            if m.getName() == "getItemCount": self.hook_method(m, GetItemCountHook())
+            elif m.getName() == "getItemViewType": self.hook_method(m, GetItemViewTypeHook())
+            elif m.getName() == "getItemId": self.hook_method(m, GetItemIdHook())
+            elif m.getName() == "onBindViewHolder" and len(m.getParameterTypes()) == 2: self.hook_method(m, BindHook(weakref.ref(self)))
+
+    def hook_proxy_cells(self):
+        try:
+            CellCls = jclass("java.lang.Class").forName("org.telegram.ui.ProxyListActivity$TextDetailProxyCell")
+        except: return
+        
+        class ProxyHook(MethodHook):
+            def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+            def after_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin: return
+                cell, info = param.thisObject, param.args[0]
+                try:
+                    tv = get_private_field(cell, "textView")
+                    if not tv: return
+                    
+                    addr = str(info.address)
+                    key = plugin._get_proxy_key(info)
+                    show_flags = plugin.get_setting("show_flags", True)
+                    show_type = plugin.get_setting("show_proxy_type", True)
+                    
+                    data = plugin.ip_data.get(addr, {})
+                    flag = data.get("flag", "")
+                    
+                    if show_flags and not flag and addr not in plugin.pending_lookups:
+                        plugin._fetch_flag_batch(addr)
+                            
+                    name = plugin.proxy_names.get(key)
+                    is_pinned = key in plugin.pinned_proxies
+                    
+                    base_info = f"{name}" if name else f"{addr}:{info.port}"
+                    text = f"{flag} | {base_info}" if (flag and show_flags) else base_info
+                    tv.setText(text)
+                    
+                    context = cell.getContext()
+                    
+                    type_tv = cell.findViewWithTag("proxy_type_label")
+                    if show_type:
+                        if not type_tv:
+                            TextView = jclass("android.widget.TextView")
+                            type_tv = TextView(context)
+                            type_tv.setTag("proxy_type_label")
+                            type_tv.setTextSize(1, 13)
+                            type_tv.setGravity(16 | 5)
+                            
+                            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+                            type_tv.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                            
+                            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+                            type_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText3))
+                            
+                            L = jclass("org.telegram.ui.Components.LayoutHelper")
+                            LocaleController = jclass("org.telegram.messenger.LocaleController")
+                            gravity = (3 if LocaleController.isRTL else 5)
+                            margin_right = 56 if not LocaleController.isRTL else 21
+                            margin_left = 21 if not LocaleController.isRTL else 56
+                            
+                            lp = L.createFrame(-2, -1, gravity, margin_left, 0, margin_right, 0)
+                            cell.addView(type_tv, lp)
+                            
+                        type_tv.setVisibility(0)
+                        is_mt = hasattr(info, "secret") and bool(info.secret)
+                        type_tv.setText("MTProto" if is_mt else "SOCKS5")
+                    else:
+                        if type_tv: type_tv.setVisibility(8)
+                    
+                    if is_pinned:
+                        pin_id = context.getResources().getIdentifier("chats_pin", "drawable", context.getPackageName())
+                        if pin_id == 0: pin_id = context.getResources().getIdentifier("msg_pin", "drawable", context.getPackageName())
+                        if pin_id != 0:
+                            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+                            PorterDuffColorFilter = jclass("android.graphics.PorterDuffColorFilter")
+                            drawable = context.getResources().getDrawable(pin_id).mutate()
+                            drawable.setColorFilter(PorterDuffColorFilter(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText3), jclass("android.graphics.PorterDuff").Mode.MULTIPLY))
+                            LocaleController = jclass("org.telegram.messenger.LocaleController")
+                            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+                            if LocaleController.isRTL: tv.setCompoundDrawablesWithIntrinsicBounds(None, None, drawable, None)
+                            else: tv.setCompoundDrawablesWithIntrinsicBounds(drawable, None, None, None)
+                            tv.setCompoundDrawablePadding(AndroidUtilities.dp(6))
+                    else:
+                        tv.setCompoundDrawablesWithIntrinsicBounds(None, None, None, None)
+                        
+                except Exception as e: log(f"Error updating proxy cell: {e}")
+
+        class UpdateStatusHook(MethodHook):
+            def __init__(self, plugin_ref): self.plugin_ref = plugin_ref
+            def after_hooked_method(self, param):
+                plugin = self.plugin_ref()
+                if not plugin: return
+                cell = param.thisObject
+                try:
+                    info = get_private_field(cell, "currentInfo")
+                    if not info: return
+                    show_flags = plugin.get_setting("show_flags", True)
+                    tv = get_private_field(cell, "valueTextView")
+                    if not tv: return
+                    current_text = str(tv.getText() or "")
+                    
+                    if show_flags:
+                        addr = str(info.address)
+                        data = plugin.ip_data.get(addr, {})
+                        isp = data.get("isp", "")
+                        if isp and " • " not in current_text:
+                            tv.setText(f"{current_text} • {isp}")
+                except Exception as e: log(f"Error in updateStatus: {e}")
+
+        for m in CellCls.getDeclaredMethods():
+            if m.getName() == "setProxy": self.hook_method(m, ProxyHook(weakref.ref(self)))
+            elif m.getName() == "updateStatus": self.hook_method(m, UpdateStatusHook(weakref.ref(self)))
+
+    def _fetch_flag_batch(self, addr):
+        with self._batch_lock: self.pending_lookups.add(addr)
+            
+        def batch_task():
+            time.sleep(1.0)
+            with self._batch_lock:
+                if not self.pending_lookups: return
+                ips_to_process = list(self.pending_lookups)[:100]
+                for ip in ips_to_process: self.pending_lookups.remove(ip)
+            if not ips_to_process: return
+            
+            try:
+                resolved_ips = []
+                ip_to_domain = {}
+                for host in ips_to_process:
+                    ip = socket.gethostbyname(host) if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host) else host
+                    resolved_ips.append({"query": ip})
+                    ip_to_domain[ip] = host
+
+                res = requests.post("http://ip-api.com/batch?fields=query,countryCode,isp", json=resolved_ips, timeout=5).json()
+                
+                updated = False
+                for item in res:
+                    cc = item.get("countryCode")
+                    query_ip = item.get("query")
+                    isp = item.get("isp", "")
+                    
+                    isp = re.sub(r"(?i)\s+(LLC|Inc\.|Ltd\.|Corporation|Corp\.|Hosting|Network|Communications|GmbH)", "", isp).strip(" ,.")
+                    if len(isp) > 20: isp = isp[:18] + ".."
+                    
+                    if cc and query_ip:
+                        flag = chr(ord(cc[0]) + 127397) + chr(ord(cc[1]) + 127397)
+                        original_host = ip_to_domain.get(query_ip, query_ip)
+                        self.ip_data[original_host] = {"flag": flag, "isp": isp}
+                        updated = True
+                
+                if updated:
+                    self.save_settings_data(); run_on_ui_thread(self._safe_refresh)
+            except Exception as e: log(f"Batch IP fetch error: {e}")
+
+        if len(self.pending_lookups) == 1 or len(self.pending_lookups) % 20 == 0:
+            threading.Thread(target=batch_task, daemon=True).start()
+
+    def _import_from_clipboard(self):
+        try:
+            clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+            if not clip.hasPrimaryClip(): return
+            text = str(clip.getPrimaryClip().getItemAt(0).getText() or "").replace("tg://", " tg://").replace("https://t.me/", " https://t.me/")
+            links = re.findall(r"(tg://[^\s\"'<>]+|https?://t\.me/[^\s\"'<>]+)", text)
+            if not links: return
+            
+            SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+            ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+            added = 0
+            
+            for l in links:
+                if "proxy?" in l or "socks?" in l:
+                    l = l.replace("https://t.me/", "tg://")
+                    parsed_url = urllib.parse.urlsplit(l.replace("tg://", "http://"))
+                    q = urllib.parse.parse_qs(parsed_url.query)
+                    
+                    srv, port = q.get("server", [""])[0], q.get("port", ["0"])[0]
+                    title = urllib.parse.unquote(q.get("title", [""])[0])
+                    
+                    if srv and port.isdigit():
+                        info = ProxyInfo(srv, int(port), urllib.parse.unquote(q.get("user", [""])[0]), urllib.parse.unquote(q.get("pass", [""])[0]), q.get("secret", [""])[0])
+                        SharedConfig.addProxy(info)
+                        if title: self.proxy_names[self._get_proxy_key(info)] = title
+                        added += 1
+                        
+            if added: 
+                SharedConfig.saveProxyList(); self.save_settings_data()
+                self._notify_ui(f"Импортировано: {added}")
+            else: self._notify_ui("Прокси не найдены")
+        except Exception as e: log(f"Import error: {e}")
+
+    def _start_optimization(self):
+        run_on_ui_thread(lambda: BulletinHelper.show_success("Оптимизация..."))
+        def task():
+            try:
+                SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+                SharedConfig.loadProxyList()
+                proxies = SharedConfig.proxyList
+                mod = 0
+                for i in range(proxies.size()):
+                    p = proxies.get(i); ch = False
+                    if hasattr(p, "secret") and p.secret:
+                        s = str(p.secret)
+                        if len(s) == 32 and all(c in string.hexdigits for c in s):
+                            p.secret = "dd" + s; ch = True
+                            
+                    addr = str(p.address)
+                    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", addr):
+                        try:
+                            new_ip = socket.gethostbyname(addr)
+                            if new_ip != addr:
+                                old_key = self._get_proxy_key(p)
+                                if old_key in self.proxy_names: self.proxy_names[f"{new_ip}:{p.port}"] = self.proxy_names.pop(old_key)
+                                if old_key in self.pinned_proxies: 
+                                    self.pinned_proxies.pop(old_key, None)
+                                    self.pinned_proxies[f"{new_ip}:{p.port}"] = True
+                                p.address = new_ip; ch = True
+                        except: pass
+                    if ch: mod += 1
+                if mod > 0: 
+                    self.save_settings_data()
+                    run_on_ui_thread(lambda: (SharedConfig.saveProxyList(), self._notify_ui(f"Обновлено: {mod}")))
+                else: run_on_ui_thread(lambda: BulletinHelper.show_success("Всё уже оптимизировано"))
+            except Exception as e: log(f"Optimize error: {e}")
+        threading.Thread(target=task, daemon=True).start()
+
+    def _remove_duplicates(self):
+        try:
+            SharedConfig = jclass("org.telegram.messenger.SharedConfig")
             SharedConfig.loadProxyList()
             proxies = SharedConfig.proxyList
-            if not proxies or proxies.size() == 0:
-                BulletinHelper.show_error("Список пуст")
-                return
-
-            links = []
+            seen, unique_proxies = set(), []
             for i in range(proxies.size()):
                 p = proxies.get(i)
-                address = str(p.address)
-                port = str(p.port)
-                
-                if hasattr(p, "secret") and p.secret:
-                    link = f"tg://proxy?server={address}&port={port}&secret={str(p.secret)}"
-                else:
-                    link = f"tg://socks?server={address}&port={port}"
-                    if hasattr(p, "username") and p.username:
-                        link += f"&user={urllib.parse.quote(str(p.username))}"
-                    if hasattr(p, "password") and p.password:
-                        link += f"&pass={urllib.parse.quote(str(p.password))}"
-                links.append(link)
-            
-            export_text = f"Экспорт прокси ({len(links)} шт):\n\n" + "\n\n".join(links)
-            
-            saved_messages_peer = get_user_config().getClientUserId()
-            quote_entity = TLRPC.TL_messageEntityBlockquote()
-            quote_entity.collapsed = True
-            quote_entity.offset = 0
-            quote_entity.length = len(export_text.encode('utf-16-le')) // 2
+                k = f"{p.address}:{p.port}:{p.secret if hasattr(p, 'secret') else ''}"
+                if k not in seen:
+                    seen.add(k); unique_proxies.append(p)
+            dups = proxies.size() - len(unique_proxies)
+            if dups > 0:
+                proxies.clear()
+                for p in unique_proxies: proxies.add(p)
+                SharedConfig.saveProxyList()
+                self._notify_ui(f"Удалено дублей: {dups}")
+            else: self._notify_ui("Дубликатов нет")
+        except: pass
 
-            send_message({
-                "peer": saved_messages_peer,
-                "message": export_text,
-                "entities": [quote_entity]
-            })
-            BulletinHelper.show_success(f"Экспортировано {len(links)} прокси")
-        except Exception as e:
-            log(f"ProxyTools Export Error: {e}")
+    def _start_dead_cleanup(self):
+        run_on_ui_thread(lambda: BulletinHelper.show_info("Массовая проверка на доступность..."))
+        def check_proxy(p):
+            try: 
+                s = socket.create_connection((str(p.address), int(p.port)), timeout=2.0)
+                s.close(); return None
+            except: return p
 
-    def _notify_ui(self, message):
+        def task():
+            try:
+                SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+                SharedConfig.loadProxyList()
+                snap = [SharedConfig.proxyList.get(i) for i in range(SharedConfig.proxyList.size())]
+                with ThreadPoolExecutor(max_workers=15) as executor: results = list(executor.map(check_proxy, snap))
+                to_rem = [p for p in results if p is not None]
+                if to_rem: run_on_ui_thread(lambda: self._finalize_dead_cleanup(to_rem))
+                else: run_on_ui_thread(lambda: BulletinHelper.show_success("Все прокси работают"))
+            except Exception as e: log(f"Dead cleanup error: {e}")
+        threading.Thread(target=task, daemon=True).start()
+
+    def _finalize_dead_cleanup(self, to_rem):
         try:
-            NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged)
-        except Exception: pass
-        BulletinHelper.show_success(message)
+            SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+            for p in to_rem: SharedConfig.deleteProxy(p)
+            self._notify_ui(f"Удалено мертвых: {len(to_rem)}")
+        except: pass
+        
+    def _ping_all(self):
+        try:
+            SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+            for i in range(SharedConfig.proxyList.size()):
+                p = SharedConfig.proxyList.get(i)
+                p.checking = False
+                p.availableCheckTime = 0
+            self._safe_refresh()
+            self._notify_ui("Запущена перепроверка пинга...")
+        except Exception as e: log(f"Ping all error: {e}")
+
+    def _export_proxies(self):
+        try:
+            SharedConfig = jclass("org.telegram.messenger.SharedConfig")
+            SharedConfig.loadProxyList()
+            proxies = SharedConfig.proxyList
+            mt, sk = [], []
+            
+            for i in range(proxies.size()):
+                p = proxies.get(i)
+                name = self.proxy_names.get(self._get_proxy_key(p), "")
+                title_param = f"&title={urllib.parse.quote(name)}" if name else ""
+                
+                if hasattr(p, "secret") and p.secret: mt.append(f"tg://proxy?server={p.address}&port={p.port}&secret={p.secret}{title_param}")
+                else: sk.append(f"tg://socks?server={p.address}&port={p.port}&user={p.username}&pass={p.password}{title_param}")
+                    
+            txt = f"Ваши прокси ({proxies.size()}):\n\n"
+            if sk: txt += "SOCKS5:\n" + "\n".join(sk) + "\n\n"
+            if mt: txt += "MTProto:\n" + "\n".join(mt)
+            
+            if len(txt) > 4000:
+                file_path = os.path.join(get_plugins_dir(), "proxies_export.txt")
+                write_file(file_path, txt)
+                send_document(get_user_config().getClientUserId(), file_path, caption="Ваши экспортированные прокси")
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Слишком большой список. Файл сохранен в Избранное."))
+            else:
+                q = TLRPC.TL_messageEntityBlockquote()
+                q.collapsed, q.offset, q.length = True, 0, len(txt.encode('utf-16-le')) // 2
+                send_message({"peer": get_user_config().getClientUserId(), "message": txt, "entities": [q]})
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Экспортировано в Избранное"))
+        except Exception as e: log(f"Export error: {e}")
+
+    def _safe_refresh(self):
+        run_on_ui_thread(lambda: NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged), 150)
