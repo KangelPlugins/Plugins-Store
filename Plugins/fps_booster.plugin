@@ -1,0 +1,631 @@
+from base_plugin import AppEvent, BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from java.lang import Runtime
+from java.lang import Float
+from java.lang import System
+from ui.bulletin import BulletinHelper
+
+__id__ = "fps_booster"
+__name__ = "Opimizer AI"
+__description__ = "Умный локальный оптимизатор: сам анализирует Telegram и делает его плавнее без конфликтов с другими плагинами."
+__author__ = "@PluginProject · @w3b_0s1nt"
+__version__ = "2.5.0"
+__icon__ = "exteraPlugins/2"
+__min_version__ = "12.5.1"
+
+
+class _ChatCreateViewHook(MethodHook):
+    def __init__(self, plugin: "FPSBoosterPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            chat_list_view = self.plugin._resolve_chat_list_view(param.thisObject)
+            if chat_list_view is None:
+                return
+
+            item_animator = chat_list_view.getItemAnimator()
+            if item_animator is not None and self.plugin._is_default_item_animator(item_animator):
+                chat_list_view.setItemAnimator(None)
+            if not chat_list_view.hasFixedSize():
+                chat_list_view.setHasFixedSize(True)
+
+            current_cache = int(chat_list_view.getItemViewCacheSize())
+            if current_cache != self.plugin._list_cache_size:
+                chat_list_view.setItemViewCacheSize(self.plugin._list_cache_size)
+            self.plugin._ai_adapt_for_chat(chat_list_view)
+        except Exception as e:
+            self.plugin.log(f"Chat list optimization skipped: {e}")
+
+
+class FPSBoosterPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._chat_create_view_unhooks = []
+        self._selected_scale = 0.7
+        self._list_cache_size = 20
+        self._last_pressure = 0.0
+        self._value_animator_class = None
+        self._set_duration_scale_method = None
+        self._last_applied_scale = 1.0
+        self._last_ai_update_ms = 0
+        self._last_health_check_ms = 0
+        self._last_error_decay_ms = 0
+        self._last_chat_seen_ms = 0
+        self._safe_mode_entered_ms = 0
+        self._last_module_recover_attempt_ms = 0
+        self._last_log_learning_ms = 0
+        self._last_external_scale_detect_ms = 0
+        self._respect_external_scale_until_ms = 0
+        self._last_pressure_sample_ms = 0
+        self._cached_pressure = 0.0
+        self._last_complexity_sample_ms = 0
+        self._cached_complexity = 0.5
+        self._ai_score_ema = 0.5
+        self._ai_complexity_ema = 0.5
+        self._ai_pressure_ema = 0.5
+        self._ai_confidence = 0.5
+        self._ai_update_interval_ms = 1500
+        self._ai_weight_pressure = 0.58
+        self._ai_weight_complexity = 0.42
+        self._prev_pressure_for_learning = 0.0
+        self._prev_complexity_for_learning = 0.5
+        self._burst_until_ms = 0
+        self._burst_cooldown_until_ms = 0
+        self._profile_step_scale = 0.025
+        self._profile_step_cache = 2
+        self._compatibility_mode = True
+        self._super_safe_mode = False
+        self._engine_initialized = False
+        self._engine_init_scheduled = False
+        self._startup_delay_ms = 2400
+        self._disabled_modules = set()
+        self._module_error_thresholds = {
+            "chat_hook": 2,
+            "animator_scale": 4,
+            "ai_adaptation": 3,
+        }
+        self._error_counters = {
+            "chat_hook": 0,
+            "animator_scale": 0,
+            "ai_adaptation": 0,
+        }
+        self._stable_cycles = 0
+        self._diag_limit = 50
+        self._diag_events = []
+        self._diag_export_limit = 30
+
+    def on_plugin_load(self):
+        self._schedule_engine_init()
+        self._diag("plugin_load_scheduled")
+
+    def on_plugin_unload(self):
+        if self._chat_create_view_unhooks:
+            for unhook in self._chat_create_view_unhooks:
+                try:
+                    self.unhook_method(unhook)
+                except Exception:
+                    pass
+            self._chat_create_view_unhooks = []
+
+        self._apply_animator_scale(force_default=True)
+        self._diag("plugin_unload")
+        BulletinHelper.show_info("Opimizer AI выключен")
+
+    def on_app_event(self, event_type: AppEvent):
+        if not self._engine_initialized and event_type in (AppEvent.START, AppEvent.RESUME):
+            self._schedule_engine_init()
+        if event_type == AppEvent.RESUME:
+            self._run_health_check()
+            self._recalculate_runtime_profile()
+            self._apply_animator_scale()
+            self._diag("app_resume")
+        elif event_type == AppEvent.PAUSE:
+            self._apply_animator_scale_internal(force_idle=True)
+            self._ai_update_interval_ms = 2200
+            self._diag("app_pause")
+        elif event_type == AppEvent.STOP:
+            self._ai_update_interval_ms = 2600
+            self._diag("app_stop")
+        elif event_type == AppEvent.START:
+            self._ai_update_interval_ms = 1600
+            self._diag("app_start")
+
+    def _schedule_engine_init(self):
+        if self._engine_initialized or self._engine_init_scheduled:
+            return
+        self._engine_init_scheduled = True
+        run_on_ui_thread(self._complete_engine_init, self._startup_delay_ms)
+
+    def _complete_engine_init(self):
+        if self._engine_initialized:
+            return
+        self._engine_init_scheduled = False
+        self._engine_initialized = True
+        self._run_health_check()
+        self._recalculate_runtime_profile()
+        self._install_chat_hook()
+        self._apply_animator_scale()
+        self._diag("engine_initialized")
+        BulletinHelper.show_success("Opimizer AI активирован")
+
+    def _install_chat_hook(self):
+        if "chat_hook" in self._disabled_modules:
+            return
+        if self._chat_create_view_unhooks:
+            return
+
+        try:
+            chat_activity_class = find_class("org.telegram.ui.ChatActivity")
+            if not chat_activity_class:
+                self.log("ChatActivity hook skipped: class not found")
+                return
+
+            unhooks = self.hook_all_methods(
+                chat_activity_class,
+                "createView",
+                _ChatCreateViewHook(self),
+                priority=-100,
+            )
+            if unhooks:
+                self._chat_create_view_unhooks = list(unhooks)
+            else:
+                self.log("Opimizer AI: createView hooks not installed")
+        except Exception as e:
+            self.log(f"Failed to install chat performance hook: {e}")
+            self._register_module_error("chat_hook", str(e))
+
+    def _apply_animator_scale(self, force_default: bool = False):
+        return self._apply_animator_scale_internal(force_default=force_default, force_idle=False)
+
+    def _apply_animator_scale_internal(self, force_default: bool = False, force_idle: bool = False):
+        if (not force_default) and (not self._engine_initialized):
+            return
+        if (not force_default) and ("animator_scale" in self._disabled_modules):
+            return
+        now = int(System.currentTimeMillis())
+        if (not force_default) and now < self._respect_external_scale_until_ms:
+            return
+        try:
+            target_scale = 1.0 if force_default else self._selected_scale
+            if self._value_animator_class is None:
+                self._value_animator_class = find_class("android.animation.ValueAnimator")
+            if not self._value_animator_class:
+                return
+
+            if self._set_duration_scale_method is None:
+                self._set_duration_scale_method = self._value_animator_class.getDeclaredMethod(
+                    "setDurationScale", Float.TYPE
+                )
+                self._set_duration_scale_method.setAccessible(True)
+
+            if self._compatibility_mode:
+                target_scale = self._clamp(target_scale, 0.64, 0.96)
+
+            if force_idle or (not force_default and now - self._last_chat_seen_ms > 25000):
+                target_scale = 0.98
+
+            if (not force_default) and abs(target_scale - self._last_applied_scale) < 0.015:
+                return
+
+            self._detect_external_scale_override(now)
+            self._set_duration_scale_method.invoke(None, target_scale)
+            self._last_applied_scale = target_scale
+            self._diag(f"scale_apply:{target_scale:.2f}")
+        except Exception as e:
+            self._register_module_error("animator_scale", str(e))
+
+    def _recalculate_runtime_profile(self):
+        if not self._engine_initialized:
+            return
+        if "ai_adaptation" in self._disabled_modules:
+            return
+        base_scale, base_cache = self._pick_smart_profile()
+        pressure = self._memory_pressure()
+        pressure = (self._last_pressure * 0.6) + (pressure * 0.4)
+        self._last_pressure = pressure
+        self._ai_pressure_ema = (self._ai_pressure_ema * 0.7) + (pressure * 0.3)
+
+        target_scale, target_cache = self._local_ai_decide_profile(
+            base_scale, base_cache, self._ai_pressure_ema, chat_complexity=self._ai_complexity_ema
+        )
+        self._apply_profile_smoothly(target_scale, target_cache)
+
+    def _memory_pressure(self) -> float:
+        try:
+            now = int(System.currentTimeMillis())
+            if now - self._last_pressure_sample_ms < 1200:
+                return self._cached_pressure
+            runtime = Runtime.getRuntime()
+            max_mem = float(runtime.maxMemory())
+            used_mem = float(runtime.totalMemory() - runtime.freeMemory())
+            if max_mem <= 0:
+                return self._cached_pressure
+            self._cached_pressure = self._clamp(used_mem / max_mem, 0.0, 1.0)
+            self._last_pressure_sample_ms = now
+            return self._cached_pressure
+        except Exception:
+            return self._cached_pressure
+
+    def _pick_smart_profile(self):
+        try:
+            runtime = Runtime.getRuntime()
+            cores = int(runtime.availableProcessors())
+            max_mem_mb = int(runtime.maxMemory() / (1024 * 1024))
+
+            sdk_int = 30
+            build_version = find_class("android.os.Build$VERSION")
+            if build_version:
+                try:
+                    sdk_int = int(build_version.SDK_INT)
+                except Exception:
+                    sdk_int = 30
+            cores_score = self._normalize(cores, 2, 12)
+            mem_score = self._normalize(max_mem_mb, 192, 1536)
+            sdk_score = self._normalize(sdk_int, 23, 36)
+            total = (cores_score * 0.4) + (mem_score * 0.4) + (sdk_score * 0.2)
+
+            scale = 0.62 + (0.28 * total)
+            cache = int(16 + (16 * total))
+            return self._clamp(scale, 0.62, 0.9), self._clamp_int(cache, 16, 32)
+        except Exception:
+            return 0.72, 20
+
+    def _normalize(self, value: int, min_value: int, max_value: int) -> float:
+        if max_value <= min_value:
+            return 0.5
+        if value <= min_value:
+            return 0.0
+        if value >= max_value:
+            return 1.0
+        return float(value - min_value) / float(max_value - min_value)
+
+    def _clamp(self, value: float, min_value: float, max_value: float) -> float:
+        if value < min_value:
+            return min_value
+        if value > max_value:
+            return max_value
+        return value
+
+    def _clamp_int(self, value: int, min_value: int, max_value: int) -> int:
+        if value < min_value:
+            return min_value
+        if value > max_value:
+            return max_value
+        return int(value)
+
+    def _resolve_chat_list_view(self, chat_activity):
+        for field_name in ("chatListView", "chatListRecyclerView", "recyclerView"):
+            try:
+                candidate = get_private_field(chat_activity, field_name)
+                if candidate is not None:
+                    return candidate
+            except Exception:
+                pass
+        return None
+
+    def _ai_adapt_for_chat(self, chat_list_view):
+        try:
+            if not self._engine_initialized:
+                return
+            if "ai_adaptation" in self._disabled_modules:
+                return
+            now = int(System.currentTimeMillis())
+            if now - self._last_ai_update_ms < self._ai_update_interval_ms:
+                return
+            self._last_ai_update_ms = now
+
+            base_scale, base_cache = self._pick_smart_profile()
+            pressure = self._memory_pressure()
+            complexity = self._estimate_chat_complexity(chat_list_view)
+            self._self_learn_weights(pressure, complexity)
+            self._ai_pressure_ema = (self._ai_pressure_ema * 0.7) + (pressure * 0.3)
+            self._ai_complexity_ema = (self._ai_complexity_ema * 0.75) + (complexity * 0.25)
+            scale, cache = self._local_ai_decide_profile(
+                base_scale, base_cache, self._ai_pressure_ema, self._ai_complexity_ema
+            )
+            self._apply_profile_smoothly(scale, cache)
+            self._last_chat_seen_ms = now
+            self._diag(f"ai_chat:{self._selected_scale:.2f}/{self._list_cache_size}")
+            self._apply_animator_scale()
+        except Exception as e:
+            self._register_module_error("ai_adaptation", str(e))
+
+    def _estimate_chat_complexity(self, chat_list_view) -> float:
+        try:
+            now = int(System.currentTimeMillis())
+            if now - self._last_complexity_sample_ms < 1300:
+                return self._cached_complexity
+            visible_children = int(chat_list_view.getChildCount())
+            adapter_count = 0
+            adapter = chat_list_view.getAdapter()
+            if adapter is not None:
+                adapter_count = int(adapter.getItemCount())
+
+            visible_score = self._normalize(visible_children, 4, 18)
+            items_score = self._normalize(adapter_count, 100, 5000)
+            self._cached_complexity = self._clamp((visible_score * 0.45) + (items_score * 0.55), 0.0, 1.0)
+            self._last_complexity_sample_ms = now
+            return self._cached_complexity
+        except Exception:
+            return self._cached_complexity
+
+    def _local_ai_decide_profile(
+        self, base_scale: float, base_cache: int, pressure: float, chat_complexity: float
+    ):
+        now = int(System.currentTimeMillis())
+        pressure = self._clamp(pressure, 0.0, 1.0)
+        chat_complexity = self._clamp(chat_complexity, 0.0, 1.0)
+        self._update_burst_mode(now, pressure, chat_complexity)
+        ai_score = (pressure * self._ai_weight_pressure) + (chat_complexity * self._ai_weight_complexity)
+        delta = abs(ai_score - self._ai_score_ema)
+        self._ai_score_ema = (self._ai_score_ema * 0.78) + (ai_score * 0.22)
+        self._ai_confidence = self._clamp((self._ai_confidence * 0.8) + ((1.0 - delta) * 0.2), 0.2, 0.98)
+
+        if delta > 0.14:
+            self._ai_update_interval_ms = 900
+        elif delta > 0.08:
+            self._ai_update_interval_ms = 1200
+        else:
+            self._ai_update_interval_ms = 1800
+
+        if self._super_safe_mode:
+            return 0.9, 16
+
+        heavy_t = 0.80 - (0.08 * self._ai_confidence)
+        medium_t = 0.62 - (0.06 * self._ai_confidence)
+        light_t = 0.46 - (0.04 * self._ai_confidence)
+        if now < self._burst_until_ms:
+            heavy_t = heavy_t - 0.06
+            medium_t = medium_t - 0.04
+            light_t = light_t - 0.03
+        deadband = 0.018
+
+        if self._ai_score_ema >= heavy_t + deadband:
+            scale = self._clamp(base_scale - 0.10, 0.56, 0.90)
+            cache = self._clamp_int(base_cache - 10, 10, 26)
+        elif self._ai_score_ema >= medium_t + deadband:
+            scale = self._clamp(base_scale - 0.06, 0.58, 0.92)
+            cache = self._clamp_int(base_cache - 6, 12, 28)
+        elif self._ai_score_ema >= light_t + deadband:
+            scale = self._clamp(base_scale - 0.03, 0.60, 0.94)
+            cache = self._clamp_int(base_cache - 3, 14, 30)
+        else:
+            scale = self._clamp(base_scale, 0.62, 0.96)
+            cache = self._clamp_int(base_cache, 16, 32)
+
+        return scale, cache
+
+    def _self_learn_weights(self, pressure: float, complexity: float):
+        pressure_delta = pressure - self._prev_pressure_for_learning
+        complexity_delta = complexity - self._prev_complexity_for_learning
+        self._prev_pressure_for_learning = pressure
+        self._prev_complexity_for_learning = complexity
+
+        if pressure_delta > 0.03:
+            self._ai_weight_pressure = self._clamp(self._ai_weight_pressure + 0.012, 0.45, 0.72)
+        elif pressure_delta < -0.03:
+            self._ai_weight_pressure = self._clamp(self._ai_weight_pressure - 0.008, 0.45, 0.72)
+
+        if complexity_delta > 0.04:
+            self._ai_weight_complexity = self._clamp(self._ai_weight_complexity + 0.01, 0.28, 0.55)
+        elif complexity_delta < -0.04:
+            self._ai_weight_complexity = self._clamp(self._ai_weight_complexity - 0.008, 0.28, 0.55)
+
+        weight_sum = self._ai_weight_pressure + self._ai_weight_complexity
+        if weight_sum <= 0:
+            self._ai_weight_pressure = 0.58
+            self._ai_weight_complexity = 0.42
+            return
+        self._ai_weight_pressure = self._ai_weight_pressure / weight_sum
+        self._ai_weight_complexity = self._ai_weight_complexity / weight_sum
+
+    def _update_burst_mode(self, now: int, pressure: float, complexity: float):
+        if now < self._burst_cooldown_until_ms:
+            return
+        if now < self._burst_until_ms:
+            return
+        load = (pressure * 0.6) + (complexity * 0.4)
+        if load >= 0.86:
+            self._burst_until_ms = now + 16000
+            self._burst_cooldown_until_ms = now + 70000
+            self._diag("burst_enter")
+
+    def _detect_external_scale_override(self, now: int):
+        if self._set_duration_scale_method is None:
+            return
+        if now - self._last_external_scale_detect_ms < 8000:
+            return
+        self._last_external_scale_detect_ms = now
+        try:
+            get_duration_scale = self._value_animator_class.getDeclaredMethod("getDurationScale")
+            get_duration_scale.setAccessible(True)
+            current_scale = float(get_duration_scale.invoke(None))
+            if abs(current_scale - self._last_applied_scale) > 0.08:
+                self._respect_external_scale_until_ms = now + 20000
+                self._diag("external_scale_detected")
+        except Exception:
+            pass
+
+    def _apply_profile_smoothly(self, target_scale: float, target_cache: int):
+        scale_delta = target_scale - self._selected_scale
+        if abs(scale_delta) <= self._profile_step_scale:
+            self._selected_scale = target_scale
+        elif scale_delta > 0:
+            self._selected_scale = self._selected_scale + self._profile_step_scale
+        else:
+            self._selected_scale = self._selected_scale - self._profile_step_scale
+
+        cache_delta = int(target_cache) - int(self._list_cache_size)
+        if abs(cache_delta) <= self._profile_step_cache:
+            self._list_cache_size = int(target_cache)
+        elif cache_delta > 0:
+            self._list_cache_size = int(self._list_cache_size + self._profile_step_cache)
+        else:
+            self._list_cache_size = int(self._list_cache_size - self._profile_step_cache)
+
+        self._selected_scale = self._clamp(self._selected_scale, 0.56, 0.96)
+        self._list_cache_size = self._clamp_int(self._list_cache_size, 10, 32)
+
+    def _is_default_item_animator(self, item_animator) -> bool:
+        try:
+            class_name = str(item_animator.getClass().getName())
+            return (
+                "DefaultItemAnimator" in class_name
+                or "SimpleItemAnimator" in class_name
+                or class_name.startswith("androidx.recyclerview")
+            )
+        except Exception:
+            return False
+
+    def _register_module_error(self, module_name: str, error_text: str = ""):
+        if module_name not in self._error_counters:
+            self._error_counters[module_name] = 0
+        self._error_counters[module_name] += 1
+        self._diag(f"module_error:{module_name}:{self._error_counters[module_name]}")
+
+        threshold = self._module_error_thresholds.get(module_name, 3)
+        if self._error_counters[module_name] >= threshold and module_name not in self._disabled_modules:
+            self._disabled_modules.add(module_name)
+            self.log(f"Opimizer AI: module disabled after repeated errors: {module_name}")
+            if error_text:
+                self.log(f"Opimizer AI: last error ({module_name}): {error_text}")
+            self._diag(f"module_disabled:{module_name}")
+
+        self._run_health_check()
+
+    def _run_health_check(self):
+        now = int(System.currentTimeMillis())
+        if now - self._last_health_check_ms < 1200:
+            return
+        self._last_health_check_ms = now
+        if self._last_error_decay_ms == 0:
+            self._last_error_decay_ms = now
+        if now - self._last_error_decay_ms >= 60000:
+            for key in list(self._error_counters.keys()):
+                self._error_counters[key] = max(0, int(self._error_counters[key]) - 1)
+            self._last_error_decay_ms = now
+
+        self._learn_from_internal_logs(now)
+        self._try_recover_modules(now)
+
+        total_errors = 0
+        for _, count in self._error_counters.items():
+            total_errors += count
+
+        if total_errors <= 1:
+            self._stable_cycles = self._stable_cycles + 1
+        else:
+            self._stable_cycles = 0
+
+        if total_errors >= 6 and not self._super_safe_mode:
+            self._enter_super_safe_mode()
+            return
+
+        if total_errors <= 2 and self._super_safe_mode:
+            self._try_leave_super_safe_mode()
+
+    def _learn_from_internal_logs(self, now: int):
+        if now - self._last_log_learning_ms < 30000:
+            return
+        self._last_log_learning_ms = now
+        recent = self._diag_events[-self._diag_export_limit :]
+        if not recent:
+            return
+
+        module_errors = 0
+        scale_events = 0
+        burst_events = 0
+        for item in recent:
+            if ":module_error:" in item:
+                module_errors += 1
+            if ":scale_apply:" in item:
+                scale_events += 1
+            if ":burst_enter" in item:
+                burst_events += 1
+
+        if module_errors >= 4:
+            self._profile_step_scale = self._clamp(self._profile_step_scale - 0.003, 0.015, 0.035)
+            self._profile_step_cache = self._clamp_int(self._profile_step_cache - 1, 1, 3)
+            self._ai_update_interval_ms = self._clamp_int(self._ai_update_interval_ms + 200, 900, 3000)
+
+        if scale_events >= 8:
+            self._ai_update_interval_ms = self._clamp_int(self._ai_update_interval_ms + 150, 900, 3000)
+        elif scale_events <= 2:
+            self._ai_update_interval_ms = self._clamp_int(self._ai_update_interval_ms - 100, 900, 3000)
+
+        if burst_events >= 2:
+            self._ai_weight_pressure = self._clamp(self._ai_weight_pressure + 0.015, 0.45, 0.75)
+            self._ai_weight_complexity = self._clamp(1.0 - self._ai_weight_pressure, 0.25, 0.55)
+
+    def _try_recover_modules(self, now: int):
+        if now - self._last_module_recover_attempt_ms < 180000:
+            return
+        self._last_module_recover_attempt_ms = now
+        if self._super_safe_mode:
+            return
+        if self._stable_cycles < 3:
+            return
+        if self._error_counters.get("chat_hook", 0) <= 1 and "chat_hook" in self._disabled_modules:
+            self._disabled_modules.remove("chat_hook")
+            self._install_chat_hook()
+            self._diag("module_recover:chat_hook")
+        if self._error_counters.get("ai_adaptation", 0) <= 1 and "ai_adaptation" in self._disabled_modules:
+            self._disabled_modules.remove("ai_adaptation")
+            self._diag("module_recover:ai_adaptation")
+
+    def _try_leave_super_safe_mode(self):
+        now = int(System.currentTimeMillis())
+        if self._safe_mode_entered_ms > 0 and now - self._safe_mode_entered_ms < 180000:
+            return
+        self._super_safe_mode = False
+        self._compatibility_mode = True
+        if "ai_adaptation" in self._disabled_modules:
+            self._disabled_modules.remove("ai_adaptation")
+        if "chat_hook" in self._disabled_modules:
+            self._disabled_modules.remove("chat_hook")
+        self._ai_update_interval_ms = 1800
+        self._ai_confidence = 0.5
+        self._diag("super_safe_exit")
+        self._recalculate_runtime_profile()
+        self._install_chat_hook()
+
+    def _enter_super_safe_mode(self):
+        self._super_safe_mode = True
+        self._compatibility_mode = True
+        self._safe_mode_entered_ms = int(System.currentTimeMillis())
+
+        self._selected_scale = 0.9
+        self._list_cache_size = 16
+
+        self._disabled_modules.add("ai_adaptation")
+        self._disabled_modules.add("chat_hook")
+        self._diag("super_safe_enter")
+
+        if self._chat_create_view_unhooks:
+            for unhook in self._chat_create_view_unhooks:
+                try:
+                    self.unhook_method(unhook)
+                except Exception:
+                    pass
+            self._chat_create_view_unhooks = []
+
+        self._apply_animator_scale_internal(force_idle=True)
+        BulletinHelper.show_info("Opimizer AI: включен super-safe режим")
+
+    def _diag(self, event: str):
+        try:
+            ts = int(System.currentTimeMillis())
+            self._diag_events.append(f"{ts}:{event}")
+            if len(self._diag_events) > self._diag_limit:
+                self._diag_events = self._diag_events[-self._diag_limit :]
+        except Exception:
+            pass
+
+    def get_diagnostics_export(self) -> str:
+        try:
+            recent = self._diag_events[-self._diag_export_limit :]
+            return "\n".join(recent)
+        except Exception:
+            return ""
