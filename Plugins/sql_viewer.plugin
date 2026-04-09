@@ -1,0 +1,523 @@
+import os
+import re
+import sqlite3
+from typing import Any, List, Optional, Set
+from urllib.parse import quote
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_account_instance, get_file_loader, run_on_queue, send_message
+from ui.settings import Divider, Header, Input, Text
+
+__id__ = "sql_viewer"
+__name__ = "SQL Viewer"
+__description__ = (
+    "`.sql` к SQLite: реплай на файл в чате или путь в настройках. Только чтение (SELECT и т.п.)."
+)
+__author__ = "hyponomic"
+__version__ = "1.1.1"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.12.0"
+
+_HELP = (
+    "SQL Viewer\n\n"
+    "Сообщение с запросом **обязательно** начинается с `.sql` (иначе плагин его не видит).\n"
+    "Ответь **реплаем** на сообщение с .db (файл открой/скачай в Telegram), затем:\n"
+    "`.sql SELECT name FROM sqlite_master WHERE type='table' LIMIT 20`\n\n"
+    "Можно просто `.sql` с реплаем на .db — выполню короткий список таблиц.\n\n"
+    "Без реплая — путь к .db в настройках. Лимит строк — там же.\n\n"
+    "Только SELECT / WITH / VALUES (можно EXPLAIN). Без записи и PRAGMA."
+)
+
+
+def _document_from_media(media: Any) -> Any:
+    if media is None:
+        return None
+    doc = getattr(media, "document", None)
+    if doc is not None:
+        return doc
+    return getattr(media, "Document", None)
+
+
+def _document_from_message(mo: Any) -> Any:
+    if mo is None:
+        return None
+    gd = getattr(mo, "getDocument", None)
+    if callable(gd):
+        try:
+            d = gd()
+            if d is not None:
+                return d
+        except Exception:
+            pass
+    owner = getattr(mo, "messageOwner", None)
+    if owner is not None:
+        doc = _document_from_media(getattr(owner, "media", None))
+        if doc is not None:
+            return doc
+    doc = _document_from_media(getattr(mo, "media", None))
+    if doc is not None:
+        return doc
+    return None
+
+
+def _reply_msg_id_from_header(obj: Any) -> Optional[int]:
+    if obj is None:
+        return None
+    rh = getattr(obj, "reply_to", None) or getattr(obj, "replyTo", None)
+    if rh is None:
+        return None
+    for attr in ("reply_to_msg_id", "replyToMsgId", "reply_to_top_id", "replyToTopId"):
+        v = getattr(rh, attr, None)
+        if v is None:
+            continue
+        try:
+            n = int(v)
+            if n != 0:
+                return n
+        except Exception:
+            pass
+    return None
+
+
+def _reply_msg_id_from_any(mo: Any) -> Optional[int]:
+    if mo is None:
+        return None
+    mid = _reply_msg_id_from_header(getattr(mo, "messageOwner", None))
+    if mid is not None:
+        return mid
+    return _reply_msg_id_from_header(mo)
+
+
+def _resolve_reply_by_msg_id(account: int, params: Any) -> Any:
+    peer = getattr(params, "peer", None)
+    if peer is None:
+        return None
+    dialog_id = int(peer)
+    acc = int(account)
+    try:
+        from org.telegram.messenger import MessagesController
+
+        mc = MessagesController.getInstance(acc)
+        if mc is None:
+            return None
+        fn = getattr(mc, "getMessageObject", None)
+        if not callable(fn):
+            return None
+    except Exception as e:
+        log(f"sql_viewer MessagesController: {e}")
+        return None
+
+    for src in (
+        getattr(params, "messageObject", None),
+        getattr(params, "message_object", None),
+        getattr(params, "currentMessageObject", None),
+    ):
+        mid = _reply_msg_id_from_any(src)
+        if not mid:
+            continue
+        try:
+            mo = fn(dialog_id, int(mid))
+            if mo is not None:
+                return mo
+        except Exception as e:
+            log(f"sql_viewer getMessageObject: {e}")
+    return None
+
+
+def _iter_reply_candidates(params: Any, account: int) -> List[Any]:
+    seen: Set[int] = set()
+    out: List[Any] = []
+
+    def add(obj: Any) -> None:
+        if obj is None:
+            return
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        out.append(obj)
+
+    attr_names = (
+        "reply_to_msg",
+        "replyToMsg",
+        "replyMessage",
+        "reply_to_message",
+        "replyToMessage",
+        "replyMsg",
+        "reply_msg",
+        "quoteReplyMessage",
+        "replyToTopMsg",
+        "reply_to_top_msg",
+    )
+    for n in attr_names:
+        add(getattr(params, n, None))
+
+    for meth in (
+        "getReplyToMsg",
+        "getReplyToMessage",
+        "getReplyMessageObject",
+        "getReplyMessage",
+        "getQuoteReplyMessage",
+        "getReplyToTopMsg",
+    ):
+        fn = getattr(params, meth, None)
+        if callable(fn):
+            try:
+                add(fn())
+            except Exception:
+                pass
+
+    for parent_name in ("messageObject", "message_object", "currentMessageObject", "msgObj"):
+        parent = getattr(params, parent_name, None)
+        if parent is None:
+            continue
+        for n in attr_names:
+            add(getattr(parent, n, None))
+        for meth in (
+            "getReplyToMsg",
+            "getReplyToMessage",
+            "getReplyMessageObject",
+            "getReplyMessage",
+            "getReplyMsg",
+            "getReplyToTopMsg",
+        ):
+            fn = getattr(parent, meth, None)
+            if callable(fn):
+                try:
+                    add(fn())
+                except Exception:
+                    pass
+        for child in (
+            "replyMessageObject",
+            "reply_message_object",
+            "replyMessage",
+            "replyToMessage",
+            "reply_to_message",
+        ):
+            add(getattr(parent, child, None))
+
+    add(_resolve_reply_by_msg_id(account, params))
+    return out
+
+
+def _reply_message_object(params: Any, account: int) -> Any:
+    for obj in _iter_reply_candidates(params, account):
+        if _document_from_message(obj) is not None:
+            return obj
+    return None
+
+
+def _path_via_file_loader(doc: Any) -> Optional[str]:
+    if doc is None:
+        return None
+    try:
+        fl = get_file_loader()
+        if fl is None:
+            return None
+        for force in (True, False):
+            try:
+                p = fl.getPathToAttach(doc, force)
+                if p:
+                    s = str(p)
+                    if os.path.isfile(s):
+                        return s
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"sql_viewer file_loader: {e}")
+    try:
+        from org.telegram.messenger import FileLoader
+
+        ai = get_account_instance()
+        if ai is None:
+            return None
+        idx = getattr(ai, "getCurrentAccount", lambda: 0)()
+        if callable(idx):
+            idx = idx()
+        inst = FileLoader.getInstance(int(idx))
+        if inst is None:
+            return None
+        for force in (True, False):
+            try:
+                p = inst.getPathToAttach(doc, force)
+                if p:
+                    s = str(p)
+                    if os.path.isfile(s):
+                        return s
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"sql_viewer FileLoader.getInstance: {e}")
+    return None
+
+
+def _path_from_message_object(mo: Any) -> Optional[str]:
+    if mo is None:
+        return None
+    for name in (
+        "getDocumentFilePath",
+        "getDocumentFileName",
+    ):
+        fn = getattr(mo, name, None)
+        if callable(fn):
+            try:
+                p = fn()
+                if p and os.path.isfile(str(p)):
+                    return str(p)
+            except Exception:
+                pass
+    return None
+
+
+def _reply_has_document(params: Any, account: int) -> bool:
+    return _document_from_message(_reply_message_object(params, account)) is not None
+
+
+def _path_from_reply(params: Any, account: int) -> Optional[str]:
+    mo = _reply_message_object(params, account)
+    doc = _document_from_message(mo)
+    if doc is None:
+        return None
+    p = _path_via_file_loader(doc)
+    if p:
+        return p
+    p = _path_from_message_object(mo)
+    return p
+
+
+_DEFAULT_MAX = 25
+_MSG_CAP = 3800
+_MAX_SQL_CHARS = 8000
+
+_BAD_KEYWORDS = (
+    "insert",
+    "update",
+    "delete",
+    "drop",
+    "attach",
+    "detach",
+    "create",
+    "alter",
+    "replace",
+    "truncate",
+    "vacuum",
+    "reindex",
+    "analyze",
+    "pragma",
+    "merge",
+    "commit",
+    "rollback",
+    "savepoint",
+    "release",
+    "transaction",
+    "begin",
+    "end",
+    "grant",
+    "revoke",
+    "load_extension",
+    "unload_extension",
+    "import",
+    "copy",
+    "call",
+    "execute",
+    "shutdown",
+    "restore",
+    "backup",
+)
+
+_BAD = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _BAD_KEYWORDS) + r")\b",
+    re.I,
+)
+
+_ALLOWED_START = re.compile(
+    r"^\s*(select|with|values)\b",
+    re.I,
+)
+
+_EXPLAIN_HEAD = re.compile(
+    r"^\s*(explain(\s+query\s+plan)?)\s+",
+    re.I,
+)
+
+
+def _parse_max_rows(s: str) -> int:
+    try:
+        n = int((s or str(_DEFAULT_MAX)).strip())
+        return max(1, min(n, 200))
+    except ValueError:
+        return _DEFAULT_MAX
+
+
+def _strip_leading_explain(sql: str) -> str:
+    t = sql.strip()
+    m = _EXPLAIN_HEAD.match(t)
+    if not m:
+        return t
+    return t[m.end() :].strip()
+
+
+def _is_safe_query(sql: str) -> bool:
+    s = sql.strip()
+    if not s:
+        return False
+    if "\x00" in s:
+        return False
+    if len(s) > _MAX_SQL_CHARS:
+        return False
+    if ";" in s:
+        parts = [p.strip() for p in s.split(";") if p.strip()]
+        if len(parts) != 1:
+            return False
+        s = parts[0]
+    core = _strip_leading_explain(s)
+    if not core:
+        return False
+    if _BAD.search(s):
+        return False
+    if _BAD.search(core):
+        return False
+    return bool(_ALLOWED_START.match(core))
+
+
+def _format_table(cols: List[str], rows: List[tuple], more: bool) -> str:
+    if not cols:
+        return "(пусто — ни колонок, ни строк)"
+    w = [len(str(c)) for c in cols]
+    for r in rows:
+        for i, v in enumerate(r):
+            w[i] = max(w[i], len(str(v) if v is not None else "NULL"))
+    sep = " | "
+    head = sep.join(str(cols[i]).ljust(w[i]) for i in range(len(cols)))
+    line = "-+-".join("-" * w[i] for i in range(len(cols)))
+    out = [head, line]
+    for r in rows:
+        out.append(
+            sep.join(
+                str(r[i] if r[i] is not None else "NULL").ljust(w[i])
+                for i in range(len(cols))
+            )
+        )
+    if more:
+        out.append("... дальше обрезал — лимит строк")
+    return "\n".join(out)
+
+
+def _execute(path: str, sql: str, max_rows: int) -> str:
+    if not path:
+        return (
+            "Нет базы: ответь реплаем на сообщение с файлом .db (сначала открой/скачай его в Telegram) "
+            "или впиши путь в настройках плагина."
+        )
+    if not _is_safe_query(sql):
+        return (
+            "Такой запрос я не выполню — у меня только спокойное чтение: "
+            "один SELECT / WITH / VALUES (можно с EXPLAIN). "
+            "Никаких ; с кучей команд, никакого PRAGMA и прочей записи."
+        )
+    q = sql.strip()
+    if ";" in q:
+        q = [p.strip() for p in q.split(";") if p.strip()][0]
+    try:
+        qp = quote(path, safe="/:")
+        con = sqlite3.connect(f"file:{qp}?mode=ro", uri=True)
+    except Exception as e:
+        try:
+            con = sqlite3.connect(path)
+        except Exception as e2:
+            return f"База не открылась. Файл точно SQLite? Ошибка: {e} / {e2}"
+    try:
+        cur = con.cursor()
+        cur.execute(q)
+        desc = cur.description
+        cols = [d[0] for d in desc] if desc else []
+        buf = cur.fetchmany(max_rows + 1)
+        more = len(buf) > max_rows
+        buf = buf[:max_rows]
+        text = _format_table(cols, buf, more)
+        if len(text) > _MSG_CAP:
+            text = text[: _MSG_CAP - 30] + "\n…тут обрезал, слишком длинно для чата"
+        return text
+    except Exception as e:
+        return f"SQLite ругнулся: {e}"
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _send(peer: Any, text: str) -> None:
+    run_on_ui_thread(
+        lambda pr=peer, t=text: send_message({"message": t, "peer": pr})
+    )
+
+
+class SqlViewerPlugin(BasePlugin):
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="SQL Viewer"),
+            Input(
+                key="db_path",
+                text="Путь к .db (если без реплая)",
+                default="",
+                subtext="Если пользуешься реплаем на файл — можно не заполнять.",
+                icon="msg_storage",
+            ),
+            Input(
+                key="max_rows",
+                text="Макс. строк ответа",
+                default=str(_DEFAULT_MAX),
+                subtext="1–200",
+                icon="msg_list",
+            ),
+            Divider(),
+            Text(
+                text="Только чтение. Чужие базы без спроса не трогай.",
+                red=True,
+            ),
+        ]
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        msg = params.message
+        if not isinstance(msg, str):
+            return HookResult()
+        raw = msg.strip()
+        if not raw.startswith(".sql"):
+            return HookResult()
+        tail = raw[4:].strip()
+        peer = getattr(params, "peer", None)
+        if tail.lower() in ("help", "?", "-h"):
+            _send(peer, _HELP)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        reply_path = _path_from_reply(params, account)
+        settings_path = (self.get_setting("db_path", "") or "").strip()
+        path = reply_path or settings_path
+        mr = _parse_max_rows(str(self.get_setting("max_rows", str(_DEFAULT_MAX))))
+
+        if not tail:
+            if path:
+                tail = "SELECT name FROM sqlite_master WHERE type='table' LIMIT 40"
+            else:
+                _send(peer, _HELP)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+        def work():
+            if not path and _reply_has_document(params, account):
+                _send(
+                    peer,
+                    "Реплай на файл есть, но путь к нему на диске не нашёлся — "
+                    "тапни по вложению и дождись загрузки, потом повтори `.sql …`. "
+                    "Или укажи путь в настройках.",
+                )
+                return
+            out = _execute(path, tail, mr)
+            _send(peer, out)
+
+        run_on_queue(work)
+        return HookResult(strategy=HookStrategy.CANCEL)
