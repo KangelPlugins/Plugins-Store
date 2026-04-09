@@ -1,0 +1,844 @@
+import mimetypes
+import os
+import re
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from java import jclass
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_file_loader, run_on_queue, send_message
+from ui.settings import Divider, Header, Input, Switch, Text
+
+__id__ = "real_metadata"
+__name__ = "Real Metadata"
+__description__ = (
+    "Показывает реальные метаданные медиа: контейнер, длительность, треки, "
+    "кодеки, битрейт и EXIF (если есть)."
+)
+__author__ = "hyponomic"
+__version__ = "1.0.0"
+__icon__ = "msg_info"
+__min_version__ = "11.9.0"
+
+_HELP = (
+    "Real Metadata\n\n"
+    "Использование:\n"
+    "1) Ответь реплаем на медиа (видео/аудио/фото/документ) и отправь `.meta`\n"
+    "2) Или `.meta \"путь_к_файлу\"`\n"
+    "3) `.meta full` — добавить сырой dump форматов треков\n\n"
+    "Под капотом: MediaExtractor + MediaMetadataRetriever + EXIF.\n"
+    "Это реальные данные контейнера и дорожек, не только «размер файла»."
+)
+
+_MSG_CAP = 3900
+_DEFAULT_MAX_LINES = 110
+_MAX_LINES_MIN = 40
+_MAX_LINES_MAX = 350
+
+_META_CMD = re.compile(r"^\.(meta|metadata|mediainfo)\b(.*)$", re.I)
+
+
+def _send(peer: Any, text: str) -> None:
+    run_on_ui_thread(lambda p=peer, t=text: send_message({"message": t, "peer": p}))
+
+
+def _safe_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _safe_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(float(str(v)))
+        except Exception:
+            return None
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    x = float(n)
+    units = ["KB", "MB", "GB", "TB"]
+    for u in units:
+        x /= 1024.0
+        if x < 1024.0:
+            return f"{x:.2f} {u}"
+    return f"{x:.2f} PB"
+
+
+def _fmt_duration_ms(ms: Optional[int]) -> str:
+    if ms is None or ms < 0:
+        return "?"
+    sec_total = ms / 1000.0
+    h = int(sec_total // 3600)
+    m = int((sec_total % 3600) // 60)
+    s = sec_total % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
+    return f"{m:02d}:{s:06.3f}"
+
+
+def _fmt_bitrate(br: Optional[int]) -> str:
+    if br is None or br <= 0:
+        return "?"
+    return f"{br / 1000.0:.1f} kbps"
+
+
+def _norm_path(s: str) -> str:
+    t = (s or "").strip()
+    if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
+        t = t[1:-1].strip()
+    return os.path.expanduser(t)
+
+
+def _parse_max_lines(s: str) -> int:
+    try:
+        n = int((s or str(_DEFAULT_MAX_LINES)).strip())
+        return max(_MAX_LINES_MIN, min(_MAX_LINES_MAX, n))
+    except Exception:
+        return _DEFAULT_MAX_LINES
+
+
+def _cap_text_lines(lines: List[str], max_lines: int) -> str:
+    out = list(lines)
+    if len(out) > max_lines:
+        out = out[:max_lines]
+        out.append("... обрезано по лимиту строк")
+    text = "\n".join(out)
+    if len(text) > _MSG_CAP:
+        text = text[: _MSG_CAP - 40] + "\n... обрезано по лимиту Telegram"
+    return text
+
+
+def _document_from_media(media: Any) -> Any:
+    if media is None:
+        return None
+    doc = getattr(media, "document", None)
+    if doc is not None:
+        return doc
+    return getattr(media, "Document", None)
+
+
+def _document_from_message(mo: Any) -> Any:
+    if mo is None:
+        return None
+    gd = getattr(mo, "getDocument", None)
+    if callable(gd):
+        try:
+            d = gd()
+            if d is not None:
+                return d
+        except Exception:
+            pass
+    owner = getattr(mo, "messageOwner", None)
+    if owner is not None:
+        doc = _document_from_media(getattr(owner, "media", None))
+        if doc is not None:
+            return doc
+    doc = _document_from_media(getattr(mo, "media", None))
+    if doc is not None:
+        return doc
+    return None
+
+
+def _reply_msg_id_from_header(obj: Any) -> Optional[int]:
+    if obj is None:
+        return None
+    rh = getattr(obj, "reply_to", None) or getattr(obj, "replyTo", None)
+    if rh is None:
+        return None
+    for attr in ("reply_to_msg_id", "replyToMsgId", "reply_to_top_id", "replyToTopId"):
+        v = getattr(rh, attr, None)
+        if v is None:
+            continue
+        try:
+            n = int(v)
+            if n != 0:
+                return n
+        except Exception:
+            pass
+    return None
+
+
+def _reply_msg_id_from_any(mo: Any) -> Optional[int]:
+    if mo is None:
+        return None
+    mid = _reply_msg_id_from_header(getattr(mo, "messageOwner", None))
+    if mid is not None:
+        return mid
+    return _reply_msg_id_from_header(mo)
+
+
+def _resolve_reply_by_msg_id(account: int, params: Any) -> Any:
+    peer = getattr(params, "peer", None)
+    if peer is None:
+        return None
+    dialog_id = int(peer)
+    try:
+        from org.telegram.messenger import MessagesController
+
+        mc = MessagesController.getInstance(int(account))
+        if mc is None:
+            return None
+        fn = getattr(mc, "getMessageObject", None)
+        if not callable(fn):
+            return None
+    except Exception as e:
+        log(f"[{__id__}] MessagesController: {e}")
+        return None
+
+    for src in (
+        getattr(params, "messageObject", None),
+        getattr(params, "message_object", None),
+        getattr(params, "currentMessageObject", None),
+    ):
+        mid = _reply_msg_id_from_any(src)
+        if not mid:
+            continue
+        try:
+            mo = fn(dialog_id, int(mid))
+            if mo is not None:
+                return mo
+        except Exception:
+            pass
+    return None
+
+
+def _iter_reply_candidates(params: Any, account: int) -> List[Any]:
+    seen = set()
+    out: List[Any] = []
+
+    def add(obj: Any) -> None:
+        if obj is None:
+            return
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        out.append(obj)
+
+    attr_names = (
+        "reply_to_msg",
+        "replyToMsg",
+        "replyMessage",
+        "reply_to_message",
+        "replyToMessage",
+        "replyMsg",
+        "reply_msg",
+        "quoteReplyMessage",
+        "replyToTopMsg",
+        "reply_to_top_msg",
+    )
+    for n in attr_names:
+        add(getattr(params, n, None))
+
+    for meth in (
+        "getReplyToMsg",
+        "getReplyToMessage",
+        "getReplyMessageObject",
+        "getReplyMessage",
+        "getQuoteReplyMessage",
+        "getReplyToTopMsg",
+    ):
+        fn = getattr(params, meth, None)
+        if callable(fn):
+            try:
+                add(fn())
+            except Exception:
+                pass
+
+    for parent_name in ("messageObject", "message_object", "currentMessageObject", "msgObj"):
+        parent = getattr(params, parent_name, None)
+        if parent is None:
+            continue
+        for n in attr_names:
+            add(getattr(parent, n, None))
+        for meth in (
+            "getReplyToMsg",
+            "getReplyToMessage",
+            "getReplyMessageObject",
+            "getReplyMessage",
+            "getReplyMsg",
+            "getReplyToTopMsg",
+        ):
+            fn = getattr(parent, meth, None)
+            if callable(fn):
+                try:
+                    add(fn())
+                except Exception:
+                    pass
+        for child in (
+            "replyMessageObject",
+            "reply_message_object",
+            "replyMessage",
+            "replyToMessage",
+            "reply_to_message",
+        ):
+            add(getattr(parent, child, None))
+
+    add(_resolve_reply_by_msg_id(account, params))
+    return out
+
+
+def _reply_message_object(params: Any, account: int) -> Any:
+    for obj in _iter_reply_candidates(params, account):
+        owner = getattr(obj, "messageOwner", None) or getattr(obj, "message_owner", None)
+        if owner is not None or _document_from_message(obj) is not None:
+            return obj
+    return None
+
+
+def _path_via_file_loader(account: int, mo: Any, doc: Any) -> Optional[str]:
+    owner = getattr(mo, "messageOwner", None) or getattr(mo, "message_owner", None)
+
+    def check_path(p: Any) -> Optional[str]:
+        if p is None:
+            return None
+        s = str(p)
+        if s and os.path.isfile(s):
+            return s
+        return None
+
+    try:
+        fl = get_file_loader()
+        if fl is not None:
+            if owner is not None:
+                for use_q in (True, False):
+                    try:
+                        found = check_path(fl.getPathToMessage(owner, use_q))
+                        if found:
+                            return found
+                    except Exception:
+                        pass
+            if doc is not None:
+                for force in (True, False):
+                    try:
+                        found = check_path(fl.getPathToAttach(doc, force))
+                        if found:
+                            return found
+                    except Exception:
+                        pass
+    except Exception as e:
+        log(f"[{__id__}] get_file_loader: {e}")
+
+    try:
+        from org.telegram.messenger import FileLoader
+
+        inst = FileLoader.getInstance(int(account))
+        if inst is not None:
+            if owner is not None:
+                for use_q in (True, False):
+                    try:
+                        found = check_path(inst.getPathToMessage(owner, use_q))
+                        if found:
+                            return found
+                    except Exception:
+                        pass
+            if doc is not None:
+                for force in (True, False):
+                    for use_q in (True, False):
+                        try:
+                            found = check_path(inst.getPathToAttach(doc, None, force, use_q))
+                            if found:
+                                return found
+                        except Exception:
+                            pass
+                        try:
+                            found = check_path(inst.getPathToAttach(doc, force))
+                            if found:
+                                return found
+                        except Exception:
+                            pass
+    except Exception as e:
+        log(f"[{__id__}] FileLoader.getInstance: {e}")
+    return None
+
+
+def _path_from_message_object(mo: Any, account: int) -> Optional[str]:
+    if mo is None:
+        return None
+
+    for direct_attr in ("attachPath", "localPath", "path"):
+        v = getattr(mo, direct_attr, None)
+        if v and os.path.isfile(str(v)):
+            return str(v)
+
+    owner = getattr(mo, "messageOwner", None) or getattr(mo, "message_owner", None)
+    if owner is not None:
+        for direct_attr in ("attachPath", "path"):
+            v = getattr(owner, direct_attr, None)
+            if v and os.path.isfile(str(v)):
+                return str(v)
+
+    for meth in (
+        "getDocumentFilePath",
+        "getPathToMessage",
+        "getFilePath",
+        "getFileName",
+    ):
+        fn = getattr(mo, meth, None)
+        if callable(fn):
+            try:
+                p = fn()
+                if p and os.path.isfile(str(p)):
+                    return str(p)
+            except Exception:
+                pass
+
+    doc = _document_from_message(mo)
+    p = _path_via_file_loader(int(account), mo, doc)
+    if p:
+        return p
+    return None
+
+
+def _reply_has_media(params: Any, account: int) -> bool:
+    mo = _reply_message_object(params, account)
+    if mo is None:
+        return False
+    if _document_from_message(mo) is not None:
+        return True
+    owner = getattr(mo, "messageOwner", None) or getattr(mo, "message_owner", None)
+    media = getattr(owner, "media", None) if owner is not None else None
+    return media is not None
+
+
+def _path_from_reply(params: Any, account: int) -> Optional[str]:
+    mo = _reply_message_object(params, account)
+    if mo is None:
+        return None
+    return _path_from_message_object(mo, account)
+
+
+def _parse_meta_command(text: str) -> Optional[Dict[str, Any]]:
+    m = _META_CMD.match(text.strip())
+    if not m:
+        return None
+    tail = (m.group(2) or "").strip()
+    if not tail:
+        return {"help": False, "full": False, "path": None}
+
+    full = False
+    help_req = False
+    rest: List[str] = []
+    for part in tail.split():
+        p = part.strip()
+        pl = p.lower()
+        if pl in ("full", "--full", "-full", "raw", "--raw", "-raw"):
+            full = True
+            continue
+        if pl in ("help", "--help", "-h", "?"):
+            help_req = True
+            continue
+        rest.append(p)
+    path = _norm_path(" ".join(rest).strip()) if rest else None
+    if path and path.lower().startswith("path="):
+        path = _norm_path(path[5:])
+    if path == "":
+        path = None
+    return {"help": help_req, "full": full, "path": path}
+
+
+def _meta_retriever(path: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    mmr = None
+    try:
+        MMR = jclass("android.media.MediaMetadataRetriever")
+        mmr = MMR()
+        mmr.setDataSource(path)
+
+        def read_key(const_name: str) -> Optional[str]:
+            key = getattr(MMR, const_name, None)
+            if key is None:
+                return None
+            try:
+                return _safe_str(mmr.extractMetadata(int(key)))
+            except Exception:
+                return None
+
+        out["mime"] = read_key("METADATA_KEY_MIMETYPE")
+        out["duration_ms"] = _safe_int(read_key("METADATA_KEY_DURATION"))
+        out["bitrate"] = _safe_int(read_key("METADATA_KEY_BITRATE"))
+        out["has_video"] = read_key("METADATA_KEY_HAS_VIDEO")
+        out["has_audio"] = read_key("METADATA_KEY_HAS_AUDIO")
+        out["video_width"] = _safe_int(read_key("METADATA_KEY_VIDEO_WIDTH"))
+        out["video_height"] = _safe_int(read_key("METADATA_KEY_VIDEO_HEIGHT"))
+        out["rotation"] = _safe_int(read_key("METADATA_KEY_VIDEO_ROTATION"))
+        out["framerate"] = _safe_float(read_key("METADATA_KEY_CAPTURE_FRAMERATE"))
+        out["location"] = read_key("METADATA_KEY_LOCATION")
+        out["date"] = read_key("METADATA_KEY_DATE")
+        out["title"] = read_key("METADATA_KEY_TITLE")
+        out["artist"] = read_key("METADATA_KEY_ARTIST")
+        out["album"] = read_key("METADATA_KEY_ALBUM")
+        out["author"] = read_key("METADATA_KEY_AUTHOR")
+        out["composer"] = read_key("METADATA_KEY_COMPOSER")
+        out["genre"] = read_key("METADATA_KEY_GENRE")
+    except Exception as e:
+        out["error"] = str(e)
+    finally:
+        if mmr is not None:
+            try:
+                mmr.release()
+            except Exception:
+                pass
+    return out
+
+
+def _mf_read(fmt: Any, key: str) -> Any:
+    if fmt is None:
+        return None
+    ck = getattr(fmt, "containsKey", None)
+    if callable(ck):
+        try:
+            if not bool(ck(key)):
+                return None
+        except Exception:
+            pass
+    for getter in ("getString", "getInteger", "getLong", "getFloat"):
+        fn = getattr(fmt, getter, None)
+        if not callable(fn):
+            continue
+        try:
+            return fn(key)
+        except Exception:
+            pass
+    return None
+
+
+def _meta_extractor(path: str, include_raw: bool) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"tracks": []}
+    ex = None
+    try:
+        MediaExtractor = jclass("android.media.MediaExtractor")
+        ex = MediaExtractor()
+        ex.setDataSource(path)
+        count = int(ex.getTrackCount())
+        out["track_count"] = count
+
+        keys = (
+            "mime",
+            "width",
+            "height",
+            "rotation-degrees",
+            "durationUs",
+            "bitrate",
+            "frame-rate",
+            "sample-rate",
+            "channel-count",
+            "language",
+            "profile",
+            "level",
+            "max-input-size",
+            "color-range",
+            "color-standard",
+            "color-transfer",
+        )
+        for i in range(count):
+            fmt = ex.getTrackFormat(int(i))
+            row: Dict[str, Any] = {"index": i}
+            for k in keys:
+                v = _mf_read(fmt, k)
+                if v is None:
+                    continue
+                row[k] = v
+            mime = _safe_str(row.get("mime"))
+            if mime:
+                if mime.startswith("video/"):
+                    row["type"] = "video"
+                elif mime.startswith("audio/"):
+                    row["type"] = "audio"
+                elif mime.startswith("text/") or "subtitle" in mime:
+                    row["type"] = "subtitle"
+                else:
+                    row["type"] = "other"
+            if include_raw:
+                try:
+                    row["raw"] = str(fmt)
+                except Exception:
+                    pass
+            out["tracks"].append(row)
+    except Exception as e:
+        out["error"] = str(e)
+    finally:
+        if ex is not None:
+            try:
+                ex.release()
+            except Exception:
+                pass
+    return out
+
+
+def _meta_exif(path: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    Exif = None
+    for cls_name in (
+        "androidx.exifinterface.media.ExifInterface",
+        "android.media.ExifInterface",
+    ):
+        try:
+            Exif = jclass(cls_name)
+            break
+        except Exception:
+            continue
+    if Exif is None:
+        return out
+    try:
+        exif = Exif(path)
+    except Exception:
+        return out
+
+    def tag(attr_name: str, fallback: str) -> str:
+        return getattr(Exif, attr_name, fallback)
+
+    def ga(key: str) -> Optional[str]:
+        try:
+            return _safe_str(exif.getAttribute(key))
+        except Exception:
+            return None
+
+    out["make"] = ga(tag("TAG_MAKE", "Make"))
+    out["model"] = ga(tag("TAG_MODEL", "Model"))
+    out["datetime"] = ga(tag("TAG_DATETIME", "DateTime"))
+    out["datetime_original"] = ga(tag("TAG_DATETIME_ORIGINAL", "DateTimeOriginal"))
+    out["lens_model"] = ga(tag("TAG_LENS_MODEL", "LensModel"))
+    out["f_number"] = ga(tag("TAG_F_NUMBER", "FNumber"))
+    out["focal_length"] = ga(tag("TAG_FOCAL_LENGTH", "FocalLength"))
+    out["iso"] = ga(tag("TAG_PHOTOGRAPHIC_SENSITIVITY", "PhotographicSensitivity")) or ga(
+        tag("TAG_ISO_SPEED_RATINGS", "ISOSpeedRatings")
+    )
+    out["exposure_time"] = ga(tag("TAG_EXPOSURE_TIME", "ExposureTime"))
+    out["orientation"] = ga(tag("TAG_ORIENTATION", "Orientation"))
+    out["image_width"] = ga(tag("TAG_IMAGE_WIDTH", "ImageWidth"))
+    out["image_length"] = ga(tag("TAG_IMAGE_LENGTH", "ImageLength"))
+    out["gps_latitude"] = ga(tag("TAG_GPS_LATITUDE", "GPSLatitude"))
+    out["gps_longitude"] = ga(tag("TAG_GPS_LONGITUDE", "GPSLongitude"))
+    out["gps_altitude"] = ga(tag("TAG_GPS_ALTITUDE", "GPSAltitude"))
+
+    for k in list(out.keys()):
+        if out[k] is None:
+            del out[k]
+    return out
+
+
+def _build_report(path: str, include_raw: bool, max_lines: int) -> str:
+    st = os.stat(path)
+    size = int(st.st_size)
+    mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    mime_guess = mimetypes.guess_type(path)[0] or "?"
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+
+    t0 = time.monotonic()
+    retr = _meta_retriever(path)
+    extx = _meta_extractor(path, include_raw)
+    exif = _meta_exif(path)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    lines: List[str] = []
+    lines.append("Real Metadata")
+    lines.append(f"Файл: {os.path.basename(path)}")
+    lines.append(f"Путь: {path}")
+    lines.append(f"Размер: {_fmt_bytes(size)} ({size} bytes)")
+    lines.append(f"Изменён: {mtime}")
+    lines.append(f"Расширение: {ext or '?'}")
+    lines.append(f"MIME (guess): {mime_guess}")
+
+    lines.append("")
+    lines.append("MediaMetadataRetriever:")
+    if retr.get("error"):
+        lines.append(f"- ошибка: {retr.get('error')}")
+    else:
+        lines.append(f"- MIME: {retr.get('mime') or '?'}")
+        lines.append(f"- Длительность: {_fmt_duration_ms(_safe_int(retr.get('duration_ms')))}")
+        lines.append(f"- Битрейт: {_fmt_bitrate(_safe_int(retr.get('bitrate')))}")
+
+        w = _safe_int(retr.get("video_width"))
+        h = _safe_int(retr.get("video_height"))
+        rot = _safe_int(retr.get("rotation"))
+        fps = _safe_float(retr.get("framerate"))
+        if w and h:
+            vp = f"{w}x{h}"
+            if fps:
+                vp += f", {fps:.3f} fps"
+            if rot is not None:
+                vp += f", rot {rot}"
+            lines.append(f"- Видео: {vp}")
+
+        has_video = _safe_str(retr.get("has_video"))
+        has_audio = _safe_str(retr.get("has_audio"))
+        if has_video is not None or has_audio is not None:
+            lines.append(f"- has_video={has_video or '?'} has_audio={has_audio or '?'}")
+
+        if retr.get("title"):
+            lines.append(f"- title: {retr.get('title')}")
+        if retr.get("artist"):
+            lines.append(f"- artist: {retr.get('artist')}")
+        if retr.get("album"):
+            lines.append(f"- album: {retr.get('album')}")
+        if retr.get("author"):
+            lines.append(f"- author: {retr.get('author')}")
+        if retr.get("composer"):
+            lines.append(f"- composer: {retr.get('composer')}")
+        if retr.get("genre"):
+            lines.append(f"- genre: {retr.get('genre')}")
+        if retr.get("date"):
+            lines.append(f"- date: {retr.get('date')}")
+        if retr.get("location"):
+            lines.append(f"- location: {retr.get('location')}")
+
+    lines.append("")
+    lines.append("MediaExtractor tracks:")
+    if extx.get("error"):
+        lines.append(f"- ошибка: {extx.get('error')}")
+    else:
+        tracks: List[Dict[str, Any]] = extx.get("tracks", [])
+        lines.append(f"- count: {len(tracks)}")
+        for tr in tracks:
+            idx = int(tr.get("index", 0)) + 1
+            mime = _safe_str(tr.get("mime")) or "?"
+            typ = _safe_str(tr.get("type")) or "other"
+            parts = [f"{idx}) {typ} {mime}"]
+            if tr.get("width") and tr.get("height"):
+                parts.append(f"{tr.get('width')}x{tr.get('height')}")
+            if tr.get("frame-rate") is not None:
+                parts.append(f"{tr.get('frame-rate')} fps")
+            if tr.get("sample-rate") is not None:
+                parts.append(f"{tr.get('sample-rate')} Hz")
+            if tr.get("channel-count") is not None:
+                parts.append(f"{tr.get('channel-count')} ch")
+            br = _safe_int(tr.get("bitrate"))
+            if br:
+                parts.append(_fmt_bitrate(br))
+            dur_us = _safe_int(tr.get("durationUs"))
+            if dur_us is not None:
+                parts.append(_fmt_duration_ms(int(dur_us / 1000)))
+            if tr.get("language"):
+                parts.append(f"lang={tr.get('language')}")
+            lines.append("   - " + " | ".join(parts))
+            if include_raw and tr.get("raw"):
+                lines.append(f"     raw: {tr.get('raw')}")
+
+    if exif:
+        lines.append("")
+        lines.append("EXIF:")
+        for k in (
+            "make",
+            "model",
+            "lens_model",
+            "datetime_original",
+            "datetime",
+            "f_number",
+            "focal_length",
+            "iso",
+            "exposure_time",
+            "orientation",
+            "image_width",
+            "image_length",
+            "gps_latitude",
+            "gps_longitude",
+            "gps_altitude",
+        ):
+            if k in exif:
+                lines.append(f"- {k}: {exif[k]}")
+
+    if retr.get("error") and extx.get("error") and not exif:
+        lines.append("")
+        lines.append("Не удалось вытащить метаданные. Файл может быть недокачан или формат не поддержан.")
+
+    lines.append("")
+    lines.append(f"Источник: MediaExtractor / MMR / EXIF · {elapsed_ms} ms")
+    return _cap_text_lines(lines, max_lines)
+
+
+class RealMetadataPlugin(BasePlugin):
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Real Metadata"),
+            Input(
+                key="meta_max_lines",
+                text="Максимум строк в ответе",
+                default=str(_DEFAULT_MAX_LINES),
+                subtext=f"{_MAX_LINES_MIN}–{_MAX_LINES_MAX}",
+                icon="msg_list",
+            ),
+            Switch(
+                key="meta_full_default",
+                text="По умолчанию FULL",
+                subtext="Добавлять сырой dump форматов дорожек",
+                default=False,
+                icon="msg_info",
+                on_change=lambda v: None,
+            ),
+            Divider(),
+            Text(
+                text="Команда: `.meta` реплаем на медиа, либо `.meta \"путь\"`.",
+                red=False,
+            ),
+        ]
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+
+        parsed = _parse_meta_command(msg.strip())
+        if parsed is None:
+            return HookResult()
+
+        peer = getattr(params, "peer", None)
+        if parsed.get("help"):
+            _send(peer, _HELP)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        max_lines = _parse_max_lines(str(self.get_setting("meta_max_lines", str(_DEFAULT_MAX_LINES))))
+        full_default = bool(self.get_setting("meta_full_default", False))
+        include_raw = bool(parsed.get("full")) or full_default
+        manual_path = parsed.get("path")
+
+        def work() -> None:
+            try:
+                path = _norm_path(str(manual_path)) if manual_path else None
+                if path and not os.path.isfile(path):
+                    _send(peer, f"Файл не найден: {path}")
+                    return
+                if not path:
+                    path = _path_from_reply(params, int(account))
+                if not path:
+                    if _reply_has_media(params, int(account)):
+                        _send(
+                            peer,
+                            "Реплай на медиа есть, но локальный файл не найден.\n"
+                            "Открой вложение и дождись загрузки, потом повтори `.meta`.",
+                        )
+                    else:
+                        _send(peer, _HELP)
+                    return
+                report = _build_report(path, include_raw, max_lines)
+                _send(peer, report)
+            except Exception as e:
+                log(f"[{__id__}] worker: {e}")
+                _send(peer, f"Ошибка анализа метаданных: {e}")
+
+        run_on_queue(work)
+        return HookResult(strategy=HookStrategy.CANCEL)
