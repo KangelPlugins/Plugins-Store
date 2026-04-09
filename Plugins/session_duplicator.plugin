@@ -1,0 +1,623 @@
+__id__ = "session_duplicator"
+__name__ = "Session Duplicator"
+__description__ = "Дублирует сессии и показывает их в списке Активные сессии"
+__author__ = "@comproduce"
+__version__ = "13.0.0"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.12.0"
+
+import random
+import json
+import os
+import time
+import datetime
+import traceback
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from hook_utils import find_class, get_private_field
+from android_utils import log, run_on_ui_thread, OnClickListener
+from client_utils import get_last_fragment, run_on_queue
+from ui.alert import AlertDialogBuilder
+from typing import Any
+
+
+STORAGE_FILE = "/data/user/0/com.exteragram.messenger/files/plugins/session_dup_storage.json"
+
+
+def _load_sessions():
+    try:
+        if os.path.exists(STORAGE_FILE):
+            with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log(f"[SD] load error: {e}")
+    return []
+
+
+def _save_sessions(sessions):
+    try:
+        os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
+        with open(STORAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        log(f"[SD] save error: {e}")
+        return False
+
+
+def _auth_to_dict(auth):
+    try:
+        return {
+            "hash": str(auth.hash),
+            "device_model": str(auth.device_model or "Unknown"),
+            "platform": str(auth.platform or "Unknown"),
+            "system_version": str(auth.system_version or "Unknown"),
+            "api_id": int(auth.api_id),
+            "app_name": str(auth.app_name or "Unknown"),
+            "app_version": str(auth.app_version or "Unknown"),
+            "date_created": int(auth.date_created),
+            "date_active": int(auth.date_active),
+            "country": str(auth.country or "Unknown"),
+            "region": str(auth.region or "Unknown"),
+            "flags": int(auth.flags),
+            "duplicated_at": int(time.time()),
+            "local_id": "dup_" + str(int(time.time())) + "_" + str(random.randint(1000, 9999)),
+        }
+    except Exception as e:
+        log(f"[SD] auth_to_dict error: {e}")
+        return None
+
+
+def _make_fake_auth(d, show_label):
+    suffix = " [copy]" if show_label else ""
+    fake = None
+
+    try:
+        from org.telegram.tgnet import TLRPC
+        fake = TLRPC.TL_authorization()
+    except Exception as e1:
+        log(f"[SD] TLRPC.TL_authorization() failed: {e1}")
+        try:
+            from org.telegram.tgnet.tl import TL_account
+            fake = TL_account.TL_authorization()
+        except Exception as e2:
+            log(f"[SD] TL_account.TL_authorization() also failed: {e2}")
+            return None
+
+    try:
+        fake.hash = abs(hash(d.get("local_id", "x"))) % 2000000000
+    except Exception:
+        pass
+    try:
+        fake.device_model = str(d.get("device_model", "Unknown")) + suffix
+    except Exception:
+        pass
+    try:
+        fake.platform = str(d.get("platform", "Unknown"))
+    except Exception:
+        pass
+    try:
+        fake.system_version = str(d.get("system_version", "Unknown"))
+    except Exception:
+        pass
+    try:
+        fake.api_id = int(d.get("api_id", 0))
+    except Exception:
+        pass
+    try:
+        fake.app_name = str(d.get("app_name", "Unknown"))
+    except Exception:
+        pass
+    try:
+        fake.app_version = str(d.get("app_version", "Unknown"))
+    except Exception:
+        pass
+    try:
+        fake.date_created = int(d.get("date_created", 0))
+    except Exception:
+        pass
+    try:
+        fake.date_active = int(d.get("date_active", int(time.time())))
+    except Exception:
+        pass
+    try:
+        fake.ip = ""
+    except Exception:
+        pass
+    try:
+        fake.country = str(d.get("country", "Unknown"))
+    except Exception:
+        pass
+    try:
+        fake.region = str(d.get("region", "Unknown"))
+    except Exception:
+        pass
+    try:
+        fake.flags = int(d.get("flags", 0)) & ~1
+    except Exception:
+        pass
+
+    return fake
+
+
+class CreateViewHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            fragment = param.thisObject
+            if fragment is None:
+                return
+            self.plugin._current_fragment = fragment
+            run_on_ui_thread(lambda: self.plugin._on_fragment_ready(fragment), 600)
+        except Exception as e:
+            log(f"[SD] CreateViewHook error: {e}")
+
+
+class SessionDuplicatorPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._duplicated = []
+        self._spinner = None
+        self._cached_auths = []
+        self._current_fragment = None
+
+    def on_plugin_load(self):
+        self.log("SessionDuplicator v13.0 loaded")
+        self._duplicated = _load_sessions()
+        self.log(f"[SD] loaded {len(self._duplicated)} saved duplicates")
+        self._hook_create_view()
+        self.add_hook("TL_account_getAuthorizations")
+        self.add_hook("getAuthorizations", match_substring=True)
+
+    def on_plugin_unload(self):
+        self.log("SessionDuplicator unloaded")
+
+    def post_request_hook(self, request_name: str, account: int, response: Any, error: Any) -> HookResult:
+        try:
+            is_auth_request = (
+                "getAuthorizations" in request_name
+                or "Authorizations" in request_name
+            )
+            if not is_auth_request:
+                return HookResult(strategy=HookStrategy.DEFAULT)
+
+            self.log(f"[SD] post_request_hook fired: {request_name}")
+
+            if error is not None or response is None:
+                self.log(f"[SD] error or null response: error={error}")
+                return HookResult(strategy=HookStrategy.DEFAULT)
+
+            self.log(f"[SD] response class: {response.getClass().getName()}")
+
+            saved = _load_sessions()
+            self.log(f"[SD] saved duplicates count: {len(saved)}")
+
+            auths_list = None
+            for field_name in ["authorizations", "mAuthorizations", "items"]:
+                try:
+                    auths_list = getattr(response, field_name, None)
+                    if auths_list is not None:
+                        self.log(f"[SD] found auths in field '{field_name}', size={auths_list.size()}")
+                        break
+                except Exception as ef:
+                    self.log(f"[SD] field {field_name} error: {ef}")
+
+            if auths_list is None:
+                self.log("[SD] could not find authorizations field on response")
+                return HookResult(strategy=HookStrategy.DEFAULT)
+
+            count = auths_list.size()
+            self.log(f"[SD] original count: {count}")
+
+            real_items = []
+            for i in range(count):
+                try:
+                    real_items.append(auths_list.get(i))
+                except Exception:
+                    pass
+            if real_items:
+                self._cached_auths = real_items
+                self.log(f"[SD] cached {len(real_items)} real auths")
+
+            if not saved:
+                self.log("[SD] no saved duplicates to inject")
+                return HookResult(strategy=HookStrategy.DEFAULT)
+
+            show_label = self.get_setting("show_copy_label", False)
+            injected = 0
+
+            for d in saved:
+                try:
+                    fake = _make_fake_auth(d, show_label)
+                    if fake is not None:
+                        auths_list.add(fake)
+                        injected += 1
+                        self.log(f"[SD] injected: {d.get('device_model', '?')} / {d.get('app_name', '?')}")
+                    else:
+                        self.log(f"[SD] fake is None for {d.get('device_model', '?')}")
+                except Exception as ex:
+                    self.log(f"[SD] inject loop error: {ex}")
+                    self.log(traceback.format_exc())
+
+            self.log(f"[SD] after inject size: {auths_list.size()}, injected={injected}")
+
+            result = HookResult()
+            result.strategy = HookStrategy.MODIFY
+            result.response = response
+            return result
+
+        except Exception as e:
+            self.log(f"[SD] post_request_hook error: {e}")
+            self.log(traceback.format_exc())
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+    def _hook_create_view(self):
+        try:
+            SessionsActivityClass = find_class("org.telegram.ui.SessionsActivity")
+            if SessionsActivityClass is None:
+                self.log("[SD] SessionsActivity not found")
+                return
+            ContextClass = find_class("android.content.Context")
+            if ContextClass is None:
+                self.log("[SD] Context not found")
+                return
+            m = SessionsActivityClass.getClass().getDeclaredMethod("createView", ContextClass)
+            m.setAccessible(True)
+            result = self.hook_method(m, CreateViewHook(self), priority=5)
+            if result:
+                self.log("[SD] hooked createView OK")
+            else:
+                self.log("[SD] createView hook failed")
+        except Exception as e:
+            self.log(f"[SD] _hook_create_view error: {e}")
+            self.log(traceback.format_exc())
+
+    def _extract_auths_from_fragment(self, fragment):
+        field_names = [
+            "authorizations", "sessions", "authorizationsList",
+            "sessionsList", "currentAuthorizations", "items",
+            "auths", "mSessions", "mAuthorizations",
+            "otherSessions", "sessionItems", "authItems",
+        ]
+        for fname in field_names:
+            try:
+                val = get_private_field(fragment, fname)
+                if val is None:
+                    continue
+                items = []
+                try:
+                    count = val.size()
+                    for i in range(count):
+                        try:
+                            items.append(val.get(i))
+                        except Exception:
+                            pass
+                except Exception:
+                    try:
+                        for item in val:
+                            items.append(item)
+                    except Exception:
+                        pass
+                if items:
+                    self._cached_auths = items
+                    self.log(f"[SD] extracted {len(items)} auths from field '{fname}'")
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _on_fragment_ready(self, fragment):
+        self._extract_auths_from_fragment(fragment)
+        if self.get_setting("button_visible", True):
+            self._inject_button(fragment)
+
+    def _inject_button(self, fragment):
+        try:
+            from android.widget import LinearLayout, FrameLayout, TextView
+            from android.view import Gravity, ViewGroup
+            from org.telegram.messenger import AndroidUtilities
+            from org.telegram.ui.ActionBar import Theme
+
+            activity = fragment.getParentActivity()
+            if activity is None:
+                self.log("[SD] no activity")
+                return
+
+            root_view = None
+            for fname in ["fragmentView", "contentView", "rootView"]:
+                try:
+                    v = get_private_field(fragment, fname)
+                    if v is not None:
+                        root_view = v
+                        break
+                except Exception:
+                    pass
+            if root_view is None:
+                try:
+                    root_view = fragment.getFragmentView()
+                except Exception:
+                    pass
+            if root_view is None:
+                self.log("[SD] root_view is None")
+                return
+
+            btn = TextView(activity)
+            btn.setText("\u29c9  \u0414\u0443\u0431\u043b\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u0435\u0441\u0441\u0438\u044e")
+            btn.setTextSize(15)
+            btn.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4))
+            btn.setGravity(Gravity.CENTER)
+            btn.setPadding(
+                AndroidUtilities.dp(16),
+                AndroidUtilities.dp(14),
+                AndroidUtilities.dp(16),
+                AndroidUtilities.dp(14),
+            )
+            btn.setOnClickListener(OnClickListener(lambda v: self._on_button_click()))
+
+            try:
+                if isinstance(root_view, LinearLayout):
+                    lp = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    )
+                    root_view.addView(btn, 0, lp)
+                    self.log("[SD] btn -> LinearLayout[0]")
+                elif isinstance(root_view, FrameLayout):
+                    lp = FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        AndroidUtilities.dp(56),
+                        Gravity.BOTTOM,
+                    )
+                    lp.bottomMargin = AndroidUtilities.dp(16)
+                    lp.leftMargin = AndroidUtilities.dp(16)
+                    lp.rightMargin = AndroidUtilities.dp(16)
+                    root_view.addView(btn, lp)
+                    self.log("[SD] btn -> FrameLayout BOTTOM")
+                else:
+                    lp = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    )
+                    root_view.addView(btn, lp)
+                    self.log("[SD] btn -> ViewGroup")
+            except Exception as e2:
+                self.log(f"[SD] addView error: {e2}")
+
+        except Exception as e:
+            self.log(f"[SD] _inject_button error: {e}")
+            self.log(traceback.format_exc())
+
+    def _on_button_click(self):
+        self.log(f"[SD] button clicked, cached={len(self._cached_auths)}")
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+
+        if not self._cached_auths and self._current_fragment is not None:
+            self._extract_auths_from_fragment(self._current_fragment)
+
+        if not self._cached_auths:
+            b = AlertDialogBuilder(activity)
+            b.set_title("Подождите")
+            b.set_message(
+                "Сессии ещё не загрузились.\n\n"
+                "Закройте экран Устройства и откройте снова — "
+                "плагин автоматически перехватит данные."
+            )
+            b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+            b.show()
+            return
+
+        self._spinner = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        self._spinner.set_cancelable(False)
+        self._spinner.show()
+
+        run_on_queue(self._do_duplicate)
+
+    def _do_duplicate(self):
+        try:
+            if not self._cached_auths:
+                run_on_ui_thread(self._show_no_sessions)
+                return
+
+            real_auths = []
+            for a in self._cached_auths:
+                try:
+                    flags_val = int(str(a.flags))
+                    if not (flags_val & 1):
+                        real_auths.append(a)
+                except Exception:
+                    real_auths.append(a)
+
+            pool = real_auths if real_auths else self._cached_auths
+            chosen = random.choice(pool)
+            d = _auth_to_dict(chosen)
+
+            if d is None:
+                run_on_ui_thread(lambda: self._show_error("Не удалось прочитать данные сессии"))
+                return
+
+            self._duplicated.append(d)
+            saved_ok = _save_sessions(self._duplicated)
+            self.log(f"[SD] duplicated, saved={saved_ok}, total={len(self._duplicated)}")
+
+            _d = d
+            _s = saved_ok
+            run_on_ui_thread(lambda: self._show_success(_d, _s))
+
+        except Exception as e:
+            self.log(f"[SD] _do_duplicate error: {e}")
+            self.log(traceback.format_exc())
+            _e = str(e)
+            run_on_ui_thread(lambda: self._show_error(_e))
+
+    def _dismiss_spinner(self):
+        try:
+            if self._spinner is not None:
+                self._spinner.dismiss()
+                self._spinner = None
+        except Exception:
+            pass
+
+    def _show_success(self, d, saved):
+        self._dismiss_spinner()
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+
+        device = d.get("device_model", "?")
+        app = d.get("app_name", "?")
+        lid = d.get("local_id", "?")
+        ts = d.get("duplicated_at", 0)
+        dt = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if ts else "?"
+        total = len(self._duplicated)
+        save_txt = "Сохранено!" if saved else "Ошибка сохранения!"
+
+        msg = (
+            f"Сессия продублирована!\n\n"
+            f"Устройство: {device}\n"
+            f"Приложение: {app}\n"
+            f"ID: {lid}\n"
+            f"Время: {dt}\n\n"
+            f"{save_txt}\n"
+            f"Всего дубликатов: {total}\n\n"
+            f"Закройте экран Устройства и откройте снова — "
+            f"дубликат появится в списке Активные сессии."
+        )
+
+        b = AlertDialogBuilder(activity)
+        b.set_title("Дублирование сессии")
+        b.set_message(msg)
+        b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+        b.set_neutral_button(
+            "Все дубликаты",
+            lambda bld, w: (bld.dismiss(), run_on_ui_thread(self._show_all))
+        )
+        b.show()
+        self.log(f"[SD] success shown: {device} / {app}")
+
+    def _show_error(self, msg):
+        self._dismiss_spinner()
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+        b = AlertDialogBuilder(activity)
+        b.set_title("Ошибка")
+        b.set_message(str(msg))
+        b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+        b.show()
+
+    def _show_no_sessions(self):
+        self._dismiss_spinner()
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+        b = AlertDialogBuilder(activity)
+        b.set_title("Нет сессий")
+        b.set_message("Активных сессий не найдено.")
+        b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+        b.show()
+
+    def _show_all(self):
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+        dups = _load_sessions()
+        if not dups:
+            b = AlertDialogBuilder(activity)
+            b.set_title("Дубликаты")
+            b.set_message("Нет сохранённых дубликатов.")
+            b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+            b.show()
+            return
+        lines = []
+        for i, s in enumerate(dups, 1):
+            ts = s.get("duplicated_at", 0)
+            dt = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if ts else "?"
+            lines.append(
+                f"{i}. {s.get('device_model', '?')} / {s.get('app_name', '?')}\n"
+                f"   {dt}"
+            )
+        b = AlertDialogBuilder(activity)
+        b.set_title(f"Дубликаты ({len(dups)})")
+        b.set_message("\n\n".join(lines))
+        b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+        b.set_negative_button(
+            "Очистить всё",
+            lambda bld, w: (bld.dismiss(), self._clear_all())
+        )
+        b.show()
+
+    def _clear_all(self):
+        self._duplicated = []
+        _save_sessions([])
+        self.log("[SD] all duplicates cleared")
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+        b = AlertDialogBuilder(activity)
+        b.set_title("Готово")
+        b.set_message(
+            "Все дубликаты удалены.\n"
+            "Закройте экран Устройства и откройте снова."
+        )
+        b.set_positive_button("OK", lambda bld, w: bld.dismiss())
+        b.show()
+
+    def create_settings(self):
+        from ui.settings import Header, Text, Divider, Switch
+
+        count = len(_load_sessions())
+
+        return [
+            Header(text="Session Duplicator by @comproduce"),
+            Switch(
+                key="button_visible",
+                text="Показывать кнопку «Дублировать сессию»",
+                default=True,
+                subtext="Кнопка отображается на экране Настройки → Устройства. Перезайдите на экран после изменения.",
+                icon="msg_devices",
+            ),
+            Switch(
+                key="show_copy_label",
+                text="Показывать метку [copy] у дубликатов",
+                default=False,
+                subtext="Дубликаты будут помечены [copy] в списке устройств.",
+                icon="msg_edit",
+            ),
+            Divider(),
+            Header(text="Локальное хранилище"),
+            Text(
+                text=f"Сохранённых дубликатов: {count}",
+                icon="msg_saved_messages",
+                on_click=lambda v: run_on_ui_thread(self._show_all),
+            ),
+            Text(
+                text="Очистить все дубликаты",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda v: run_on_ui_thread(self._clear_all),
+            ),
+            Divider(text="Дубликаты отображаются в списке Активные сессии при открытии экрана Устройства."),
+        ]
