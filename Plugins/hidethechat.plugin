@@ -1,0 +1,707 @@
+# Логика основана на hideChats (@RazaDroid); отдельный id и файл данных.
+
+__id__ = "hidethechat"
+__name__ = "Hide the chat"
+__description__ = "Скрывает чаты из списка; можно вставить ссылку на канал в настройках."
+__version__ = "1.1.0"
+__author__ = "hyponomic"
+__icon__ = "msg_hide"
+__min_version__ = "11.12.0"
+
+import re
+
+from base_plugin import BasePlugin, XposedHook, HookResult, HookStrategy, MenuItemData, MenuItemType
+from ui.settings import Header, Switch, Divider, Text, Input
+
+from android.widget import Toast
+from java.util import ArrayList
+from java.lang import Class, Integer
+from org.telegram.messenger import MessagesController, UserConfig, ApplicationLoader, NotificationCenter
+
+import json
+import os
+import threading
+from typing import Optional
+
+try:
+    from android_utils import log as _alog
+except ImportError:
+    _alog = None
+
+
+def log(msg):
+    s = f"[HideTheChat] {msg}"
+    if _alog:
+        try:
+            _alog(s)
+            return
+        except Exception:
+            pass
+    print(s)
+
+
+def show_toast(text):
+    try:
+        ctx = ApplicationLoader.applicationContext
+        Toast.makeText(ctx, text, Toast.LENGTH_SHORT).show()
+    except Exception:
+        pass
+
+
+def get_save_path():
+    try:
+        base = ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath()
+        return os.path.join(base, "hidethechat_data.json")
+    except Exception:
+        return "hidethechat_data.json"
+
+
+def get_dialog_id_fast(obj):
+    val = getattr(obj, "id", 0)
+    if val != 0:
+        return val
+    val = getattr(obj, "dialog_id", 0)
+    if val != 0:
+        return val
+    return None
+
+
+def get_dialog_id_safe(obj):
+    try:
+        return obj.getDialogId()
+    except Exception:
+        try:
+            return getattr(obj, "dialog_id", 0)
+        except Exception:
+            return None
+
+
+def _split_link_tokens(text):
+    if not text or not str(text).strip():
+        return []
+    raw = str(text).replace(";", "\n")
+    out = []
+    for line in raw.splitlines():
+        for part in line.split(","):
+            t = part.strip()
+            if t:
+                out.append(t)
+    return out
+
+
+def _extract_username(token: str):
+    t = (token or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    if "t.me/" in low:
+        idx = low.index("t.me/")
+        part = t[idx + 5 :].split("?")[0].strip("/")
+        if part.lower().startswith("+"):
+            return None
+        if "/" in part:
+            part = part.split("/")[0]
+        if not part or part.startswith("+"):
+            return None
+        return part.lstrip("@").lower()
+    if t.startswith("@"):
+        return t[1:].lower()
+    if re.match(r"^[A-Za-z0-9_]{4,}$", t):
+        return t.lower()
+    return None
+
+
+def _dialog_id_from_tl_object(obj) -> Optional[int]:
+    if obj is None:
+        return None
+    try:
+        from org.telegram.messenger import DialogObject
+
+        did = DialogObject.getDialogId(obj)
+        if did != 0:
+            return int(did)
+    except Exception as e:
+        log(f"DialogObject.getDialogId: {e}")
+    return None
+
+
+def _resolve_username_to_dialog_id(account: int, username: str):
+    mc = MessagesController.getInstance(int(account))
+    if mc is None:
+        return None, "нет MessagesController"
+
+    try:
+        chat = mc.getChatByUsername(username)
+        if chat is not None:
+            did = _dialog_id_from_tl_object(chat)
+            if did is not None:
+                return did, None
+    except Exception as e:
+        log(f"getChatByUsername: {e}")
+
+    user = None
+    try:
+        user = mc.getUser(username)
+    except Exception:
+        try:
+            fn = getattr(mc, "getUserByUsername", None)
+            if callable(fn):
+                user = fn(username)
+        except Exception:
+            pass
+    if user is not None:
+        did = _dialog_id_from_tl_object(user)
+        if did is not None:
+            return did, None
+
+    try:
+        fn = getattr(mc, "getUserOrChat", None)
+        if callable(fn):
+            obj = fn(username)
+            if obj is not None:
+                did = _dialog_id_from_tl_object(obj)
+                if did is not None:
+                    return did, None
+    except Exception as e:
+        log(f"getUserOrChat: {e}")
+
+    return None, "не найдено в кэше — открой канал/чат в приложении и повтори"
+
+
+def _resolve_link_token(account: int, token: str):
+    uname = _extract_username(token)
+    if not uname:
+        return None, "не похоже на t.me/name или @name"
+    return _resolve_username_to_dialog_id(account, uname)
+
+
+class HiddenState:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.lock = threading.Lock()
+        self.int_set = set()
+
+    def _update_int_set(self):
+        self.int_set.clear()
+        for did_str in self.plugin.hidden_ids:
+            try:
+                self.int_set.add(int(did_str))
+            except ValueError:
+                pass
+
+    def is_hidden(self, dialog_id):
+        if isinstance(dialog_id, int):
+            return dialog_id in self.int_set
+        try:
+            return int(dialog_id) in self.int_set
+        except ValueError:
+            return False
+
+    def hide(self, dialog_id):
+        key = str(dialog_id)
+        with self.lock:
+            if key not in self.plugin.hidden_ids:
+                self.plugin.hidden_ids.add(key)
+                self._update_int_set()
+                self.plugin.save_data_async()
+
+    def unhide(self, dialog_id):
+        key = str(dialog_id)
+        with self.lock:
+            if key in self.plugin.hidden_ids:
+                self.plugin.hidden_ids.discard(key)
+                self._update_int_set()
+                self.plugin.save_data_async()
+
+
+class GetDialogsHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin.is_hidden_mode_active:
+            return
+        hidden_int = self.plugin.state.int_set
+        if not hidden_int:
+            return
+        dialogs = param.getResult()
+        if not dialogs or dialogs.isEmpty():
+            return
+
+        to_remove = ArrayList()
+        for i in range(dialogs.size()):
+            dlg = dialogs.get(i)
+            did = get_dialog_id_fast(dlg)
+            if did is not None and did in hidden_int:
+                to_remove.add(dlg)
+
+        if not to_remove.isEmpty():
+            dialogs.removeAll(to_remove)
+
+
+class UniversalNotifHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("block_notifications", True):
+            return
+        hidden_int = self.plugin.state.int_set
+        if not hidden_int:
+            return
+
+        messages_list = None
+        for arg in param.args:
+            if isinstance(arg, ArrayList):
+                messages_list = arg
+                break
+
+        if not messages_list or messages_list.isEmpty():
+            return
+
+        to_remove = ArrayList()
+        for i in range(messages_list.size()):
+            msg = messages_list.get(i)
+            if msg:
+                did = get_dialog_id_safe(msg)
+                if did is not None and did in hidden_int:
+                    to_remove.add(msg)
+
+        if not to_remove.isEmpty():
+            messages_list.removeAll(to_remove)
+            if messages_list.isEmpty():
+                param.setResult(None)
+
+
+class ChatActivityEventsHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("fake_empty", False):
+            return
+        activity = param.thisObject
+        try:
+            did = activity.getDialogId()
+            if self.plugin.state.is_hidden(did):
+                param.setResult(None)
+                msgs = getattr(activity, "messages", None)
+                if msgs and isinstance(msgs, ArrayList):
+                    msgs.clear()
+        except Exception:
+            pass
+
+
+class ChatActivityLoadHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("fake_empty", False):
+            return
+        activity = param.thisObject
+        try:
+            did = activity.getDialogId()
+            if self.plugin.state.is_hidden(did):
+                param.setResult(None)
+                msgs = getattr(activity, "messages", None)
+                if msgs and isinstance(msgs, ArrayList):
+                    msgs.clear()
+                adapter = getattr(activity, "chatAdapter", None)
+                if adapter:
+                    adapter.notifyDataSetChanged()
+        except Exception:
+            pass
+
+
+class SharedMediaLoadHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("fake_empty", False):
+            return
+        try:
+            did = param.args[0]
+            if self.plugin.state.is_hidden(did):
+                param.setResult(None)
+        except Exception:
+            pass
+
+
+class SharedMediaCountHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("fake_empty", False):
+            return
+        try:
+            did = param.args[0]
+            if self.plugin.state.is_hidden(did):
+                param.setResult(Integer(0))
+        except Exception:
+            pass
+
+
+class SearchMessagesHook(XposedHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("fake_empty", False):
+            return
+        try:
+            peer = param.args[0]
+            if self.plugin.state.is_hidden(peer):
+                param.setResult(None)
+        except Exception:
+            pass
+
+
+class HideTheChatPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.hidden_ids = set()
+        self.name_cache = {}
+        self.is_hidden_mode_active = True
+        self.hooks = []
+        self.state = HiddenState(self)
+        self.reload_timer = None
+        self.reload_lock = threading.Lock()
+        self._hide_links_timer = None
+        self._hide_links_timer_lock = threading.Lock()
+
+    def on_plugin_load(self):
+        self.load_data_async()
+        self.is_hidden_mode_active = self.get_setting("hidden_mode", True)
+
+        self.add_on_send_message_hook()
+
+        if self.get_setting("show_menu_item", True):
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Скрыть / показать чат",
+                    on_click=self.handle_menu_click,
+                    icon="outline_visibility_off_24",
+                )
+            )
+
+        try:
+            cls = Class.forName("org.telegram.ui.DialogsActivity")
+            for m in cls.getDeclaredMethods():
+                if m.getName() == "getDialogsArray":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, GetDialogsHook(self)))
+        except Exception as e:
+            log(f"DialogsActivity hook: {e}")
+
+        try:
+            NC_Ctrl = Class.forName("org.telegram.messenger.NotificationsController")
+            for m in NC_Ctrl.getDeclaredMethods():
+                if m.getName() == "processNewMessages":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, UniversalNotifHook(self)))
+        except Exception as e:
+            log(f"NotificationsController hook: {e}")
+
+        try:
+            CA = Class.forName("org.telegram.ui.ChatActivity")
+            for m in CA.getDeclaredMethods():
+                if m.getName() == "didReceivedNotification":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, ChatActivityEventsHook(self)))
+                if m.getName() == "loadMessages":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, ChatActivityLoadHook(self)))
+                if m.getName() == "onResume":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, ChatActivityLoadHook(self)))
+        except Exception as e:
+            log(f"ChatActivity hook: {e}")
+
+        try:
+            MDC = Class.forName("org.telegram.messenger.MediaDataController")
+            for m in MDC.getDeclaredMethods():
+                if m.getName() == "loadMedia":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, SharedMediaLoadHook(self)))
+                if m.getName() == "getSharedMediaCount":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, SharedMediaCountHook(self)))
+
+            MC = Class.forName("org.telegram.messenger.MessagesController")
+            for m in MC.getDeclaredMethods():
+                if m.getName() == "searchMessages":
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, SearchMessagesHook(self)))
+        except Exception as e:
+            log(f"Media/Messages hook: {e}")
+
+        self.debounced_reload()
+
+    def on_plugin_unload(self):
+        with self._hide_links_timer_lock:
+            if self._hide_links_timer:
+                try:
+                    self._hide_links_timer.cancel()
+                except Exception:
+                    pass
+                self._hide_links_timer = None
+        for h in self.hooks:
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self.hooks.clear()
+        self.debounced_reload()
+
+    def load_data_async(self):
+        def _load():
+            path = get_save_path()
+            data = set()
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = set(json.load(f))
+                except Exception:
+                    pass
+            with self.state.lock:
+                self.hidden_ids = data
+                self.state._update_int_set()
+            self.prefetch_names()
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def save_data_async(self):
+        def _save():
+            with self.state.lock:
+                ids_copy = list(self.hidden_ids)
+            path = get_save_path()
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(ids_copy, f)
+                os.replace(tmp, path)
+            except Exception:
+                pass
+
+        threading.Thread(target=_save, daemon=True).start()
+
+    def prefetch_names(self):
+        with self.state.lock:
+            ids = list(self.hidden_ids)
+        for cid in ids:
+            self.get_chat_name(cid)
+
+    def get_chat_name(self, cid):
+        cid_int = int(cid)
+        if cid_int in self.name_cache:
+            return self.name_cache[cid_int]
+        try:
+            acc = UserConfig.selectedAccount
+            controller = MessagesController.getInstance(acc)
+            if cid_int > 0:
+                u = controller.getUser(cid_int)
+                if u:
+                    f = getattr(u, "first_name", "") or ""
+                    l = getattr(u, "last_name", "") or ""
+                    name = f"{f} {l}".strip()
+                else:
+                    name = f"User {cid_int}"
+            else:
+                c = controller.getChat(abs(cid_int))
+                name = getattr(c, "title", "") or f"Chat {cid_int}"
+        except Exception:
+            name = f"ID: {cid_int}"
+        self.name_cache[cid_int] = name
+        return name
+
+    def debounced_reload(self):
+        with self.reload_lock:
+            if self.reload_timer:
+                self.reload_timer.cancel()
+            self.reload_timer = threading.Timer(0.3, self.force_reload)
+            self.reload_timer.start()
+
+    def force_reload(self):
+        try:
+            acc = UserConfig.selectedAccount
+            NotificationCenter.getInstance(acc).postNotificationName(
+                NotificationCenter.dialogsNeedReload, []
+            )
+        except Exception:
+            pass
+
+    def create_settings(self):
+        return [
+            Header(text="Интерфейс"),
+            Switch(
+                key="show_menu_item",
+                text="Пункт в меню чата",
+                subtext="«Скрыть / показать чат» в меню (после смены — перезапуск)",
+                default=True,
+                icon="outline_menu_24",
+            ),
+            Divider(),
+            Header(text="Приватность"),
+            Switch(
+                key="hidden_mode",
+                text="Скрывать из списка",
+                subtext="Убрать диалоги из ленты чатов",
+                default=True,
+                icon="outline_lock_24",
+                on_change=self.toggle_mode,
+            ),
+            Switch(
+                key="block_notifications",
+                text="Без уведомлений",
+                subtext="Не показывать уведомления от скрытых чатов",
+                default=True,
+                icon="outline_notifications_off_24",
+            ),
+            Switch(
+                key="fake_empty",
+                text="Пустой чат",
+                subtext="Блок сообщений, медиа и поиска внутри скрытого чата",
+                default=False,
+                icon="outline_ghost_24",
+            ),
+            Divider(),
+            Header(text="Управление"),
+            Input(
+                key="hide_links_field",
+                text="Ссылка на канал / чат",
+                default="",
+                subtext="https://t.me/username или @username — несколько через запятую или с новой строки. После ввода подтверди (ок) в настройках.",
+                icon="msg_link",
+                on_change=self._on_hide_links_field_change,
+            ),
+            Text(
+                text=f"Скрытые чаты ({len(self.hidden_ids)})",
+                icon="msg_folders",
+                create_sub_fragment=self.create_hidden_list_page,
+            ),
+            Text(
+                text="Команда в чате: /hide — скрыть или вернуть текущий диалог.",
+                icon="msg_info",
+            ),
+        ]
+
+    def create_hidden_list_page(self):
+        items = [Header(text=f"Скрытые чаты ({len(self.hidden_ids)})"), Divider()]
+        with self.state.lock:
+            ids = list(self.hidden_ids)
+        if ids:
+            for cid in ids:
+                name = self.get_chat_name(cid)
+                items.append(
+                    Switch(
+                        key=f"h_{cid}",
+                        text=name,
+                        subtext=f"ID: {cid}",
+                        default=True,
+                        on_change=lambda a, c=cid: self.toggle_from_list(a, c),
+                    )
+                )
+        else:
+            items.append(Text(text="Нет скрытых чатов"))
+        return items
+
+    def toggle_mode(self, active):
+        self.is_hidden_mode_active = active
+        self.debounced_reload()
+
+    def _on_hide_links_field_change(self, value):
+        text = (value or "").strip()
+        if not text:
+            return
+
+        def fire():
+            threading.Thread(target=self._apply_hide_links_text, args=(text,), daemon=True).start()
+
+        with self._hide_links_timer_lock:
+            if self._hide_links_timer:
+                try:
+                    self._hide_links_timer.cancel()
+                except Exception:
+                    pass
+            self._hide_links_timer = threading.Timer(0.7, fire)
+            self._hide_links_timer.start()
+
+    def _apply_hide_links_text(self, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+        acc = int(UserConfig.selectedAccount)
+        tokens = _split_link_tokens(text)
+        if not tokens:
+            return
+        ok = 0
+        errs = []
+        for tok in tokens:
+            did, err = _resolve_link_token(acc, tok)
+            if did is not None:
+                self.state.hide(did)
+                ok += 1
+                try:
+                    self.name_cache.pop(int(did), None)
+                except Exception:
+                    pass
+            else:
+                errs.append(f"{tok}: {err}")
+
+        def finish():
+            try:
+                self.set_setting("hide_links_field", "")
+            except Exception:
+                pass
+            if ok:
+                show_toast(f"Скрыто: {ok}")
+            if errs:
+                show_toast("Есть ссылки без результата — открой чат в TG и повтори")
+                for e in errs[:8]:
+                    log(e)
+            self.debounced_reload()
+            self.prefetch_names()
+
+        try:
+            from android_utils import run_on_ui_thread
+
+            run_on_ui_thread(finish)
+        except Exception:
+            finish()
+
+    def toggle_from_list(self, active, cid):
+        if active:
+            self.state.hide(cid)
+        else:
+            self.state.unhide(cid)
+        self.debounced_reload()
+
+    def handle_menu_click(self, context):
+        raw = context.get("dialog_id")
+        if raw is None:
+            return
+        cid = str(raw)
+        if self.state.is_hidden(cid):
+            self.state.unhide(cid)
+            show_toast("Чат снова в списке")
+        else:
+            self.state.hide(cid)
+            show_toast("Чат скрыт")
+        self.debounced_reload()
+
+    def on_send_message_hook(self, account, params):
+        if params.message and params.message.strip() == "/hide":
+            cid = str(params.peer)
+            if self.state.is_hidden(cid):
+                self.state.unhide(cid)
+                show_toast("Снова в списке")
+            else:
+                self.state.hide(cid)
+                show_toast("Скрыт")
+            self.debounced_reload()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
