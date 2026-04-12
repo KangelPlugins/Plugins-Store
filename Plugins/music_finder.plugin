@@ -2,13 +2,14 @@ __id__ = "music_dl"
 __name__ = "Music Downloader"
 __description__ = "Search & download music via SoundCloud"
 __author__ = "@s1mclick"
-__version__ = "1.2.0"
+__version__ = "3.1.0"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
 
 import os
 import re
 import struct
+import threading
 from typing import Any, List
 import requests
 from PIL import Image
@@ -16,7 +17,7 @@ import io
 
 from base_plugin import BasePlugin, HookResult, HookStrategy
 from client_utils import run_on_queue, send_audio, send_text
-from ui.settings import Header, Divider, Switch, Selector, Input, Text
+from ui.settings import Header, Input, Divider, Switch, Selector, Text, EditText
 
 # ─────────────────────────────────────────────────────────────────────────────
 SC_API     = "https://api-v2.soundcloud.com"
@@ -27,23 +28,21 @@ SC_HEADERS = {
     "Referer":    "https://soundcloud.com/"
 }
 
-_sc_client_id = None
+_sc_client_id  = None
+_search_sessions: dict = {}   # peer_id → session dict
 
-# Состояние пагинации — { peer_id: { query, page, total_pages, results_per_page } }
-_search_sessions: dict = {}
-
-# ─── SoundCloud helpers ───────────────────────────────────────────────────────
+# ─── SoundCloud ───────────────────────────────────────────────────────────────
 
 def get_sc_client_id():
     global _sc_client_id
     if _sc_client_id:
         return _sc_client_id
     try:
-        resp = requests.get("https://soundcloud.com", headers=SC_HEADERS, timeout=10)
-        js_urls = re.findall(r'"(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', resp.text)
-        for js_url in reversed(js_urls):
+        resp     = requests.get("https://soundcloud.com", headers=SC_HEADERS, timeout=10)
+        js_urls  = re.findall(r'"(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', resp.text)
+        for url in reversed(js_urls):
             try:
-                js    = requests.get(js_url, headers=SC_HEADERS, timeout=10)
+                js    = requests.get(url, headers=SC_HEADERS, timeout=10)
                 match = re.search(r'client_id\s*:\s*"([a-zA-Z0-9]{32})"', js.text)
                 if not match:
                     match = re.search(r'"client_id"\s*,\s*"([a-zA-Z0-9]{32})"', js.text)
@@ -57,17 +56,18 @@ def get_sc_client_id():
     return None
 
 
-def sc_search(query, limit=10):
+def sc_search(query, limit=20):
     client_id = get_sc_client_id()
     if not client_id:
         return [], "❌ Не удалось получить SoundCloud client_id"
     try:
         resp   = requests.get(
             f"{SC_API}/search/tracks",
-            params={"q": query, "limit": limit, "client_id": client_id, "app_version": "1735820463"},
+            params={"q": query, "limit": limit, "client_id": client_id,
+                    "app_version": "1735820463"},
             headers=SC_HEADERS, timeout=10
         )
-        tracks = resp.json().get("collection", [])
+        tracks  = resp.json().get("collection", [])
         results = []
         for t in tracks:
             dur_ms   = t.get("duration", 0)
@@ -78,7 +78,8 @@ def sc_search(query, limit=10):
                     "artist":      t.get("user", {}).get("username", ""),
                     "duration":    duration,
                     "id":          t.get("id"),
-                    "artwork_url": (t.get("artwork_url") or "").replace("large", "t500x500"),
+                    # маленькая обложка для скорости — 200px
+                    "artwork_url": (t.get("artwork_url") or "").replace("large", "t200x200"),
                     "genre":       t.get("genre", ""),
                     "year":        (t.get("created_at") or "")[:4],
                     "plays":       t.get("playback_count", 0),
@@ -94,10 +95,13 @@ def get_stream_url(track_id):
     if not client_id:
         return None, "нет client_id"
     try:
-        resp         = requests.get(f"{SC_API}/tracks/{track_id}", params={"client_id": client_id},
-                                    headers=SC_HEADERS, timeout=10)
+        resp         = requests.get(
+            f"{SC_API}/tracks/{track_id}",
+            params={"client_id": client_id},
+            headers=SC_HEADERS, timeout=10
+        )
         transcodings = resp.json().get("media", {}).get("transcodings", [])
-        mp3_url = None
+        mp3_url      = None
         for tc in transcodings:
             fmt = tc.get("format", {})
             if fmt.get("mime_type") == "audio/mpeg" and fmt.get("protocol") == "progressive":
@@ -110,9 +114,11 @@ def get_stream_url(track_id):
                     break
         if not mp3_url:
             return None, f"нет mp3 (форматов: {len(transcodings)})"
-        final_url = requests.get(mp3_url, params={"client_id": client_id},
-                                 headers=SC_HEADERS, timeout=10).json().get("url")
-        return (final_url, None) if final_url else (None, "нет url в ответе")
+        final = requests.get(
+            mp3_url, params={"client_id": client_id},
+            headers=SC_HEADERS, timeout=10
+        ).json().get("url")
+        return (final, None) if final else (None, "нет url в ответе")
     except Exception as e:
         return None, str(e)
 
@@ -133,90 +139,80 @@ def fetch_artwork(url):
     if not url:
         return None
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=8)
         resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90)
+        img  = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        buf  = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
     except Exception:
         return None
 
 
-# ─── ID3 writer (pure Python, no mutagen) ────────────────────────────────────
+# ─── ID3 (pure Python) ────────────────────────────────────────────────────────
 
-def _encode_syncsafe(n):
-    result = bytearray(4)
+def _syncsafe(n):
+    r = bytearray(4)
     for i in range(3, -1, -1):
-        result[i] = n & 0x7F
+        r[i] = n & 0x7F
         n >>= 7
-    return bytes(result)
+    return bytes(r)
 
-def _id3_frame(fid, data: bytes) -> bytes:
-    return fid.encode("ascii") + struct.pack(">I", len(data)) + b"\x00\x00" + data
+def _frame(fid, data):
+    return fid.encode() + struct.pack(">I", len(data)) + b"\x00\x00" + data
 
-def _text_frame(fid, text: str) -> bytes:
-    return _id3_frame(fid, b"\x03" + text.encode("utf-8"))
+def _tf(fid, text):
+    return _frame(fid, b"\x03" + text.encode("utf-8"))
 
-def _apic_frame(jpeg: bytes) -> bytes:
-    return _id3_frame("APIC", b"\x03image/jpeg\x00\x03\x00" + jpeg)
+def _apic(jpeg):
+    return _frame("APIC", b"\x03image/jpeg\x00\x03\x00" + jpeg)
 
-def write_id3(mp3_path, title, artist, genre, year, artwork_jpeg, performer_tag):
+def write_id3(path, title, artist, performer_tag, genre, year, artwork):
     try:
         frames  = b""
-        frames += _text_frame("TIT2", title)
-        frames += _text_frame("TPE1", performer_tag)   # исполнитель — там водяной знак
-        frames += _text_frame("TPE2", artist)
-        if genre:
-            frames += _text_frame("TCON", genre)
-        if year:
-            frames += _text_frame("TDRC", year)
-        frames += _text_frame("TENC", "music_dl by @s1mclick")
-        if artwork_jpeg:
-            frames += _apic_frame(artwork_jpeg)
+        frames += _tf("TIT2", title)
+        frames += _tf("TPE1", performer_tag)
+        frames += _tf("TPE2", artist)
+        if genre: frames += _tf("TCON", genre)
+        if year:  frames += _tf("TDRC", year)
+        frames += _tf("TENC", "music_dl")
+        if artwork: frames += _apic(artwork)
 
-        header   = b"ID3\x03\x00\x00" + _encode_syncsafe(len(frames))
-        with open(mp3_path, "rb") as f:
+        header = b"ID3\x03\x00\x00" + _syncsafe(len(frames))
+        with open(path, "rb") as f:
             mp3 = f.read()
         if mp3[:3] == b"ID3":
             old = ((mp3[6]&0x7F)<<21|(mp3[7]&0x7F)<<14|(mp3[8]&0x7F)<<7|(mp3[9]&0x7F))
             mp3 = mp3[10 + old:]
-        with open(mp3_path, "wb") as f:
+        with open(path, "wb") as f:
             f.write(header + frames + mp3)
-        return True
     except Exception:
-        return False
+        pass
 
 
-# ─── Search session helpers ───────────────────────────────────────────────────
+# ─── Search page builder ──────────────────────────────────────────────────────
 
-def _build_results_page(results: list, page: int, per_page: int, query: str,
-                         show_stats: bool, show_genre: bool) -> str:
-    total        = len(results)
-    total_pages  = max(1, (total + per_page - 1) // per_page)
-    page         = max(1, min(page, total_pages))
-    start        = (page - 1) * per_page
-    chunk        = results[start : start + per_page]
+def build_page(results, page, per_page, query, show_stats, show_genre):
+    total_pages = max(1, (len(results) + per_page - 1) // per_page)
+    page        = max(1, min(page, total_pages))
+    start       = (page - 1) * per_page
+    chunk       = results[start: start + per_page]
 
     lines = [f"🔎 «{query}»  •  стр. {page}/{total_pages}\n"]
     for i, t in enumerate(chunk, start + 1):
-        dur   = f" [{t['duration']}]" if t['duration'] else ""
+        dur   = f" [{t['duration']}]" if t["duration"] else ""
         extra = ""
         if show_stats:
-            plays = t.get("plays", 0)
-            likes = t.get("likes", 0)
-            if plays:
-                extra += f"  ▶ {plays:,}"
-            if likes:
-                extra += f"  ♥ {likes:,}"
+            if t.get("plays"): extra += f"  ▶{t['plays']:,}"
+            if t.get("likes"): extra += f"  ♥{t['likes']:,}"
         if show_genre and t.get("genre"):
             extra += f"  [{t['genre']}]"
         lines.append(f"{i}. {t['title']} — {t['artist']}{dur}{extra}")
 
     lines.append("")
-    lines.append(f"⬇️  dlF [1–{start + len(chunk)}]  •  скачать трек по номеру")
+    lines.append(f"⬇️  dlF [1–{start + len(chunk)}]  — скачать по номеру")
     if total_pages > 1:
-        lines.append(f"📄  .fc next / .fc prev  •  листать страницы")
+        lines.append("📄  .fc next / .fc prev  — листать")
     return "\n".join(lines)
 
 
@@ -227,88 +223,92 @@ class MusicPlugin(BasePlugin):
     def on_plugin_load(self):
         self.add_on_send_message_hook()
 
-    # ── Settings ──────────────────────────────────────────────────────────────
+    # ── settings ──────────────────────────────────────────────────────────────
 
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="🔎 Поиск"),
+            Header(text="Поиск"),
             Selector(
                 key="results_per_page",
                 text="Результатов на странице",
-                default=1,               # индекс → 5
+                default=1,
                 items=["3", "5", "7", "10"],
-                icon="msg_list",
-                subtext="Сколько треков показывать за раз при .find"
+                icon="msg_list"
             ),
             Selector(
                 key="search_limit",
-                text="Всего результатов (пагинация)",
-                default=1,               # индекс → 20
+                text="Всего результатов",
+                default=1,
                 items=["10", "20", "30", "50"],
-                icon="msg_search",
-                subtext="Сколько треков грузить из SoundCloud за один запрос"
+                icon="msg_search"
             ),
             Switch(
                 key="show_stats",
-                text="Показывать статистику трека",
+                text="Показывать статистику",
                 default=True,
-                icon="msg_stats",
-                subtext="Прослушивания и лайки рядом с каждым треком"
+                subtext="Прослушивания и лайки в списке",
+                icon="msg_stats"
             ),
             Switch(
                 key="show_genre",
                 text="Показывать жанр",
                 default=False,
-                icon="msg_topic",
-                subtext="Жанр трека в результатах поиска"
+                subtext="Жанр рядом с треком",
+                icon="msg_topic"
             ),
             Divider(),
-            Header(text="⬇️ Скачивание"),
+            Header(text="Скачивание"),
             Switch(
                 key="send_artwork",
-                text="Вшивать обложку в MP3",
+                text="Обложка в MP3",
                 default=True,
-                icon="msg_photos",
-                subtext="Обложка 500×500 из SoundCloud в ID3 теге"
+                subtext="Вшивать обложку в ID3 тег",
+                icon="msg_photos"
             ),
             Switch(
-                key="show_download_stats",
-                text="Показывать статистику при скачивании",
+                key="show_dl_stats",
+                text="Статистика при скачивании",
                 default=True,
-                icon="msg_info",
-                subtext="Прослушивания, лайки и жанр в сообщении"
+                subtext="Прослушивания и лайки в caption",
+                icon="msg_info"
             ),
             Divider(),
-            Header(text="💧 Водяной знак"),
+            Header(text="Водяной знак"),
             Input(
                 key="watermark_user",
                 text="Ваш username",
                 default="@s1mclick",
-                icon="msg_mention",
-                subtext="Появится в теге исполнителя: [Автор] | dled by @вы"
+                subtext="Появится в теге: [Автор] | dled by @вы",
+                icon="msg_mention"
             ),
-            Divider(text="music_dl v3.0 by @s1mclick"),
         ]
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _per_page(self) -> int:
-        idx = self.get_setting("results_per_page", 1)
-        return [3, 5, 7, 10][idx]
+    def _per_page(self):
+        return [3, 5, 7, 10][self.get_setting("results_per_page", 1)]
 
-    def _search_limit(self) -> int:
-        idx = self.get_setting("search_limit", 1)
-        return [10, 20, 30, 50][idx]
+    def _limit(self):
+        return [10, 20, 30, 50][self.get_setting("search_limit", 1)]
 
-    def _watermark_user(self) -> str:
+    def _wm(self):
         return self.get_setting("watermark_user", "@s1mclick")
 
-    def _performer_tag(self, artist: str) -> str:
-        return f"{artist} | dled by {self._watermark_user()}"
+    def _performer(self, artist):
+        return f"{artist} | dled by {self._wm()}"
 
-    def _do_download(self, peer_id, track: dict):
-        dur      = f" [{track['duration']}]" if track['duration'] else ""
+    def _do_download(self, peer_id, track):
+        dur = f" [{track['duration']}]" if track["duration"] else ""
         send_text(peer_id, f"⬇️ Скачиваю: {track['title']} — {track['artist']}{dur}")
+
+        # Запускаем загрузку обложки параллельно с получением stream url
+        artwork_result = [None]
+        def _fetch_art():
+            if self.get_setting("send_artwork", True):
+                artwork_result[0] = fetch_artwork(track.get("artwork_url", ""))
+
+        art_thread = threading.Thread(target=_fetch_art, daemon=True)
+        art_thread.start()
 
         stream_url, err = get_stream_url(track["id"])
         if not stream_url:
@@ -323,110 +323,97 @@ class MusicPlugin(BasePlugin):
             send_text(peer_id, "❌ Ошибка при скачивании файла")
             return
 
-        artwork = fetch_artwork(track.get("artwork_url", "")) \
-            if self.get_setting("send_artwork", True) else None
+        # Ждём обложку (она уже почти готова пока качался трек)
+        art_thread.join(timeout=10)
 
         write_id3(
-            mp3_path      = path,
-            title         = track["title"],
-            artist        = track["artist"],
-            genre         = track.get("genre", ""),
-            year          = track.get("year", ""),
-            artwork_jpeg  = artwork,
-            performer_tag = self._performer_tag(track["artist"])
+            path         = path,
+            title        = track["title"],
+            artist       = track["artist"],
+            performer_tag= self._performer(track["artist"]),
+            genre        = track.get("genre", ""),
+            year         = track.get("year", ""),
+            artwork      = artwork_result[0]
         )
 
         caption = f"🎧 {track['title']} — {track['artist']}{dur}"
-        if self.get_setting("show_download_stats", True):
-            plays = track.get("plays", 0)
-            likes = track.get("likes", 0)
-            genre = track.get("genre", "")
-            if plays:
-                caption += f"\n▶ {plays:,} прослушиваний"
-            if likes:
-                caption += f"  ♥ {likes:,} лайков"
-            if genre:
-                caption += f"\n🎵 {genre}"
-        caption += f"\n\ndled by {self._watermark_user()} via music_dl"
+        if self.get_setting("show_dl_stats", True):
+            if track.get("plays"): caption += f"\n▶ {track['plays']:,} прослушиваний"
+            if track.get("likes"): caption += f"  ♥ {track['likes']:,} лайков"
+            if track.get("genre"): caption += f"\n🎵 {track['genre']}"
+        caption += f"\n\ndled by {self._wm()} via music_dl"
 
         send_audio(peer_id, path, caption=caption)
 
-    # ── Hook ──────────────────────────────────────────────────────────────────
+    # ── hook ──────────────────────────────────────────────────────────────────
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         if not isinstance(params.message, str):
             return HookResult()
 
-        msg      = params.message.strip()
-        peer_id  = params.peer
+        msg     = params.message.strip()
+        peer_id = params.peer
 
-        # ── .find <query> ──────────────────────────────────────────────────
+        # .find
         if msg.startswith(".find"):
             query = msg[5:].strip()
             if not query:
                 params.message = "Использование: .find <название>"
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
-            per_page    = self._per_page()
-            limit       = self._search_limit()
-            show_stats  = self.get_setting("show_stats", True)
-            show_genre  = self.get_setting("show_genre", False)
+            per_page   = self._per_page()
+            limit      = self._limit()
+            show_stats = self.get_setting("show_stats", True)
+            show_genre = self.get_setting("show_genre", False)
 
             def search_task():
                 results, err = sc_search(query, limit=limit)
                 if not results:
                     send_text(peer_id, err or f"❌ Ничего не найдено: {query}")
                     return
-
                 _search_sessions[peer_id] = {
-                    "query":      query,
-                    "results":    results,
-                    "page":       1,
-                    "per_page":   per_page,
-                    "show_stats": show_stats,
-                    "show_genre": show_genre,
+                    "query": query, "results": results, "page": 1,
+                    "per_page": per_page, "show_stats": show_stats, "show_genre": show_genre
                 }
-                text = _build_results_page(results, 1, per_page, query, show_stats, show_genre)
-                send_text(peer_id, text)
+                send_text(peer_id, build_page(results, 1, per_page, query, show_stats, show_genre))
 
             run_on_queue(search_task)
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        # ── .fc next / .fc prev ────────────────────────────────────────────
+        # .fc next / .fc prev
         if msg.startswith(".fc"):
-            arg = msg[3:].strip().lower()
-            if arg not in ("next", "prev", "previous"):
-                params.message = "Использование: .fc next / .fc prev"
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-
+            arg     = msg[3:].strip().lower()
             session = _search_sessions.get(peer_id)
+
             if not session:
                 params.message = "❌ Нет активного поиска. Сначала используй .find"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            if arg not in ("next", "prev", "previous"):
+                params.message = "Использование: .fc next / .fc prev"
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
             results    = session["results"]
             per_page   = session["per_page"]
             total_pgs  = max(1, (len(results) + per_page - 1) // per_page)
-            direction  = 1 if arg == "next" else -1
-            new_page   = session["page"] + direction
+            new_page   = session["page"] + (1 if arg == "next" else -1)
 
-            if new_page < 1 or new_page > total_pgs:
-                params.message = "❌ Больше страниц нет" if arg == "next" else "❌ Это первая страница"
+            if new_page < 1:
+                params.message = "❌ Это первая страница"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            if new_page > total_pgs:
+                params.message = "❌ Больше страниц нет"
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
             session["page"] = new_page
-            text = _build_results_page(
-                results, new_page, per_page,
-                session["query"], session["show_stats"], session["show_genre"]
-            )
+            text = build_page(results, new_page, per_page,
+                              session["query"], session["show_stats"], session["show_genre"])
 
             def fc_task():
                 send_text(peer_id, text)
-
             run_on_queue(fc_task)
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        # ── dlF <number> ───────────────────────────────────────────────────
+        # dlF <number>
         if msg.lower().startswith("dlf"):
             arg = msg[3:].strip()
             if not arg.isdigit():
@@ -445,28 +432,26 @@ class MusicPlugin(BasePlugin):
 
             track = session["results"][idx]
 
-            def dl_task():
+            def dlf_task():
                 self._do_download(peer_id, track)
-
-            run_on_queue(dl_task)
+            run_on_queue(dlf_task)
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        # ── .download <query> ──────────────────────────────────────────────
+        # .download
         if msg.startswith(".download"):
             query = msg[9:].strip()
             if not query:
                 params.message = "Использование: .download <название>"
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
-            def quick_dl_task():
+            def quick_task():
                 send_text(peer_id, f"⏳ Ищу: {query}...")
                 results, err = sc_search(query, limit=1)
                 if not results:
                     send_text(peer_id, err or "❌ Ничего не найдено")
                     return
                 self._do_download(peer_id, results[0])
-
-            run_on_queue(quick_dl_task)
+            run_on_queue(quick_task)
             return HookResult(strategy=HookStrategy.CANCEL)
 
         return HookResult()
