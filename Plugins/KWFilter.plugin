@@ -1,9 +1,10 @@
 import re
 import json
 import time
+from collections import OrderedDict
 from typing import Any, List, Dict, Optional
 from android_utils import log, run_on_ui_thread
-from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
 from client_utils import get_last_fragment
 from ui.settings import Header, Switch, Text, Divider
@@ -14,7 +15,7 @@ __id__ = "KWFilter"
 __name__ = "Keyword Message Filter"
 __description__ = "Hiding messages by keywords"
 __author__ = "@NCRCPlugins"
-__version__ = "2.1.0"
+__version__ = "2.5"
 __icon__ = "NCRCPlugins/0"
 __min_version__ = "11.12.0"
 
@@ -45,46 +46,36 @@ class DebugLog:
 
 
 class LRUCache:
-    """Simple LRU cache for filter results."""
+    # O(1) LRU cache for filter results
 
     def __init__(self, max_size: int = 2000):
-        self._cache: Dict[int, bool] = {}
-        self._order: List[int] = []
+        self._cache: "OrderedDict[int, bool]" = OrderedDict()
         self._max_size = max_size
 
     def get(self, msg_id: int) -> Optional[bool]:
-        if msg_id is None:
+        if msg_id is None or msg_id not in self._cache:
             return None
-        return self._cache.get(msg_id)
+        self._cache.move_to_end(msg_id)
+        return self._cache[msg_id]
 
     def set(self, msg_id: int, value: bool):
         if msg_id is None:
             return
-
         if msg_id in self._cache:
-            # Move to end (recently used)
-            try:
-                self._order.remove(msg_id)
-            except ValueError:
-                pass
-            self._order.append(msg_id)
+            self._cache.move_to_end(msg_id)
             self._cache[msg_id] = value
             return
-
-        # Evict oldest if full
         while len(self._cache) >= self._max_size:
-            if self._order:
-                oldest = self._order.pop(0)
-                self._cache.pop(oldest, None)
-            else:
-                break
-
+            self._cache.popitem(last=False)
         self._cache[msg_id] = value
-        self._order.append(msg_id)
+
+    def remove(self, msg_id: int):
+        if msg_id is None:
+            return
+        self._cache.pop(msg_id, None)
 
     def clear(self):
         self._cache.clear()
-        self._order.clear()
 
     def size(self) -> int:
         return len(self._cache)
@@ -93,10 +84,9 @@ class LRUCache:
 class MessageCellHook(MethodHook):
     def __init__(self, plugin: 'KeywordFilterPlugin'):
         self.plugin = plugin
-        self._hidden_cells = set()  # Track cells we've hidden
 
+    # Called BEFORE setMessageObject executes. Decides + caches hide status.
     def before_hooked_method(self, param):
-        """Called BEFORE setMessageObject executes."""
         if not self.plugin.filter_enabled or not self.plugin.compiled_patterns:
             return
 
@@ -105,108 +95,89 @@ class MessageCellHook(MethodHook):
             if msg_obj is None:
                 return
 
+            dialog_id = self._get_dialog_id(msg_obj)
+            if not self.plugin.should_filter_in_chat(dialog_id):
+                return
+
             msg_id = self._get_msg_id(msg_obj)
             group_id = self._get_group_id(msg_obj)
 
-            # Skip own messages if configured
-            if not self.plugin.filter_own_messages:
-                if self._is_own_message(msg_obj):
-                    if msg_id is not None:
-                        self.plugin.cache.set(msg_id, False)
-                    return
-
-            # 1. Check if this message's group is already marked for hiding
-            if group_id is not None:
-                group_cached = self.plugin.group_cache.get(group_id)
-                if group_cached == True:
-                    # Whole group is marked - hide this message too
-                    if msg_id is not None:
-                        self.plugin.cache.set(msg_id, True)
-                    self._mark_as_filtered(param, msg_id)
-                    return
-
-            # 2. Check per-message cache
-            cached = self.plugin.cache.get(msg_id)
-            if cached is not None:
-                if cached:
-                    self._mark_as_filtered(param, msg_id)
+            # Group already marked — hide this member too (even own messages).
+            if group_id is not None and self.plugin.group_cache.get(group_id) is True:
+                if msg_id is not None:
+                    self.plugin.cache.set(msg_id, True)
                 return
 
-            # 3. Extract and check text
+            if not self.plugin.filter_own_messages and self._is_own_message(msg_obj):
+                if msg_id is not None:
+                    self.plugin.cache.set(msg_id, False)
+                return
+
+            if self.plugin.cache.get(msg_id) is not None:
+                return
+
             text = self._extract_text(msg_obj)
             should_hide = bool(text and self.plugin.matches_filter(text))
 
-            # 4. Cache result
-            if msg_id is not None:
-                self.plugin.cache.set(msg_id, should_hide)
-
             if should_hide:
-                self._mark_as_filtered(param, msg_id)
-                DebugLog.add(f"Filter: id={msg_id}, group={group_id}, text={text[:50]}...")
+                if msg_id is not None:
+                    self.plugin.cache.set(msg_id, True)
+                DebugLog.add(f"Filter: id={msg_id}, group={group_id}, text={str(text)[:50]}...")
 
-                # 5. Mark entire group for hiding + force re-layout
                 if group_id is not None:
                     self.plugin.group_cache.set(group_id, True)
                     DebugLog.add(f"Marked group {group_id} for hiding")
-                    # Force parent to re-layout so other photos in group get re-checked
+                    # Force parent re-layout so sibling media in the album re-bind.
                     try:
                         cell = param.thisObject
                         if cell:
                             parent = cell.getParent()
                             if parent:
-                                run_on_ui_thread(lambda: parent.requestLayout())
-                    except:
+                                run_on_ui_thread(parent.requestLayout)
+                    except Exception:
                         pass
-
             elif group_id is not None and not text:
-                # No text on this message but it belongs to a group.
-                # Don't cache as "don't hide" - group may be marked later
-                # when the message with caption is processed.
+                # No text yet but part of a group — don't cache a False that
+                # would block a later-processed caption from flipping the group.
+                pass
+            else:
                 if msg_id is not None:
-                    # Remove the False we just cached
-                    try:
-                        self.plugin.cache._cache.pop(msg_id, None)
-                        self.plugin.cache._order.remove(msg_id)
-                    except (ValueError, KeyError):
-                        pass
+                    self.plugin.cache.set(msg_id, False)
 
         except Exception as e:
             DebugLog.add(f"Hook err: {e}")
 
+    # Apply collapse/restore based on the cache for the cell's bound message.
     def after_hooked_method(self, param):
         try:
             cell = param.thisObject
             if cell is None:
                 return
 
-            cell_id = id(cell)
+            msg_id = None
+            try:
+                bound = cell.getMessageObject()
+                if bound is not None:
+                    msg_id = self._get_msg_id(bound)
+            except Exception:
+                pass
 
-            # Check if this cell should be hidden
-            if cell_id in self._hidden_cells:
+            should_hide = False
+            if msg_id is not None:
+                should_hide = self.plugin.cache.get(msg_id) is True
+
+            if should_hide:
                 self._collapse_cell(cell)
-                self._hidden_cells.discard(cell_id)
             else:
-                # Reset cell to visible state (for recycled cells)
                 self._restore_cell(cell)
-
         except Exception as e:
             DebugLog.add(f"After hook err: {e}")
 
-    def _mark_as_filtered(self, param, msg_id):
-        """Mark message for filtering."""
-        try:
-            cell = param.thisObject
-            if cell:
-                self._hidden_cells.add(id(cell))
-        except:
-            pass
-
+    # Collapse cell using v1.0 proven method.
     def _collapse_cell(self, cell):
-        """Collapse cell using v1.0 proven method."""
         def do_collapse():
             try:
-                # Get current height BEFORE hiding
-                current_height = 200  # Default fallback
+                current_height = 200
                 try:
                     h = cell.getMeasuredHeight()
                     if h > 0:
@@ -215,161 +186,147 @@ class MessageCellHook(MethodHook):
                         h = cell.getHeight()
                         if h > 0:
                             current_height = h
-                except:
+                except Exception:
                     pass
 
-                # Make invisible
                 try:
                     cell.setAlpha(0.0)
-                except:
+                except Exception:
                     pass
 
                 try:
                     cell.setVisibility(8)  # View.GONE
-                except:
+                except Exception:
                     pass
 
-                # Collapse LayoutParams with NEGATIVE margin (key from v1.0!)
                 try:
                     lp = cell.getLayoutParams()
                     if lp is not None:
                         lp.height = 0
                         try:
                             lp.bottomMargin = -current_height
-                        except:
+                        except Exception:
                             pass
                         try:
                             lp.topMargin = 0
-                        except:
+                        except Exception:
                             pass
                         cell.setLayoutParams(lp)
-                except:
+                except Exception:
                     pass
 
-                # Remove minimum height
                 try:
                     cell.setMinimumHeight(0)
-                except:
+                except Exception:
                     pass
 
-                # Remove padding
                 try:
                     cell.setPadding(0, 0, 0, 0)
-                except:
+                except Exception:
                     pass
 
-                # Move off-screen as fallback
                 try:
                     cell.setTranslationY(-10000)
-                except:
+                except Exception:
                     pass
 
-                # Force re-layout
                 try:
                     cell.requestLayout()
-                except:
+                except Exception:
                     pass
 
-                # Request parent to update
                 try:
                     parent = cell.getParent()
                     if parent is not None:
                         parent.requestLayout()
                         try:
                             parent.invalidateItemDecorations()
-                        except:
+                        except Exception:
                             pass
-                except:
+                except Exception:
                     pass
 
-            except:
-                pass  # Silently fail to prevent crashes
+            except Exception:
+                pass
 
         run_on_ui_thread(do_collapse)
 
+    # Restore cell to normal visible state.
     def _restore_cell(self, cell):
-        """Restore cell to normal visible state."""
         def do_restore():
             try:
-                # Check if cell was hidden by us
+                # Check any collapse signal — if any found, restore ALL properties
+                # to avoid partial state from interrupted collapse.
                 needs_restore = False
-
                 try:
-                    if cell.getTranslationY() < -1000:
-                        needs_restore = True
-                except:
+                    needs_restore = (
+                        cell.getTranslationY() < -1000
+                        or cell.getAlpha() < 0.1
+                        or cell.getVisibility() != 0
+                    )
+                except Exception:
                     pass
 
-                try:
-                    if cell.getAlpha() < 0.1:
-                        needs_restore = True
-                except:
-                    pass
-
-                try:
-                    lp = cell.getLayoutParams()
-                    if lp is not None and lp.height == 0:
-                        needs_restore = True
-                except:
-                    pass
+                if not needs_restore:
+                    try:
+                        lp = cell.getLayoutParams()
+                        if lp is not None and lp.height == 0:
+                            needs_restore = True
+                    except Exception:
+                        pass
 
                 if not needs_restore:
                     return
 
-                # Restore visibility
                 try:
                     cell.setVisibility(0)  # View.VISIBLE
-                except:
+                except Exception:
                     pass
-
                 try:
                     cell.setAlpha(1.0)
-                except:
+                except Exception:
                     pass
-
                 try:
                     cell.setTranslationY(0)
-                except:
+                except Exception:
                     pass
-
-                # Restore LayoutParams
                 try:
                     lp = cell.getLayoutParams()
                     if lp is not None:
                         lp.height = -2  # WRAP_CONTENT
                         lp.width = -1   # MATCH_PARENT
-                        try:
-                            lp.topMargin = 0
-                            lp.bottomMargin = 0
-                        except:
-                            pass
+                        lp.topMargin = 0
+                        lp.bottomMargin = 0
                         cell.setLayoutParams(lp)
-                except:
+                except Exception:
                     pass
-
+                try:
+                    cell.setMinimumHeight(-1)
+                except Exception:
+                    pass
                 try:
                     cell.requestLayout()
-                except:
+                except Exception:
                     pass
 
-            except:
-                pass  # Silently fail
+            except Exception:
+                pass
 
         run_on_ui_thread(do_restore)
 
+    # Extract message ID.
     def _get_msg_id(self, msg_obj) -> Optional[int]:
-        """Extract message ID."""
         try:
             if hasattr(msg_obj, 'getId'):
                 return msg_obj.getId()
             if hasattr(msg_obj, 'messageOwner') and msg_obj.messageOwner:
                 return msg_obj.messageOwner.id
-        except:
+        except Exception:
             pass
         return None
 
+    # Extract media group ID (for albums).
     def _get_group_id(self, msg_obj) -> Optional[int]:
-        """Extract media group ID (for albums)."""
         try:
             if hasattr(msg_obj, 'messageOwner') and msg_obj.messageOwner:
                 owner = msg_obj.messageOwner
@@ -377,45 +334,60 @@ class MessageCellHook(MethodHook):
                     gid = owner.grouped_id
                     if gid and gid != 0:
                         return gid
-        except:
+        except Exception:
             pass
         try:
             if hasattr(msg_obj, 'getGroupId'):
                 gid = msg_obj.getGroupId()
                 if gid and gid != 0:
                     return gid
-        except:
+        except Exception:
             pass
         return None
 
+    # Check if message is from current user.
     def _is_own_message(self, msg_obj) -> bool:
-        """Check if message is from current user."""
         try:
             if hasattr(msg_obj, 'isOutOwner'):
                 return msg_obj.isOutOwner()
             if hasattr(msg_obj, 'messageOwner') and msg_obj.messageOwner:
                 return getattr(msg_obj.messageOwner, 'out', False)
-        except:
+        except Exception:
             pass
         return False
 
+    # Extract dialog/chat ID from message. Always returns Python int.
+    def _get_dialog_id(self, msg_obj) -> Optional[int]:
+        try:
+            if hasattr(msg_obj, 'getDialogId'):
+                did = msg_obj.getDialogId()
+                if did and did != 0:
+                    return int(did)
+        except Exception:
+            pass
+        try:
+            if hasattr(msg_obj, 'messageOwner') and msg_obj.messageOwner:
+                owner = msg_obj.messageOwner
+                if hasattr(owner, 'dialog_id') and owner.dialog_id:
+                    return int(owner.dialog_id)
+        except Exception:
+            pass
+        return None
+
+    # Extract all searchable text from message.
     def _extract_text(self, msg_obj) -> str:
-        """Extract all searchable text from message."""
         parts = []
 
         try:
             owner = getattr(msg_obj, 'messageOwner', None)
             if owner:
-                # Main message text
                 if hasattr(owner, 'message') and owner.message:
                     parts.append(str(owner.message))
 
-                # Media caption
                 media = getattr(owner, 'media', None)
                 if media:
                     if hasattr(media, 'caption') and media.caption:
                         parts.append(str(media.caption))
-                    # Document filename
                     doc = getattr(media, 'document', None)
                     if doc:
                         attrs = getattr(doc, 'attributes', None)
@@ -424,32 +396,29 @@ class MessageCellHook(MethodHook):
                                 if hasattr(attr, 'file_name') and attr.file_name:
                                     parts.append(str(attr.file_name))
 
-                # Forwarded from name
                 fwd = getattr(owner, 'fwd_from', None)
                 if fwd and hasattr(fwd, 'from_name') and fwd.from_name:
                     parts.append(str(fwd.from_name))
-        except:
+        except Exception:
             pass
 
-        # MessageObject.messageText (formatted)
         try:
             if hasattr(msg_obj, 'messageText') and msg_obj.messageText:
                 parts.append(str(msg_obj.messageText))
-        except:
+        except Exception:
             pass
 
-        # Caption field
         try:
             if hasattr(msg_obj, 'caption') and msg_obj.caption:
                 parts.append(str(msg_obj.caption))
-        except:
+        except Exception:
             pass
 
         return " ".join(parts)
 
 
 class KeywordFilterPlugin(BasePlugin):
-    """Main plugin class with data-level filtering."""
+    # Main plugin class with data-level filtering.
 
     def __init__(self):
         super().__init__()
@@ -459,16 +428,21 @@ class KeywordFilterPlugin(BasePlugin):
         self.filter_own_messages: bool = False
         self.case_insensitive: bool = True
         self.use_regex: bool = False
+        self.channel_filter_enabled: bool = False
+        self.channel_list_inverted: bool = False  # False = filter in listed, True = filter everywhere except listed
+        self.channel_list: List[Dict] = []  # [{"id": int, "title": str}, ...]
+        self._channel_id_set: set = set()  # cached set of channel IDs for fast lookup
         self._hooks_applied: bool = False
         self.cache = LRUCache(max_size=2000)
         self.group_cache = LRUCache(max_size=500)  # grouped_id -> should_hide
 
     def on_plugin_load(self):
-        DebugLog.add("Loading v2.2 (stable)...")
+        DebugLog.add("Loading v2.5...")
         self._load_settings()
         self._load_keywords()
+        self._load_channel_list()
         self._apply_hooks()
-        DebugLog.add(f"Loaded: {len(self.keywords)} keywords, cache size={self.cache.size()}")
+        DebugLog.add(f"Loaded: {len(self.keywords)} keywords, {len(self.compiled_patterns)} patterns, cache size={self.cache.size()}")
 
     def on_plugin_unload(self):
         self.cache.clear()
@@ -480,14 +454,18 @@ class KeywordFilterPlugin(BasePlugin):
         self.filter_own_messages = self.get_setting("filter_own_messages", False)
         self.case_insensitive = self.get_setting("case_insensitive", True)
         self.use_regex = self.get_setting("use_regex", False)
+        self.channel_filter_enabled = self.get_setting("channel_filter_enabled", False)
+        self.channel_list_inverted = self.get_setting("channel_list_inverted", False)
 
     def _load_keywords(self):
         try:
             kw_json = self.get_setting("keywords_list", "[]")
-            self.keywords = json.loads(kw_json)
-            if not isinstance(self.keywords, list):
+            loaded = json.loads(kw_json)
+            if isinstance(loaded, list):
+                self.keywords = [k for k in loaded if isinstance(k, str)]
+            else:
                 self.keywords = []
-        except:
+        except (ValueError, TypeError):
             self.keywords = []
         self._compile_patterns()
 
@@ -497,8 +475,8 @@ class KeywordFilterPlugin(BasePlugin):
         except Exception as e:
             DebugLog.add(f"Save err: {e}")
 
+    # Compile keyword patterns to regex.
     def _compile_patterns(self):
-        """Compile keyword patterns to regex."""
         self.compiled_patterns = []
         if not self.keywords:
             self.cache.clear()
@@ -509,12 +487,12 @@ class KeywordFilterPlugin(BasePlugin):
         errors = 0
 
         for kw in self.keywords:
-            if not kw:
+            if not isinstance(kw, str) or not kw:
                 continue
             try:
                 pattern = kw if self.use_regex else re.escape(kw)
                 self.compiled_patterns.append(re.compile(pattern, flags))
-            except re.error as e:
+            except (re.error, TypeError) as e:
                 DebugLog.add(f"Regex err for '{kw}': {e}")
                 errors += 1
 
@@ -523,8 +501,8 @@ class KeywordFilterPlugin(BasePlugin):
         DebugLog.add(f"Compiled {len(self.compiled_patterns)} patterns")
         return errors
 
+    # Check if text matches any filter pattern.
     def matches_filter(self, text: str) -> bool:
-        """Check if text matches any filter pattern."""
         if not text:
             return False
         for pattern in self.compiled_patterns:
@@ -532,73 +510,68 @@ class KeywordFilterPlugin(BasePlugin):
                 return True
         return False
 
-    def should_filter(self, msg_obj) -> bool:
-        """Check if message should be filtered."""
-        if not self.filter_enabled or not self.compiled_patterns:
-            return False
+    # === Channel List Management ===
+
+    def _load_channel_list(self):
+        try:
+            cl_json = self.get_setting("channel_list", "[]")
+            raw = json.loads(cl_json)
+            if not isinstance(raw, list):
+                raw = []
+            normalized = []
+            for ch in raw:
+                try:
+                    if isinstance(ch, dict) and "id" in ch:
+                        normalized.append({
+                            "id": int(ch["id"]),
+                            "title": str(ch.get("title", "Unknown")),
+                        })
+                except Exception:
+                    continue
+            self.channel_list = normalized
+        except (ValueError, TypeError):
+            self.channel_list = []
+        self._rebuild_channel_id_set()
+        DebugLog.add(f"Channel list loaded: {len(self.channel_list)} channels")
+
+    def _save_channel_list(self):
+        try:
+            self.set_setting("channel_list", json.dumps(self.channel_list, ensure_ascii=False))
+        except Exception as e:
+            DebugLog.add(f"Save channel list err: {e}")
+        self._rebuild_channel_id_set()
+
+    def _rebuild_channel_id_set(self):
+        ids = set()
+        for ch in self.channel_list:
+            try:
+                ids.add(int(ch["id"]))
+            except (ValueError, TypeError):
+                pass
+        self._channel_id_set = ids
+
+    # Check if filtering should apply in this chat based on channel list.
+    def should_filter_in_chat(self, dialog_id) -> bool:
+        if not self.channel_filter_enabled or not self.channel_list:
+            return True  # No channel filter active — filter everywhere
+
+        if dialog_id is None:
+            return True  # Can't check — fall back to filtering
 
         try:
-            # Get message ID
-            msg_id = None
-            if hasattr(msg_obj, 'getId'):
-                msg_id = msg_obj.getId()
-            elif hasattr(msg_obj, 'messageOwner') and msg_obj.messageOwner:
-                msg_id = msg_obj.messageOwner.id
+            did = int(dialog_id)
+        except (ValueError, TypeError):
+            return True
 
-            # Check cache
-            cached = self.cache.get(msg_id)
-            if cached is not None:
-                return cached
+        in_list = did in self._channel_id_set
 
-            # Skip own messages if configured
-            if not self.filter_own_messages:
-                is_out = False
-                if hasattr(msg_obj, 'isOutOwner'):
-                    is_out = msg_obj.isOutOwner()
-                elif hasattr(msg_obj, 'messageOwner') and msg_obj.messageOwner:
-                    is_out = getattr(msg_obj.messageOwner, 'out', False)
-                if is_out:
-                    if msg_id is not None:
-                        self.cache.set(msg_id, False)
-                    return False
+        if self.channel_list_inverted:
+            return not in_list  # Filter everywhere except listed chats
+        else:
+            return in_list  # Only filter in listed chats
 
-            # Extract text and check
-            text = self._extract_text_from_msg(msg_obj)
-            result = bool(text and self.matches_filter(text))
-
-            if msg_id is not None:
-                self.cache.set(msg_id, result)
-
-            return result
-        except:
-            return False
-
-    def _extract_text_from_msg(self, msg_obj) -> str:
-        """Extract text from message object."""
-        parts = []
-
-        try:
-            owner = getattr(msg_obj, 'messageOwner', None)
-            if owner:
-                if hasattr(owner, 'message') and owner.message:
-                    parts.append(str(owner.message))
-
-                media = getattr(owner, 'media', None)
-                if media and hasattr(media, 'caption') and media.caption:
-                    parts.append(str(media.caption))
-        except:
-            pass
-
-        try:
-            if hasattr(msg_obj, 'messageText') and msg_obj.messageText:
-                parts.append(str(msg_obj.messageText))
-        except:
-            pass
-
-        return " ".join(parts)
-
+    # Apply method hooks for filtering.
     def _apply_hooks(self):
-        """Apply method hooks for filtering."""
         DebugLog.add("Applying hooks...")
 
         # Hook ChatMessageCell.setMessageObject (proven method from v1.0)
@@ -625,6 +598,9 @@ class KeywordFilterPlugin(BasePlugin):
         keyword = keyword.strip()
         if not keyword or keyword in self.keywords:
             return False
+        if len(keyword) > 500:
+            DebugLog.add(f"Keyword too long ({len(keyword)} chars), truncated")
+            keyword = keyword[:500]
         self.keywords.append(keyword)
         self._save_keywords()
         self._compile_patterns()
@@ -643,6 +619,7 @@ class KeywordFilterPlugin(BasePlugin):
     def refresh_filters(self):
         self._load_settings()
         self._load_keywords()
+        self._load_channel_list()
         DebugLog.add("Refreshed")
 
     # === UI Dialogs ===
@@ -668,7 +645,7 @@ class KeywordFilterPlugin(BasePlugin):
             builder.set_view(input_field)
             builder.set_positive_button("Add", lambda d, w: self._on_add(input_field))
             builder.set_negative_button("Cancel", None)
-            run_on_ui_thread(lambda: builder.show())
+            run_on_ui_thread(builder.show)
         except Exception as e:
             DebugLog.add(f"Dialog err: {e}")
 
@@ -679,7 +656,7 @@ class KeywordFilterPlugin(BasePlugin):
                 BulletinHelper.show_success(f"Added: {text}")
             else:
                 BulletinHelper.show_error("Already exists or empty")
-        except:
+        except Exception:
             pass
 
     def _show_keywords_list(self):
@@ -700,7 +677,7 @@ class KeywordFilterPlugin(BasePlugin):
             builder.set_title(f"Keywords ({len(items)})")
             builder.set_items(items, lambda d, w: self._confirm_delete(items[w]))
             builder.set_negative_button("Close", None)
-            run_on_ui_thread(lambda: builder.show())
+            run_on_ui_thread(builder.show)
         except Exception as e:
             DebugLog.add(f"List err: {e}")
 
@@ -720,8 +697,8 @@ class KeywordFilterPlugin(BasePlugin):
             builder.set_message(f"Delete '{keyword}'?")
             builder.set_positive_button("Delete", lambda d, w: self._do_delete(keyword))
             builder.set_negative_button("Cancel", None)
-            run_on_ui_thread(lambda: builder.show())
-        except:
+            run_on_ui_thread(builder.show)
+        except Exception:
             self.remove_keyword(keyword)
 
     def _do_delete(self, keyword: str):
@@ -729,7 +706,9 @@ class KeywordFilterPlugin(BasePlugin):
             BulletinHelper.show_success(f"Deleted: {keyword}")
 
     def _refresh_and_notify(self):
-        self.refresh_filters()
+        self._load_settings()
+        self._load_keywords()
+        self._load_channel_list()
         errors = self._compile_patterns()
         if errors > 0:
             BulletinHelper.show_error(f"Refreshed with {errors} errors")
@@ -741,12 +720,19 @@ class KeywordFilterPlugin(BasePlugin):
         if len(self.keywords) > 10:
             kw_list += f"\n  ... +{len(self.keywords) - 10} more"
 
+        ch_mode = "Inverted" if self.channel_list_inverted else "Normal"
+        ch_names = ", ".join(ch["title"] for ch in self.channel_list[:5])
+        if len(self.channel_list) > 5:
+            ch_names += f" +{len(self.channel_list) - 5} more"
+
         status = f"""Status:
   Filter: {'ON' if self.filter_enabled else 'OFF'}
   Keywords: {len(self.keywords)}
   Patterns: {len(self.compiled_patterns)}
   Cache: {self.cache.size()} msg, {self.group_cache.size()} groups
   Hooks: {'Active' if self._hooks_applied else 'Failed'}
+  Channel filter: {'ON' if self.channel_filter_enabled else 'OFF'} ({ch_mode})
+  Channels: {len(self.channel_list)}{(' — ' + ch_names) if ch_names else ''}
 
 Keywords:
 {kw_list if kw_list else '  (none)'}"""
@@ -766,12 +752,13 @@ Keywords:
                 if activity:
                     builder = AlertDialogBuilder(activity)
                     builder.set_title("Debug Logs")
-                    display_logs = logs[-5000:] if len(logs) > 5000 else logs
+                    lines = logs.splitlines()
+                    display_logs = "\n".join(lines[-200:]) if len(lines) > 200 else logs
                     builder.set_message(display_logs)
                     builder.set_positive_button("Copy", lambda d, w: self._copy_to_clipboard(logs))
                     builder.set_negative_button("Close", None)
                     builder.set_neutral_button("Clear", lambda d, w: self._clear_logs())
-                    run_on_ui_thread(lambda: builder.show())
+                    run_on_ui_thread(builder.show)
         except Exception as e:
             DebugLog.add(f"Export err: {e}")
 
@@ -797,7 +784,7 @@ Keywords:
     def _clear_cache_notify(self):
         self.cache.clear()
         self.group_cache.clear()
-        BulletinHelper.show_success(f"Cache cleared")
+        BulletinHelper.show_success("Cache cleared")
 
     def _confirm_clear_all(self):
         try:
@@ -815,8 +802,8 @@ Keywords:
             builder.set_message(f"Delete all {len(self.keywords)} keywords?")
             builder.set_positive_button("Clear All", lambda d, w: self._clear_all())
             builder.set_negative_button("Cancel", None)
-            run_on_ui_thread(lambda: builder.show())
-        except:
+            run_on_ui_thread(builder.show)
+        except Exception:
             self._clear_all()
 
     def _clear_all(self):
@@ -824,6 +811,247 @@ Keywords:
         self._save_keywords()
         self._compile_patterns()
         BulletinHelper.show_success("All keywords cleared")
+
+    # === Channel List UI ===
+
+    # Show dialog with all user's chats to pick from.
+    def _show_chat_picker(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                return
+
+            from client_utils import get_messages_controller
+            mc = get_messages_controller()
+            dialogs = mc.getAllDialogs()
+
+            if not dialogs or dialogs.size() == 0:
+                BulletinHelper.show_info("No chats found")
+                return
+
+            existing_ids = set(self._channel_id_set)
+            max_items = 100
+            count = min(dialogs.size(), max_items)
+
+            chat_names = []
+            chat_data = []
+            for i in range(count):
+                try:
+                    dialog = dialogs.get(i)
+                    did = int(dialog.id)
+                    title = self._resolve_dialog_title(mc, did)
+                    kind = self._dialog_type_icon(mc, did)
+                    mark = "✓ " if did in existing_ids else "    "
+                    chat_names.append(f"{mark}{kind} {title}")
+                    chat_data.append({"id": did, "title": title})
+                except Exception as e:
+                    DebugLog.add(f"Dialog {i} skipped: {e}")
+                    continue
+
+            if not chat_names:
+                BulletinHelper.show_info("No dialogs resolved")
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(f"Select chat ({len(chat_names)})")
+            builder.set_items(chat_names, lambda d, idx: self._add_from_picker(chat_data[idx]))
+            builder.set_negative_button("Close", None)
+            run_on_ui_thread(builder.show)
+        except Exception as e:
+            DebugLog.add(f"Chat picker err: {e}")
+            BulletinHelper.show_error(f"Picker error: {e}")
+
+    # Convert dialog_id to chat_id for MessagesController.getChat.
+    # User: did >= 0 → None. Group: -1e12 < did < 0 → -did. Super/channel: did <= -1e12 → -(did + 1e12)
+    @staticmethod
+    def _chat_id_from_dialog_id(did):
+        if did is None or did >= 0:
+            return None
+        if did > -1_000_000_000_000:
+            return -did
+        return -(did + 1_000_000_000_000)
+
+    # Return short tag for dialog type.
+    def _dialog_type_icon(self, mc, dialog_id):
+        try:
+            chat_id = self._chat_id_from_dialog_id(dialog_id)
+            if chat_id is not None:
+                chat = mc.getChat(int(chat_id))
+                if chat:
+                    if getattr(chat, 'broadcast', False):
+                        return "[CH]"
+                    if getattr(chat, 'megagroup', False):
+                        return "[SG]"
+                    return "[GR]"
+                return "[??]"
+            user = mc.getUser(int(dialog_id))
+            if user and getattr(user, 'bot', False):
+                return "[BOT]"
+            return "[U]"
+        except Exception:
+            return "[?]"
+
+    # Get chat/user title by dialog ID.
+    def _resolve_dialog_title(self, mc, dialog_id):
+        title = "Unknown"
+        try:
+            chat_id = self._chat_id_from_dialog_id(dialog_id)
+            if chat_id is not None:
+                chat = mc.getChat(int(chat_id))
+                if chat and hasattr(chat, 'title') and chat.title:
+                    title = str(chat.title)
+            else:
+                user = mc.getUser(int(dialog_id))
+                if user:
+                    parts = []
+                    if hasattr(user, 'first_name') and user.first_name:
+                        parts.append(str(user.first_name))
+                    if hasattr(user, 'last_name') and user.last_name:
+                        parts.append(str(user.last_name))
+                    if parts:
+                        title = " ".join(parts)
+        except Exception:
+            pass
+        return title
+
+    # Add a chat from the picker dialog.
+    def _add_from_picker(self, chat):
+        try:
+            did = int(chat["id"])
+            title = str(chat["title"])
+        except Exception as e:
+            DebugLog.add(f"Add picker err: {e}")
+            return
+
+        for ch in self.channel_list:
+            if int(ch["id"]) == did:
+                BulletinHelper.show_info(f"'{title}' already in list")
+                return
+
+        self.channel_list.append({"id": did, "title": title})
+        self._save_channel_list()
+        self.cache.clear()
+        self.group_cache.clear()
+        BulletinHelper.show_success(f"Added: {title}")
+        DebugLog.add(f"Channel added: {title} (ID: {did})")
+
+    # Show dialog with all channels in the list.
+    def _show_channel_list_dialog(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                return
+
+            if not self.channel_list:
+                BulletinHelper.show_info("Channel list is empty")
+                return
+
+            items = [ch["title"] for ch in self.channel_list]
+            mode_name = "Inverted" if self.channel_list_inverted else "Channel list"
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(f"{mode_name} ({len(items)})")
+            builder.set_items(items, lambda d, w: self._confirm_remove_channel(w))
+            builder.set_negative_button("Close", None)
+            run_on_ui_thread(builder.show)
+        except Exception as e:
+            DebugLog.add(f"Channel list dialog err: {e}")
+
+    # Confirm removal of a channel from the list.
+    def _confirm_remove_channel(self, index: int):
+        try:
+            if index < 0 or index >= len(self.channel_list):
+                return
+            ch = self.channel_list[index]
+
+            fragment = get_last_fragment()
+            if not fragment:
+                self._do_remove_channel(index)
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                self._do_remove_channel(index)
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Remove Channel")
+            builder.set_message(f"Remove '{ch['title']}' from the list?")
+            builder.set_positive_button("Remove", lambda d, w: self._do_remove_channel(index))
+            builder.set_negative_button("Cancel", None)
+            run_on_ui_thread(builder.show)
+        except Exception:
+            self._do_remove_channel(index)
+
+    # Remove a channel from the list by index.
+    def _do_remove_channel(self, index: int):
+        try:
+            if index < 0 or index >= len(self.channel_list):
+                return
+            ch = self.channel_list.pop(index)
+            self._save_channel_list()
+            self.cache.clear()
+            self.group_cache.clear()
+            BulletinHelper.show_success(f"Removed: {ch['title']}")
+            DebugLog.add(f"Channel removed: {ch['title']} (ID: {ch['id']})")
+        except Exception as e:
+            DebugLog.add(f"Remove channel err: {e}")
+
+    # Clear the entire channel list.
+    def _clear_channel_list(self):
+        self.channel_list = []
+        self._save_channel_list()
+        self.cache.clear()
+        self.group_cache.clear()
+        BulletinHelper.show_success("Channel list cleared")
+
+    # Confirm clearing the entire channel list.
+    def _confirm_clear_channels(self):
+        try:
+            if not self.channel_list:
+                BulletinHelper.show_info("Channel list is already empty")
+                return
+
+            fragment = get_last_fragment()
+            if not fragment:
+                self._clear_channel_list()
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                self._clear_channel_list()
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Clear Channel List")
+            builder.set_message(f"Remove all {len(self.channel_list)} channels from the list?")
+            builder.set_positive_button("Clear All", lambda d, w: self._clear_channel_list())
+            builder.set_negative_button("Cancel", None)
+            run_on_ui_thread(builder.show)
+        except Exception:
+            self._clear_channel_list()
+
+    def _on_channel_filter_toggle(self, value):
+        self.channel_filter_enabled = value
+        self.cache.clear()
+        self.group_cache.clear()
+        if value:
+            inv = "inverted" if self.channel_list_inverted else "normal"
+            DebugLog.add(f"Channel filter enabled ({inv})")
+        else:
+            DebugLog.add("Channel filter disabled")
+
+    def _on_invert_toggle(self, value):
+        self.channel_list_inverted = value
+        self.cache.clear()
+        self.group_cache.clear()
+        if value:
+            DebugLog.add("Channel list inverted — filter everywhere EXCEPT listed")
+        else:
+            DebugLog.add("Channel list normal — filter ONLY in listed")
 
     def _alert(self, title: str, message: str):
         try:
@@ -835,8 +1063,8 @@ Keywords:
                     builder.set_title(title)
                     builder.set_message(message)
                     builder.set_positive_button("OK", None)
-                    run_on_ui_thread(lambda: builder.show())
-        except:
+                    run_on_ui_thread(builder.show)
+        except Exception:
             pass
 
     def _update_option(self, key: str, value: bool):
@@ -848,7 +1076,7 @@ Keywords:
 
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="Message Filter v2.1"),
+            Header(text="Keyword Message Filter v2.5"),
 
             Switch(
                 key="filter_enabled",
@@ -856,7 +1084,7 @@ Keywords:
                 default=True,
                 subtext="Hide messages containing keywords",
                 icon="msg_block2",
-                on_change=lambda v: setattr(self, 'filter_enabled', v)
+                on_change=lambda v: (setattr(self, 'filter_enabled', v), self.cache.clear(), self.group_cache.clear())
             ),
 
             Divider(),
@@ -881,6 +1109,53 @@ Keywords:
                 on_click=lambda v: self._refresh_and_notify()
             ),
 
+            Text(
+                text="Clear all keywords",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda v: self._confirm_clear_all()
+            ),
+
+            Divider(),
+            Header(text="Channel Filter"),
+
+            Switch(
+                key="channel_filter_enabled",
+                text="Enable channel filter",
+                default=False,
+                subtext="Apply keyword filter only in selected chats",
+                icon="msg_groups",
+                on_change=lambda v: self._on_channel_filter_toggle(v)
+            ),
+
+            Switch(
+                key="channel_list_inverted",
+                text="Invert channel list",
+                default=False,
+                subtext="OFF: filter only in listed chats\nON: filter everywhere except listed",
+                icon="msg_retry",
+                on_change=lambda v: self._on_invert_toggle(v)
+            ),
+
+            Text(
+                text="Select chats",
+                icon="msg_addbot",
+                on_click=lambda v: self._show_chat_picker()
+            ),
+
+            Text(
+                text="View/Remove channels",
+                icon="msg_list",
+                on_click=lambda v: self._show_channel_list_dialog()
+            ),
+
+            Text(
+                text="Clear channel list",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda v: self._confirm_clear_channels()
+            ),
+
             Divider(text="Options"),
 
             Switch(
@@ -888,8 +1163,8 @@ Keywords:
                 text="Filter own messages",
                 default=False,
                 subtext="Also hide your own messages",
-                icon="msg_openprofile",
-                on_change=lambda v: setattr(self, 'filter_own_messages', v)
+                icon="msg_contacts",
+                on_change=lambda v: (setattr(self, 'filter_own_messages', v), self.cache.clear(), self.group_cache.clear())
             ),
 
             Switch(
@@ -897,7 +1172,7 @@ Keywords:
                 text="Ignore case",
                 default=True,
                 subtext="Case insensitive matching",
-                icon="msg_edit",
+                icon="msg_language",
                 on_change=lambda v: self._update_option("case_insensitive", v)
             ),
 
@@ -906,7 +1181,7 @@ Keywords:
                 text="Enable regex",
                 default=False,
                 subtext="Use regular expressions",
-                icon="msg_link",
+                icon="msg_language",
                 on_change=lambda v: self._update_option("use_regex", v)
             ),
 
@@ -926,18 +1201,11 @@ Keywords:
 
             Text(
                 text="Clear cache",
-                icon="msg_clear",
+                icon="msg_delete",
                 on_click=lambda v: self._clear_cache_notify()
             ),
 
-            Divider(),
-
-            Text(
-                text="Clear all keywords",
-                icon="msg_delete",
-                red=True,
-                on_click=lambda v: self._confirm_clear_all()
-            ),
-
-            Divider(text=f"v{__version__} - Kinda cringe comeback")
+            Divider(text="v2.5 - Channel filter and stuff, you know...")
         ]
+
+
