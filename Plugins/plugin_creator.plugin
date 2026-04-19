@@ -30,31 +30,50 @@ Hi! If you want to borrow something from my plugin, please tag me @mr_Vestr.
 
 """
 
-from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy
-from ui.settings import Divider, Header, Input, Switch, Text
-from ui.alert import AlertDialogBuilder
-from android_utils import run_on_ui_thread
-import urllib.parse
-import locale
-import os
-import re
-from markdown_utils import parse_markdown
-from org.telegram.ui import DialogsActivity, LaunchActivity
-from android.os import Bundle
-from java import dynamic_proxy
+import os, threading, time, json, signal, re, urllib.request
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook
+from ui.settings import Divider, Header, Input, Switch, Text, Selector
+from android_utils import run_on_ui_thread, OnClickListener, copy_to_clipboard, log
+from java import dynamic_proxy, jclass, jarray, jint, jlong
 from ui.bulletin import BulletinHelper
-from org.telegram.messenger import ApplicationLoader
-from java.io import File
-from org.telegram.ui.Components import EditTextBoldCursor
-from android.text import InputType
-from android.widget import ScrollView
+from java.io import File, FileOutputStream
+from client_utils import get_last_fragment, get_account_instance, get_messages_controller
+from com.exteragram.messenger.plugins import PluginsController, PluginsConstants
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from hook_utils import find_class, get_private_field
+from java.lang import Runnable, Long, String
+from file_utils import get_cache_dir
+from java.util import Locale
+from ui.alert import AlertDialogBuilder
+
+from android.graphics.drawable import GradientDrawable, LayerDrawable, PaintDrawable, RippleDrawable
+from android.net import Uri
+from android.text import SpannableString, TextWatcher, SpannableStringBuilder, InputType
+from android.text.style import StrikethroughSpan, URLSpan, StyleSpan, UnderlineSpan, ForegroundColorSpan
+from android.text.method import LinkMovementMethod, ArrowKeyMovementMethod
+from android.view import View, MotionEvent, Gravity, ViewTreeObserver
+from android.graphics import Rect,Color, Typeface
+from android.os import Environment
+from android.content.res import ColorStateList
+from android.content import ClipData, Context, Intent, DialogInterface
+from android.widget import LinearLayout, TextView, ScrollView, FrameLayout, ImageView, HorizontalScrollView, EditText
+from androidx.core.widget import NestedScrollView
 from android.util import TypedValue
+
+from org.telegram.ui import LaunchActivity, ChatActivity
+from org.telegram.messenger.browser import Browser
+from org.telegram.ui.Components.Premium import StarParticlesView
+from org.telegram.ui.Gifts import GiftSheet
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import LayoutHelper, UItem, BackupImageView
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities, LocaleController, Utilities, ImageLocation, MediaDataController, UserConfig, SendMessagesHelper, MessagesController
+from org.telegram.messenger import R as R_tg
+from org.telegram.tgnet import TLRPC
+
 
 try:
     from android_utils import Callback
 except ImportError:
-    from java import dynamic_proxy
-    from org.telegram.messenger import Utilities
     class Callback(dynamic_proxy(Utilities.Callback)):
         def __init__(self, fn):
             super().__init__()
@@ -65,8 +84,6 @@ except ImportError:
 try:
     from android_utils import OnClickListener
 except ImportError:
-    from java import dynamic_proxy
-    from android.view import View
     class OnClickListener(dynamic_proxy(View.OnClickListener)):
         def __init__(self, fn):
             super().__init__()
@@ -74,15 +91,18 @@ except ImportError:
         def onClick(self, v):
             self._fn(v)
 
+try:
+    from com.exteragram.messenger.plugins.models import HeaderSetting
+except ImportError:
+    HeaderSetting = None
+
 
 __id__ = "plugin_creator"
 __name__ = "Plugin creator"
-__description__ = """Плагин для быстрого создания плагинов из кода.
-
-Plugin for quick plugin creation from code."""
+__description__ = """Плагин для быстрого создания файлов из кода.\n\nA plugin for quickly creating files from code."""
 __author__ = "@mr_Vestr"
-__version__ = "2.0"
-__min_version__ = "12.1.1"
+__version__ = "3.0"
+__min_version__ = "12.5.0"
 __icon__ = "mr_vestr/12"
 
 
@@ -91,178 +111,335 @@ LANG = {
         'settings': 'Настройки',
         'plugin_settings': 'Настройки плагина',
         'chat_menu': 'Кнопка в меню чата',
-        'chat_menu_sub': 'Добавляет кнопку настроек создателя плагинов в обычное меню чата.',
-        'drawer_menu': 'Кнопка в боковом меню',
-        'drawer_menu_sub': 'Добавляет кнопку настроек создателя плагинов в боковое меню.',
+        'chat_menu_sub': 'Добавляет кнопку настроек создателя файлов в обычное меню чата.',
         'chat_plugins_menu': 'Кнопка в плагинах в чате',
-        'chat_plugins_menu_sub': 'Добавляет кнопку настроек создателя плагинов в меню плагинов в чате.',
+        'chat_plugins_menu_sub': 'Добавляет кнопку настроек создателя файлов в меню плагинов в чате.',
         'send_button': 'Кнопка при отправке сообщения',
-        'send_button_sub': 'Добавляет кнопку отправить как плагин при долгом нажатии на кнопку отправки сообщения.',
-        'send_as_plugin': 'Отправить как плагин',
+        'send_button_sub': 'Добавляет кнопку «Отправить как файл» при долгом нажатии на кнопку отправки сообщения.',
+        'send_as_plugin': 'Отправить как файл',
         'send_cmd': 'Команда отправки файла',
-        'send_cmd_sub': 'Введите команду для отправки файла плагинов.',
-        'message_settings': 'Настройки сообщения',
+        'send_cmd_sub': 'Введите команду для отправки файла.',
         'send_name': 'Название файла',
-        'send_name_sub': 'Введите имя для файлов плагинов.',
+        'send_name_sub': 'Введите имя для файлов (до 20 символов, формат: название.расширение).',
         'send_message': 'Текст сообщения',
-        'send_message_sub': 'Текст сообщения при отправке плагина (пусто = без текста).',
-        'create_plugin': 'Создать плагин',
+        'send_message_sub': 'Текст сообщения при отправке файла (пусто = без текста).',
+        'create_plugin': 'Создать файл',
         'contacts': 'Мои контакты',
         'channel_1': 'Мой канал — @I_am_Vestr',
         'personal_1': 'Моя личка — @mr_Vestr',
         'other': 'Другое',
-        'plugin_version': 'Версия плагина — 1.2',
+        'plugin_version': f'Версия плагина — {__version__}',
         'updates': 'Обновления',
         'current_version': 'Текущая версия: {version}',
-        'updates_info': 'Новые версии будут в моём телеграм канале.',
+        'updates_info': 'Нажмите на кнопку ниже чтобы проверить обновления. Или проверьте мой канал @I_am_Vestr.',
         'check_updates': 'Проверить обновление',
         'close': 'Закрыть',
-        'send': 'Отправить',
-        'enter_plugin_code': 'Введите код плагина',
-        'plugin_created': 'Плагин создан и отправлен',
+        'plugin_created': 'Файл создан и отправлен',
         'error_occurred': 'Произошла ошибка!',
         'support_me': 'Поддержать меня',
         'support_me_text': 'Если вы хотите меня поддержать, вы можете отправить мне подарок в Telegram или подарить Telegram Premium :)',
-        'my_account': 'Мой аккаунт',
-        'restart_error': 'Ошибка перезапуска: {error}',
-        'download_error': 'Ошибка загрузки: {error}',
         'error_occurred_with_reason': 'Ошибка: {error}',
         'link_open_error': 'Ошибка при открытии ссылки: {error}',
         'channel': 'Мой канал',
         'personal': 'Моя личка',
         'link_copied': 'Ссылка скопирована',
         'copied_to_clipboard': 'Скопировано в буфер обмена',
-        'error_prefix': 'Ошибка:',
         'how_it_works': 'Как это работает?',
-        'how_it_works_text': '''**Plugin creator — позволяет удобно создавать файл плагинов из готового кода, есть много настроек и быстрая вставка.**
+        'how_it_works_text': '''**Plugin creator — позволяет удобно создавать файлы из текста (плагины из готового кода), есть много настроек и быстрая вставка.**
 
 **Способы создания:**
-1. И если в сообщение ввести команду → после enter и код плагина → отправить. По умолчанию команда «.plugin»;
-2. Удерживая кнопку «Отправить» → «Отправить как плагин»;
-3. Через специальное меню. "⁝" → "Создать плагин" или "⁝" → "Плагины" → "Создать плагин".
+1. В сообщение ввести команду → после enter и текст файла → «Отправить». По умолчанию команда «.file»;
+2. Также в сообщении ввести текст → Удерживая кнопку «Отправить» → «Отправить как файл»;
+3. Через специальное меню. «⁝» → «Создать файл» или «⁝» → «Плагины» → «Создать файл».
 
 **Возможности:**
-• Быстро из текста создать файл плагина. Например, вы попросили ИИ создать плагин, он написал вам код, и вы можете обернуть этот код в плагин прямо в Telegram;
-• В чате, куда хотите отправить плагин, нажмите «⁝» → «Создать плагин». Тут можно писать текст или быстро вставить его и нажать «Отправить»;
-• Можно отправлять плагин через команду в поле ввода: напишите команду (настраивается) и на новой строке вставьте код;
-• Также можно отправить как плагин через долгое нажатие на кнопку отправки сообщения.
+• Быстро из текста создать файл. Например, вы попросили ИИ создать плагин, он написал вам код, и вы можете обернуть этот код в плагин прямо в Telegram;
+• В чате, куда хотите отправить файл, нажмите «⁝» → «Создать файл». Тут можно писать текст или быстро вставить его и нажать «Отправить»;
+• Можно отправлять файл через команду в поле ввода: напишите команду (настраивается) и на новой строке вставьте текст;
+• Также можно отправить как файл через долгое нажатие на кнопку отправки сообщения.
 • Поддерживаются два языка (русский и английский).
 
 **Настройки:**
-• Возможность добавить кнопку «Создать плагин» в меню чата или меню плагинов в чате;
-• Команда отправки файла — позволяет быстро отправлять код как файл плагина из поля ввода;
-• Кнопка при отправке сообщения — добавляет пункт «Отправить как плагин» при долгом нажатии на кнопку отправки;
-• Также можно изменить имя отправляемого файла;
-• И можно изменить текст в сообщении у файла.
+• Кнопки в главном меню — добавляет кнопку открытия настроек в главное меню Telegram или в главное меню плагинов;
+• Кнопка в меню настроек — добавляет кнопку открытия настроек в меню настроек Telegram;
+• Кнопка в меню чата — добавляет кнопку «Создать файл» в меню чата;
+• Кнопка в плагинах в чате — добавляет кнопку «Создать файл» в меню плагинов в чате;
+• Кнопка при отправке сообщения — добавляет пункт «Отправить как файл» при долгом нажатии на кнопку отправки;
+• Команда отправки файла — позволяет быстро отправлять текст как файл из поля ввода;
+• Название файла — можно изменить имя отправляемого файла;
+• Текст сообщения — можно изменить текст в сообщении у файла;
+• Кнопки в панели — настройка кнопок в панели редактора (Настройки, Вставить, Вернуть, Поделиться, Копировать, Очистить);
+• Действие основной кнопки — что делает основная кнопка (Отправить в чат, Поделиться файлом, Сохранить в загрузки, Установить плагин);
+• Скрыть элементы — можно скрыть панель инструментов и основную кнопку;
+• Размер шрифта — настройка размера текста в редакторе.
+
+**Популярные вопросы:**
+1. Где кнопка «Вернуть»?
+— Кнопка «Вернуть» появляется, если вы что-то ввели в поле и закрыли его.
+2. Плагин безопасный?
+— Да, плагин полностью безопасный и никуда не передаёт ваши данные. Вы сами можете убедиться, проверив код плагина, он полностью открыт.
 
 **Если вы хотите предложить идею для улучшения плагина, сообщить об ошибке или что-то другое, то пишите в сообщения к каналу @I_am_Vestr или мне в личные сообщения @mr_Vestr.**''',
-        'create_plugin_title': 'Создать плагин',
-        'enter_plugin_code_hint': 'Введите или вставте код плагина.',
+        'create_plugin_title': 'Создать файл',
+        'create_title_prefix': 'Создать: ',
+        'rename_file_hint': 'Введите значение',
+        'enter_plugin_code_hint': 'Введите или вставьте текст файла.',
         'paste_error': 'Ошибка вставки',
-        'plugin_code_empty': 'Код плагина не может быть пустым.',
+        'plugin_code_empty': 'Текст файла не может быть пустым.',
         'error_occurred': 'Произошла ошибка.',
         'copy_button': 'Копировать',
         'error_copied': 'Ошибка скопирована',
         'share': 'Поделиться',
         'clear': 'Очистить',
-        'settings_button': 'Настройки',
-        'paste_button': 'Вставить',
+        'settings': 'Настройки',
+        'paste': 'Вставить',
         'restore_button': 'Вернуть',
-        'create_and_send': 'Создать и отправить',
-        'clear_confirm_message': 'Точно очистить поле с кодом плагина?',
+        'create_and_send': 'Отправить в чат',
+        'clear_confirm_message': 'Точно очистить поле с текстом файла?',
         'close_button': 'Закрыть',
-        'clear_code_title': 'Очистка кода',
+        'clear_code_title': 'Очистка текста',
+        'filename_limit': 'Максимальная длина — 20 символов. Часть была обрезана.',
+        'filename_restored': 'Название файла было восстановлено: {default}',
+        'filename_format_error': 'Неверный формат названия.',
+        'restart_required': 'Для применения, нужно перезапустить приложение.',
+        'restart_button': 'Перезапуск',
+        'file_action_title': 'Что нужно сделать с файлом?',
+        'save_file': 'Сохранить в загрузки',
+        'install_file': 'Установить плагин',
+        'share_file': 'Поделиться файлом',
+        'header_title': f'Plugin creator — {__version__}',
+        'header_subtitle': 'Управляй файлами прямо в телеграм!',
+        'settings_section': 'Настройки',
+        'plugin_settings_section': 'Настройки Plugin creator',
+        'file_creation_section': 'Создание файлов',
+        'text_editor_section': 'Текстовый редактор',
+        'main_menu_button': 'Кнопка в главном меню',
+        'main_menu_button_sub': 'Открыть настройки главного меню Telegram для добавления кнопки.',
+        'main_plugins_menu_button': 'Кнопка в главном меню плагинов',
+        'main_plugins_menu_button_sub': 'Добавляет кнопку открытия настроек в главное меню плагинов.',
+        'settings_menu_button': 'Кнопка в меню настроек',
+        'settings_menu_button_sub': 'Добавляет кнопку открытия настроек в меню настроек Telegram.',
+        'particles_in_settings': 'Частицы в настройках',
+        'plugin_language': 'Язык плагина',
+        'triggers': 'Триггеры',
+        'chat_menu_button': 'Кнопка в меню чата',
+        'plugins_menu_button': 'Кнопка в плагинах в чате',
+        'send_message_button': 'Кнопка при отправке сообщения',
+        'send_command': 'Команда для отправки',
+        'message': 'Сообщение',
+        'file_name': 'Название файла',
+        'message_text': 'Текст сообщения',
+        'font_size': 'Размер шрифта',
+        'font_size_sub': 'Размер текста в редакторе (5-50)',
+        'panel_buttons': 'Кнопки в панели',
+        'panel_buttons_in_panel': 'Кнопки в панели:',
+        'panel_buttons_in_menu': 'Кнопки в выпадающем меню:',
+        'main_button_action': 'Действие основной кнопки',
+        'options': 'Скрыть элементы',
+        'hide_toolbar': 'Панель инструментов',
+        'hide_toolbar_sub': 'Скрывает панель инструментов при редактировании текста.',
+        'hide_main_button': 'Основная кнопка',
+        'hide_main_button_sub': 'Скрывает основную кнопку при редактировании текста.',
+        'main_section': 'Главное',
+        'checking_updates': 'Проверка обновления Plugin creator...',
+        'no_updates_available': 'У вас последняя версия плагина.',
+        'update_check_error': 'Ошибка проверки обновлений: {error}',
+        'update_timeout_error': 'Не удалось проверить обновления. Проверьте подключение к интернету.',
+        'changes': 'Изменения:',
+        'full_changelog': 'Полный список изменений',
+        'update': 'Обновить',
+        'updating_plugin': 'Обновление плагина Plugin creator...',
+        'update_failed': 'Плагин Plugin creator не удалось обновить.',
+        'update_success': 'Плагин Plugin creator успешно обновлён!',
+        'no_changelog': 'Нет информации об изменениях',
+        'dialog_done': 'Готово',
+        'dialog_cancel': 'Отмена',
+        'file_saved_to': 'Файл сохранен в: {path}',
+        'install_error': 'Ошибка установки: {error}',
+        'no_fragment_found': 'Фрагмент не найден',
+        'error_message': 'Ошибка: {error}',
+        'system': 'Системно',
+        'panel_buttons_hint': 'Удерживайте для перетаскивания. Нажмите на кнопку для перемещения между панелью и меню.'
     },
     'en': {
         'settings': 'Settings',
         'plugin_settings': 'Plugin settings',
         'chat_menu': 'Button in chat menu',
-        'chat_menu_sub': 'Adds a plugin creator settings button to the regular chat menu.',
-        'drawer_menu': 'Button in drawer menu',
-        'drawer_menu_sub': 'Adds a plugin creator settings button to the drawer menu.',
-        'chat_plugins_menu': 'Button in plugins chat menu',
-        'chat_plugins_menu_sub': 'Adds a plugin creator settings button to the plugins menu in chat.',
-        'send_button': 'Button on send',
-        'send_button_sub': 'Adds a "Send as plugin" button on long press of the send button.',
-        'send_as_plugin': 'Send as plugin',
+        'chat_menu_sub': 'Adds a file creator settings button to the regular chat menu.',
+        'chat_plugins_menu': 'Button in plugins in chat',
+        'chat_plugins_menu_sub': 'Adds a file creator settings button to plugins menu in chat.',
+        'send_button': 'Button on send message',
+        'send_button_sub': 'Adds a "Send as file" button on long press of the send button.',
+        'send_as_plugin': 'Send as file',
         'send_cmd': 'File send command',
-        'send_cmd_sub': 'Enter the command to send plugin files.',
-        'message_settings': 'Message settings',
-        'send_name': 'Plugin file names',
-        'send_name_sub': 'Enter the name for plugin files.',
+        'send_cmd_sub': 'Enter the command to send files.',
+        'send_name': 'File name',
+        'send_name_sub': 'Enter name for files (up to 20 characters, format: name.extension).',
         'send_message': 'Message text',
-        'send_message_sub': 'Message text when sending plugin (empty = no text).',
-        'create_plugin': 'Create plugin',
+        'send_message_sub': 'Message text when sending file (empty = no text).',
+        'create_plugin': 'Create file',
         'contacts': 'My contacts',
         'channel_1': 'My channel — @I_am_Vestr',
         'personal_1': 'My DM — @mr_Vestr',
         'other': 'Other',
-        'plugin_version': 'Plugin version — 2.0',
+        'plugin_version': f'Plugin version — {__version__}',
         'updates': 'Updates',
         'current_version': 'Current version: {version}',
-        'updates_info': 'New versions are available in my Telegram channel.',
-        'check_updates': 'Check updates',
+        'updates_info': 'Click button below to check for updates. Or check my channel @I_am_Vestr.',
+        'check_updates': 'Check for updates',
         'close': 'Close',
-        'send': 'Send',
-        'enter_plugin_code': 'Enter plugin code',
-        'plugin_created': 'Plugin created and sent',
+        'plugin_created': 'File created and sent',
         'error_occurred': 'An error occurred!',
         'support_me': 'Support me',
         'support_me_text': 'If you want to support me, you can send me a gift in Telegram or gift me Telegram Premium :)',
-        'my_account': 'My account',
-        'restart_error': 'Restart error: {error}',
-        'download_error': 'Download error: {error}',
         'error_occurred_with_reason': 'Error: {error}',
         'link_open_error': 'Error opening link: {error}',
         'channel': 'My channel',
         'personal': 'My DM',
         'link_copied': 'Link copied',
         'copied_to_clipboard': 'Copied to clipboard',
-        'error_prefix': 'Error:',
-        'how_it_works': 'How does it work?',
-        'how_it_works_text': '''**Plugin creator — allows you to easily create plugin files from ready-made code, has many settings and quick insertion.**
+        'how_it_works': 'How it works?',
+        'how_it_works_text': '''**Plugin creator — allows you to conveniently create files from text (plugins from ready code), has many settings and quick paste.**
 
 **Creation methods:**
-1. Enter command in message → press enter and plugin code → send. Default command is ".plugin";
-2. Hold the "Send" button → "Send as plugin";
-3. Through special menu: "⁝" → "Create plugin" or "⁝" → "Plugins" → "Create plugin".
+1. Enter command in message → after enter and file text → "Send". Default command is ".file";
+2. Also in message enter text → Hold "Send" button → "Send as file";
+3. Through special menu. "⁝" → "Create file" or "⁝" → "Plugins" → "Create file".
 
 **Features:**
-• Quickly create a plugin file from text. For example, you asked AI to create a plugin, it wrote you code, and you can wrap this code into a plugin right in Telegram;
-• In the chat where you want to send the plugin, tap "⁝" → "Create plugin". Here you can write text or quickly paste it and tap "Send";
-• You can send a plugin via a command in the chat input: type the command (configurable) and paste the code on a new line;
-• You can also send as a plugin via long press on the send button.
-• Two languages are supported (Russian and English).
+• Quickly create file from text. For example, you asked AI to create a plugin, it wrote you code, and you can wrap this code into a plugin right in Telegram;
+• In the chat where you want to send the file, tap "⁝" → "Create file". Here you can write text or quickly paste it and tap "Send";
+• You can send a file via a command in the chat input: type the command (configurable) and paste the text on a new line;
+• You can also send as a file via long press on the send button.
+• Supports two languages (Russian and English).
 
 **Settings:**
-• Ability to add "Create plugin" button to chat menu or plugins menu in chat;
-• File send command — lets you quickly send code as a plugin file from the chat input;
-• Button on send — adds a "Send as plugin" option on long press of the send button;
-• You can also change the name of the sent file;
-• And you can change the text in the file message.
+• Main menu buttons — adds a settings button to the Telegram main menu or to the main plugins menu;
+• Settings menu button — adds a settings button to the Telegram settings menu;
+• Chat menu button — adds a "Create file" button to the chat menu;
+• Plugins menu button — adds a "Create file" button to the plugins menu in chat;
+• Send message button — adds a "Send as file" option on long press of the send button;
+• File send command — lets you quickly send text as a file from the chat input;
+• File name — you can change the name of the sent file;
+• Message text — you can change the message text for the file;
+• Panel buttons — configure buttons in the editor panel (Settings, Paste, Restore, Share, Copy, Clear);
+• Main button action — what the main button does (Send to chat, Share file, Save to downloads, Install plugin);
+• Hide elements — you can hide the toolbar and main button;
+• Font size — configure the text size in the editor.
+
+**Frequently Asked Questions:**
+1. Where is the "Return" button?
+— The "Return" button appears if you've entered something in the field and closed it.
+2. Is the plugin secure?
+— Yes, the plugin is completely secure and doesn't transmit your data anywhere. You can verify this yourself by inspecting the plugin's code; it's completely open source.
 
 **If you want to suggest an idea for improving the plugin, report a bug, or anything else, write to the @I_am_Vestr channel or DM @mr_Vestr.**''',
-        'create_plugin_title': 'Create Plugin',
-        'enter_plugin_code_hint': 'Enter or paste plugin code.',
+        'create_plugin_title': 'Create file',
+        'create_title_prefix': 'Create: ',
+        'rename_file_hint': 'Enter a value',
+        'enter_plugin_code_hint': 'Enter or paste file text.',
         'paste_error': 'Paste error',
-        'plugin_code_empty': 'Plugin code cannot be empty.',
+        'plugin_code_empty': 'File text cannot be empty.',
         'error_occurred': 'An error occurred.',
         'copy_button': 'Copy',
         'error_copied': 'Error copied',
         'share': 'Share',
         'clear': 'Clear',
-        'settings_button': 'Settings',
-        'paste_button': 'Paste',
+        'settings': 'Settings',
+        'paste': 'Paste',
         'restore_button': 'Restore',
-        'create_and_send': 'Create & Send',
-        'clear_confirm_message': 'Are you sure you want to clear the plugin code field?',
+        'create_and_send': 'Send to chat',
+        'clear_confirm_message': 'Are you sure you want to clear file text field?',
         'close_button': 'Close',
-        'clear_code_title': 'Clear code',
+        'clear_code_title': 'Clear text',
+        'filename_limit': 'Maximum length — 20 characters. Part was cut off.',
+        'filename_restored': 'Filename was restored: {default}',
+        'filename_format_error': 'Invalid filename format.',
+        'restart_required': 'To apply, you need to restart the application.',
+        'restart_button': 'Restart',
+        'file_action_title': 'What to do with the file?',
+        'save_file': 'Save to Downloads',
+        'install_file': 'Install Plugin',
+        'share_file': 'Share File',
+        'header_title': f'Plugin creator — {__version__}',
+        'header_subtitle': 'Manage files right in Telegram!',
+        'settings_section': 'Settings',
+        'plugin_settings_section': 'Plugin creator Settings',
+        'file_creation_section': 'File Creation',
+        'text_editor_section': 'Text Editor',
+        'main_menu_button': 'Main Menu Button',
+        'main_menu_button_sub': 'Open Telegram main menu settings to add the button.',
+        'main_plugins_menu_button': 'Main Plugins Menu Button',
+        'main_plugins_menu_button_sub': 'Adds a plugin button to the main plugins menu.',
+        'settings_menu_button': 'Settings Menu Button',
+        'settings_menu_button_sub': 'Adds a plugin button to the settings menu of Telegram.',
+        'particles_in_settings': 'Particles in Settings',
+        'plugin_language': 'Plugin Language',
+        'triggers': 'Triggers',
+        'chat_menu_button': 'Chat Menu Button',
+        'plugins_menu_button': 'Plugins Menu Button',
+        'send_message_button': 'Send Message Button',
+        'send_command': 'Send Command',
+        'message': 'Message',
+        'file_name': 'File Name',
+        'message_text': 'Message Text',
+        'font_size': 'Font Size',
+        'font_size_sub': 'Text size in editor (5-50)',
+        'panel_buttons': 'Panel Buttons',
+        'panel_buttons_in_panel': 'Panel buttons:',
+        'panel_buttons_in_menu': 'Dropdown menu buttons:',
+        'main_button_action': 'Main Button Action',
+        'options': 'Hide Elements',
+        'hide_toolbar': 'Toolbar',
+        'hide_toolbar_sub': 'Hides the toolbar when editing text.',
+        'hide_main_button': 'Main Button',
+        'hide_main_button_sub': 'Hides the main button when editing text.',
+        'main_section': 'Main',
+        'checking_updates': 'Checking updates for Plugin creator...',
+        'no_updates_available': 'You have the latest version of the plugin.',
+        'update_check_error': 'Update check error: {error}',
+        'update_timeout_error': 'Failed to check for updates. Check your internet connection.',
+        'changes': 'Changes:',
+        'full_changelog': 'Full changelog',
+        'update': 'Update',
+        'updating_plugin': 'Updating Plugin creator plugin...',
+        'update_failed': 'Failed to update Plugin creator plugin.',
+        'update_success': 'Plugin creator plugin updated successfully!',
+        'no_changelog': 'No changelog available',
+        'dialog_done': 'Done',
+        'dialog_cancel': 'Cancel',
+        'file_saved_to': 'File saved to: {path}',
+        'install_error': 'Install error: {error}',
+        'no_fragment_found': 'No fragment found',
+        'error_message': 'Error: {error}',
+        'system': 'System',
+        'panel_buttons_hint': 'Hold to drag. Tap the button to move between panel and menu.'
     }
 }
 
 def t(key, lang='ru', **kwargs):
     return LANG[lang][key].format(**kwargs)
+
+def _get_lang():
+    try:
+        lang = Locale.getDefault().getLanguage()
+        return lang if lang in ('ru', 'en') else 'en'
+    except Exception:
+        return 'en'
+
+def _get_context():
+    if ApplicationLoader:
+        try:
+            return ApplicationLoader.applicationContext
+        except Exception:
+            pass
+    return None
+
+class _MethodHook:
+    def before_hooked_method(self, param):
+        pass
+    def after_hooked_method(self, param):
+        pass
 
 class _LocalFileSystem:
     @classmethod
@@ -275,7 +452,6 @@ class _LocalFileSystem:
 
     @classmethod
     def write_temp_file(cls, filename: str, content: bytes, mode: str = "wb", delete_after: int = 0):
-        import os, threading
         path = File(cls.tempdir(), filename).getAbsolutePath()
         with open(path, mode) as f:
             f.write(content)
@@ -286,16 +462,219 @@ class _LocalFileSystem:
                 pass
         return path
 
+class _BadgeHook(_MethodHook):
+    def __init__(self, manager):
+        self.manager = manager
+
+    def before_hooked_method(self, param):
+        try:
+            entity_id = param.args[0] if param.args else None
+            if entity_id and entity_id in self.manager.custom_badges:
+                param.setResult(self.manager.custom_badges[entity_id])
+        except Exception:
+            pass
+
+class _DeveloperHook(_MethodHook):
+    def __init__(self, manager):
+        self.manager = manager
+
+    def before_hooked_method(self, param):
+        try:
+            entity_id = param.args[0] if param.args else None
+            if entity_id and entity_id in self.manager.custom_badges:
+                param.setResult(True)
+        except Exception:
+            pass
+
+class _ChangeHook(_MethodHook):
+    def __init__(self, manager):
+        self.manager = manager
+
+    def before_hooked_method(self, param):
+        try:
+            entity_id = param.args[0] if param.args else None
+            if entity_id and entity_id in self.manager.custom_badges:
+                param.setResult(True)
+        except Exception:
+            pass
+
+class BadgeManager:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.custom_badges = {}
+        self._hook_refs = []
+        self.api_badge_source = None
+        self.lang = _get_lang()
+
+    def setup(self, badges_data):
+        try:
+            self._get_api_badge_source()
+            self._setup_hooks()
+            self._load_badges(badges_data)
+        except Exception:
+            pass
+
+    def _get_api_badge_source(self):
+        try:
+            BadgesController = find_class("com.exteragram.messenger.badges.BadgesController")
+            if not BadgesController:
+                return
+            instance = BadgesController.INSTANCE
+            self.api_badge_source = get_private_field(instance, "apiBadgeSource")
+        except Exception:
+            pass
+
+    def _setup_hooks(self):
+        try:
+            if not self.api_badge_source:
+                return
+            ApiBadgeSource = find_class("com.exteragram.messenger.badges.source.ApiBadgeSource")
+            if not ApiBadgeSource:
+                return
+
+            for method_name, hook_cls in [
+                ("getBadge",      _BadgeHook),
+                ("isDeveloper",   _DeveloperHook),
+                ("canChangeBadge", _ChangeHook),
+            ]:
+                refs = self.plugin.hook_all_methods(ApiBadgeSource, method_name, hook_cls(self))
+                if refs:
+                    self._hook_refs.extend(refs)
+        except Exception:
+            pass
+
+    def _load_badges(self, badges_data):
+        try:
+            if not self.api_badge_source or not badges_data:
+                return
+            cache = get_private_field(self.api_badge_source, "cache")
+            if not cache:
+                return
+            BadgeDTO   = find_class("com.exteragram.messenger.api.dto.BadgeDTO")
+            BadgeInfo  = find_class("com.exteragram.messenger.badges.source.BadgeInfo")
+            ProfileStatus = find_class("com.exteragram.messenger.api.model.ProfileStatus")
+            if not all([BadgeDTO, BadgeInfo, ProfileStatus]):
+                return
+            for entry in badges_data:
+                emoji_id   = entry.get("emoji_id")
+                text_key   = f"text_{self.lang}"
+                text       = entry.get(text_key) or entry.get("text_en", "")
+                user_id    = entry.get("user_id")
+                chat_id    = entry.get("chat_id")
+                if not emoji_id or not text:
+                    continue
+
+                if user_id:
+                    try:
+                        user = MessagesController.getInstance(0).getUser(user_id)
+                        name = f"{user.first_name} {user.last_name or ''}".strip() if user else f"User {user_id}"
+                    except Exception:
+                        name = f"User {user_id}"
+                    formatted = text.format(user_name=name)
+                    dto  = BadgeDTO(emoji_id, formatted)
+                    info = BadgeInfo(dto, ProfileStatus.DEVELOPER, True)
+                    cache.put(Long.valueOf(user_id), info)
+                    self.custom_badges[user_id] = dto
+
+                elif chat_id:
+                    try:
+                        chat = MessagesController.getInstance(0).getChat(-abs(chat_id))
+                        name = chat.title if chat else f"Channel {chat_id}"
+                    except Exception:
+                        name = f"Channel {chat_id}"
+                    formatted = text.format(chat_name=name)
+                    dto  = BadgeDTO(emoji_id, formatted)
+                    info = BadgeInfo(dto, ProfileStatus.DEVELOPER, True)
+                    cache.put(Long.valueOf(chat_id), info)
+                    self.custom_badges[chat_id] = dto
+
+        except Exception:
+            pass
+
+    def cleanup(self):
+        try:
+            for ref in self._hook_refs:
+                try:
+                    self.plugin.unhook_method(ref)
+                except Exception:
+                    pass
+            self._hook_refs.clear()
+            if self.api_badge_source and self.custom_badges:
+                try:
+                    cache = get_private_field(self.api_badge_source, "cache")
+                    if cache:
+                        for eid in list(self.custom_badges.keys()):
+                            cache.remove(Long.valueOf(eid))
+                except Exception:
+                    pass
+            self.custom_badges.clear()
+        except Exception:
+            pass
+
+class _DeeplinkHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if len(param.args) < 7:
+                return
+            intent = param.args[0]
+            if not intent or intent.getAction() != "android.intent.action.VIEW":
+                return
+            data = intent.getData()
+            if not data:
+                return
+            url = str(data)
+            matched_target = self.plugin._match_deeplink(url)
+            if matched_target is None:
+                return
+            param.setResult(None)
+            run_on_ui_thread(lambda: self.plugin._handle_target(matched_target))
+        except Exception:
+            pass
+
+def _open_url_in_telegram(url):
+    try:
+        fragment = get_last_fragment()
+        act = fragment.getParentActivity() if fragment else None
+        if act and Browser and Uri:
+            Browser.openUrl(act, Uri.parse(url), True, True, True, None, None, False, False, False)
+        else:
+            pass
+    except Exception:
+        pass
+
+def _open_gift_sheet(user_id_str):
+    try:
+        uid = int(user_id_str)
+        if LaunchActivity is None:
+            return
+        launch_activity = LaunchActivity.instance
+        if launch_activity is None:
+            return
+        get_last = launch_activity.getClass().getDeclaredMethod("getSafeLastFragment")
+        get_last.setAccessible(True)
+        last_fragment = get_last.invoke(launch_activity)
+        if last_fragment is None or last_fragment.getContext() is None:
+            return
+        current_account = UserConfig.selectedAccount if UserConfig else 0
+        sheet = GiftSheet(last_fragment.getContext(), current_account, uid, None, None)
+        sheet.show()
+    except Exception:
+        pass
+
+
 class PluginCreatorPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
         self.menu_shown = False
         self.plugin_creator_menu_id = 880033
+        self._settings_activity_hooks = []
         self.saved_plugin_text = ""
         self.saved_text_time = 0
         self.closed_by_send = False
         try:
-            from org.telegram.messenger import LocaleController
             lang_code = LocaleController.getInstance().getCurrentLocale().getLanguage()
         except Exception:
             lang_code = ''
@@ -306,13 +685,23 @@ class PluginCreatorPlugin(BasePlugin):
         if not hasattr(self, '_settings') or not self._settings:
             self.set_setting('show_chat_menu', self.get_setting('show_chat_menu', True), reload_settings=False)
             self.set_setting('show_chat_plugins_menu', self.get_setting('show_chat_plugins_menu', False), reload_settings=False)
-            self.set_setting('send_cmd', self.get_setting('send_cmd', '.plugin'), reload_settings=False)
+            self.set_setting('send_cmd', self.get_setting('send_cmd', '.file'), reload_settings=False)
             self.set_setting('show_send_button', self.get_setting('show_send_button', True), reload_settings=False)
+            self.set_setting('show_settings_menu_button', self.get_setting('show_settings_menu_button', True), reload_settings=False)
+            self.set_setting('text_font_size', self.get_setting('text_font_size', 15), reload_settings=False)
+        self._badge_manager = None
+        self._deeplink_hook_ref = None
+        self._deeplinks = {}
+        self.update_available = False
+        self.checking_update = False
+        self.latest_version = None
+        self.changelog = None
+        self.download_url = None
+        self.sticker_pack = None
+        self.sticker_index = None
 
     def _apply_press_scale(self, view):
         try:
-            from android.view import View, MotionEvent
-            from java import dynamic_proxy
             class _TouchListener(dynamic_proxy(View.OnTouchListener)):
                 def __init__(self, fn):
                     super().__init__()
@@ -333,17 +722,539 @@ class PluginCreatorPlugin(BasePlugin):
         except Exception:
             pass
 
+    def try_load_sticker(self, img, sticker_name, sticker_index=0, size="72_72"):
+        try:
+            if isinstance(sticker_name, str) and "/" in sticker_name:
+                icon_parts = sticker_name.split("/")
+                if len(icon_parts) == 2:
+                    sticker_set_name = icon_parts[0]
+                    sticker_index = int(icon_parts[1])
+            else:
+                sticker_set_name = sticker_name
+            ss = MediaDataController.getInstance(0).getStickerSetByName(sticker_set_name) or MediaDataController.getInstance(0).getStickerSetByEmojiOrName(sticker_set_name)
+            if ss and ss.documents and ss.documents.size() > sticker_index:
+                img.setImage(ImageLocation.getForDocument(ss.documents.get(sticker_index)), size, None, None, 0, 1)
+                return True
+        except:
+            pass
+        return False
+
+    def load_sticker_with_fallback(self, img, sticker_name, sticker_index=0, size="72_72", delay=1500):
+        try:
+            img.setAlpha(0.0)
+            img.setScaleX(0.8)
+            img.setScaleY(0.8)
+        except Exception:
+            pass
+
+        if self.try_load_sticker(img, sticker_name, sticker_index, size):
+            try:
+                img.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).setDuration(300).start()
+            except Exception:
+                try:
+                    img.setAlpha(1.0)
+                    img.setScaleX(1.0)
+                    img.setScaleY(1.0)
+                except Exception:
+                    pass
+        else:
+            try:
+                if isinstance(sticker_name, str) and "/" in sticker_name:
+                    sticker_set_name = sticker_name.split("/")[0]
+                else:
+                    sticker_set_name = sticker_name
+                MediaDataController.getInstance(0).loadStickersByEmojiOrName(sticker_set_name, False, False)
+                def load_with_animation():
+                    if self.try_load_sticker(img, sticker_name, sticker_index, size):
+                        try:
+                            img.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).setDuration(300).start()
+                        except Exception:
+                            try:
+                                img.setAlpha(1.0)
+                                img.setScaleX(1.0)
+                                img.setScaleY(1.0)
+                            except Exception:
+                                pass
+                run_on_ui_thread(load_with_animation, delay)
+            except:
+                pass
+
+    def _check_for_updates_on_load_with_timeout(self):
+        try:
+            last_check_time = self.get_setting('last_update_check_time', 0)
+            current_time = int(time.time())
+            ten_minutes_ago = current_time - 600
+
+            if last_check_time < ten_minutes_ago:
+                def delayed_check():
+                    time.sleep(3)
+                    self._check_for_updates(show_on_load=True)
+                    self.set_setting('last_update_check_time', current_time, reload_settings=False)
+                thread = threading.Thread(target=delayed_check)
+                thread.daemon = True
+                thread.start()
+            else:
+                pass
+        except Exception:
+            pass
+
+    def _check_for_updates(self, show_on_load=False, show_loading=True):
+        if self.checking_update:
+            return
+        self.update_available = False
+        self.checking_update = True
+        timeout_reached = [False]
+
+        def check_thread():
+            try:
+                if show_loading and not show_on_load:
+                    run_on_ui_thread(lambda: self._show_checking_bulletin())
+                raw_url = "https://raw.githubusercontent.com/mr-Vestr/plugins/refs/heads/main/Plugin%20creator/config.json"
+                timestamp = int(time.time() * 1000)
+                raw_url_with_timestamp = f"{raw_url}?t={timestamp}"
+                request = urllib.request.Request(raw_url_with_timestamp)
+                request.add_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                request.add_header('Pragma', 'no-cache')
+                request.add_header('Expires', '0')
+                request.add_header('Accept', 'application/json')
+                if show_loading and not show_on_load:
+                    check_started = time.time()
+                    def check_timeout():
+                        time.sleep(10)
+                        if self.checking_update and not timeout_reached[0]:
+                            timeout_reached[0] = True
+                            self.checking_update = False
+                            run_on_ui_thread(lambda: self._show_timeout_bulletin())
+                    timeout_thread = threading.Thread(target=check_timeout, daemon=True)
+                    timeout_thread.start()
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    if timeout_reached[0]:
+                        return
+                    if response.getcode() != 200:
+                        raise Exception(f"HTTP {response.getcode()}")
+                    content_raw = response.read().decode('utf-8')
+                    if not content_raw:
+                        raise Exception("No content in response")
+                    config_data = json.loads(content_raw)
+                    if timeout_reached[0]:
+                        return
+                    latest_version_from_config = config_data.get("version", "0.0.0")
+                    if self.lang == 'ru':
+                        changelog_from_config = config_data.get("changelog_ru", config_data.get("changelog", self._t('no_changelog')))
+                    else:
+                        changelog_from_config = config_data.get("changelog_en", config_data.get("changelog", self._t('no_changelog')))
+                    sticker_info = config_data.get("sticker", "")
+                    download_url_from_config = config_data.get("link", "")
+                    sticker_pack_from_config = None
+                    sticker_index_from_config = 0
+                    if sticker_info and "/" in sticker_info:
+                        parts = sticker_info.split("/")
+                        sticker_pack_from_config = parts[0]
+                        try:
+                            sticker_index_from_config = int(parts[1]) if len(parts) > 1 else 0
+                        except:
+                            sticker_index_from_config = 0
+                    else:
+                        sticker_pack_from_config = "mr_vestr"
+                        sticker_index_from_config = 1
+                    current_version = __version__.strip()
+                    latest_version_clean = latest_version_from_config.strip()
+                    current_base = current_version.split(" (")[0].strip() if " (" in current_version else current_version.strip()
+                    latest_base = latest_version_clean.split(" (")[0].strip() if " (" in latest_version_clean else latest_version_clean.strip()
+                    if current_base != latest_base:
+                        self.update_available = True
+                        self.latest_version = latest_version_from_config
+                        self.changelog = changelog_from_config
+                        self.download_url = download_url_from_config
+                        self.sticker_pack = sticker_pack_from_config
+                        self.sticker_index = sticker_index_from_config
+                        if show_on_load and not timeout_reached[0]:
+                            run_on_ui_thread(lambda: self._show_update_bottom_sheet())
+                        elif show_loading and not timeout_reached[0]:
+                            run_on_ui_thread(lambda: self._show_update_bottom_sheet())
+                    else:
+                        self.update_available = False
+                        self.latest_version = latest_version_from_config
+                        self.changelog = changelog_from_config
+                        self.download_url = download_url_from_config
+                        self.sticker_pack = sticker_pack_from_config
+                        self.sticker_index = sticker_index_from_config
+                        if show_loading and not show_on_load and not timeout_reached[0]:
+                            run_on_ui_thread(lambda: self._show_no_update_bulletin())
+            except Exception as e:
+                if show_loading and not timeout_reached[0] and not show_on_load:
+                    error_message = str(e)
+                    run_on_ui_thread(lambda: self._show_error_bulletin(error_message))
+            finally:
+                if not timeout_reached[0]:
+                    self.checking_update = False
+                    if not show_on_load:
+                        current_time = int(time.time())
+                        self.set_setting('last_update_check_time', current_time, reload_settings=False)
+        threading.Thread(target=check_thread, daemon=True).start()
+
+    def _show_checking_bulletin(self):
+        try:
+            BulletinHelper.show_with_button(
+                self._t('checking_updates'),
+                R_tg.raw.camera_flip,
+                self._t('close'),
+                lambda: None,
+                None
+            )
+        except Exception:
+            pass
+
+    def _show_no_update_bulletin(self):
+        try:
+            BulletinHelper.show_with_button(
+                self._t('no_updates_available'),
+                R_tg.raw.done,
+                self._t('close'),
+                lambda: None,
+                None
+            )
+        except Exception:
+            pass
+
+    def _show_error_bulletin(self, error_msg):
+        try:
+            BulletinHelper.show_with_button(
+                self._t('update_check_error', error=error_msg),
+                R_tg.raw.error,
+                self._t('close'),
+                lambda: None,
+                None
+            )
+        except Exception:
+            pass
+
+    def _show_timeout_bulletin(self):
+        try:
+            BulletinHelper.show_with_button(
+                self._t('update_timeout_error'),
+                R_tg.raw.error,
+                self._t('close'),
+                lambda: None,
+                None
+            )
+        except Exception as e:
+            pass
+
+    def _show_update_bottom_sheet(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            act = fragment.getParentActivity()
+            if not act:
+                return
+            sheet = BottomSheet(act, False, fragment.getResourceProvider())
+            sheet.setApplyBottomPadding(False)
+            sheet.setApplyTopPadding(False)
+            sheet.setCanDismissWithSwipe(False)
+            scroll_view = NestedScrollView(act)
+            try:
+                scroll_view.setNestedScrollingEnabled(True)
+                scroll_view.setVerticalScrollBarEnabled(False)
+                scroll_view.setFillViewport(True)
+            except Exception:
+                pass
+            scroll_content = LinearLayout(act)
+            scroll_content.setOrientation(LinearLayout.VERTICAL)
+            scroll_content.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(8))
+            root_layout = LinearLayout(act)
+            root_layout.setOrientation(LinearLayout.VERTICAL)
+            try:
+                scroll_content.setAlpha(0.0)
+                scroll_content.setScaleX(0.3)
+                scroll_content.setScaleY(0.3)
+                scroll_content.setTranslationY(AndroidUtilities.dp(100))
+            except Exception:
+                pass
+            try:
+                bg_drawable = GradientDrawable()
+                bg_drawable.setShape(GradientDrawable.RECTANGLE)
+                bg_drawable.setCornerRadii([AndroidUtilities.dp(20), AndroidUtilities.dp(20), AndroidUtilities.dp(20), AndroidUtilities.dp(20), 0, 0, 0, 0])
+                bg_drawable.setColor(Theme.getColor(Theme.key_dialogBackground))
+                root_layout.setBackground(bg_drawable)
+            except Exception:
+                try:
+                    root_layout.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground))
+                except Exception:
+                    pass
+            avatar_view = BackupImageView(act)
+            avatar_view.setRoundRadius(AndroidUtilities.dp(45))
+            root_layout.addView(avatar_view, LayoutHelper.createLinear(130, 130, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12))
+            if self.sticker_pack:
+                sticker_name = f"{self.sticker_pack}/{self.sticker_index}" if self.sticker_index > 0 else self.sticker_pack
+                self.load_sticker_with_fallback(avatar_view, sticker_name, self.sticker_index, "130_130")
+            title_view = TextView(act)
+            title_view.setTypeface(AndroidUtilities.bold())
+            title_view.setGravity(Gravity.CENTER)
+            title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 24)
+            title_view.setText("Plugin creator")
+            try:
+                title_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            except Exception:
+                pass
+            try:
+                title_view.setAlpha(0.0)
+                title_view.setTranslationY(AndroidUtilities.dp(50))
+                title_view.setScaleX(0.8)
+                title_view.setScaleY(0.8)
+            except Exception:
+                pass
+            root_layout.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 8))
+            version_view = TextView(act)
+            version_view.setGravity(Gravity.CENTER)
+            version_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            version_view.setTextColor(Theme.getColor(Theme.key_dialogTextGray))
+            current_version_clean = __version__.split(" (")[0].strip()
+            version_text = f"{current_version_clean} → {self.latest_version}"
+            spannable = SpannableString(version_text)
+            spannable.setSpan(StrikethroughSpan(), 0, len(current_version_clean), SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+            version_view.setText(spannable)
+            root_layout.addView(version_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 16))
+            changes_title = TextView(act)
+            changes_title.setTypeface(AndroidUtilities.bold())
+            changes_title.setGravity(Gravity.LEFT)
+            changes_title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+            changes_title.setText(self._t('changes'))
+            changes_title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            root_layout.addView(changes_title, LayoutHelper.createLinear(-1, -2, Gravity.LEFT, 0, 0, 0, 8))
+            changelog_container = FrameLayout(act)
+            try:
+                border_drawable = GradientDrawable()
+                border_drawable.setShape(GradientDrawable.RECTANGLE)
+                border_drawable.setCornerRadius(AndroidUtilities.dp(8))
+                border_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+                border_drawable.setStroke(AndroidUtilities.dp(2), border_color)
+                border_drawable.setColor(Theme.getColor(Theme.key_dialogBackground))
+                changelog_container.setBackground(border_drawable)
+            except Exception:
+                pass
+            changelog_container.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12), AndroidUtilities.dp(12))
+            changelog_view = TextView(act)
+            changelog_view.setGravity(Gravity.LEFT)
+            changelog_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+            changelog_view.setText(self.changelog or self._t('no_changelog'))
+            changelog_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            changelog_view.setLineSpacing(AndroidUtilities.dp(4), 1.15)
+            changelog_container.addView(changelog_view, FrameLayout.LayoutParams(-1, -2))
+            root_layout.addView(changelog_container, LayoutHelper.createLinear(-1, -2, Gravity.LEFT, 0, 0, 0, 12))
+            changelog_link_btn = TextView(act)
+            changelog_link_btn.setText(self._t('full_changelog'))
+            changelog_link_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            changelog_link_btn.setGravity(Gravity.CENTER)
+            try:
+                changelog_link_btn.setTextColor(Theme.getColor(Theme.key_featuredStickers_addButton))
+            except Exception:
+                changelog_link_btn.setTextColor(Color.BLUE)
+            changelog_link_btn.setClickable(True)
+            changelog_link_btn.setFocusable(True)
+            def on_changelog_link_click(v):
+                try:
+                    sheet.dismiss()
+                    Browser.openUrl(act, Uri.parse("https://t.me/I_am_Vestr"))
+                except Exception:
+                    pass
+            changelog_link_btn.setOnClickListener(OnClickListener(lambda *_: on_changelog_link_click(changelog_link_btn)))
+            self._apply_press_scale(changelog_link_btn)
+            try:
+                changelog_link_btn.setAlpha(0.0)
+                changelog_link_btn.setTranslationY(AndroidUtilities.dp(50))
+                changelog_link_btn.setScaleX(0.8)
+                changelog_link_btn.setScaleY(0.8)
+            except Exception:
+                pass
+            root_layout.addView(changelog_link_btn, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 16))
+            update_btn_frame = FrameLayout(act)
+            base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+            pressed_color = Theme.getColor(Theme.key_featuredStickers_addButtonPressed)
+            update_btn_frame.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
+                AndroidUtilities.dp(28),
+                base_color,
+                pressed_color
+            ))
+            update_btn_frame.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(14))
+            update_btn_frame.setClickable(True)
+            update_btn_frame.setFocusable(True)
+            update_btn_text = TextView(act)
+            update_btn_text.setText(self._t('update'))
+            update_btn_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            update_btn_text.setTypeface(AndroidUtilities.bold())
+            update_btn_text.setGravity(Gravity.CENTER)
+            update_btn_text.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            update_btn_frame.addView(update_btn_text, FrameLayout.LayoutParams(-1, -2))
+            def on_update_click(v):
+                try:
+                    sheet.dismiss()
+                    self._download_and_install_update()
+                except Exception:
+                    pass
+            update_btn_frame.setOnClickListener(OnClickListener(lambda *_: on_update_click(update_btn_frame)))
+            self._apply_press_scale(update_btn_frame)
+            try:
+                update_btn_frame.setAlpha(0.0)
+                update_btn_frame.setTranslationY(AndroidUtilities.dp(50))
+                update_btn_frame.setScaleX(0.8)
+                update_btn_frame.setScaleY(0.8)
+            except Exception:
+                pass
+            root_layout.addView(update_btn_frame, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0))
+            scroll_content.addView(root_layout)
+            scroll_view.addView(scroll_content)
+            sheet.setCustomView(scroll_view)
+            sheet.show()
+            def animate_elements():
+                try:
+                    try:
+                        scroll_content.animate().alpha(0.8).scaleX(0.4).scaleY(0.4).translationY(AndroidUtilities.dp(50)).setDuration(200).start()
+                    except Exception:
+                        pass
+                    def scale_up_menu():
+                        try:
+                            scroll_content.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).translationY(0).setDuration(400).start()
+                        except Exception:
+                            pass
+                        def show_elements():
+                            try:
+                                title_view.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).start()
+                            except Exception:
+                                pass
+                            try:
+                                changelog_container.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(50).start()
+                            except Exception:
+                                pass
+                            try:
+                                changelog_link_btn.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(75).start()
+                            except Exception:
+                                pass
+                            try:
+                                update_btn_frame.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(100).start()
+                            except Exception:
+                                pass
+                        try:
+                            run_on_ui_thread(show_elements)
+                        except Exception:
+                            pass
+                    try:
+                        class ScaleUpRunnable(dynamic_proxy(Runnable)):
+                            def __init__(self, func):
+                                super().__init__()
+                                self.func = func
+                            def run(self):
+                                self.func()
+                        run_on_ui_thread(ScaleUpRunnable(scale_up_menu), 200)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                class AnimateRunnable(dynamic_proxy(Runnable)):
+                    def __init__(self, func):
+                        super().__init__()
+                        self.func = func
+                    def run(self):
+                        self.func()
+                run_on_ui_thread(AnimateRunnable(animate_elements))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _download_and_install_update(self):
+        try:
+            loading_bulletin = [None]
+            def show_loading():
+                loading_bulletin[0] = BulletinHelper.show_with_button(
+                    self._t('updating_plugin'),
+                    R_tg.raw.download_progress,
+                    self._t('close'),
+                    lambda: None,
+                    None
+                )
+            run_on_ui_thread(show_loading)
+            callback_shown = [False]
+            def download_thread():
+                try:
+                    if not self.download_url:
+                        raise Exception("Download URL not available")
+                    with urllib.request.urlopen(self.download_url, timeout=30) as response:
+                        plugin_content = response.read()
+                    plugins_dir = os.path.join(str(ApplicationLoader.applicationContext.getFilesDir()), "plugins")
+                    temp_file = os.path.join(plugins_dir, "plugin_creator_update.tmp")
+                    with open(temp_file, 'wb') as f:
+                        f.write(plugin_content)
+                    version = self.latest_version
+                    class Callback(dynamic_proxy(Utilities.Callback)):
+                        def run(self_cb, error):
+                            if callback_shown[0]:
+                                return
+                            callback_shown[0] = True
+                            try:
+                                os.remove(temp_file)
+                            except:
+                                pass
+                            if error:
+                                run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                                    self._t('update_failed'),
+                                    R_tg.raw.error,
+                                    self._t('close'),
+                                    lambda: None,
+                                    None
+                                ))
+                            else:
+                                def open_settings_after_update():
+                                    try:
+                                        fragment = get_last_fragment()
+                                        plugin = PluginsController.getInstance().plugins.get(self.id)
+                                        if plugin:
+                                            fragment.presentFragment(PluginSettingsActivity(plugin))
+                                    except Exception:
+                                        pass
+                                run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                                    self._t('update_success'),
+                                    R_tg.raw.done,
+                                    self._t('settings'),
+                                    open_settings_after_update,
+                                    None
+                                ))
+                    class Runnable(dynamic_proxy(jclass("java.lang.Runnable"))):
+                        def run(self_r):
+                            PluginsController.engines.get(PluginsConstants.PYTHON).loadPluginFromFile(temp_file, None, Callback())
+                    Utilities.pluginsQueue.postRunnable(Runnable())
+                except Exception as e:
+                    if not callback_shown[0]:
+                        callback_shown[0] = True
+                        run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                            self._t('update_failed'),
+                            R_tg.raw.error,
+                            self._t('close'),
+                            lambda: None,
+                            None
+                        ))
+            threading.Thread(target=download_thread, daemon=True).start()
+        except Exception as e:
+            pass
+
     def on_plugin_load(self):
         if not hasattr(self, '_settings') or not self._settings:
             self.set_setting('show_chat_menu', self.get_setting('show_chat_menu', True), reload_settings=False)
             self.set_setting('show_chat_plugins_menu', self.get_setting('show_chat_plugins_menu', False), reload_settings=False)
-            self.set_setting('send_cmd', self.get_setting('send_cmd', '.plugin'), reload_settings=False)
+            self.set_setting('send_cmd', self.get_setting('send_cmd', '.file'), reload_settings=False)
             self.set_setting('show_send_button', self.get_setting('show_send_button', True), reload_settings=False)
+            self.set_setting('show_settings_menu_button', self.get_setting('show_settings_menu_button', True), reload_settings=False)
+            self.set_setting('text_font_size', self.get_setting('text_font_size', 15), reload_settings=False)
         self._update_chat_menu()
         self._update_chat_plugins_menu()
+        self._update_main_plugins_menu()
         try:
-            from android_utils import run_on_ui_thread
-            from org.telegram.messenger import AndroidUtilities
+            self._setup_dialogs_menu_hook()
+        except Exception:
+            pass
+        try:
             def update_chat_menu():
                 if self.get_setting('show_chat_menu', True):
                     self._add_plugin_creator_item_to_current_chat_header()
@@ -352,6 +1263,12 @@ class PluginCreatorPlugin(BasePlugin):
             pass
         self._hook_chat_activity_resume()
         self._force_load_stickers()
+        self._setup_settings_header_hook()
+        try:
+            if self.get_setting('show_settings_menu_button', True):
+                self._setup_settings_activity_hook()
+        except Exception:
+            pass
         try:
             self.add_on_send_message_hook()
         except Exception:
@@ -361,6 +1278,14 @@ class PluginCreatorPlugin(BasePlugin):
                 self._hook_send_button_menu()
         except Exception:
             pass
+        self._badge_manager = BadgeManager(self)
+        self._setup_deeplink_hook()
+        self._check_for_updates_on_load_with_timeout()
+        def load_cached_with_delay():
+            self._load_cached_config()
+        run_on_ui_thread(load_cached_with_delay, 1000)
+        t = threading.Thread(target=self._fetch_and_apply_config, daemon=True)
+        t.start()
 
     def set_setting(self, key, value, reload_settings=False):
         try:
@@ -371,7 +1296,6 @@ class PluginCreatorPlugin(BasePlugin):
             finally:
                 if reload_settings:
                     try:
-                        from client_utils import get_last_fragment
                         frag = get_last_fragment()
                         try:
                             frag.rebuildAllFragments(True)
@@ -380,10 +1304,157 @@ class PluginCreatorPlugin(BasePlugin):
                     except Exception:
                         pass
 
+    def _on_send_name_change(self, value):
+        if isinstance(value, str):
+            if '\n' in value:
+                value = value.split('\n')[0]
+            
+            MAX_CHARS = 20
+            corrected_value = value
+            need_reload = False
+            show_limit_error = False
+            show_empty_error = False
+            
+            if not corrected_value.strip():
+                default_name = 'main.plugin'
+                corrected_value = default_name
+                need_reload = True
+                show_empty_error = True
+            
+            if len(corrected_value) > MAX_CHARS:
+                corrected_value = corrected_value[:MAX_CHARS]
+                show_limit_error = True
+                need_reload = True
+            
+            format_error = False
+            
+            if corrected_value.count('.') != 1:
+                format_error = True
+            
+            match = re.match(r'^([^.]+)\.([a-zA-Zа-яёА-ЯЁ0-9_-]+)$', corrected_value)
+            if not match:
+                format_error = True
+            
+            if format_error:
+                default_name = 'main.plugin'
+                corrected_value = default_name
+                need_reload = True
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    self._t('filename_format_error', default=default_name)
+                ))
+            
+            if show_empty_error:
+                run_on_ui_thread(lambda: BulletinHelper.show_info(
+                    self._t('filename_restored', default=default_name)
+                ))
+            
+            if show_limit_error:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    self._t('filename_limit')
+                ))
+            
+            self.set_setting('send_name', corrected_value, reload_settings=need_reload)
+
+    def _fetch_and_apply_config(self):
+        try:
+            with urllib.request.urlopen("https://raw.githubusercontent.com/mr-Vestr/plugins/refs/heads/main/config.json", timeout=10) as resp:
+                raw = resp.read().decode("utf-8")
+            config = json.loads(raw)
+            badges_data   = config.get("badges", [])
+            deeplinks_data = config.get("deeplinks", [])
+            self._deeplinks = {}
+            for entry in deeplinks_data:
+                dl = entry.get("deeplink", "")
+                target = entry.get("target", "")
+                if dl and target:
+                    self._deeplinks[dl] = target
+            run_on_ui_thread(lambda: self._badge_manager.setup(badges_data))
+            self._save_config(config)
+        except Exception:
+            self._load_cached_config()
+
+    def _save_config(self, config):
+        try:
+            ctx = _get_context()
+            if not ctx:
+                return
+            prefs = ctx.getSharedPreferences("plugin_creator_plugin", 0)
+            editor = prefs.edit()
+            editor.putString("config", json.dumps(config))
+            editor.apply()
+        except Exception:
+            pass
+
+    def _load_cached_config(self):
+        try:
+            ctx = _get_context()
+            if not ctx:
+                return
+            prefs = ctx.getSharedPreferences("plugin_creator_plugin", 0)
+            raw = prefs.getString("config", None)
+            if not raw:
+                return
+            config = json.loads(raw)
+            badges_data    = config.get("badges", [])
+            deeplinks_data = config.get("deeplinks", [])
+            self._deeplinks = {e["deeplink"]: e["target"] for e in deeplinks_data if e.get("deeplink") and e.get("target")}
+            if badges_data:
+                run_on_ui_thread(lambda: self._badge_manager.setup(badges_data))
+        except Exception:
+            pass
+
+    def _match_deeplink(self, url):
+        if url in self._deeplinks:
+            return self._deeplinks[url]
+        stripped = url.rstrip("/")
+        if stripped in self._deeplinks:
+            return self._deeplinks[stripped]
+        return None
+
+    def _handle_target(self, target):
+        try:
+            if target.startswith("gifts_"):
+                user_id_str = target[len("gifts_"):]
+                _open_gift_sheet(user_id_str)
+            elif target.startswith("https://"):
+                _open_url_in_telegram(target)
+            else:
+                _open_url_in_telegram(target)
+        except Exception:
+            pass
+
+    def _setup_deeplink_hook(self):
+        try:
+            if LaunchActivity is None:
+                return
+            LaunchActivityClass = find_class("org.telegram.ui.LaunchActivity")
+            if not LaunchActivityClass:
+                return
+            method = None
+            try:
+                method = LaunchActivityClass.getClass().getDeclaredMethod(
+                    "handleIntent",
+                    find_class("android.content.Intent"),
+                    find_class("java.lang.Boolean").TYPE,
+                    find_class("java.lang.Boolean").TYPE,
+                    find_class("java.lang.Boolean").TYPE,
+                    find_class("org.telegram.messenger.browser.Browser$Progress"),
+                    find_class("java.lang.Boolean").TYPE,
+                    find_class("java.lang.Boolean").TYPE,
+                )
+            except Exception:
+                for m in LaunchActivityClass.getClass().getDeclaredMethods():
+                    if m.getName() == "handleIntent":
+                        method = m
+                        break
+            if not method:
+                return
+            method.setAccessible(True)
+            self._deeplink_hook_ref = self.hook_method(method, _DeeplinkHook(self))
+        except Exception:
+            pass
+
     def open_plugin_settings(self):
-        from client_utils import get_last_fragment
-        from com.exteragram.messenger.plugins import PluginsController
-        from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
         def _open_settings():
             try:
                 fragment = get_last_fragment()
@@ -392,16 +1463,11 @@ class PluginCreatorPlugin(BasePlugin):
                     fragment.presentFragment(PluginSettingsActivity(plugin))
                     self._force_load_stickers()
             except Exception as e:
-                from ui.bulletin import BulletinHelper
-                BulletinHelper.show_error(t('open_settings_error', lang=self.lang, error=str(e)))
+                BulletinHelper.show_error(self._t('open_settings_error', error=str(e)))
         run_on_ui_thread(_open_settings)
 
     def _force_load_stickers(self):
         try:
-            from client_utils import get_last_fragment
-            from org.telegram.messenger import MediaDataController
-            from org.telegram.tgnet import TLRPC
-
             def load_stickers():
                 try:
                     fragment = get_last_fragment()
@@ -410,11 +1476,9 @@ class PluginCreatorPlugin(BasePlugin):
                         if fragment is not None and hasattr(fragment, 'getCurrentAccount'):
                             current_account = fragment.getCurrentAccount()
                         else:
-                            from org.telegram.messenger import UserConfig
                             current_account = UserConfig.selectedAccount
                     except Exception:
                         try:
-                            from org.telegram.messenger import UserConfig
                             current_account = UserConfig.selectedAccount
                         except Exception:
                             current_account = 0
@@ -425,8 +1489,6 @@ class PluginCreatorPlugin(BasePlugin):
                         media_controller.getStickerSet(input_set, None, False, None)
                 except Exception:
                     pass
-            from android_utils import run_on_ui_thread
-            from org.telegram.messenger import AndroidUtilities
             AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(load_stickers), 1000)
         except Exception:
             pass
@@ -435,7 +1497,6 @@ class PluginCreatorPlugin(BasePlugin):
         show_chat = self.get_setting('show_chat_menu', True)
         if show_chat:
             try:
-                from android_utils import run_on_ui_thread
                 run_on_ui_thread(self._add_plugin_creator_item_to_current_chat_header)
             except Exception:
                 pass
@@ -451,11 +1512,260 @@ class PluginCreatorPlugin(BasePlugin):
             if menu_type:
                 self.add_menu_item(MenuItemData(
                     menu_type=menu_type,
-                    text=t('create_plugin', lang=self.lang),
+                    text=self._t('create_plugin'),
                     icon='msg_addbot',
                     item_id='plugin_creator_chat_plugins',
                     on_click=lambda ctx: self._show_plugin_creator_popup_menu(None)
                 ))
+
+    def _update_main_plugins_menu(self):
+        self.remove_menu_item('plugin_creator_drawer')
+        if self.get_setting('show_main_plugins_menu_button', False):
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                text='Plugin creator',
+                icon='menu_sendfile_plus',
+                item_id='plugin_creator_drawer',
+                on_click=lambda ctx: self.open_plugin_settings()
+            ))
+
+    def _create_settings_header(self, context):
+        try:
+            container = FrameLayout(context)
+            if self.get_setting('particles_in_settings', True):
+                try:
+                    particlesView = StarParticlesView(context)
+                    particlesView.doNotFling = True
+                    particlesView.setClipWithGradient()
+                    particlesView.drawable.colorKey = Theme.key_premiumGradient1
+                    particlesView.drawable.isCircle = False
+                    particlesView.drawable.roundEffect = False
+                    particlesView.drawable.useRotate = False
+                    particlesView.drawable.useBlur = True
+                    particlesView.drawable.checkBounds = True
+                    particlesView.drawable.useScale = True
+                    particlesView.drawable.startFromCenter = True
+                    particlesView.drawable.centerOffsetY = AndroidUtilities.dp(24)
+                    particlesView.drawable.size1 = 17
+                    particlesView.drawable.size2 = 18
+                    particlesView.drawable.size3 = 19
+                    particlesView.drawable.init()
+                    container.addView(particlesView, LayoutHelper.createFrame(-1, 238, Gravity.CENTER_HORIZONTAL | Gravity.TOP, 0, -10, 0, 0))
+                except: pass
+            
+            main_layout = LinearLayout(context)
+            main_layout.setOrientation(LinearLayout.VERTICAL)
+            main_layout.setGravity(Gravity.CENTER)
+            main_layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(20), AndroidUtilities.dp(20), AndroidUtilities.dp(20))
+            imageView = BackupImageView(context)
+            imageView.setRoundRadius(AndroidUtilities.dp(45))
+            if not self.try_load_sticker(imageView, __icon__, 0, "130_130"):
+                self.load_sticker_with_fallback(imageView, __icon__, 0, "130_130")
+            sticker_container = FrameLayout(context)
+            border_drawable = GradientDrawable()
+            border_drawable.setShape(GradientDrawable.RECTANGLE)
+            border_drawable.setCornerRadius(AndroidUtilities.dp(47))
+            border_drawable.setColor(Color.WHITE)
+            border_drawable.setStroke(AndroidUtilities.dp(3), Color.WHITE)
+            sticker_container.setBackground(border_drawable)
+            sticker_container.addView(imageView, LayoutHelper.createFrame(130, 130, Gravity.CENTER))
+            main_layout.addView(sticker_container, LayoutHelper.createLinear(136, 136, Gravity.CENTER, 0, 0, 0, 16))
+            text_container = LinearLayout(context)
+            text_container.setOrientation(LinearLayout.VERTICAL)
+            text_container.setGravity(Gravity.CENTER)
+            title = TextView(context)
+            title.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            title.setTypeface(AndroidUtilities.getTypeface(AndroidUtilities.TYPEFACE_ROBOTO_MEDIUM))
+            title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+            title.setText(self._t('header_title'))
+            title.setSingleLine(True)
+            title.setGravity(Gravity.CENTER)
+            text_container.addView(title, LayoutHelper.createLinear(-1, -2, 0, 0, 4, 0))
+            subtitle = TextView(context)
+            subtitle.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            subtitle.setText(self._t('header_subtitle'))
+            subtitle.setGravity(Gravity.CENTER)
+            text_container.addView(subtitle, LayoutHelper.createLinear(-1, -2))
+            main_layout.addView(text_container, LayoutHelper.createLinear(-1, -2, Gravity.CENTER))
+            container.addView(main_layout, LayoutHelper.createFrame(-1, -2, Gravity.CENTER))
+            return container
+        except Exception:
+            return None
+
+    def _setup_settings_header_hook(self):
+        try:
+            if HeaderSetting is None:
+                return None
+                
+            class PluginCreatorSettingsHeaderHook(MethodHook):
+                def __init__(self, plugin_instance):
+                    self.plugin_instance = plugin_instance
+
+                def after_hooked_method(self, param):
+                    try:
+                        activity = param.thisObject
+                        items = param.args[0]
+                        if not items or items.size() == 0:
+                            return
+                        for i in range(items.size()):
+                            item = items.get(i)
+                            if hasattr(item, 'settingItem') and str(item.settingItem) == "plugin_creator_header":
+                                return
+                        plugin_obj = self.plugin_instance._get_private_field(activity, "plugin")
+                        if not plugin_obj or str(plugin_obj.getId()) != "plugin_creator":
+                            return
+                        if self.plugin_instance._get_private_field(activity, "createSubFragmentCallback") is not None:
+                            return
+                        searching = self.plugin_instance._get_private_field(activity, "searching")
+                        if searching:
+                            return
+                        header = self.plugin_instance._create_settings_header(activity.getContext())
+                        if header:
+                            item = UItem.asCustom(header)
+                            item.settingItem = HeaderSetting("plugin_creator_header")
+                            try:
+                                item.setTransparent(True)
+                            except:
+                                pass
+                            items.add(0, item)
+                            items.add(1, UItem.asShadow())
+                    except Exception:
+                        pass
+
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if PSA:
+                method = PSA.getClass().getDeclaredMethod("fillItems", find_class("java.util.ArrayList"), find_class("org.telegram.ui.Components.UniversalAdapter"))
+                method.setAccessible(True)
+                return self.hook_method(method, PluginCreatorSettingsHeaderHook(self))
+        except Exception:
+            pass
+        return None
+
+    def _setup_settings_activity_hook(self):
+        try:
+            SA = find_class("org.telegram.ui.SettingsActivity")
+            if SA is None:
+                return
+            ArrayList = find_class("java.util.ArrayList")
+            UniversalAdapter = find_class("org.telegram.ui.Components.UniversalAdapter")
+            if ArrayList is None or UniversalAdapter is None:
+                return
+
+            _SETTINGS_BTN_ID = 880098
+            plugin_ref = self
+
+            class FillItemsHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        if not plugin_ref.get_setting('show_settings_menu_button', True):
+                            return
+                        items = param.args[0]
+                        if items is None or items.size() == 0:
+                            return
+                        for i in range(items.size()):
+                            item = items.get(i)
+                            try:
+                                if item is not None and int(item.id) == _SETTINGS_BTN_ID:
+                                    return
+                            except Exception:
+                                pass
+                        extera_idx = -1
+                        for i in range(items.size()):
+                            item = items.get(i)
+                            try:
+                                if item is not None and int(item.id) == -1:
+                                    extera_idx = i
+                                    break
+                            except Exception:
+                                pass
+                        if extera_idx < 0:
+                            return
+                        SettingCellFactory = find_class("org.telegram.ui.SettingsActivity$SettingCell$Factory")
+                        if SettingCellFactory is None:
+                            return
+                        icon_id = 0
+                        try:
+                            icon_id = int(R_tg.drawable.msg_filled_data_files)
+                        except Exception:
+                            pass
+                        label = t('plugin_settings_section', lang=plugin_ref.lang)
+                        of_method = None
+                        for m in SettingCellFactory.getClass().getDeclaredMethods():
+                            try:
+                                if m.getName() == "of" and len(m.getParameterTypes()) == 5:
+                                    of_method = m
+                                    break
+                            except Exception:
+                                pass
+                        if of_method is None:
+                            return
+                        of_method.setAccessible(True)
+                        _PURPLE = -8704066
+                        item = of_method.invoke(None, [jint(_SETTINGS_BTN_ID), jint(_PURPLE), jint(_PURPLE), jint(icon_id), label])
+                        if item is None:
+                            return
+                        _PURPLE = -8704066
+                        try:
+                            item_cls = item.getClass()
+                            for _fname in ('iconColor', 'iconBgColor', 'color', 'bgColor'):
+                                try:
+                                    _f = item_cls.getDeclaredField(_fname)
+                                    _f.setAccessible(True)
+                                    _f.setInt(item, _PURPLE)
+                                    break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        if item is None:
+                            return
+                        items.add(extera_idx + 1, item)
+                    except Exception as e:
+                        log(f"plugin_creator settings hook FillItems error: {e}")
+
+            class OnClickHook(MethodHook):
+                def before_hooked_method(self, param):
+                    try:
+                        uItem = param.args[0]
+                        if uItem is None:
+                            return
+                        if int(uItem.id) != _SETTINGS_BTN_ID:
+                            return
+                        param.setResult(None)
+                        def open():
+                            try:
+                                frag = get_last_fragment()
+                                plugin_obj = PluginsController.getInstance().plugins.get(plugin_ref.id)
+                                if plugin_obj and frag:
+                                    frag.presentFragment(PluginSettingsActivity(plugin_obj))
+                            except Exception as e:
+                                log(f"plugin_creator settings hook onClick open error: {e}")
+                        run_on_ui_thread(open)
+                    except Exception as e:
+                        log(f"plugin_creator settings hook OnClick error: {e}")
+            try:
+                fill_method = SA.getClass().getDeclaredMethod("fillItems", ArrayList, UniversalAdapter)
+                fill_method.setAccessible(True)
+                self._settings_activity_hooks.append(self.hook_method(fill_method, FillItemsHook()))
+            except Exception as e:
+                log(f"plugin_creator: fillItems hook error: {e}")
+            try:
+                click_method = None
+                for m in SA.getClass().getDeclaredMethods():
+                    try:
+                        if m.getName() == "onClick" and len(m.getParameterTypes()) == 5:
+                            click_method = m
+                            break
+                    except Exception:
+                        pass
+                if click_method:
+                    click_method.setAccessible(True)
+                    self._settings_activity_hooks.append(self.hook_method(click_method, OnClickHook()))
+            except Exception as e:
+                log(f"plugin_creator: onClick hook error: {e}")
+        except Exception as e:
+            log(f"plugin_creator: _setup_settings_activity_hook error: {e}")
 
     def _get_private_field(self, obj, name):
         try:
@@ -474,10 +1784,12 @@ class PluginCreatorPlugin(BasePlugin):
                     break
         return None
 
+    def _kill_process(self):
+        time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGKILL)
+
     def _add_plugin_creator_item_to_current_chat_header(self):
         try:
-            from client_utils import get_last_fragment
-            from org.telegram.ui import ChatActivity
             frag = get_last_fragment()
             if not frag or not isinstance(frag, ChatActivity):
                 return
@@ -485,7 +1797,6 @@ class PluginCreatorPlugin(BasePlugin):
             headerItem = self._get_private_field(chat_activity, "headerItem")
             if headerItem is None:
                 return
-            from hook_utils import find_class
             R = find_class("org.telegram.messenger.R")
             try:
                 icon_id = getattr(R.drawable, 'msg_addbot')
@@ -525,7 +1836,6 @@ class PluginCreatorPlugin(BasePlugin):
                                 break
             except Exception:
                 pass
-            from java import jclass
             try:
                 ItemClass = jclass("org.telegram.ui.ActionBar.ActionBarMenuItem$Item")
                 item_java_class = ItemClass.getClass()
@@ -545,7 +1855,7 @@ class PluginCreatorPlugin(BasePlugin):
                     Integer(self.plugin_creator_menu_id),
                     Integer(icon_id),
                     None,
-                    t('create_plugin', lang=self.lang),
+                    self._t('create_plugin'),
                     Boolean(True),
                     Boolean(False)
                 )
@@ -555,7 +1865,7 @@ class PluginCreatorPlugin(BasePlugin):
                         lazy_map.put(self.plugin_creator_menu_id, our_item)
                 else:
                     try:
-                        headerItem.lazilyAddSubItem(self.plugin_creator_menu_id, icon_id, t('create_plugin', lang=self.lang))
+                        headerItem.lazilyAddSubItem(self.plugin_creator_menu_id, icon_id, self._t('create_plugin'))
                     except Exception:
                         pass
                 self._hook_chat_action_bar_callback(chat_activity)
@@ -566,7 +1876,6 @@ class PluginCreatorPlugin(BasePlugin):
 
     def _hook_chat_action_bar_callback(self, chat_activity):
         try:
-            from base_plugin import MethodHook
             action_bar = self._get_private_field(chat_activity, "actionBar")
             if action_bar is None:
                 return
@@ -574,7 +1883,6 @@ class PluginCreatorPlugin(BasePlugin):
             if current_callback is None:
                 return
             callback_class = current_callback.getClass()
-            from java import jclass
             jint = jclass("java.lang.Integer").TYPE
             onItemClickMethod = callback_class.getDeclaredMethod("onItemClick", jint)
             onItemClickMethod.setAccessible(True)
@@ -587,7 +1895,6 @@ class PluginCreatorPlugin(BasePlugin):
                     try:
                         item_id = int(param.args[0])
                         if item_id == self.plugin_ref.plugin_creator_menu_id:
-                            from android_utils import run_on_ui_thread
                             run_on_ui_thread(lambda: self.plugin_ref._show_plugin_creator_popup_menu(None))
                             param.setResult(None)
                     except Exception:
@@ -598,8 +1905,6 @@ class PluginCreatorPlugin(BasePlugin):
 
     def _hook_chat_activity_resume(self):
         try:
-            from hook_utils import find_class
-            from base_plugin import MethodHook
             ChatActivity = find_class("org.telegram.ui.ChatActivity")
             if ChatActivity is None:
                 return
@@ -629,7 +1934,6 @@ class PluginCreatorPlugin(BasePlugin):
                 def after_hooked_method(self, param):
                     try:
                         if self.p.get_setting('show_chat_menu', True):
-                            from android_utils import run_on_ui_thread
                             run_on_ui_thread(self.p._add_plugin_creator_item_to_current_chat_header)
                     except Exception:
                         pass
@@ -639,26 +1943,6 @@ class PluginCreatorPlugin(BasePlugin):
 
     def _show_plugin_creator_popup_menu(self, text_view):
         try:
-            from client_utils import get_last_fragment
-            from org.telegram.ui.ActionBar import BottomSheet, Theme
-            from org.telegram.ui.Components import LayoutHelper
-            from org.telegram.messenger import AndroidUtilities
-            from android.widget import LinearLayout, TextView, ScrollView, FrameLayout
-            from android.view import Gravity, View, MotionEvent
-            from android.util import TypedValue
-            from org.telegram.ui.Components import EditTextBoldCursor
-            from android.text import InputType
-            from android.graphics import Typeface
-            from androidx.core.widget import NestedScrollView
-            from android_utils import OnClickListener
-            from android.graphics.drawable import GradientDrawable
-            from android.content.res import ColorStateList
-            from android.graphics import Color
-            try:
-                from android.animation import ValueAnimator, AnimatorSet
-                from android.view import animation
-            except ImportError:
-                pass
             fragment = get_last_fragment()
             if not fragment or not hasattr(fragment, 'getParentActivity'):
                 return
@@ -670,6 +1954,7 @@ class PluginCreatorPlugin(BasePlugin):
             except Exception:
                 sheet = BottomSheet(context, True)
             sheet.setAllowNestedScroll(True)
+            sheet.setCanDismissWithSwipe(False)
             try:
                 sheet.setResizeKeyboardArea(True)
             except Exception:
@@ -707,28 +1992,148 @@ class PluginCreatorPlugin(BasePlugin):
                 main_container.setTranslationY(AndroidUtilities.dp(100))
             except Exception:
                 pass
+            current_filename = self.get_setting('send_name', 'main.plugin')
+            if not current_filename:
+                current_filename = 'main.plugin'
+            
+            def build_title_spannable(filename):
+                try:
+                    prefix = self._t('create_title_prefix')
+                    full_text = prefix + filename
+                    spannable = SpannableString(full_text)
+                    accent_color = Theme.getColor(Theme.key_dialogTextBlue)
+                    start = len(prefix)
+                    end = len(full_text)
+                    spannable.setSpan(UnderlineSpan(), start, end, SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    spannable.setSpan(ForegroundColorSpan(accent_color), start, end, SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    return spannable
+                except Exception:
+                    return self._t('create_plugin_title')
+            
+            title_container = FrameLayout(context)
             title_view = TextView(context)
-            title_view.setText(t('create_plugin_title', lang=self.lang))
+            title_view.setText(build_title_spannable(current_filename))
             title_view.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
             title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
             title_view.setGravity(Gravity.CENTER)
             title_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            
+            def update_title_filename(new_filename):
+                try:
+                    title_view.setText(build_title_spannable(new_filename))
+                except Exception:
+                    pass
+            
+            def show_rename_dialog(v):
+                try:
+                    builder = AlertDialogBuilder(context)
+                    builder.set_title(self._t('send_name'))
+                    dialog_content = LinearLayout(context)
+                    dialog_content.setOrientation(LinearLayout.VERTICAL)
+                    dialog_content.setPadding(AndroidUtilities.dp(24), 0, AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+                    subtitle_view = TextView(context)
+                    subtitle_view.setText(self._t('send_name_sub'))
+                    subtitle_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                    try:
+                        subtitle_view.setTextColor(Color.WHITE)
+                    except Exception:
+                        pass
+                    subtitle_view.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12))
+                    dialog_content.addView(subtitle_view, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+                    rename_edit = EditText(context)
+                    rename_edit.setText(self.get_setting('send_name', 'main.plugin') or 'main.plugin')
+                    rename_edit.setHint(self._t('rename_file_hint'))
+                    rename_edit.setSingleLine(True)
+                    rename_edit.setInputType(InputType.TYPE_CLASS_TEXT)
+                    rename_edit.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+                    rename_edit.setTextColor(Color.WHITE)
+                    rename_edit.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+                    rename_edit.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(6))
+                    try:
+                        accent_color = Theme.getColor(Theme.key_dialogTextBlue)
+                        bg_drawable = GradientDrawable()
+                        bg_drawable.setColor(Color.TRANSPARENT)
+                        line_drawable = GradientDrawable()
+                        line_drawable.setShape(GradientDrawable.RECTANGLE)
+                        line_drawable.setColor(accent_color)
+                        layer = LayerDrawable([bg_drawable, line_drawable])
+                        layer.setLayerInset(1, 0, 0, 0, 0)
+                        layer.setLayerHeight(1, AndroidUtilities.dp(2))
+                        layer.setLayerGravity(1, Gravity.BOTTOM)
+                        rename_edit.setBackground(layer)
+                    except Exception:
+                        pass
+                    
+                    def on_apply(b, w):
+                        try:
+                            value = str(rename_edit.getText()).strip()
+                            if not value:
+                                value = 'main.plugin'
+                            if '\n' in value:
+                                value = value.split('\n')[0]
+                            MAX_CHARS = 20
+                            corrected = value
+                            if len(corrected) > MAX_CHARS:
+                                corrected = corrected[:MAX_CHARS]
+                                run_on_ui_thread(lambda: BulletinHelper.show_error(self._t('filename_limit')))
+                            import re as _re
+                            if corrected.count('.') != 1 or not _re.match(r'^([^.]+)\.([a-zA-Zа-яёА-ЯЁ0-9_-]+)$', corrected):
+                                corrected = 'main.plugin'
+                                run_on_ui_thread(lambda: BulletinHelper.show_error(self._t('filename_format_error', default='main.plugin')))
+                            self.set_setting('send_name', corrected, reload_settings=True)
+                            update_title_filename(corrected)
+                            b.dismiss()
+                        except Exception:
+                            b.dismiss()
+
+                    dialog_content.addView(rename_edit, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 0))
+                    builder.set_view(dialog_content)
+                    builder.set_positive_button(self._t('dialog_done'), on_apply)
+                    builder.set_negative_button(self._t('dialog_cancel'), lambda b, w: b.dismiss())
+
+                    try:
+                        dialog = builder.create()
+                        try:
+                            bg_color = Theme.getColor(Theme.key_dialogBackground)
+                            background = GradientDrawable()
+                            background.setColor(bg_color)
+                            dialog.getWindow().setBackgroundDrawable(background)
+                        except Exception:
+                            pass
+                        dialog.show()
+                    except Exception:
+                        builder.show()
+                    try:
+                        rename_edit.selectAll()
+                        rename_edit.requestFocus()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            
+            title_view.setClickable(True)
+            title_view.setOnClickListener(OnClickListener(show_rename_dialog))
+            title_container.addView(title_view, LayoutHelper.createFrame(-1, -2, Gravity.CENTER, 0, 0, 0, 0))
+            
             try:
-                title_view.setAlpha(0.0)
-                title_view.setTranslationY(AndroidUtilities.dp(50))
-                title_view.setScaleX(0.8)
-                title_view.setScaleY(0.8)
+                title_container.setAlpha(0.0)
+                title_container.setTranslationY(AndroidUtilities.dp(50))
+                title_container.setScaleX(0.8)
+                title_container.setScaleY(0.8)
             except Exception:
                 pass
-            main_container.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 20))
-            input_container = FrameLayout(context)
+
+            main_container.addView(title_container, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 20))
+            input_container = LinearLayout(context)
+            input_container.setOrientation(LinearLayout.VERTICAL)
             input_background = GradientDrawable()
             input_background.setShape(GradientDrawable.RECTANGLE)
-            input_background.setCornerRadius(AndroidUtilities.dp(12))
+            input_background.setCornerRadius(AndroidUtilities.dp(20))
             input_background.setStroke(AndroidUtilities.dp(2), Theme.getColor(Theme.key_dialogTextBlue))
             input_background.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
             input_container.setBackground(input_background)
             input_container.setPadding(AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4), AndroidUtilities.dp(4))
+
             try:
                 input_container.setAlpha(0.0)
                 input_container.setTranslationY(AndroidUtilities.dp(30))
@@ -736,42 +2141,126 @@ class PluginCreatorPlugin(BasePlugin):
                 input_container.setScaleY(0.8)
             except Exception:
                 pass
-            edit_text = EditTextBoldCursor(context)
+
+            edit_text = EditText(context)
             edit_text.setText("")
             edit_text.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
-            edit_text.setHint(t('enter_plugin_code_hint', lang=self.lang))
-            edit_text.setMaxHeight(AndroidUtilities.dp(300))
-            edit_text.setMinHeight(AndroidUtilities.dp(80))
-            edit_text.setVerticalScrollBarEnabled(True)
-            edit_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+            edit_text.setHint(self._t('enter_plugin_code_hint'))
+            edit_text.setMinHeight(AndroidUtilities.dp(40))
+            edit_text.setBackgroundColor(Color.TRANSPARENT)
+            edit_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, self.get_setting('text_font_size', 15))
             edit_text.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
             edit_text.setHintTextColor(Theme.getColor(Theme.key_dialogTextGray3))
-            edit_text.setCursorColor(Theme.getColor(Theme.key_dialogTextLink))
+
+            try:
+                edit_text.setHorizontallyScrolling(False)
+                edit_text.setSingleLine(False)
+                edit_text.setMovementMethod(ArrowKeyMovementMethod.getInstance())
+                current_input_type = edit_text.getInputType()
+                edit_text.setInputType(current_input_type & ~0x80000)
+                if hasattr(edit_text, 'setMaxEms'):
+                    edit_text.setMaxEms(0)
+            except Exception:
+                pass
+            
+            try:
+                cursor_drawable = PaintDrawable(Theme.getColor(Theme.key_dialogTextLink))
+                cursor_drawable.setIntrinsicWidth(AndroidUtilities.dp(2))
+                if hasattr(edit_text, 'setTextCursorDrawable'):
+                    edit_text.setTextCursorDrawable(cursor_drawable)
+            except Exception:
+                pass
+            
+            def set_text_optimized(text):
+                try:
+                    if isinstance(text, str) and len(text) > 10000:
+                        edit_text.setText(SpannableStringBuilder(text))
+                    else:
+                        edit_text.setText(text)
+                except Exception:
+                    edit_text.setText(text)
+            
+            self._set_text_optimized = set_text_optimized
             edit_text.setBackground(None)
-            padding = AndroidUtilities.dp(16)
-            edit_text.setPadding(padding, padding, padding, padding)
-            import time
+            padding = AndroidUtilities.dp(8)
+            edit_text.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(8))
+            scroll_view = ScrollView(context)
+            scroll_view.setVerticalScrollBarEnabled(True)
+            scroll_view.setScrollBarStyle(View.SCROLLBARS_INSIDE_INSET)
+            try:
+                scroll_view.setFadingEdgeLength(AndroidUtilities.dp(30))
+                scroll_view.setVerticalFadingEdgeEnabled(True)
+                scroll_view.setHorizontalFadingEdgeEnabled(False)
+            except Exception:
+                pass
+            try:
+                scroll_thumb = GradientDrawable()
+                scroll_thumb.setShape(GradientDrawable.RECTANGLE)
+                scroll_thumb.setCornerRadius(AndroidUtilities.dp(4))
+                scroll_thumb.setColor(Color.parseColor("#80808080"))
+                scroll_view.setVerticalScrollbarThumbDrawable(scroll_thumb)
+                scroll_view.setScrollbarFadingEnabled(False)
+            except Exception:
+                pass
+            
+            edit_wrapper = FrameLayout(context)
+            wrapper_params = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+            edit_wrapper.addView(edit_text, wrapper_params)
+            scroll_view.addView(edit_wrapper, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ))
+            
+            scroll_params = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1.0
+            )
+            input_container.addView(scroll_view, scroll_params)
+            class SimpleTextWatcher(dynamic_proxy(TextWatcher)):
+
+                def beforeTextChanged(self, s, start, count, after):
+                    pass
+
+                def onTextChanged(self, s, start, before, count):
+                    pass
+
+                def afterTextChanged(self, s):
+                    try:
+                        selection_end = edit_text.getSelectionEnd()
+                        text_length = len(str(edit_text.getText()))
+                        if selection_end >= text_length - 1:
+                            def scroll_to_bottom():
+                                try:
+                                    scroll_view.post(lambda: scroll_view.fullScroll(ScrollView.FOCUS_DOWN))
+                                except Exception:
+                                    pass
+                            run_on_ui_thread(scroll_to_bottom, 150)
+                    except Exception:
+                        pass
+            
+            edit_text.addTextChangedListener(SimpleTextWatcher())
             current_time = time.time()
             show_restore_button = (self.saved_plugin_text and 
                                  (current_time - self.saved_text_time) < 300 and
                                  not self.closed_by_send)
-            try:
-                edit_text.setNestedScrollingEnabled(True)
-            except Exception:
-                pass
+
             def on_focus_change(v, has_focus):
                 try:
                     if has_focus:
                         try:
-                            title_view.animate().translationY(-AndroidUtilities.dp(20)).setDuration(300).start()
-                            input_container.animate().translationY(-AndroidUtilities.dp(15)).setDuration(300).start()
-                            buttons_container.animate().translationY(-AndroidUtilities.dp(10)).setDuration(300).start()
-                            send_btn.animate().translationY(-AndroidUtilities.dp(25)).setDuration(300).start()
+                            title_container.animate().translationY(-AndroidUtilities.dp(60)).setDuration(300).start()
+                            input_container.animate().translationY(-AndroidUtilities.dp(45)).setDuration(300).start()
+                            buttons_container.animate().translationY(-AndroidUtilities.dp(30)).setDuration(300).start()
+                            send_btn.animate().translationY(-AndroidUtilities.dp(75)).setDuration(300).start()
                         except Exception:
                             pass
                     else:
                         try:
-                            title_view.animate().translationY(0).setDuration(300).start()
+                            title_container.animate().translationY(0).setDuration(300).start()
                             input_container.animate().translationY(0).setDuration(300).start()
                             buttons_container.animate().translationY(0).setDuration(300).start()
                             send_btn.animate().translationY(0).setDuration(300).start()
@@ -779,40 +2268,40 @@ class PluginCreatorPlugin(BasePlugin):
                             pass
                 except Exception:
                     pass
-            try:
-                edit_text.setOnFocusChangeListener(lambda v, has_focus: on_focus_change(v, has_focus))
-            except Exception:
-                pass
-            try:
-                from java import dynamic_proxy
-                class _OnTouchListener(dynamic_proxy(View.OnTouchListener)):
-                    def __init__(self, fn):
-                        super().__init__()
-                        self._fn = fn
-                    def onTouch(self, v, event):
-                        return self._fn(v, event)
-                def _on_edit_touch(v, event):
+            
+            original_on_focus_change = on_focus_change
+            def enhanced_on_focus_change(v, has_focus):
+                original_on_focus_change(v, has_focus)
+                run_on_ui_thread(lambda: update_container_layout(), 200)
+                if has_focus:
                     try:
-                        parent = v.getParent()
-                        if parent is not None:
-                            action = event.getActionMasked()
-                            if action == MotionEvent.ACTION_DOWN:
-                                parent.requestDisallowInterceptTouchEvent(True)
-                            elif action == MotionEvent.ACTION_MOVE:
-                                parent.requestDisallowInterceptTouchEvent(True)
-                            elif action in (MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL):
-                                parent.requestDisallowInterceptTouchEvent(False)
+                        run_on_ui_thread(lambda: scroll_view.scrollTo(0, edit_text.getBottom()), 300)
                     except Exception:
                         pass
-                    return False
-                edit_text.setOnTouchListener(_OnTouchListener(_on_edit_touch))
+            try:
+                edit_text.setOnFocusChangeListener(lambda v, has_focus: enhanced_on_focus_change(v, has_focus))
             except Exception:
                 pass
-            input_container.addView(edit_text, FrameLayout.LayoutParams(-1, -2))
-            main_container.addView(input_container, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 20))
+            try:
+                pass
+            except Exception:
+                pass
+
+            main_container.addView(input_container, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1.0
+            ))
+            
+            spacer = View(context)
+            main_container.addView(spacer, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                AndroidUtilities.dp(16)
+            ))
+            
+            run_on_ui_thread(lambda: None, 300)
+            
             def create_settings_button(text: str, on_click, icon_only=False):
-                from androidx.core.content import ContextCompat
-                from android.widget import ImageView
                 btn_frame = FrameLayout(context)
                 btn_bg = GradientDrawable()
                 btn_bg.setCornerRadius(AndroidUtilities.dp(18))
@@ -822,8 +2311,6 @@ class PluginCreatorPlugin(BasePlugin):
                     bg_color = Color.parseColor("#F0F0F0")
                 btn_bg.setColor(bg_color)
                 try:
-                    from android.graphics.drawable import RippleDrawable
-                    from android.content.res import ColorStateList
                     ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
                     ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
                     btn_frame.setBackground(ripple_drawable)
@@ -832,28 +2319,25 @@ class PluginCreatorPlugin(BasePlugin):
                 btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
                 icon_view = ImageView(context)
                 try:
-                    from org.telegram.messenger import R as R_tg
                     icon_view.setImageResource(R_tg.drawable.msg_settings)
                 except Exception:
                     pass
                 icon_view.setScaleType(ImageView.ScaleType.CENTER)
                 icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
-                
                 if icon_only:
-                    btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.CENTER, 0, 0, 0, 0))
+                    btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.CENTER, 0, 0, 0, 0))
                 else:
                     text_view = TextView(context)
                     text_view.setText(text)
                     text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
                     text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
                     text_view.setGravity(Gravity.CENTER_VERTICAL)
-                    btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-                    btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
+                    btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
+                    btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 32, 0, 0, 0))
                 btn_frame.setOnClickListener(OnClickListener(on_click))
                 return btn_frame
+
             def create_paste_button(text: str, on_click):
-                from androidx.core.content import ContextCompat
-                from android.widget import ImageView
                 btn_frame = FrameLayout(context)
                 btn_bg = GradientDrawable()
                 btn_bg.setCornerRadius(AndroidUtilities.dp(18))
@@ -863,8 +2347,6 @@ class PluginCreatorPlugin(BasePlugin):
                     bg_color = Color.parseColor("#F0F0F0")
                 btn_bg.setColor(bg_color)
                 try:
-                    from android.graphics.drawable import RippleDrawable
-                    from android.content.res import ColorStateList
                     ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
                     ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
                     btn_frame.setBackground(ripple_drawable)
@@ -873,7 +2355,6 @@ class PluginCreatorPlugin(BasePlugin):
                 btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
                 icon_view = ImageView(context)
                 try:
-                    from org.telegram.messenger import R as R_tg
                     icon_view.setImageResource(R_tg.drawable.msg_log)
                 except Exception:
                     pass
@@ -884,13 +2365,13 @@ class PluginCreatorPlugin(BasePlugin):
                 text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
                 text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
                 text_view.setGravity(Gravity.CENTER_VERTICAL)
-                btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-                btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
+                btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
+                btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 32, 0, 0, 0))
                 btn_frame.setOnClickListener(OnClickListener(on_click))
                 return btn_frame
+
             def paste_from_clipboard(v):
                 try:
-                    from android.content import ClipboardManager, ClipData, Context
                     clipboard_manager = context.getSystemService(Context.CLIPBOARD_SERVICE)
                     if clipboard_manager:
                         clip_data = clipboard_manager.getPrimaryClip()
@@ -898,21 +2379,20 @@ class PluginCreatorPlugin(BasePlugin):
                             item = clip_data.getItemAt(0)
                             text = item.getText()
                             if text:
-                                edit_text.setText(str(text))
+                                self._set_text_optimized(str(text))
                                 edit_text.setSelection(edit_text.getText().length())
+                                update_container_layout()
+                                run_on_ui_thread(lambda: update_container_layout(), 50)
                                 return
                     return
                 except Exception as e:
-                    error_msg = t('paste_error', lang=self.lang)
+                    error_msg = self._t('paste_error')
                     try:
-                        from ui.bulletin import BulletinHelper
-                        BulletinHelper.show_error(error_msg)
+                        BulletinHelper.show_with_button(error_msg, getattr(R_tg.raw, 'error', 0), self._t('close'), lambda: None, None)
                     except Exception:
                         pass
             
             def create_restore_button(text: str, on_click):
-                from androidx.core.content import ContextCompat
-                from android.widget import ImageView
                 btn_frame = FrameLayout(context)
                 btn_bg = GradientDrawable()
                 btn_bg.setCornerRadius(AndroidUtilities.dp(18))
@@ -922,8 +2402,6 @@ class PluginCreatorPlugin(BasePlugin):
                     bg_color = Color.parseColor("#F0F0F0")
                 btn_bg.setColor(bg_color)
                 try:
-                    from android.graphics.drawable import RippleDrawable
-                    from android.content.res import ColorStateList
                     ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
                     ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
                     btn_frame.setBackground(ripple_drawable)
@@ -932,7 +2410,6 @@ class PluginCreatorPlugin(BasePlugin):
                 btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
                 icon_view = ImageView(context)
                 try:
-                    from org.telegram.messenger import R as R_tg
                     icon_view.setImageResource(R_tg.drawable.menu_feature_premium)
                 except Exception:
                     pass
@@ -943,110 +2420,40 @@ class PluginCreatorPlugin(BasePlugin):
                 text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
                 text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
                 text_view.setGravity(Gravity.CENTER_VERTICAL)
-                btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-                btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
+                btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
+                btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 32, 0, 0, 0))
                 btn_frame.setOnClickListener(OnClickListener(on_click))
                 return btn_frame
             
             def restore_saved_text(v):
                 try:
                     if self.saved_plugin_text:
-                        edit_text.setText(self.saved_plugin_text)
+                        self._set_text_optimized(self.saved_plugin_text)
                         edit_text.setSelection(edit_text.getText().length())
+                        run_on_ui_thread(lambda: update_container_layout(), 200)
                         try:
-                            def restore_settings_button():
-                                try:
-                                    settings_btn.removeAllViews()
-                                    from android.widget import ImageView
-                                    icon_view = ImageView(context)
+                            if 'btn_restore_panel' in locals() and btn_restore_panel is not None:
+                                def animate_remove_panel():
                                     try:
-                                        from org.telegram.messenger import R as R_tg
-                                        icon_view.setImageResource(R_tg.drawable.msg_settings)
+                                        btn_restore_panel.animate().alpha(0.0).scaleX(0.8).scaleY(0.8).setDuration(300).withEndAction(lambda: buttons_container.removeView(btn_restore_panel)).start()
                                     except Exception:
-                                        pass
-                                    icon_view.setScaleType(ImageView.ScaleType.CENTER)
-                                    icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
-                                    text_view = TextView(context)
-                                    text_view.setText(t('settings_button', lang=self.lang))
-                                    text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
-                                    text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
-                                    text_view.setGravity(Gravity.CENTER_VERTICAL)
-                                    settings_btn.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-                                    settings_btn.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
-                                    settings_btn.setScaleX(0.8)
-                                    settings_btn.setScaleY(0.8)
-                                    settings_btn.animate().scaleX(1.0).scaleY(1.0).translationX(0).setDuration(300).start()
-                                    paste_btn.animate().translationX(0).setDuration(300).start()
-                                    menu_btn.animate().translationX(0).setDuration(300).start()
-                                except Exception:
-                                    pass
-                            try:
-                                from java import dynamic_proxy
-                                from java.lang import Runnable
-                                class RestoreRunnable(dynamic_proxy(Runnable)):
-                                    def __init__(self, func):
-                                        super().__init__()
-                                        self.func = func
-                                    def run(self):
-                                        self.func()
-                                def on_animation_end():
-                                    try:
-                                        buttons_container.removeView(restore_btn)
-                                        restore_settings_button()
-                                    except Exception:
-                                        pass
-                                restore_btn.animate().alpha(0.0).scaleX(0.8).scaleY(0.8).setDuration(300).withEndAction(RestoreRunnable(on_animation_end)).start()
-                            except Exception:
-                                try:
-                                    from org.telegram.messenger import AndroidUtilities
-                                    from java import dynamic_proxy
-                                    from java.lang import Runnable
-                                    class DelayedRestoreRunnable(dynamic_proxy(Runnable)):
-                                        def __init__(self, func):
-                                            super().__init__()
-                                            self.func = func
-                                        def run(self):
-                                            self.func()
-                                    def delayed_restore():
                                         try:
-                                            buttons_container.removeView(restore_btn)
-                                            restore_settings_button()
+                                            buttons_container.removeView(btn_restore_panel)
                                         except Exception:
                                             pass
-                                    AndroidUtilities.runOnUIThread(DelayedRestoreRunnable(delayed_restore), 300)
-                                    restore_btn.animate().alpha(0.0).scaleX(0.8).scaleY(0.8).setDuration(300).start()
-                                except Exception:
-                                    buttons_container.removeView(restore_btn)
-                                    restore_settings_button()
+                                run_on_ui_thread(animate_remove_panel, 100)
                         except Exception:
-                            try:
-                                buttons_container.removeView(restore_btn)
-                                settings_btn.removeAllViews()
-                                from android.widget import ImageView
-                                icon_view = ImageView(context)
-                                try:
-                                    from org.telegram.messenger import R as R_tg
-                                    icon_view.setImageResource(R_tg.drawable.msg_settings)
-                                except Exception:
-                                    pass
-                                icon_view.setScaleType(ImageView.ScaleType.CENTER)
-                                icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
-                                text_view = TextView(context)
-                                text_view.setText(t('settings_button', lang=self.lang))
-                                text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
-                                text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
-                                text_view.setGravity(Gravity.CENTER_VERTICAL)
-                                settings_btn.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-                                settings_btn.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
-                            except Exception:
-                                pass
+                            pass
+                        self.saved_plugin_text = ""
+                        self.saved_text_time = 0
                 except Exception:
                     pass
+
             buttons_container = LinearLayout(context)
             buttons_container.setOrientation(LinearLayout.HORIZONTAL)
             buttons_container.setGravity(Gravity.CENTER)
+
             def create_icon_button(icon_name: str, on_click):
-                from android.widget import ImageView
                 btn_frame = FrameLayout(context)
                 btn_bg = GradientDrawable()
                 btn_bg.setCornerRadius(AndroidUtilities.dp(18))
@@ -1056,8 +2463,6 @@ class PluginCreatorPlugin(BasePlugin):
                     bg_color = Color.parseColor("#F0F0F0")
                 btn_bg.setColor(bg_color)
                 try:
-                    from android.graphics.drawable import RippleDrawable
-                    from android.content.res import ColorStateList
                     ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
                     ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
                     btn_frame.setBackground(ripple_drawable)
@@ -1066,7 +2471,6 @@ class PluginCreatorPlugin(BasePlugin):
                 btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
                 icon_view = ImageView(context)
                 try:
-                    from org.telegram.messenger import R as R_tg
                     icon_res = getattr(R_tg.drawable, icon_name, 0)
                     if not icon_res:
                         for _fallback in ('ic_ab_other', 'c_ab_other', 'msg_other', 'msg_menu', 'msg_more'):
@@ -1082,9 +2486,56 @@ class PluginCreatorPlugin(BasePlugin):
                     icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
                 except Exception:
                     pass
-                btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.CENTER, 0, 0, 0, 0))
+                btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.CENTER, 0, 0, 0, 0))
                 btn_frame.setOnClickListener(OnClickListener(on_click))
                 return btn_frame
+
+            def do_clear_confirm():
+                try:
+                    builder = AlertDialogBuilder(context)
+                    builder.set_title(self._t('clear_code_title'))
+                    builder.set_message(self._t('clear_confirm_message'))
+                    def on_yes(b, w):
+                        try:
+                            edit_text.setText("")
+                        except Exception:
+                            pass
+                        try:
+                            b.dismiss()
+                        except Exception:
+                            pass
+                    builder.set_positive_button(self._t('clear'), on_yes)
+                    builder.set_negative_button(self._t('close_button'), lambda b, w: b.dismiss())
+                    try:
+                        builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+                    except Exception:
+                        pass
+                    builder.show()
+                except Exception:
+                    pass
+
+            def do_share():
+                try:
+                    share_text = str(edit_text.getText())
+                    intent = Intent(Intent.ACTION_SEND)
+                    intent.setType("text/plain")
+                    intent.putExtra(Intent.EXTRA_TEXT, share_text)
+                    chooser = Intent.createChooser(intent, self._t('share'))
+                    context.startActivity(chooser)
+                except Exception:
+                    pass
+
+            def do_copy():
+                try:
+                    clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                    clipboard.setPrimaryClip(ClipData.newPlainText("plugin_code", str(edit_text.getText())))
+                    try:
+                        icon_attr = getattr(R_tg.raw, 'copy', 0)
+                        BulletinHelper.show_with_button(self._t('copied_to_clipboard'), icon_attr, self._t('close'), lambda: None, None)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
             def show_code_actions_menu(anchor_view):
                 try:
@@ -1092,16 +2543,13 @@ class PluginCreatorPlugin(BasePlugin):
                     from android.view import View as AView, Gravity as AGravity
                     from android.widget import FrameLayout as AFrame, LinearLayout as ALinear, TextView as AText, ImageView as AImage
                     from androidx.core.content import ContextCompat
-                    from org.telegram.messenger import R as R_tg
                     popup_layout = ActionBarPopupWindow.ActionBarPopupWindowLayout(context)
                     popup_layout.setBackgroundColor(Theme.getColor(Theme.key_actionBarDefaultSubmenuBackground))
                     popup_layout.setFitItems(True)
                     popup_window_ref = [None]
                     def create_menu_item(icon_res: int, title: str, action, is_clear=False):
-                        from android.graphics.drawable import GradientDrawable
                         from android.graphics import Color as AColor, PorterDuff
                         from android.content.res import ColorStateList as AColorStateList
-                        from android.graphics.drawable import RippleDrawable
                         item_frame = AFrame(context)
                         item_frame.setMinimumWidth(AndroidUtilities.dp(160))
                         item_frame.setClickable(True)
@@ -1194,62 +2642,24 @@ class PluginCreatorPlugin(BasePlugin):
                                 pass
                         item_frame.setOnClickListener(OnClickListener(_on_click))
                         popup_layout.addView(item_frame, LayoutHelper.createLinear(-1, -2))
-                    def do_share():
-                        try:
-                            from android.content import Intent
-                            share_text = str(edit_text.getText())
-                            intent = Intent(Intent.ACTION_SEND)
-                            intent.setType("text/plain")
-                            intent.putExtra(Intent.EXTRA_TEXT, share_text)
-                            chooser = Intent.createChooser(intent, t('share', lang=self.lang))
-                            context.startActivity(chooser)
-                        except Exception:
-                            pass
-                    def do_copy():
-                        try:
-                            from android.content import ClipData, ClipboardManager, Context
-                            clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
-                            clipboard.setPrimaryClip(ClipData.newPlainText("plugin_code", str(edit_text.getText())))
-                            try:
-                                from ui.bulletin import BulletinHelper
-                                from org.telegram.messenger import R as R_tg
-                                icon_attr = getattr(R_tg.raw, 'copy', 0)
-                                BulletinHelper.show_with_button(t('copied_to_clipboard', lang=self.lang), icon_attr, t('close', lang=self.lang), lambda: None, None)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                    def do_clear_confirm():
-                        try:
-                            from ui.alert import AlertDialogBuilder
-                            builder = AlertDialogBuilder(context)
-                            builder.set_title(t('clear_code_title', lang=self.lang))
-                            builder.set_message(t('clear_confirm_message', lang=self.lang))
-                            def on_yes(b, w):
-                                try:
-                                    edit_text.setText("")
-                                except Exception:
-                                    pass
-                                try:
-                                    b.dismiss()
-                                except Exception:
-                                    pass
-                            builder.set_positive_button(t('clear', lang=self.lang), on_yes)
-                            builder.set_negative_button(t('close_button', lang=self.lang), lambda b, w: b.dismiss())
-                            try:
-                                builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
-                            except Exception:
-                                pass
-                            builder.show()
-                        except Exception:
-                            pass
-                    from org.telegram.messenger import R as R_tg
                     icon_share = getattr(R_tg.drawable, 'msg_share', 0)
                     icon_copy = getattr(R_tg.drawable, 'msg_copy', getattr(R_tg.drawable, 'msg_copy_filled', 0))
                     icon_clear = getattr(R_tg.drawable, 'msg_delete', getattr(R_tg.drawable, 'msg_clear', 0))
-                    create_menu_item(icon_share, t('share', lang=self.lang), do_share, False)
-                    create_menu_item(icon_copy, t('copy_button', lang=self.lang), do_copy, False)
-                    create_menu_item(icon_clear, t('clear', lang=self.lang), do_clear_confirm, True)
+                    panel_keys, menu_keys = self._get_panel_buttons_state()
+                    for k in menu_keys:
+                        if k == 'share':
+                            create_menu_item(icon_share, self._t('share'), do_share, False)
+                        elif k == 'copy':
+                            create_menu_item(icon_copy, self._t('copy_button'), do_copy, False)
+                        elif k == 'clear':
+                            create_menu_item(icon_clear, self._t('clear'), do_clear_confirm, False)
+                        elif k == 'settings':
+                            create_menu_item(getattr(R_tg.drawable, 'msg_settings', 0), self._t('settings'), lambda: (sheet.dismiss(), self.open_plugin_settings()), False)
+                        elif k == 'paste':
+                            create_menu_item(getattr(R_tg.drawable, 'msg_log', 0), self._t('paste'), lambda: paste_from_clipboard(None), False)
+                        elif k == 'restore':
+                            if show_restore_button:
+                                create_menu_item(getattr(R_tg.drawable, 'menu_feature_premium', 0), self._t('restore_button'), lambda: restore_saved_text(None), False)
                     popup_window = ActionBarPopupWindow(popup_layout, -2, -2)
                     popup_window_ref[0] = popup_window
                     popup_window.setOutsideTouchable(True)
@@ -1268,39 +2678,103 @@ class PluginCreatorPlugin(BasePlugin):
                     popup_window.dimBehind()
                 except Exception:
                     pass
-            settings_btn = create_settings_button(t('settings_button', lang=self.lang), lambda *_: (sheet.dismiss(), self.open_plugin_settings()), icon_only=show_restore_button)
-            paste_btn = create_paste_button(t('paste_button', lang=self.lang), paste_from_clipboard)
-            menu_btn = create_icon_button('ic_ab_other', lambda *_: show_code_actions_menu(menu_btn))
-            restore_btn = None
-            if show_restore_button:
-                restore_btn = create_restore_button(t('restore_button', lang=self.lang), restore_saved_text)
-                self._apply_press_scale(restore_btn)
+
+            def create_action_button(text: str, icon_res: int, on_click):
+                btn_frame = FrameLayout(context)
+                btn_bg = GradientDrawable()
+                btn_bg.setCornerRadius(AndroidUtilities.dp(18))
                 try:
-                    restore_btn.setAlpha(0.0)
-                    restore_btn.setTranslationY(0)
+                    bg_color = Theme.getColor(Theme.key_chat_inLoader) & 0x20FFFFFF | 0x10000000
+                except Exception:
+                    bg_color = Color.parseColor("#F0F0F0")
+                btn_bg.setColor(bg_color)
+                try:
+                    ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
+                    ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
+                    btn_frame.setBackground(ripple_drawable)
+                except Exception:
+                    btn_frame.setBackground(btn_bg)
+                btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
+                icon_view = ImageView(context)
+                try:
+                    if icon_res:
+                        icon_view.setImageResource(icon_res)
                 except Exception:
                     pass
-            self._apply_press_scale(settings_btn)
-            self._apply_press_scale(paste_btn)
-            self._apply_press_scale(menu_btn)
-            try:
-                settings_btn.setAlpha(1.0)
-                settings_btn.setTranslationY(0)
-                paste_btn.setAlpha(1.0)
-                paste_btn.setTranslationY(0)
-                menu_btn.setAlpha(1.0)
-                menu_btn.setTranslationY(0)
-            except Exception:
-                pass
-            if restore_btn:
-                buttons_container.addView(restore_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
-                buttons_container.addView(settings_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
-                buttons_container.addView(paste_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                icon_view.setScaleType(ImageView.ScaleType.CENTER)
+                try:
+                    icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
+                except Exception:
+                    pass
+                text_view = TextView(context)
+                text_view.setText(text)
+                text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+                text_view.setGravity(Gravity.CENTER_VERTICAL)
+                btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
+                btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 32, 0, 0, 0))
+                btn_frame.setOnClickListener(OnClickListener(on_click))
+                return btn_frame
+
+            panel_keys, menu_keys = self._get_panel_buttons_state()
+            
+            def has_visible_menu_items():
+                if not menu_keys:
+                    return False
+                for k in menu_keys:
+                    if k != 'restore':
+                        return True
+                    if k == 'restore' and show_restore_button:
+                        return True
+                return False
+
+            menu_btn = None
+            if has_visible_menu_items():
+                menu_btn = create_icon_button('ic_ab_other', lambda *_: show_code_actions_menu(menu_btn))
+                self._apply_press_scale(menu_btn)
+                try:
+                    menu_btn.setAlpha(1.0)
+                    menu_btn.setTranslationY(0)
+                except Exception:
+                    pass
+
+            settings_btn = None
+            paste_btn = None
+            panel_buttons = []
+            for k in panel_keys:
+                if k == 'settings':
+                    settings_btn = create_settings_button(self._t('settings'), lambda *_: (sheet.dismiss(), self.open_plugin_settings()), icon_only=False)
+                    self._apply_press_scale(settings_btn)
+                    buttons_container.addView(settings_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                elif k == 'paste':
+                    paste_btn = create_paste_button(self._t('paste'), paste_from_clipboard)
+                    self._apply_press_scale(paste_btn)
+                    buttons_container.addView(paste_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                elif k == 'restore':
+                    if show_restore_button:
+                        btn_restore_panel = create_restore_button(self._t('restore_button'), restore_saved_text)
+                        self._apply_press_scale(btn_restore_panel)
+                        buttons_container.addView(btn_restore_panel, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                elif k == 'share':
+                    btn = create_action_button(self._t('share'), getattr(R_tg.drawable, 'msg_share', 0), lambda *_: do_share())
+                    self._apply_press_scale(btn)
+                    buttons_container.addView(btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                    panel_buttons.append(btn)
+                elif k == 'copy':
+                    btn = create_action_button(self._t('copy_button'), getattr(R_tg.drawable, 'msg_copy', getattr(R_tg.drawable, 'msg_copy_filled', 0)), lambda *_: do_copy())
+                    self._apply_press_scale(btn)
+                    buttons_container.addView(btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                    panel_buttons.append(btn)
+                elif k == 'clear':
+                    btn = create_action_button(self._t('clear'), getattr(R_tg.drawable, 'msg_delete', getattr(R_tg.drawable, 'msg_clear', 0)), lambda *_: do_clear_confirm())
+                    self._apply_press_scale(btn)
+                    buttons_container.addView(btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
+                    panel_buttons.append(btn)
+
+            if menu_btn:
                 buttons_container.addView(menu_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 0, 0))
-            else:
-                buttons_container.addView(settings_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
-                buttons_container.addView(paste_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 8, 0))
-                buttons_container.addView(menu_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER, 0, 0, 0, 0))
+                panel_buttons.append(menu_btn)
+            buttons_container.setGravity(Gravity.CENTER)
             try:
                 buttons_container.setAlpha(0.0)
                 buttons_container.setTranslationY(AndroidUtilities.dp(40))
@@ -1308,13 +2782,39 @@ class PluginCreatorPlugin(BasePlugin):
                 buttons_container.setScaleY(0.8)
             except Exception:
                 pass
-            main_container.addView(buttons_container, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 16))
-            send_btn = TextView(context)
-            send_btn.setText(t('create_and_send', lang=self.lang))
-            send_btn.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
-            send_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
-            send_btn.setGravity(Gravity.CENTER)
-            send_btn.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            
+            horizontal_scroll = HorizontalScrollView(context)
+            horizontal_scroll.setHorizontalScrollBarEnabled(False)
+            horizontal_scroll.setFillViewport(True)
+            horizontal_scroll.setHorizontalFadingEdgeEnabled(True)
+            horizontal_scroll.setFadingEdgeLength(AndroidUtilities.dp(16))
+            horizontal_scroll.addView(buttons_container, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ))
+            
+            main_container.addView(horizontal_scroll, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 16))
+            send_btn_layout = LinearLayout(context)
+            send_btn_layout.setOrientation(LinearLayout.HORIZONTAL)
+            send_btn_layout.setGravity(Gravity.CENTER)
+            send_btn_text = TextView(context)
+            btn_text, btn_icon = self._get_main_button_text_and_icon()
+            send_btn_text.setText(btn_text)
+            send_btn_text.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            send_btn_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            send_btn_text.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            send_btn_layout.addView(send_btn_text, LayoutHelper.createLinear(-2, -2))
+            send_btn_icon = ImageView(context)
+            send_btn_icon.setScaleType(ImageView.ScaleType.CENTER)
+            try:
+                send_btn_icon.setImageResource(getattr(R_tg.drawable, btn_icon, 0))
+            except Exception:
+                pass
+            send_btn_icon.setColorFilter(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            send_btn_layout.addView(send_btn_icon, LayoutHelper.createLinear(24, 24, Gravity.CENTER, 8, 0, 0, 0))
+
+            send_btn = FrameLayout(context)
+            send_btn.addView(send_btn_layout, LayoutHelper.createFrame(-2, -2, Gravity.CENTER))
             try:
                 send_btn.setAlpha(0.0)
                 send_btn.setTranslationY(AndroidUtilities.dp(60))
@@ -1325,34 +2825,6 @@ class PluginCreatorPlugin(BasePlugin):
             btn_background = GradientDrawable()
             btn_background.setShape(GradientDrawable.RECTANGLE)
             btn_background.setCornerRadius(AndroidUtilities.dp(28))
-            def _brighten_color(c, amount=0.22):
-                try:
-                    def _to_int32(x):
-                        x = int(x) & 0xFFFFFFFF
-                        if x >= 0x80000000:
-                            x -= 0x100000000
-                        return x
-                    a = (c >> 24) & 0xFF
-                    try:
-                        from android.graphics import Color as _AColor
-                        hsv = [0.0, 0.0, 0.0]
-                        _AColor.colorToHSV(int(c), hsv)
-                        k = max(0.0, min(1.0, amount))
-                        hsv[1] = max(0.0, min(1.0, hsv[1] * (1.0 - 0.08 * k)))
-                        hsv[2] = max(0.0, min(1.0, hsv[2] * (1.0 - 0.015 * k)))
-                        return _to_int32(_AColor.HSVToColor(a, hsv))
-                    except Exception:
-                        r = (c >> 16) & 0xFF
-                        g = (c >> 8) & 0xFF
-                        b = c & 0xFF
-                        gray = int(r * 0.299 + g * 0.587 + b * 0.114)
-                        k = max(0.0, min(1.0, amount)) * 0.18
-                        r = int(r + (gray - r) * k)
-                        g = int(g + (gray - g) * k)
-                        b = int(b + (gray - b) * k)
-                        return _to_int32((a << 24) | (r << 16) | (g << 8) | b)
-                except Exception:
-                    return c
             try:
                 base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
             except Exception:
@@ -1366,32 +2838,21 @@ class PluginCreatorPlugin(BasePlugin):
                     if not plugin_code:
                         sheet.dismiss()
                         try:
-                            from ui.bulletin import BulletinHelper
-                            from org.telegram.messenger import R as R_tg
-                            from client_utils import get_last_fragment
                             frag = get_last_fragment()
                             icon_attr = getattr(R_tg.raw, 'error', 0)
-                            BulletinHelper.show_simple(t('plugin_code_empty', lang=self.lang), icon_attr, frag)
+                            BulletinHelper.show_with_button(self._t('plugin_code_empty'), icon_attr, self._t('close'), lambda: None, None)
                         except Exception:
-                            try:
-                                from ui.bulletin import BulletinHelper
-                                BulletinHelper.show_error(t('plugin_code_empty', lang=self.lang))
-                            except Exception:
-                                pass
+                            pass
                         return
                     self.closed_by_send = True
                     sheet.dismiss()
-                    self._send_plugin_file(plugin_code, None)
+                    self._execute_main_button_action(plugin_code, edit_text, sheet)
                 except Exception as e:
                     try:
                         sheet.dismiss()
                     except Exception:
                         pass
                     try:
-                        from ui.bulletin import BulletinHelper
-                        from org.telegram.messenger import R as R_tg
-                        from client_utils import get_last_fragment
-                        from android_utils import copy_to_clipboard
                         frag = get_last_fragment()
                         icon_attr = getattr(R_tg.raw, 'error', 0)
                         def _copy():
@@ -1399,21 +2860,31 @@ class PluginCreatorPlugin(BasePlugin):
                                 copy_to_clipboard(str(e))
                             except Exception:
                                 pass
-                        BulletinHelper.show_with_button(t('error_occurred', lang=self.lang), icon_attr, t('copy_button', lang=self.lang), _copy, frag)
+                        BulletinHelper.show_with_button(self._t('error_occurred'), icon_attr, self._t('copy_button'), _copy, frag)
                     except Exception:
                         try:
-                            from ui.bulletin import BulletinHelper
-                            BulletinHelper.show_error(t('error_occurred', lang=self.lang))
+                            icon_attr = getattr(R_tg.raw, 'error', 0)
+                            BulletinHelper.show_with_button(self._t('error_occurred'), icon_attr, self._t('close'), lambda: None, None)
                         except Exception:
                             pass
             send_btn.setOnClickListener(OnClickListener(on_send_click))
+            class OnLongClickListener(dynamic_proxy(View.OnLongClickListener)):
+                def __init__(self, func):
+                    super().__init__()
+                    self._fn = func
+                def onLongClick(self, v):
+                    return self._fn(v)
+            def on_send_long_click(v):
+                plugin_code = str(edit_text.getText()).strip()
+                self.show_file_action_menu(plugin_code, context, sheet)
+                return True
+            send_btn.setOnLongClickListener(OnLongClickListener(on_send_long_click))
             self._apply_press_scale(send_btn)
             main_container.addView(send_btn, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0))
             sheet.setCustomView(main_container)
             sheet.show()
             def on_sheet_dismiss():
                 try:
-                    import time
                     if not self.closed_by_send:
                         current_text = str(edit_text.getText()).strip()
                         if current_text:
@@ -1432,8 +2903,6 @@ class PluginCreatorPlugin(BasePlugin):
                 sheet.setOnDismissListener(OnClickListener(on_sheet_dismiss))
             except Exception:
                 try:
-                    from java import dynamic_proxy
-                    from android.content import DialogInterface
                     class DismissListener(dynamic_proxy(DialogInterface.OnDismissListener)):
                         def __init__(self, func):
                             super().__init__()
@@ -1443,6 +2912,45 @@ class PluginCreatorPlugin(BasePlugin):
                     sheet.setOnDismissListener(DismissListener(on_sheet_dismiss))
                 except Exception:
                     pass
+            try:
+                content_view = main_container
+                previous_height = [0]
+                hide_toolbar_setting = self.get_setting('hide_toolbar', False)
+                hide_main_button_setting = self.get_setting('hide_main_button', False)
+                class KeyboardListener(dynamic_proxy(ViewTreeObserver.OnGlobalLayoutListener)):
+                    def onGlobalLayout(self):
+                        try:
+                            rect = Rect()
+                            content_view.getWindowVisibleDisplayFrame(rect)
+                            screen_height = content_view.getRootView().getHeight()
+                            keypad_height = screen_height - rect.bottom
+                            is_keyboard_shown = keypad_height > screen_height * 0.15
+                            if is_keyboard_shown:
+                                if hide_toolbar_setting:
+                                    if settings_btn: settings_btn.setVisibility(View.GONE)
+                                    if paste_btn: paste_btn.setVisibility(View.GONE)
+                                    if 'btn_restore_panel' in locals() and btn_restore_panel is not None:
+                                        btn_restore_panel.setVisibility(View.GONE)
+                                    for btn in panel_buttons:
+                                        if btn: btn.setVisibility(View.GONE)
+                                if hide_main_button_setting:
+                                    send_btn.setVisibility(View.GONE)
+                            else:
+                                if hide_toolbar_setting:
+                                    if settings_btn: settings_btn.setVisibility(View.VISIBLE)
+                                    if paste_btn: paste_btn.setVisibility(View.VISIBLE)
+                                    if 'btn_restore_panel' in locals() and btn_restore_panel is not None:
+                                        btn_restore_panel.setVisibility(View.VISIBLE)
+                                    for btn in panel_buttons:
+                                        if btn: btn.setVisibility(View.VISIBLE)
+                                if hide_main_button_setting:
+                                    send_btn.setVisibility(View.VISIBLE)
+                        except Exception:
+                            pass
+                content_view.getViewTreeObserver().addOnGlobalLayoutListener(KeyboardListener())
+            except Exception:
+                pass
+
             def animate_elements():
                 try:
                     try:
@@ -1456,7 +2964,7 @@ class PluginCreatorPlugin(BasePlugin):
                             pass
                         def show_elements():
                             try:
-                                title_view.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).start()
+                                title_container.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).start()
                             except Exception:
                                 pass
                             try:
@@ -1465,9 +2973,9 @@ class PluginCreatorPlugin(BasePlugin):
                                 pass
                             try:
                                 buttons_container.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(100).start()
-                                if restore_btn:
+                                if btn_restore_panel:
                                     try:
-                                        restore_btn.animate().alpha(1.0).translationX(0).setDuration(300).setStartDelay(200).start()
+                                        btn_restore_panel.animate().alpha(1.0).translationX(0).setDuration(300).setStartDelay(200).start()
                                     except Exception:
                                         pass
                             except Exception:
@@ -1481,9 +2989,6 @@ class PluginCreatorPlugin(BasePlugin):
                         except Exception:
                             pass
                     try:
-                        from org.telegram.messenger import AndroidUtilities
-                        from java import dynamic_proxy
-                        from java.lang import Runnable
                         class ScaleUpRunnable(dynamic_proxy(Runnable)):
                             def __init__(self, func):
                                 super().__init__()
@@ -1498,16 +3003,13 @@ class PluginCreatorPlugin(BasePlugin):
                             pass
                 except Exception:
                     pass
-            from android_utils import run_on_ui_thread
+
             def focus_field():
                 try:
                     edit_text.requestFocus()
                 except Exception:
                     pass
             try:
-                from org.telegram.messenger import AndroidUtilities
-                from java import dynamic_proxy
-                from java.lang import Runnable
                 class AnimationRunnable(dynamic_proxy(Runnable)):
                     def __init__(self, func):
                         super().__init__()
@@ -1528,7 +3030,8 @@ class PluginCreatorPlugin(BasePlugin):
                 except Exception:
                     pass
         except Exception as e:
-            self._show_error_with_copy(t('error_occurred_with_reason', lang=self.lang, error=str(e)))
+            self._show_error_with_copy(self._t('error_occurred_with_reason', error=str(e)))
+
     def _get_current_input_text(self, fragment):
         try:
             enter_view = self._get_private_field(fragment, "chatActivityEnterView")
@@ -1539,6 +3042,7 @@ class PluginCreatorPlugin(BasePlugin):
         except Exception:
             pass
         return ""
+
     def _clear_input_field(self, fragment):
         try:
             enter_view = self._get_private_field(fragment, "chatActivityEnterView")
@@ -1558,15 +3062,10 @@ class PluginCreatorPlugin(BasePlugin):
                     pass
         except Exception:
             pass
+
     def _hook_send_button_menu(self):
         try:
-            from hook_utils import find_class
-            from base_plugin import MethodHook
-            from java import dynamic_proxy
-            from java.lang import Runnable
-            from client_utils import get_last_fragment
             from org.telegram.messenger import R
-            from org.telegram.messenger import AndroidUtilities
             class RunnableImpl(dynamic_proxy(Runnable)):
                 def __init__(self, func):
                     super().__init__()
@@ -1698,12 +3197,12 @@ class PluginCreatorPlugin(BasePlugin):
             if msg is None:
                 return HookResult(strategy=HookStrategy.NONE)
             msg = msg.strip()
-            send_cmd = self.get_setting('send_cmd', '.plugin')
+            send_cmd = self.get_setting('send_cmd', '.file')
             if send_cmd is None:
-                send_cmd = '.plugin'
+                send_cmd = '.file'
             send_cmd = str(send_cmd).strip()
             if not send_cmd:
-                send_cmd = '.plugin'
+                send_cmd = '.file'
             cmd_token = None
             if msg.startswith(send_cmd):
                 cmd_token = send_cmd
@@ -1737,22 +3236,26 @@ class PluginCreatorPlugin(BasePlugin):
 
     def _show_error_with_copy(self, error_text):
         try:
-            from android_utils import copy_to_clipboard
             copy_to_clipboard(error_text)
-            from ui.bulletin import BulletinHelper
-            BulletinHelper.show_copied_to_clipboard(t('error_copied', lang=self.lang))
+            try:
+                icon_attr = getattr(R_tg.raw, 'copy', 0)
+                BulletinHelper.show_with_button(self._t('error_copied'), icon_attr, self._t('close'), lambda: None, None)
+            except Exception:
+                BulletinHelper.show_copied_to_clipboard(self._t('error_copied'))
         except Exception:
             try:
-                from ui.bulletin import BulletinHelper
-                BulletinHelper.show_error(error_text)
+                icon_attr = getattr(R_tg.raw, 'error', 0)
+                BulletinHelper.show_with_button(error_text, icon_attr, self._t('close'), lambda: None, None)
             except Exception:
-                pass
+                try:
+                    BulletinHelper.show_error(error_text)
+                except Exception:
+                    pass
 
     def _shake_view(self, view):
         try:
             from android.view import animation
             from android.view.animation import TranslateAnimation, AnimationSet
-            from org.telegram.messenger import AndroidUtilities
             shake = AnimationSet(True)
             shake.setDuration(500)
             left_move = TranslateAnimation(
@@ -1796,11 +3299,6 @@ class PluginCreatorPlugin(BasePlugin):
             pass
 
     def _create_button(self, act, text, theme_key, on_click):
-        from android.widget import TextView, FrameLayout
-        from android.view import Gravity
-        from android.util import TypedValue
-        from org.telegram.ui.Components import LayoutHelper
-        from org.telegram.messenger import AndroidUtilities
         btn_frame = FrameLayout(act)
         btn_frame.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
             AndroidUtilities.dp(10),
@@ -1817,6 +3315,7 @@ class PluginCreatorPlugin(BasePlugin):
         btn_text.setGravity(Gravity.CENTER)
         btn_text.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
         btn_frame.addView(btn_text, FrameLayout.LayoutParams(-1, -2))
+
         def handle_click(v):
             try:
                 result = on_click()
@@ -1826,22 +3325,27 @@ class PluginCreatorPlugin(BasePlugin):
                 pass
         btn_frame.setOnClickListener(OnClickListener(handle_click))
         return btn_frame
+
     def _send_plugin_file(self, plugin_code, sheet=None):
         try:
             if not plugin_code or not plugin_code.strip():
                 return
             if sheet and hasattr(sheet, 'dismiss'):
                 sheet.dismiss()
-            filename = self.get_setting('send_name', 'main')
+            send_cmd = self.get_setting('send_cmd', '.file')
+            if send_cmd is None:
+                send_cmd = '.file'
+            send_cmd = str(send_cmd).strip()
+            if not send_cmd:
+                send_cmd = '.file'
+            filename = self.get_setting('send_name', 'main.plugin')
             if not filename:
-                filename = 'main'
+                filename = 'main.plugin'
             message = self.get_setting('send_message', '').strip()
             if not message:
                 message = None
             content = plugin_code.encode('utf-8')
-            temp_path = _LocalFileSystem.write_temp_file(f"{filename}.plugin", content)
-            from client_utils import get_last_fragment, get_account_instance
-            from java import jarray, jint, jlong
+            temp_path = _LocalFileSystem.write_temp_file(filename, content)
             try:
                 from java.lang import Integer
             except Exception:
@@ -1857,7 +3361,6 @@ class PluginCreatorPlugin(BasePlugin):
             dialog_id = frag.getDialogId()
             if dialog_id is None:
                 return
-            from org.telegram.messenger import SendMessagesHelper
             methods = SendMessagesHelper.getClass().getDeclaredMethods()
             target = None
             use_uri = False
@@ -1949,6 +3452,7 @@ class PluginCreatorPlugin(BasePlugin):
                 else:
                     arg_value = None
                 args.append(arg_value)
+
             if len(params) != len(args):
                 def _def_for(t):
                     try:
@@ -1984,25 +3488,321 @@ class PluginCreatorPlugin(BasePlugin):
                         new_args.append(default_val)
                 args = new_args
             target.invoke(None, *args)
-            from ui.bulletin import BulletinHelper
-            BulletinHelper.show_success(t('plugin_created', lang=self.lang))
+            try:
+                icon_attr = getattr(R_tg.raw, 'done', getattr(R_tg.raw, 'check', 0))
+                BulletinHelper.show_with_button(self._t('plugin_created'), icon_attr if icon_attr else 0, self._t('close'), lambda: None, None)
+            except Exception:
+                BulletinHelper.show_success(self._t('plugin_created'))
         except Exception as e:
-            self._show_error_with_copy(t('error_occurred_with_reason', lang=self.lang, error=str(e)))
+            self._show_error_with_copy(self._t('error_occurred_with_reason', error=str(e)))
+
+    def show_file_action_menu(self, plugin_code, context, parent_sheet):
+        try:
+            action_sheet = BottomSheet(context, False)
+            try:
+                if hasattr(action_sheet, 'setUseSmoothKeyboard'):
+                    action_sheet.setUseSmoothKeyboard(True)
+            except Exception:
+                pass
+            try:
+                if hasattr(action_sheet, 'setUseSmoothKeyboardTransition'):
+                    action_sheet.setUseSmoothKeyboardTransition(True)
+            except Exception:
+                pass
+            try:
+                action_sheet.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground))
+            except Exception:
+                pass
+
+            main_container = LinearLayout(context)
+            main_container.setOrientation(LinearLayout.VERTICAL)
+            main_container.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(16))
+            title = TextView(context)
+            title.setText(self._t('file_action_title'))
+            title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+            title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            title.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            title.setGravity(Gravity.CENTER)
+            main_container.addView(title, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            main_container.addView(View(context), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                AndroidUtilities.dp(20)
+            ))
+
+            dark_container = LinearLayout(context)
+            dark_container.setOrientation(LinearLayout.VERTICAL)
+            dark_container.setGravity(Gravity.CENTER)
+            dark_container.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(10), AndroidUtilities.dp(20), AndroidUtilities.dp(10))
+
+            try:
+                dark_field_color = Theme.getColor(Theme.key_windowBackgroundGray)
+            except Exception:
+                dark_field_color = 0xFF2C2C2C
+            dark_bg = GradientDrawable()
+            dark_bg.setShape(GradientDrawable.RECTANGLE)
+            dark_bg.setCornerRadius(AndroidUtilities.dp(18))
+            dark_bg.setColor(dark_field_color)
+            dark_container.setBackground(dark_bg)
+
+            def create_pill_button(text, icon_name, on_click):
+                btn_frame = FrameLayout(context)
+                btn_frame.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(14), AndroidUtilities.dp(16), AndroidUtilities.dp(14))
+                try:
+                    bg_color = Theme.getColor(Theme.key_dialogBackground)
+                except Exception:
+                    bg_color = 0xFF2C2C2C
+                try:
+                    pressed_color = Theme.getColor(Theme.key_listSelector) & 0x40FFFFFF | 0x30000000
+                except Exception:
+                    pressed_color = 0x30000000
+
+                btn_bg = GradientDrawable()
+                btn_bg.setCornerRadius(AndroidUtilities.dp(30))
+                btn_bg.setColor(bg_color)
+
+                try:
+                    from android.content.res import ColorStateList as AColorStateList
+                    from android.graphics import Color as AColor
+                    ripple_color = AColorStateList.valueOf(AColor.parseColor("#40000000"))
+                    ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
+                    btn_frame.setBackground(ripple_drawable)
+                except Exception:
+                    btn_frame.setBackground(btn_bg)
+
+                content_layout = LinearLayout(context)
+                content_layout.setOrientation(LinearLayout.HORIZONTAL)
+                content_layout.setGravity(Gravity.CENTER)
+                content_layout.setPadding(0, 0, 0, 0)
+                icon_view = ImageView(context)
+                icon_view.setScaleType(ImageView.ScaleType.CENTER)
+                try:
+                    icon_res = getattr(R_tg.drawable, icon_name, 0)
+                    if not icon_res:
+                        for _fallback in ('ic_ab_other', 'msg_other'):
+                            icon_res = getattr(R_tg.drawable, _fallback, 0)
+                            if icon_res:
+                                break
+                    if icon_res:
+                        icon_view.setImageResource(icon_res)
+                except Exception:
+                    pass
+                icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextGray))
+                content_layout.addView(icon_view, LayoutHelper.createLinear(26, 26, Gravity.CENTER, 0, 0, 12, 0))
+                text_view = TextView(context)
+                text_view.setText(text)
+                text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+                text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                text_view.setGravity(Gravity.CENTER)
+                try:
+                    text_view.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                except Exception:
+                    text_view.setTypeface(AndroidUtilities.bold())
+                content_layout.addView(text_view, LayoutHelper.createLinear(-2, -2))
+
+                btn_frame.addView(content_layout, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                btn_frame.setOnClickListener(OnClickListener(lambda v: on_click()))
+                self._apply_press_scale(btn_frame)
+                return btn_frame
+
+            def do_share():
+                try:
+                    action_sheet.dismiss()
+                except Exception:
+                    pass
+                self._open_share_alert(plugin_code, parent_sheet)
+
+            def do_save():
+                try:
+                    if parent_sheet and hasattr(parent_sheet, 'dismiss'):
+                        parent_sheet.dismiss()
+                    downloads_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    filename = self.get_setting('send_name', 'plugin.plugin')
+                    if not filename:
+                        filename = 'plugin.plugin'
+                    file_path = File(downloads_dir, filename)
+                    fos = FileOutputStream(file_path)
+                    fos.write(plugin_code.encode('utf-8'))
+                    fos.close()
+                    try:
+                        icon_attr = getattr(R_tg.raw, 'done', 0)
+                        success_message = self._t('file_saved_to', path=file_path.getAbsolutePath())
+                        BulletinHelper.show_with_button(success_message, icon_attr, self._t('close'), lambda: None, None)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        icon_attr = getattr(R_tg.raw, 'error', 0)
+                        BulletinHelper.show_with_button(self._t('error_occurred'), icon_attr, self._t('close'), lambda: None, None)
+                    except Exception:
+                        pass
+                action_sheet.dismiss()
+
+            def do_install():
+                try:
+                    if parent_sheet and hasattr(parent_sheet, 'dismiss'):
+                        parent_sheet.dismiss()
+
+                    filename = self.get_setting('send_name', 'plugin.plugin')
+                    if not filename:
+                        filename = 'plugin.plugin'
+                    
+                    cache_dir = get_cache_dir()
+                    file_path = os.path.join(cache_dir, filename)
+                    temp_file = File(file_path)
+                    if temp_file.exists():
+                        temp_file.delete()
+
+                    fos = FileOutputStream(temp_file)
+                    fos.write(plugin_code.encode('utf-8'))
+                    fos.close()
+                    
+                    fragment = get_last_fragment()
+                    if fragment:
+                        try:
+                            PluginsController.getInstance().showInstallDialog(fragment, temp_file.getAbsolutePath(), True)
+                        except Exception as e:
+                            BulletinHelper.show_error(self._t('install_error', error=str(e)))
+                    else:
+                        BulletinHelper.show_error(self._t('no_fragment_found'))
+                except Exception as e:
+                    BulletinHelper.show_error(self._t('error_message', error=str(e)))
+                action_sheet.dismiss()
+
+            def do_close(view):
+                _dismissed = [False]
+                def _dismiss_menu():
+                    if _dismissed[0]:
+                        return
+                    _dismissed[0] = True
+                    try:
+                        if hasattr(action_sheet, 'dismiss'):
+                            action_sheet.dismiss()
+                        elif hasattr(action_sheet, 'dismissInternal'):
+                            action_sheet.dismissInternal()
+                        elif hasattr(action_sheet, 'hide'):
+                            action_sheet.hide()
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(action_sheet, 'dismissFast'):
+                            action_sheet.dismissFast()
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(action_sheet, 'getParent'):
+                            p = action_sheet.getParent()
+                            if p is not None and hasattr(p, 'invalidate'):
+                                p.invalidate()
+                            if p is not None and hasattr(p, 'requestLayout'):
+                                p.requestLayout()
+                    except Exception:
+                        pass
+                run_on_ui_thread(_dismiss_menu)
+
+            def do_send():
+                try:
+                    if parent_sheet and hasattr(parent_sheet, 'dismiss'):
+                        parent_sheet.dismiss()
+                    self._send_plugin_file(plugin_code, None)
+                except Exception:
+                    pass
+                action_sheet.dismiss()
+            main_action = self._get_main_button_action()
+            buttons_to_show = []
+            if main_action != 'send':
+                buttons_to_show.append((self._t('create_and_send'), 'msg_send_solar', do_send))
+            if main_action != 'share':
+                buttons_to_show.append((self._t('share_file'), 'msg_shareout_remix', do_share))
+            if main_action != 'save':
+                buttons_to_show.append((self._t('save_file'), 'msg_download_solar', do_save))
+            if main_action != 'install':
+                buttons_to_show.append((self._t('install_file'), 'msg_addbot_remix', do_install))
+            
+            for i, (text, icon, callback) in enumerate(buttons_to_show):
+                if i > 0:
+                    dark_container.addView(View(context), LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        AndroidUtilities.dp(6)
+                    ))
+                dark_container.addView(create_pill_button(text, icon, callback))
+
+            main_container.addView(dark_container, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+
+            main_container.addView(View(context), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                AndroidUtilities.dp(16)
+            ))
+
+            close_btn = TextView(context)
+            close_btn.setText(self._t('close_button'))
+            close_btn.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            close_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            close_btn.setGravity(Gravity.CENTER)
+            close_btn.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            close_btn.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(16), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+            btn_bg = GradientDrawable()
+            btn_bg.setShape(GradientDrawable.RECTANGLE)
+            btn_bg.setCornerRadius(AndroidUtilities.dp(28))
+            try:
+                base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
+            except Exception:
+                base_color = Theme.getColor(Theme.key_dialogTextBlue)
+            btn_bg.setColor(base_color)
+            close_btn.setBackground(btn_bg)
+            close_btn.setOnClickListener(OnClickListener(do_close))
+            self._apply_press_scale(close_btn)
+            main_container.addView(close_btn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            action_sheet.setCustomView(main_container)
+
+            try:
+                from android.animation import AnimatorSet, ObjectAnimator
+                from android.view.animation import OvershootInterpolator, DecelerateInterpolator
+
+                main_container.setAlpha(0.0)
+                main_container.setScaleX(0.88)
+                main_container.setScaleY(0.88)
+                
+                def animate_in():
+                    try:
+                        fade = ObjectAnimator.ofFloat(main_container, "alpha", 0.0, 1.0)
+                        fade.setDuration(220)
+                        fade.setInterpolator(DecelerateInterpolator())
+                        scale_x = ObjectAnimator.ofFloat(main_container, "scaleX", 0.88, 1.0)
+                        scale_x.setDuration(380)
+                        scale_x.setInterpolator(OvershootInterpolator(2.0))
+                        scale_y = ObjectAnimator.ofFloat(main_container, "scaleY", 0.88, 1.0)
+                        scale_y.setDuration(380)
+                        scale_y.setInterpolator(OvershootInterpolator(2.0))
+                        s = AnimatorSet()
+                        s.playTogether(fade, scale_x, scale_y)
+                        s.start()
+                    except Exception:
+                        main_container.setAlpha(1.0)
+                        main_container.setScaleX(1.0)
+                        main_container.setScaleY(1.0)
+                run_on_ui_thread(animate_in, 50)
+                
+            except Exception:
+                main_container.setAlpha(1.0)
+                main_container.setScaleX(1.0)
+                main_container.setScaleY(1.0)
+            action_sheet.show()
+
+        except Exception as e:
+            self._show_error_with_copy(self._t('error_occurred_with_reason', error=str(e)))
 
     def _show_support_me_menu(self, _):
         self._force_load_stickers()
-        from org.telegram.ui.ActionBar import BottomSheet, Theme
-        from android.widget import LinearLayout, TextView, ScrollView, FrameLayout, ImageView
-        from android.view import Gravity, View
-        from android.util import TypedValue
-        from org.telegram.ui.Components import LayoutHelper, BackupImageView
-        from org.telegram.messenger import AndroidUtilities, MediaDataController, ImageLocation
-        from android.graphics.drawable import GradientDrawable
-        from android.graphics import Color
-        from android_utils import OnClickListener, run_on_ui_thread
-        from client_utils import get_last_fragment
-        from org.telegram.messenger.browser import Browser
-        from android.net import Uri
         frag = get_last_fragment()
         act = frag.getParentActivity() if frag else None
         if not act:
@@ -2012,6 +3812,13 @@ class PluginCreatorPlugin(BasePlugin):
         root_layout.setOrientation(LinearLayout.VERTICAL)
         root_layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(8))
         try:
+            root_layout.setAlpha(0.0)
+            root_layout.setScaleX(0.3)
+            root_layout.setScaleY(0.3)
+            root_layout.setTranslationY(AndroidUtilities.dp(100))
+        except Exception:
+            pass
+        try:
             root_layout.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground))
         except Exception:
             pass
@@ -2019,45 +3826,23 @@ class PluginCreatorPlugin(BasePlugin):
             avatar_view = BackupImageView(act)
             avatar_view.setRoundRadius(AndroidUtilities.dp(45))
             root_layout.addView(avatar_view, LayoutHelper.createLinear(130, 130, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12))
-            try:
-                current_account = frag.getCurrentAccount()
-            except Exception:
-                current_account = 0
-            media_controller = MediaDataController.getInstance(current_account)
-            if media_controller:
-                sticker_set = media_controller.getStickerSetByName("mr_vestr")
-                if not sticker_set or not sticker_set.documents or sticker_set.documents.size() <= 9:
-                    from org.telegram.tgnet import TLRPC
-                    input_set = TLRPC.TL_inputStickerSetShortName()
-                    input_set.short_name = "mr_vestr"
-                    media_controller.getStickerSet(input_set, None, False, None)
-                    def retry_load_sticker(attempt=0):
-                        try:
-                            if attempt < 5:
-                                sticker_set = media_controller.getStickerSetByName("mr_vestr")
-                                if sticker_set and sticker_set.documents and sticker_set.documents.size() > 9:
-                                    sticker_document = sticker_set.documents.get(9)
-                                    image_location = ImageLocation.getForDocument(sticker_document)
-                                    avatar_view.setImage(image_location, "90_90", None, 0, sticker_document)
-                                else:
-                                    AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(lambda: retry_load_sticker(attempt + 1)), 300)
-                        except Exception:
-                            if attempt < 5:
-                                AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(lambda: retry_load_sticker(attempt + 1)), 300)
-                    AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(lambda: retry_load_sticker(0)), 500)
-                elif sticker_set.documents.size() > 9:
-                    sticker_document = sticker_set.documents.get(9)
-                    image_location = ImageLocation.getForDocument(sticker_document)
-                    avatar_view.setImage(image_location, "90_90", None, 0, sticker_document)
+            self.load_sticker_with_fallback(avatar_view, "mr_vestr/9", 9, "90_90")
         except Exception:
             pass
         title_view = TextView(act)
         title_view.setTypeface(AndroidUtilities.bold())
         title_view.setGravity(Gravity.CENTER)
         title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 24)
-        title_view.setText(t('support_me', lang=self.lang))
+        title_view.setText(self._t('support_me'))
         try:
             title_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            pass
+        try:
+            title_view.setAlpha(0.0)
+            title_view.setTranslationY(AndroidUtilities.dp(50))
+            title_view.setScaleX(0.8)
+            title_view.setScaleY(0.8)
         except Exception:
             pass
         root_layout.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
@@ -2068,8 +3853,15 @@ class PluginCreatorPlugin(BasePlugin):
             body_scroll.setNestedScrollingEnabled(True)
         except Exception:
             pass
+        try:
+            body_scroll.setAlpha(0.0)
+            body_scroll.setTranslationY(AndroidUtilities.dp(30))
+            body_scroll.setScaleX(0.8)
+            body_scroll.setScaleY(0.8)
+        except Exception:
+            pass
         body_tv = TextView(act)
-        body_tv.setText(t('support_me_text', lang=self.lang))
+        body_tv.setText(self._t('support_me_text'))
         body_tv.setTextIsSelectable(True)
         body_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
         body_tv.setGravity(Gravity.CENTER)
@@ -2091,34 +3883,6 @@ class PluginCreatorPlugin(BasePlugin):
         divider.setBackgroundColor(divider_color)
         root_layout.addView(divider, LayoutHelper.createLinear(-1, 1, 0, 16, 0, 12))
         support_btn_frame = FrameLayout(act)
-        def _brighten_color(c, amount=0.22):
-            try:
-                def _to_int32(x):
-                    x = int(x) & 0xFFFFFFFF
-                    if x >= 0x80000000:
-                        x -= 0x100000000
-                    return x
-                a = (c >> 24) & 0xFF
-                try:
-                    from android.graphics import Color as _AColor
-                    hsv = [0.0, 0.0, 0.0]
-                    _AColor.colorToHSV(int(c), hsv)
-                    k = max(0.0, min(1.0, amount))
-                    hsv[1] = max(0.0, min(1.0, hsv[1] * (1.0 - 0.25 * k)))
-                    hsv[2] = max(0.0, min(1.0, hsv[2] * (1.0 - 0.05 * k)))
-                    return _to_int32(_AColor.HSVToColor(a, hsv))
-                except Exception:
-                    r = (c >> 16) & 0xFF
-                    g = (c >> 8) & 0xFF
-                    b = c & 0xFF
-                    gray = int(r * 0.299 + g * 0.587 + b * 0.114)
-                    k = max(0.0, min(1.0, amount)) * 0.4
-                    r = int(r + (gray - r) * k)
-                    g = int(g + (gray - g) * k)
-                    b = int(b + (gray - b) * k)
-                    return _to_int32((a << 24) | (r << 16) | (g << 8) | b)
-            except Exception:
-                return c
         try:
             base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
         except Exception:
@@ -2135,19 +3899,24 @@ class PluginCreatorPlugin(BasePlugin):
         support_btn_frame.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(14))
         support_btn_frame.setClickable(True)
         support_btn_frame.setFocusable(True)
+        try:
+            support_btn_frame.setAlpha(0.0)
+            support_btn_frame.setTranslationY(AndroidUtilities.dp(50))
+            support_btn_frame.setScaleX(0.8)
+            support_btn_frame.setScaleY(0.8)
+        except Exception:
+            pass
         support_btn_text = TextView(act)
-        support_btn_text.setText(t('support_me', lang=self.lang))
+        support_btn_text.setText(self._t('support_me'))
         support_btn_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
         support_btn_text.setTypeface(AndroidUtilities.bold())
         support_btn_text.setGravity(Gravity.CENTER)
         support_btn_text.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
         support_btn_frame.addView(support_btn_text, FrameLayout.LayoutParams(-1, -2))
+        
         def on_support(v):
             try:
                 sheet.dismiss()
-                from org.telegram.ui import LaunchActivity
-                from org.telegram.messenger import UserConfig
-                from java.lang import Integer
                 if not hasattr(LaunchActivity, 'instance') or LaunchActivity.instance is None:
                     return
                 launch_activity = LaunchActivity.instance
@@ -2158,7 +3927,6 @@ class PluginCreatorPlugin(BasePlugin):
                     return
                 target_user_id = 2037728749
                 current_account = UserConfig.selectedAccount
-                from org.telegram.ui.Gifts import GiftSheet
                 gift_sheet = GiftSheet(
                     last_fragment.getContext(),
                     current_account,
@@ -2174,23 +3942,63 @@ class PluginCreatorPlugin(BasePlugin):
         root_layout.addView(support_btn_frame, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0))
         sheet.setCustomView(root_layout)
         sheet.show()
+        def animate_elements():
+            try:
+                try:
+                    root_layout.animate().alpha(0.8).scaleX(0.4).scaleY(0.4).translationY(AndroidUtilities.dp(50)).setDuration(200).start()
+                except Exception:
+                    pass
+                def scale_up_menu():
+                    try:
+                        root_layout.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).translationY(0).setDuration(400).start()
+                    except Exception:
+                        pass
+                    def show_elements():
+                        try:
+                            title_view.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).start()
+                        except Exception:
+                            pass
+                        try:
+                            body_scroll.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(50).start()
+                        except Exception:
+                            pass
+                        try:
+                            support_btn_frame.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(100).start()
+                        except Exception:
+                            pass
+                    try:
+                        run_on_ui_thread(show_elements)
+                    except Exception:
+                        pass
+                try:
+                    class ScaleUpRunnable(dynamic_proxy(Runnable)):
+                        def __init__(self, func):
+                            super().__init__()
+                            self.func = func
+                        def run(self):
+                            self.func()
+                    AndroidUtilities.runOnUIThread(ScaleUpRunnable(lambda: run_on_ui_thread(scale_up_menu)), 200)
+                except Exception:
+                    try:
+                        run_on_ui_thread(scale_up_menu)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            run_on_ui_thread(animate_elements)
+        except Exception:
+            pass
 
     def _open_channel_link(self, _):
-        from client_utils import get_last_fragment
-        from android_utils import run_on_ui_thread
-        from client_utils import get_messages_controller
         run_on_ui_thread(lambda: get_messages_controller().openByUserName("I_am_Vestr", get_last_fragment(), 1))
 
     def _copy_channel_link(self, _):
         try:
-            from android_utils import run_on_ui_thread
-            from client_utils import get_last_fragment
             run_on_ui_thread(lambda: self._copy_link_to_clipboard("https://t.me/I_am_Vestr"))
             try:
-                from ui.bulletin import BulletinHelper
-                from org.telegram.messenger import R as R_tg
                 icon_attr = getattr(R_tg.raw, 'copy', None)
-                BulletinHelper.show_with_button(t('link_copied', lang=self.lang), icon_attr if icon_attr else 0, t('close', lang=self.lang), lambda: None, None)
+                BulletinHelper.show_with_button(self._t('link_copied'), icon_attr if icon_attr else 0, self._t('close'), lambda: None, None)
             except Exception:
                 pass
         except Exception:
@@ -2198,14 +4006,10 @@ class PluginCreatorPlugin(BasePlugin):
 
     def _copy_personal_link(self, _):
         try:
-            from android_utils import run_on_ui_thread
-            from client_utils import get_last_fragment
             run_on_ui_thread(lambda: self._copy_link_to_clipboard("https://t.me/mr_Vestr"))
             try:
-                from ui.bulletin import BulletinHelper
-                from org.telegram.messenger import R as R_tg
                 icon_attr = getattr(R_tg.raw, 'copy', None)
-                BulletinHelper.show_with_button(t('link_copied', lang=self.lang), icon_attr if icon_attr else 0, t('close', lang=self.lang), lambda: None, None)
+                BulletinHelper.show_with_button(self._t('link_copied'), icon_attr if icon_attr else 0, self._t('close'), lambda: None, None)
             except Exception:
                 pass
         except Exception:
@@ -2213,23 +4017,18 @@ class PluginCreatorPlugin(BasePlugin):
 
     def _copy_link_to_clipboard(self, url):
         try:
-            from client_utils import get_last_fragment
             fragment = get_last_fragment()
             if not fragment:
                 return
             context = fragment.getParentActivity()
             if not context:
                 return
-            from android.content import ClipboardManager, ClipData
             clipboard = context.getSystemService(context.CLIPBOARD_SERVICE)
             clipboard.setPrimaryClip(ClipData.newPlainText("link", url))
         except Exception:
             pass
 
     def _open_personal_link(self, _):
-        from client_utils import get_last_fragment
-        from org.telegram.messenger.browser import Browser
-        from android.net import Uri
         frag = get_last_fragment()
         act = frag.getParentActivity() if frag else None
         if act:
@@ -2237,25 +4036,20 @@ class PluginCreatorPlugin(BasePlugin):
                 if self.lang == 'en':
                     text = 'Hello%21+I%27m+writing+regarding+the+%22Plugin+Creator%22+plugin%3A%0D%0A'
                 else:
-                    text = '%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82%21+%D0%9F%D0%B8%D1%88%D1%83+%D0%BF%D0%BE+%D0%BF%D0%BE%D0%B2%D0%BE%D0%B4%D1%83+%D0%BF%D0%BB%D0%B0%D0%B3%D0%B8%D0%B0+%C2%ABPlugin+Creator%C2%BB%3A%0D%0A'
+                    text = '%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82%21+%D0%9F%D0%B8%D1%88%D1%83+%D0%BF%D0%BE+%D0%BF%D0%BE%D0%B2%D0%BE%D0%B4%D1%83+%D0%BF%D0%BB%D0%B0%D0%B3%D0%B8%D0%BD%D0%B0+%C2%ABPlugin+Creator%C2%BB%3A%0D%0A'
                 uri = Uri.parse(f"https://t.me/mr_vestr/?text={text}")
                 Browser.openUrl(act, uri, True, True, True, None, None, False, False, False)
             except Exception as e:
-                from ui.bulletin import BulletinHelper
-                BulletinHelper.show_error(t('link_open_error', lang=self.lang, error=str(e)))
+                try:
+                    icon_attr = getattr(R_tg.raw, 'error', 0)
+                    BulletinHelper.show_with_button(self._t('link_open_error', error=str(e)), icon_attr, self._t('close'), lambda: None, None)
+                except Exception:
+                    try:
+                        BulletinHelper.show_error(self._t('link_open_error', error=str(e)))
+                    except Exception:
+                        pass
 
     def _show_how_it_works(self, _):
-        from org.telegram.ui.ActionBar import BottomSheet, Theme
-        from android.widget import LinearLayout, TextView, ScrollView, FrameLayout
-        from android.view import Gravity, View
-        from android.util import TypedValue
-        from org.telegram.ui.Components import LayoutHelper
-        from org.telegram.messenger import AndroidUtilities
-        from android.graphics.drawable import GradientDrawable
-        from android.graphics import Color
-        from android_utils import OnClickListener
-        from client_utils import get_last_fragment
-        from markdown_utils import parse_markdown
         frag = get_last_fragment()
         act = frag.getParentActivity() if frag else None
         if not act:
@@ -2265,21 +4059,33 @@ class PluginCreatorPlugin(BasePlugin):
         root_layout.setOrientation(LinearLayout.VERTICAL)
         root_layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(8))
         try:
+            root_layout.setAlpha(0.0)
+            root_layout.setScaleX(0.3)
+            root_layout.setScaleY(0.3)
+            root_layout.setTranslationY(AndroidUtilities.dp(100))
+        except Exception:
+            pass
+        try:
             root_layout.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground))
         except Exception:
             pass
-        header = FrameLayout(act)
         title_view = TextView(act)
         title_view.setTypeface(AndroidUtilities.bold())
         title_view.setGravity(Gravity.CENTER)
         title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 24)
-        title_view.setText(t('how_it_works', lang=self.lang))
+        title_view.setText(self._t('how_it_works'))
         try:
             title_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
         except Exception:
             pass
-        header.addView(title_view, LayoutHelper.createFrame(-1, -2, Gravity.CENTER, 0, 0, 0, 0))
-        root_layout.addView(header, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
+        try:
+            title_view.setAlpha(0.0)
+            title_view.setTranslationY(AndroidUtilities.dp(50))
+            title_view.setScaleX(0.8)
+            title_view.setScaleY(0.8)
+        except Exception:
+            pass
+        root_layout.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
         body_scroll = ScrollView(act)
         body_scroll.setVerticalScrollBarEnabled(False)
         body_scroll.setPadding(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0)
@@ -2287,27 +4093,15 @@ class PluginCreatorPlugin(BasePlugin):
             body_scroll.setNestedScrollingEnabled(True)
         except Exception:
             pass
-        body_tv = TextView(act)
-        text = t('how_it_works_text', lang=self.lang)
         try:
-            from android.text import SpannableString, Spannable
-            from android.text.style import StyleSpan
-            from android.graphics import Typeface
-            import re
-            parts = re.split(r'(\*\*.*?\*\*)', text)
-            spannable = SpannableString(text.replace('**', ''))
-            start = 0
-            for i, part in enumerate(parts):
-                if part.startswith('**') and part.endswith('**'):
-                    clean_text = part[2:-2]
-                    end = start + len(clean_text)
-                    spannable.setSpan(StyleSpan(Typeface.BOLD), start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    start = end
-                else:
-                    start += len(part)
-            body_tv.setText(spannable)
+            body_scroll.setAlpha(0.0)
+            body_scroll.setTranslationY(AndroidUtilities.dp(30))
+            body_scroll.setScaleX(0.8)
+            body_scroll.setScaleY(0.8)
         except Exception:
-            body_tv.setText(text)
+            pass
+        body_tv = TextView(act)
+        body_tv.setText(self._apply_bold_markdown(self._t('how_it_works_text')))
         body_tv.setTextIsSelectable(True)
         body_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
         try:
@@ -2327,52 +4121,8 @@ class PluginCreatorPlugin(BasePlugin):
             divider_color = Color.parseColor("#E0E0E0")
         divider.setBackgroundColor(divider_color)
         root_layout.addView(divider, LayoutHelper.createLinear(-1, 1, 0, 16, 0, 12))
-
-        def create_link_button(text: str, icon_res: str, on_click):
-            from android.widget import ImageView
-            btn_frame = FrameLayout(act)
-            btn_bg = GradientDrawable()
-            btn_bg.setCornerRadius(AndroidUtilities.dp(18))
-            try:
-                bg_color = Theme.getColor(Theme.key_chat_inLoader) & 0x20FFFFFF | 0x10000000
-            except Exception:
-                bg_color = Color.parseColor("#F0F0F0")
-            btn_bg.setColor(bg_color)
-            try:
-                from android.graphics.drawable import RippleDrawable
-                from android.content.res import ColorStateList
-                ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
-                ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
-                btn_frame.setBackground(ripple_drawable)
-            except Exception:
-                btn_frame.setBackground(btn_bg)
-            btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
-            icon_view = ImageView(act)
-            try:
-                from org.telegram.messenger import R as R_tg
-                icon_view.setImageResource(getattr(R_tg.drawable, icon_res))
-            except Exception:
-                pass
-            icon_view.setScaleType(ImageView.ScaleType.CENTER)
-            try:
-                icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
-            except Exception:
-                pass
-            text_view = TextView(act)
-            text_view.setText(text)
-            text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
-            text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
-            text_view.setGravity(Gravity.CENTER_VERTICAL)
-            btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-            btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
-            btn_frame.setClickable(True)
-            btn_frame.setFocusable(True)
-            self._apply_press_scale(btn_frame)
-            btn_frame.setOnClickListener(OnClickListener(lambda *_: on_click(btn_frame)))
-            return btn_frame
         
         def create_link_button(text: str, icon_res: str, on_click):
-            from android.widget import ImageView
             btn_frame = FrameLayout(act)
             btn_bg = GradientDrawable()
             btn_bg.setCornerRadius(AndroidUtilities.dp(18))
@@ -2382,8 +4132,6 @@ class PluginCreatorPlugin(BasePlugin):
                 bg_color = Color.parseColor("#F0F0F0")
             btn_bg.setColor(bg_color)
             try:
-                from android.graphics.drawable import RippleDrawable
-                from android.content.res import ColorStateList
                 ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
                 ripple_drawable = RippleDrawable(ripple_color, btn_bg, None)
                 btn_frame.setBackground(ripple_drawable)
@@ -2392,42 +4140,64 @@ class PluginCreatorPlugin(BasePlugin):
             btn_frame.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
             icon_view = ImageView(act)
             try:
-                from org.telegram.messenger import R as R_tg
                 icon_view.setImageResource(getattr(R_tg.drawable, icon_res))
             except Exception:
                 pass
             icon_view.setScaleType(ImageView.ScaleType.CENTER)
-            try:
-                icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
-            except Exception:
-                pass
+            icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
             text_view = TextView(act)
             text_view.setText(text)
             text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
             text_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
             text_view.setGravity(Gravity.CENTER_VERTICAL)
-            btn_frame.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
-            btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 28, 0, 0, 0))
+            btn_frame.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.LEFT | Gravity.CENTER_VERTICAL, 0, 0, 8, 0))
+            btn_frame.addView(text_view, LayoutHelper.createFrame(-2, -2, Gravity.LEFT | Gravity.CENTER_VERTICAL, 32, 0, 0, 0))
             btn_frame.setClickable(True)
             btn_frame.setFocusable(True)
             self._apply_press_scale(btn_frame)
             btn_frame.setOnClickListener(OnClickListener(lambda *_: on_click(btn_frame)))
             return btn_frame
+
+        actions_row = LinearLayout(act)
+        actions_row.setOrientation(LinearLayout.HORIZONTAL)
+        actions_row.setGravity(Gravity.CENTER)
+        try:
+            actions_row.setAlpha(0.0)
+            actions_row.setTranslationY(AndroidUtilities.dp(40))
+            actions_row.setScaleX(0.8)
+            actions_row.setScaleY(0.8)
+        except Exception:
+            pass
+        
         def on_channel(v):
             try:
                 sheet.dismiss()
                 self._open_channel_link(None)
             except Exception:
                 pass
+        
         def on_personal(v):
             try:
                 sheet.dismiss()
                 self._open_personal_link(None)
             except Exception:
                 pass
-        actions_row = LinearLayout(act)
-        actions_row.setOrientation(LinearLayout.HORIZONTAL)
-        actions_row.setGravity(Gravity.CENTER)
+
+        def on_open_doc(v):
+            try:
+                if self.lang == 'ru':
+                    doc_url = 'https://github.com/mr-Vestr/plugins/blob/main/Plugin%20creator/PLUGIN_CREATOR_RU.md'
+                else:
+                    doc_url = 'https://github.com/mr-Vestr/plugins/blob/main/Plugin%20creator/PLUGIN_CREATOR_EN.md'
+                uri = Uri.parse(doc_url)
+                Browser.openUrl(act, uri, True, True, True, None, None, True, True, True)
+            except Exception:
+                pass
+
+        channel_btn = create_link_button(self._t('channel'), 'msg_channel', on_channel)
+        personal_btn = create_link_button(self._t('personal'), 'msg_contacts', on_personal)
+        channel_btn.setMinimumWidth(AndroidUtilities.dp(100))
+        personal_btn.setMinimumWidth(AndroidUtilities.dp(100))
         open_btn = FrameLayout(act)
         open_bg = GradientDrawable()
         open_bg.setCornerRadius(AndroidUtilities.dp(18))
@@ -2437,80 +4207,29 @@ class PluginCreatorPlugin(BasePlugin):
             bg_color = Color.parseColor("#F0F0F0")
         open_bg.setColor(bg_color)
         try:
-            from android.graphics.drawable import RippleDrawable
-            from android.content.res import ColorStateList
             ripple_color = ColorStateList.valueOf(Color.parseColor("#40000000"))
             ripple_drawable = RippleDrawable(ripple_color, open_bg, None)
             open_btn.setBackground(ripple_drawable)
         except Exception:
             open_btn.setBackground(open_bg)
         open_btn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
-        from android.widget import ImageView
         icon_view = ImageView(act)
         try:
-            from org.telegram.messenger import R as R_tg
             icon_view.setImageResource(getattr(R_tg.drawable, 'msg_openin', getattr(R_tg.drawable, 'msg_open', 0)))
         except Exception:
             pass
         icon_view.setScaleType(ImageView.ScaleType.CENTER)
-        try:
-            icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
-        except Exception:
-            pass
-        open_btn.addView(icon_view, LayoutHelper.createFrame(20, 20, Gravity.CENTER, 0, 0, 0, 0))
+        icon_view.setColorFilter(Theme.getColor(Theme.key_dialogTextBlue))
+        open_btn.addView(icon_view, LayoutHelper.createFrame(24, 24, Gravity.CENTER, 0, 0, 0, 0))
         open_btn.setClickable(True)
         open_btn.setFocusable(True)
         self._apply_press_scale(open_btn)
-        def _open_doc(*_a):
-            try:
-                from org.telegram.messenger.browser import Browser
-                from android.net import Uri
-                if self.lang == 'ru':
-                    doc_url = 'https://github.com/mr-Vestr/plugins/blob/main/Plugin%20creator/PLUGIN_CREATOR_RU.md'
-                else:
-                    doc_url = 'https://github.com/mr-Vestr/plugins/blob/main/Plugin%20creator/PLUGIN_CREATOR_EN.md'
-                uri = Uri.parse(doc_url)
-                Browser.openUrl(act, uri, True, True, True, None, None, False, False, False)
-            except Exception:
-                pass
-        open_btn.setOnClickListener(OnClickListener(_open_doc))
-        channel_btn = create_link_button(t('channel', lang=self.lang), 'msg_channel', on_channel)
-        personal_btn = create_link_button(t('personal', lang=self.lang), 'msg_contacts', on_personal)
-        channel_btn.setMinimumWidth(AndroidUtilities.dp(100))
-        personal_btn.setMinimumWidth(AndroidUtilities.dp(100))
+        open_btn.setOnClickListener(OnClickListener(lambda *_: on_open_doc(open_btn)))
         actions_row.addView(channel_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL, 0, 0, 6, 0))
-        actions_row.addView(personal_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL, 0, 0, 0, 0))
-        actions_row.addView(open_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL, 6, 0, 0, 0))
+        actions_row.addView(personal_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL, 0, 0, 6, 0))
+        actions_row.addView(open_btn, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL, 0, 0, 0, 0))
         root_layout.addView(actions_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12))
         close_btn_frame = FrameLayout(act)
-        def _brighten_color(c, amount=0.22):
-            try:
-                def _to_int32(x):
-                    x = int(x) & 0xFFFFFFFF
-                    if x >= 0x80000000:
-                        x -= 0x100000000
-                    return x
-                a = (c >> 24) & 0xFF
-                try:
-                    from android.graphics import Color as _AColor
-                    hsv = [0.0, 0.0, 0.0]
-                    _AColor.colorToHSV(int(c), hsv)
-                    k = max(0.0, min(1.0, amount))
-                    hsv[1] = max(0.0, min(1.0, hsv[1] * (1.0 - 0.08 * k)))
-                    hsv[2] = max(0.0, min(1.0, hsv[2] * (1.0 - 0.015 * k)))
-                    return _to_int32(_AColor.HSVToColor(a, hsv))
-                except Exception:
-                    r = (c >> 16) & 0xFF
-                    g = (c >> 8) & 0xFF
-                    b = c & 0xFF
-                    gray = int(r * 0.299 + g * 0.587 + b * 0.114)
-                    k = max(0.0, min(1.0, amount))
-                    r = int(r + (gray - r) * k)
-                    g = int(g + (gray - g) * k)
-                    b = int(b + (gray - b) * k)
-                    return _to_int32((a << 24) | (r << 16) | (g << 8) | b)
-            except Exception:
-                return c
         try:
             base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
         except Exception:
@@ -2519,7 +4238,6 @@ class PluginCreatorPlugin(BasePlugin):
             pressed_color = Theme.getColor(Theme.key_featuredStickers_addButtonPressed)
         except Exception:
             pressed_color = base_color
-
         close_btn_frame.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
             AndroidUtilities.dp(28),
             base_color,
@@ -2529,7 +4247,7 @@ class PluginCreatorPlugin(BasePlugin):
         close_btn_frame.setClickable(True)
         close_btn_frame.setFocusable(True)
         close_btn_text = TextView(act)
-        close_btn_text.setText(t('close', lang=self.lang))
+        close_btn_text.setText(self._t('close'))
         close_btn_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
         close_btn_text.setTypeface(AndroidUtilities.bold())
         close_btn_text.setGravity(Gravity.CENTER)
@@ -2537,25 +4255,90 @@ class PluginCreatorPlugin(BasePlugin):
         close_btn_frame.addView(close_btn_text, FrameLayout.LayoutParams(-1, -2))
         close_btn_frame.setOnClickListener(OnClickListener(lambda *_: sheet.dismiss()))
         self._apply_press_scale(close_btn_frame)
+        try:
+            close_btn_frame.setAlpha(0.0)
+            close_btn_frame.setTranslationY(AndroidUtilities.dp(50))
+            close_btn_frame.setScaleX(0.8)
+            close_btn_frame.setScaleY(0.8)
+        except Exception:
+            pass
         root_layout.addView(close_btn_frame, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0))
         sheet.setCustomView(root_layout)
         sheet.setCanDismissWithSwipe(False)
         sheet.show()
+        def animate_elements():
+            try:
+                try:
+                    root_layout.animate().alpha(0.8).scaleX(0.4).scaleY(0.4).translationY(AndroidUtilities.dp(50)).setDuration(200).start()
+                except Exception:
+                    pass
+                def scale_up_menu():
+                    try:
+                        root_layout.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).translationY(0).setDuration(400).start()
+                    except Exception:
+                        pass
+                    def show_elements():
+                        try:
+                            title_view.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).start()
+                        except Exception:
+                            pass
+                        try:
+                            body_scroll.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(50).start()
+                        except Exception:
+                            pass
+                        try:
+                            actions_row.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(100).start()
+                        except Exception:
+                            pass
+                        try:
+                            close_btn_frame.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(150).start()
+                        except Exception:
+                            pass
+                    try:
+                        run_on_ui_thread(show_elements)
+                    except Exception:
+                        pass
+                try:
+                    run_on_ui_thread(scale_up_menu)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            run_on_ui_thread(animate_elements)
+        except Exception:
+            pass
+
+    def _apply_bold_markdown(self, text):
+        try:
+            pattern = r'\*\*(.*?)\*\*'
+            parts = []
+            last_end = 0
+            for match in re.finditer(pattern, text):
+                if match.start() > last_end:
+                    parts.append((text[last_end:match.start()], False))
+                parts.append((match.group(1), True))
+                last_end = match.end()
+            if last_end < len(text):
+                parts.append((text[last_end:], False))
+            if not parts:
+                return text
+            spannable = SpannableString(''.join([p[0] for p in parts]))
+            pos = 0
+            for content, is_bold in parts:
+                end = pos + len(content)
+                if is_bold:
+                    try:
+                        spannable.setSpan(StyleSpan(Typeface.BOLD), pos, end, SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    except Exception:
+                        pass
+                pos = end
+            return spannable
+        except Exception:
+            return text
 
     def _show_version_dialog(self, _):
         self._force_load_stickers()
-        from org.telegram.ui.ActionBar import BottomSheet, Theme
-        from android.widget import LinearLayout, TextView, ScrollView, FrameLayout
-        from android.view import Gravity, View
-        from android.util import TypedValue
-        from org.telegram.ui.Components import LayoutHelper, BackupImageView
-        from org.telegram.messenger import AndroidUtilities, MediaDataController, ImageLocation
-        from android.graphics.drawable import GradientDrawable
-        from android.graphics import Color
-        from android_utils import OnClickListener, run_on_ui_thread
-        from client_utils import get_last_fragment
-        from org.telegram.messenger.browser import Browser
-        from android.net import Uri
         frag = get_last_fragment()
         act = frag.getParentActivity() if frag else None
         if not act:
@@ -2565,6 +4348,13 @@ class PluginCreatorPlugin(BasePlugin):
         root_layout.setOrientation(LinearLayout.VERTICAL)
         root_layout.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(16), AndroidUtilities.dp(20), AndroidUtilities.dp(8))
         try:
+            root_layout.setAlpha(0.0)
+            root_layout.setScaleX(0.3)
+            root_layout.setScaleY(0.3)
+            root_layout.setTranslationY(AndroidUtilities.dp(100))
+        except Exception:
+            pass
+        try:
             root_layout.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground))
         except Exception:
             pass
@@ -2572,45 +4362,23 @@ class PluginCreatorPlugin(BasePlugin):
             avatar_view = BackupImageView(act)
             avatar_view.setRoundRadius(AndroidUtilities.dp(45))
             root_layout.addView(avatar_view, LayoutHelper.createLinear(130, 130, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12))
-            try:
-                current_account = frag.getCurrentAccount()
-            except Exception:
-                current_account = 0
-            media_controller = MediaDataController.getInstance(current_account)
-            if media_controller:
-                sticker_set = media_controller.getStickerSetByName("mr_vestr")
-                if not sticker_set or not sticker_set.documents or sticker_set.documents.size() <= 1:
-                    from org.telegram.tgnet import TLRPC
-                    input_set = TLRPC.TL_inputStickerSetShortName()
-                    input_set.short_name = "mr_vestr"
-                    media_controller.getStickerSet(input_set, None, False, None)
-                    def retry_load_sticker(attempt=0):
-                        try:
-                            if attempt < 5:
-                                sticker_set = media_controller.getStickerSetByName("mr_vestr")
-                                if sticker_set and sticker_set.documents and sticker_set.documents.size() > 1:
-                                    sticker_document = sticker_set.documents.get(1)
-                                    image_location = ImageLocation.getForDocument(sticker_document)
-                                    avatar_view.setImage(image_location, "90_90", None, 0, sticker_document)
-                                else:
-                                    AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(lambda: retry_load_sticker(attempt + 1)), 300)
-                        except Exception:
-                            if attempt < 5:
-                                AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(lambda: retry_load_sticker(attempt + 1)), 300)
-                    AndroidUtilities.runOnUIThread(lambda: run_on_ui_thread(lambda: retry_load_sticker(0)), 500)
-                elif sticker_set.documents.size() > 1:
-                    sticker_document = sticker_set.documents.get(1)
-                    image_location = ImageLocation.getForDocument(sticker_document)
-                    avatar_view.setImage(image_location, "90_90", None, 0, sticker_document)
+            self.load_sticker_with_fallback(avatar_view, "mr_vestr/1", 1, "90_90")
         except Exception:
             pass
         title_view = TextView(act)
         title_view.setTypeface(AndroidUtilities.bold())
         title_view.setGravity(Gravity.CENTER)
         title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 24)
-        title_view.setText(t('current_version', lang=self.lang, version=__version__))
+        title_view.setText(self._t('current_version', version=__version__))
         try:
             title_view.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            pass
+        try:
+            title_view.setAlpha(0.0)
+            title_view.setTranslationY(AndroidUtilities.dp(50))
+            title_view.setScaleX(0.8)
+            title_view.setScaleY(0.8)
         except Exception:
             pass
         root_layout.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER, 0, 0, 0, 12))
@@ -2621,13 +4389,31 @@ class PluginCreatorPlugin(BasePlugin):
             body_scroll.setNestedScrollingEnabled(True)
         except Exception:
             pass
+        try:
+            body_scroll.setAlpha(0.0)
+            body_scroll.setTranslationY(AndroidUtilities.dp(30))
+            body_scroll.setScaleX(0.8)
+            body_scroll.setScaleY(0.8)
+        except Exception:
+            pass
+
         body_tv = TextView(act)
-        body_tv.setText(t('updates_info', lang=self.lang))
+        updates_text = self._t('updates_info')
+        spannable = SpannableString(updates_text)
+        username = "@I_am_Vestr"
+        start_pos = updates_text.find(username)
+        if start_pos != -1:
+            end_pos = start_pos + len(username)
+            spannable.setSpan(URLSpan("https://t.me/i_am_vestr"), start_pos, end_pos, SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE)
+        
+        body_tv.setText(spannable)
         body_tv.setTextIsSelectable(True)
         body_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
         body_tv.setGravity(Gravity.CENTER)
         try:
             body_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            body_tv.setLinkTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+            body_tv.setMovementMethod(LinkMovementMethod.getInstance())
         except Exception:
             pass
         try:
@@ -2644,33 +4430,6 @@ class PluginCreatorPlugin(BasePlugin):
         divider.setBackgroundColor(divider_color)
         root_layout.addView(divider, LayoutHelper.createLinear(-1, 1, 0, 16, 0, 12))
         check_btn_frame = FrameLayout(act)
-        def _brighten_color(c, amount=0.22):
-            try:
-                def _to_int32(x):
-                    x = int(x) & 0xFFFFFFFF
-                    if x >= 0x80000000:
-                        x -= 0x100000000
-                    return x
-                a = (c >> 24) & 0xFF
-                try:
-                    from android.graphics import Color as _AColor
-                    hsv = [0.0, 0.0, 0.0]
-                    _AColor.colorToHSV(int(c), hsv)
-                    hsv[1] = max(0.0, min(1.0, hsv[1] * 0.85))
-                    hsv[2] = max(0.0, min(1.0, hsv[2] * 0.98))
-                    return _to_int32(_AColor.HSVToColor(a, hsv))
-                except Exception:
-                    r = (c >> 16) & 0xFF
-                    g = (c >> 8) & 0xFF
-                    b = c & 0xFF
-                    gray = int(r * 0.299 + g * 0.587 + b * 0.114)
-                    k = max(0.0, min(1.0, amount))
-                    r = int(r + (gray - r) * k)
-                    g = int(g + (gray - g) * k)
-                    b = int(b + (gray - b) * k)
-                    return _to_int32((a << 24) | (r << 16) | (g << 8) | b)
-            except Exception:
-                return c
         try:
             base_color = Theme.getColor(Theme.key_featuredStickers_addButton)
         except Exception:
@@ -2679,7 +4438,6 @@ class PluginCreatorPlugin(BasePlugin):
             pressed_color = Theme.getColor(Theme.key_featuredStickers_addButtonPressed)
         except Exception:
             pressed_color = base_color
-
         check_btn_frame.setBackground(Theme.createSimpleSelectorRoundRectDrawable(
             AndroidUtilities.dp(28),
             base_color,
@@ -2688,8 +4446,15 @@ class PluginCreatorPlugin(BasePlugin):
         check_btn_frame.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(14))
         check_btn_frame.setClickable(True)
         check_btn_frame.setFocusable(True)
+        try:
+            check_btn_frame.setAlpha(0.0)
+            check_btn_frame.setTranslationY(AndroidUtilities.dp(50))
+            check_btn_frame.setScaleX(0.8)
+            check_btn_frame.setScaleY(0.8)
+        except Exception:
+            pass
         check_btn_text = TextView(act)
-        check_btn_text.setText(t('check_updates', lang=self.lang))
+        check_btn_text.setText(self._t('check_updates'))
         check_btn_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
         check_btn_text.setTypeface(AndroidUtilities.bold())
         check_btn_text.setGravity(Gravity.CENTER)
@@ -2698,8 +4463,7 @@ class PluginCreatorPlugin(BasePlugin):
         def on_check(v):
             try:
                 sheet.dismiss()
-                uri = Uri.parse("https://t.me/I_am_Vestr")
-                Browser.openUrl(act, uri, True, True, True, None, None, False, False, False)
+                self._check_for_updates(show_loading=True)
             except Exception:
                 pass
         check_btn_frame.setOnClickListener(OnClickListener(lambda *_: on_check(check_btn_frame)))
@@ -2708,19 +4472,64 @@ class PluginCreatorPlugin(BasePlugin):
         sheet.setCustomView(root_layout)
         sheet.show()
 
+        def animate_elements():
+            try:
+                try:
+                    root_layout.animate().alpha(0.8).scaleX(0.4).scaleY(0.4).translationY(AndroidUtilities.dp(50)).setDuration(200).start()
+                except Exception:
+                    pass
+                def scale_up_menu():
+                    try:
+                        root_layout.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).translationY(0).setDuration(400).start()
+                    except Exception:
+                        pass
+                    def show_elements():
+                        try:
+                            title_view.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).start()
+                        except Exception:
+                            pass
+                        try:
+                            body_scroll.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(50).start()
+                        except Exception:
+                            pass
+                        try:
+                            check_btn_frame.animate().alpha(1.0).translationY(0).scaleX(1.0).scaleY(1.0).setDuration(350).setStartDelay(100).start()
+                        except Exception:
+                            pass
+                    try:
+                        run_on_ui_thread(show_elements)
+                    except Exception:
+                        pass
+                try:
+                    class ScaleUpRunnable(dynamic_proxy(Runnable)):
+                        def __init__(self, func):
+                            super().__init__()
+                            self.func = func
+                        def run(self):
+                            self.func()
+                    AndroidUtilities.runOnUIThread(ScaleUpRunnable(lambda: run_on_ui_thread(scale_up_menu)), 200)
+                except Exception:
+                    try:
+                        run_on_ui_thread(scale_up_menu)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            run_on_ui_thread(animate_elements)
+        except Exception:
+            pass
+
     def _on_chat_switch(self, key, value, ctx):
         self.set_setting(key, value)
         if key == 'show_chat_menu':
             if value:
                 try:
-                    from android_utils import run_on_ui_thread
                     run_on_ui_thread(self._add_plugin_creator_item_to_current_chat_header)
                 except Exception:
                     pass
             else:
                 try:
-                    from client_utils import get_last_fragment
-                    from org.telegram.ui import ChatActivity
                     frag = get_last_fragment()
                     if frag and isinstance(frag, ChatActivity):
                         headerItem = self._get_private_field(frag, "headerItem")
@@ -2736,91 +4545,982 @@ class PluginCreatorPlugin(BasePlugin):
         self.set_setting(key, value)
         self._update_chat_plugins_menu()
 
+    def _on_main_plugins_menu_switch(self, key, value, ctx):
+        self.set_setting(key, value)
+        run_on_ui_thread(self._update_main_plugins_menu)
+
+    def _open_main_menu_prefs(self, view=None):
+        try:
+            AppNavPrefs = find_class("com.exteragram.messenger.preferences.appearance.AppNavigationPreferencesActivity")
+            frag = get_last_fragment()
+            if AppNavPrefs and frag:
+                frag.presentFragment(AppNavPrefs())
+        except Exception as e:
+            log(f"plugin_creator: _open_main_menu_prefs error: {e}")
+
+    _DIALOGS_BTN_ID = 880034
+    _DIALOGS_BTN_ENABLED_KEY = 'plugin_creator_dialogs_btn_enabled'
+
+    def _is_dialogs_btn_enabled(self):
+        try:
+            return bool(self.get_setting(self._DIALOGS_BTN_ENABLED_KEY, True))
+        except Exception:
+            return True
+
+    def _set_dialogs_btn_enabled(self, val):
+        try:
+            self.set_setting(self._DIALOGS_BTN_ENABLED_KEY, bool(val))
+        except Exception:
+            pass
+
+    def _register_dialogs_menu_id(self):
+        try:
+            from java.lang import Integer as _Integer
+            cfg = find_class("com.exteragram.messenger.ExteraConfig")
+            if cfg is None:
+                return False
+            layout = cfg.mainMenuLayout
+            hidden = cfg.mainMenuHiddenItems
+            if layout is None or hidden is None:
+                return False
+            id_obj = _Integer(self._DIALOGS_BTN_ID)
+            enabled = self._is_dialogs_btn_enabled()
+            layout.remove(id_obj)
+            hidden.remove(id_obj)
+            if enabled:
+                layout.add(id_obj)
+            else:
+                hidden.add(0, id_obj)
+            try:
+                cfg.saveMainMenuLayout()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            log(f"plugin_creator: _register_dialogs_menu_id error: {e}")
+            return False
+
+    def _setup_dialogs_menu_hook(self):
+        try:
+            from java.lang import Integer as _Integer
+            from java import jclass as _jclass
+
+            DialogsActivity = find_class("org.telegram.ui.DialogsActivity")
+            if DialogsActivity is None:
+                return
+
+            target_method = None
+            for m in DialogsActivity.getClass().getDeclaredMethods():
+                try:
+                    if m.getName() == "addMainMenuConfiguredItem" and len(m.getParameterTypes()) == 2:
+                        target_method = m
+                        break
+                except Exception:
+                    continue
+            if target_method is None:
+                return
+            target_method.setAccessible(True)
+            try:
+                cfg_class = find_class("com.exteragram.messenger.ExteraConfig")
+                sanitize_method = None
+                for m in cfg_class.getClass().getDeclaredMethods():
+                    try:
+                        if m.getName() == "sanitizeMenu" and len(m.getParameterTypes()) == 0:
+                            sanitize_method = m
+                            break
+                    except Exception:
+                        continue
+                if sanitize_method:
+                    sanitize_method.setAccessible(True)
+                    plugin_ref = self
+                    class SanitizeHook(MethodHook):
+                        def after_hooked_method(self_h, param):
+                            try:
+                                plugin_ref._register_dialogs_menu_id()
+                            except Exception:
+                                pass
+                    self.hook_method(sanitize_method, SanitizeHook())
+            except Exception:
+                pass
+
+            self._register_dialogs_menu_id()
+            try:
+                activity_cls = find_class("com.exteragram.messenger.preferences.appearance.AppNavigationPreferencesActivity")
+                item_info_cls = find_class("com.exteragram.messenger.preferences.appearance.AppNavigationPreferencesActivity$ItemInfo")
+                if activity_cls and item_info_cls:
+                    java_cls = activity_cls.getClass()
+                    item_info_java_cls = item_info_cls.getClass()
+                    item_details_field = java_cls.getDeclaredField("itemDetails")
+                    item_details_field.setAccessible(True)
+                    reorder_icon_field = java_cls.getDeclaredField("reorderIcon")
+                    reorder_icon_field.setAccessible(True)
+                    icon_res_field = item_info_java_cls.getDeclaredField("iconRes")
+                    icon_res_field.setAccessible(True)
+                    name_field = item_info_java_cls.getDeclaredField("name")
+                    name_field.setAccessible(True)
+                    _CharSequence = _jclass("java.lang.CharSequence")
+                    item_info_ctor = item_info_java_cls.getDeclaredConstructor(
+                        _CharSequence, _Integer.TYPE
+                    )
+                    item_info_ctor.setAccessible(True)
+
+                    R = find_class("org.telegram.messenger.R")
+                    try:
+                        btn_icon_id = int(getattr(R.drawable, "menu_sendfile_plus"))
+                    except Exception:
+                        btn_icon_id = 0
+
+                    _String = _jclass("java.lang.String")
+                    btn_id = self._DIALOGS_BTN_ID
+
+                    class InitItemDetailsHook(MethodHook):
+                        def after_hooked_method(self_h, param):
+                            try:
+                                item_details = item_details_field.get(param.thisObject)
+                                if item_details is None:
+                                    return
+                                label = _String("Plugin creator")
+                                info_obj = item_info_ctor.newInstance(label, _Integer(btn_icon_id))
+                                item_details.put(_Integer(btn_id), info_obj)
+                            except Exception:
+                                pass
+
+                    init_method = java_cls.getDeclaredMethod("initItemDetails")
+                    init_method.setAccessible(True)
+                    self.hook_method(init_method, InitItemDetailsHook())
+                    UItem = _jclass("org.telegram.ui.Components.UItem")
+                    create_method = None
+                    for m in java_cls.getDeclaredMethods():
+                        try:
+                            if m.getName() == "createMenuItem" and len(m.getParameterTypes()) == 2:
+                                create_method = m
+                                break
+                        except Exception:
+                            continue
+                    if create_method:
+                        create_method.setAccessible(True)
+                        class CreateMenuItemHook(MethodHook):
+                            def before_hooked_method(self_h, param):
+                                try:
+                                    if int(param.args[0]) != btn_id:
+                                        return
+                                    info = param.args[1]
+                                    icon = icon_res_field.getInt(info)
+                                    name = name_field.get(info)
+                                    uitem = UItem.asButton(btn_id, icon, name)
+                                    uitem.object2 = reorder_icon_field.get(param.thisObject)
+                                    param.setResult(uitem)
+                                except Exception:
+                                    pass
+                        self.hook_method(create_method, CreateMenuItemHook())
+
+                    NotificationCenter = _jclass("org.telegram.messenger.NotificationCenter")
+                    base_cls = find_class("com.exteragram.messenger.preferences.BasePreferencesActivity")
+                    lv_field = None
+                    upd_method = None
+                    try:
+                        lv_field = base_cls.getClass().getDeclaredField("listView")
+                        lv_field.setAccessible(True)
+                        upd_method = java_cls.getDeclaredMethod("updateResetButtonVisibility")
+                        upd_method.setAccessible(True)
+                    except Exception:
+                        pass
+
+                    plugin_ref = self
+                    on_click_method = None
+                    for m in java_cls.getDeclaredMethods():
+                        try:
+                            if m.getName() == "onClick" and len(m.getParameterTypes()) == 5:
+                                on_click_method = m
+                                break
+                        except Exception:
+                            continue
+                    if on_click_method:
+                        on_click_method.setAccessible(True)
+                        class OnClickHook(MethodHook):
+                            def before_hooked_method(self_h, param):
+                                try:
+                                    if int(param.args[0].id) != btn_id:
+                                        return
+                                    cfg = find_class("com.exteragram.messenger.ExteraConfig")
+                                    id_obj = _Integer(btn_id)
+                                    if cfg.mainMenuLayout.contains(id_obj):
+                                        cfg.mainMenuLayout.remove(id_obj)
+                                        if not cfg.mainMenuHiddenItems.contains(id_obj):
+                                            cfg.mainMenuHiddenItems.add(0, id_obj)
+                                        plugin_ref._set_dialogs_btn_enabled(False)
+                                    elif cfg.mainMenuHiddenItems.contains(id_obj):
+                                        cfg.mainMenuHiddenItems.remove(id_obj)
+                                        cfg.mainMenuLayout.add(id_obj)
+                                        plugin_ref._set_dialogs_btn_enabled(True)
+                                    cfg.saveMainMenuLayout()
+                                    NotificationCenter.getGlobalInstance().postNotificationName(
+                                        NotificationCenter.mainUserInfoChanged
+                                    )
+                                    try:
+                                        if lv_field:
+                                            lv = lv_field.get(param.thisObject)
+                                            if lv and lv.adapter:
+                                                lv.adapter.update(True)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if upd_method:
+                                            upd_method.invoke(param.thisObject)
+                                    except Exception:
+                                        pass
+                                    param.setResult(None)
+                                except Exception:
+                                    pass
+                        self.hook_method(on_click_method, OnClickHook())
+            except Exception as e:
+                log(f"plugin_creator: dialogs prefs hooks error: {e}")
+
+            plugin_ref = self
+            class AddMainMenuItemHook(MethodHook):
+                def before_hooked_method(self_h, param):
+                    try:
+                        if int(param.args[1]) != plugin_ref._DIALOGS_BTN_ID:
+                            return
+                        io = param.args[0]
+                        if io is None:
+                            return
+                        R = find_class("org.telegram.messenger.R")
+                        try:
+                            icon_id = int(getattr(R.drawable, "menu_sendfile_plus"))
+                        except Exception:
+                            icon_id = 0
+                        _String = _jclass("java.lang.String")
+                        _Runnable = _jclass("java.lang.Runnable")
+                        class _OnClick(dynamic_proxy(_Runnable)):
+                            def __init__(self):
+                                super().__init__()
+                            def run(self):
+                                try:
+                                    run_on_ui_thread(plugin_ref.open_plugin_settings)
+                                except Exception:
+                                    pass
+                        io.add(icon_id, _String("Plugin creator"), _OnClick())
+                        param.setResult(True)
+                    except Exception:
+                        pass
+            self.hook_method(target_method, AddMainMenuItemHook())
+        except Exception as e:
+            log(f"plugin_creator: _setup_dialogs_menu_hook error: {e}")
+
+    def _get_main_button_action(self):
+        try:
+            return self.get_setting('main_button_action', 'send') or 'send'
+        except Exception:
+            return 'send'
+
+    def _get_main_button_action_index(self):
+        action = self._get_main_button_action()
+        actions = ['send', 'share', 'save', 'install']
+        try:
+            return actions.index(action)
+        except ValueError:
+            return 0
+
+    def _on_main_button_action_changed(self, idx):
+        try:
+            actions = ['send', 'share', 'save', 'install']
+            action = actions[max(0, min(int(idx), 3))]
+            self.set_setting('main_button_action', action)
+            run_on_ui_thread(lambda: self.reload_settings())
+        except Exception:
+            pass
+
+    def _get_main_button_text_and_icon(self):
+        action = self._get_main_button_action()
+        lang = self._lang()
+        if action == 'send':
+            return self._t('create_and_send'), 'msg_send_solar'
+        elif action == 'share':
+            return self._t('share_file'), 'msg_shareout_remix'
+        elif action == 'save':
+            return self._t('save_file'), 'msg_download_solar'
+        elif action == 'install':
+            return self._t('install_file'), 'msg_addbot_remix'
+        return self._t('create_and_send'), 'msg_send_solar'
+
+    def _execute_main_button_action(self, plugin_code, edit_text, sheet):
+        action = self._get_main_button_action()
+        if action == 'send':
+            self._send_plugin_file(plugin_code, None)
+        elif action == 'share':
+            self._open_share_alert(plugin_code, sheet)
+        elif action == 'save':
+            self._save_plugin_file_direct(plugin_code, edit_text.getContext())
+        elif action == 'install':
+            self._install_plugin_file_direct(plugin_code, edit_text.getContext())
+        else:
+            self._send_plugin_file(plugin_code, None)
+
+    def _open_share_alert(self, plugin_code, parent_sheet):
+        try:
+            if parent_sheet and hasattr(parent_sheet, 'dismiss'):
+                parent_sheet.dismiss()
+            
+            def open_share():
+                try:
+                    filename = self.get_setting('send_name', 'plugin.plugin')
+                    if not filename:
+                        filename = 'plugin.plugin'
+                    
+                    cache_dir = get_cache_dir()
+                    file_path = os.path.join(cache_dir, filename)
+                    temp_file = File(file_path)
+                    if temp_file.exists():
+                        temp_file.delete()
+
+                    fos = FileOutputStream(temp_file)
+                    fos.write(plugin_code.encode('utf-8'))
+                    fos.close()
+                    
+                    fragment = get_last_fragment()
+                    if fragment is not None:
+                        try:
+                            ShareAlert = find_class("org.telegram.ui.Components.ShareAlert")
+                        except Exception:
+                            return
+                        
+                        ShareDelegateClass = jclass("org.telegram.ui.Components.ShareAlert$ShareAlertDelegate")
+                        class ShareDelegate(dynamic_proxy(ShareDelegateClass)):
+                            def __init__(self, plugin):
+                                super().__init__()
+                                self.plugin = plugin
+                            def didShare(self):
+                                run_on_ui_thread(lambda: BulletinHelper.show_success(self.plugin._t('plugin_created')))
+                            def didCopy(self):
+                                return False
+                        act = fragment.getParentActivity()
+                        if not act:
+                            return
+                        share_alert = ShareAlert(
+                            act,
+                            None, None,
+                            temp_file.getAbsolutePath(),
+                            None, None,
+                            False, None, None,
+                            False, False, False,
+                            None, None
+                        )
+                        share_alert.setDelegate(ShareDelegate(self))
+                        fragment.showDialog(share_alert)
+                except Exception:
+                    pass
+            
+            run_on_ui_thread(open_share)
+        except Exception:
+            pass
+
+    def _save_plugin_file_direct(self, plugin_code, context):
+        try:
+            downloads_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            filename = self.get_setting('send_name', 'plugin.plugin')
+            if not filename:
+                filename = 'plugin.plugin'
+            file_path = File(downloads_dir, filename)
+            fos = FileOutputStream(file_path)
+            fos.write(plugin_code.encode('utf-8'))
+            fos.close()
+            icon_attr = getattr(R_tg.raw, 'done', 0)
+            success_message = self._t('file_saved_to', path=file_path.getAbsolutePath())
+            BulletinHelper.show_with_button(success_message, icon_attr, self._t('close'), lambda: None, None)
+        except Exception as e:
+            icon_attr = getattr(R_tg.raw, 'error', 0)
+            BulletinHelper.show_with_button(self._t('error_occurred'), icon_attr, self._t('close'), lambda: None, None)
+
+    def _install_plugin_file_direct(self, plugin_code, context):
+        try:
+            filename = self.get_setting('send_name', 'plugin.plugin')
+            if not filename:
+                filename = 'plugin.plugin'
+            cache_dir = get_cache_dir()
+            file_path = os.path.join(cache_dir, filename)
+            temp_file = File(file_path)
+            if temp_file.exists():
+                temp_file.delete()
+            fos = FileOutputStream(temp_file)
+            fos.write(plugin_code.encode('utf-8'))
+            fos.close()
+            fragment = get_last_fragment()
+            if fragment:
+                PluginsController.getInstance().showInstallDialog(fragment, temp_file.getAbsolutePath(), True)
+        except Exception as e:
+            BulletinHelper.show_error(self._t('error_message', error=str(e)))
+
+    def _lang(self):
+        try:
+            idx = int(self.get_setting('plugin_lang', 0) or 0)
+            forced = ['system', 'ru', 'en'][max(0, min(idx, 2))]
+            if forced != 'system':
+                return forced
+        except Exception:
+            pass
+        try:
+            code = LocaleController.getInstance().getCurrentLocale().getLanguage().lower()
+            return 'ru' if code.startswith('ru') else 'en'
+        except Exception:
+            return 'en'
+
+    def _t(self, key, **kwargs):
+        lang = self._lang()
+        try:
+            return LANG[lang][key].format(**kwargs)
+        except Exception:
+            try:
+                return LANG['ru'][key].format(**kwargs)
+            except Exception:
+                return key
+
+    def _on_language_changed(self, idx):
+        try:
+            self.set_setting('plugin_lang', max(0, min(int(idx), 2)))
+            run_on_ui_thread(lambda: self.reload_settings())
+        except Exception:
+            pass
+
+    def _on_font_size_changed(self, value):
+        try:
+            if value.isdigit():
+                size = int(value)
+                if size < 5:
+                    size = 5
+                elif size > 50:
+                    size = 50
+                self.set_setting('text_font_size', size)
+            else:
+                self.set_setting('text_font_size', 15)
+        except Exception:
+            self.set_setting('text_font_size', 15)
+
+    def create_plugin_settings_submenu(self):
+        return [
+            Header(text=self._t('triggers')),
+            Text(
+                text=self._t('main_menu_button'),
+                subtext=self._t('main_menu_button_sub'),
+                icon='msg_menu_solar',
+                on_click=self._open_main_menu_prefs,
+                link_alias='main_menu_button'
+            ),
+            Switch(
+                key='show_main_plugins_menu_button',
+                text=self._t('main_plugins_menu_button'),
+                subtext=self._t('main_plugins_menu_button_sub'),
+                default=self.get_setting('show_main_plugins_menu_button', False),
+                on_change=lambda value: (
+            self.set_setting('show_main_plugins_menu_button', value),
+            run_on_ui_thread(self._update_main_plugins_menu),
+            run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                self._t('restart_required'),
+                getattr(R_tg.raw, 'chats_infotip', 0),
+                self._t('restart_button'),
+                lambda: threading.Thread(target=self._kill_process, daemon=True).start(),
+                None
+            ))
+        )[-1],
+                link_alias='main_plugins_menu_button'
+            ),
+            Switch(
+                key='show_settings_menu_button',
+                text=self._t('settings_menu_button'),
+                subtext=self._t('settings_menu_button_sub'),
+                default=self.get_setting('show_settings_menu_button', True),
+                on_change=lambda value: (
+            self.set_setting('show_settings_menu_button', value),
+            run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                self._t('restart_required'),
+                getattr(R_tg.raw, 'chats_infotip', 0),
+                self._t('restart_button'),
+                lambda: threading.Thread(target=self._kill_process, daemon=True).start(),
+                None
+            ))
+        )[-1],
+                link_alias='settings_menu_button'
+            ),
+            Divider(),
+            Header(text=self._t('other')),
+            Switch(
+                key='particles_in_settings',
+                text=self._t('particles_in_settings'),
+                icon='menu_feature_premium',
+                default=self.get_setting('particles_in_settings', True),
+                link_alias='particles_in_settings'
+            ),
+            Selector(
+                key='plugin_lang',
+                text=self._t('plugin_language'),
+                icon='msg_language',
+                items=[self._t('system'), 'Русский', 'English'],
+                default=self.get_setting('plugin_lang', 0),
+                on_change=self._on_language_changed,
+                link_alias='plugin_language'
+            ),
+        ]
+
+    def create_file_creation_submenu(self):
+        return [
+            Header(text=self._t('triggers')),
+            Switch(
+                key='show_chat_menu',
+                text=self._t('chat_menu_button'),
+                default=self.get_setting('show_chat_menu', True),
+                subtext=self._t('chat_menu_sub'),
+                on_change=self._on_chat_switch,
+                link_alias='show_chat_menu'
+            ),
+            Switch(
+                key='show_chat_plugins_menu',
+                text=self._t('plugins_menu_button'),
+                default=self.get_setting('show_chat_plugins_menu', False),
+                subtext=self._t('chat_plugins_menu_sub'),
+                on_change=lambda value: (
+            self.set_setting('show_chat_plugins_menu', value),
+            run_on_ui_thread(self._update_chat_plugins_menu),
+            run_on_ui_thread(lambda: BulletinHelper.show_with_button(
+                self._t('restart_required'),
+                getattr(R_tg.raw, 'chats_infotip', 0),
+                self._t('restart_button'),
+                lambda: threading.Thread(target=self._kill_process, daemon=True).start(),
+                None
+            ))
+        )[-1],
+                link_alias='show_chat_plugins_menu'
+            ),
+            Switch(
+                key='show_send_button',
+                text=self._t('send_message_button'),
+                default=self.get_setting('show_send_button', True),
+                subtext=self._t('send_button_sub'),
+                link_alias='show_send_button'
+            ),
+            Input(
+                key='send_cmd',
+                text=self._t('send_command'),
+                icon='input_bot1_solar',
+                default=self.get_setting('send_cmd', '.file'),
+                subtext=self._t('send_cmd_sub'),
+                link_alias='send_cmd'
+            ),
+            Divider(),
+            Header(text=self._t('message')),
+            Input(
+                key='send_name',
+                text=self._t('file_name'),
+                default=self.get_setting('send_name', 'main.plugin'),
+                subtext=self._t('send_name_sub'),
+                on_change=self._on_send_name_change,
+                icon='msg_edit_solar',
+                link_alias='send_name'
+            ),
+            Input(
+                key='send_message',
+                text=self._t('message_text'),
+                default=self.get_setting('send_message', ''),
+                subtext=self._t('send_message_sub'),
+                icon='msg_photo_text2',
+                link_alias='send_message'
+            ),
+        ]
+
+    def create_text_editor_submenu(self):
+        return [
+            Header(text=self._t('main_section')),
+            Input(
+                key='text_font_size',
+                text=self._t('font_size'),
+                icon='msg_photo_text2_solar',
+                default=str(self.get_setting('text_font_size', 15)),
+                subtext=self._t('font_size_sub'),
+                on_change=self._on_font_size_changed,
+                link_alias='font_size'
+            ),
+            Text(
+                text=self._t('panel_buttons'),
+                icon='msg_list_solar',
+                on_click=self._open_panel_buttons_settings,
+                link_alias='panel_buttons'
+            ),
+            Selector(
+                key='main_button_action',
+                text=self._t('main_button_action'),
+                icon='input_bot2_solar',
+                items=[
+                    self._t('create_and_send'),
+                    self._t('share_file'),
+                    self._t('save_file'),
+                    self._t('install_file')
+                ],
+                default=self._get_main_button_action_index(),
+                on_change=self._on_main_button_action_changed,
+                link_alias='main_button_action'
+            ),
+            Divider(),
+            Header(text=self._t('options')),
+            Switch(
+                key='hide_toolbar',
+                text=self._t('hide_toolbar'),
+                subtext=self._t('hide_toolbar_sub'),
+                default=self.get_setting('hide_toolbar', False),
+                link_alias='hide_toolbar'
+            ),
+            Switch(
+                key='hide_main_button',
+                text=self._t('hide_main_button'),
+                subtext=self._t('hide_main_button_sub'),
+                default=self.get_setting('hide_main_button', False),
+                link_alias='hide_main_button'
+            ),
+        ]
+
+    def _get_default_panel_buttons_panel(self):
+        return ['restore', 'settings', 'paste']
+
+    def _get_default_panel_buttons_menu(self):
+        return ['share', 'copy', 'clear']
+
+    def _get_panel_buttons_state(self):
+        panel = self.get_setting('panel_buttons_panel', None)
+        menu = self.get_setting('panel_buttons_menu', None)
+        if not isinstance(panel, list) or not isinstance(menu, list):
+            panel = self._get_default_panel_buttons_panel()
+            menu = self._get_default_panel_buttons_menu()
+            self.set_setting('panel_buttons_panel', panel, reload_settings=False)
+            self.set_setting('panel_buttons_menu', menu, reload_settings=False)
+
+        known = {'restore', 'settings', 'paste', 'share', 'copy', 'clear'}
+        panel = [x for x in panel if x in known]
+        menu = [x for x in menu if x in known and x not in panel]
+
+        missing = [
+            x for x in (self._get_default_panel_buttons_panel() + self._get_default_panel_buttons_menu())
+            if x in known and x not in panel and x not in menu
+        ]
+        for x in missing:
+            menu.append(x)
+        return panel, menu
+
+    def _panel_button_title_icon(self, k):
+        if k == 'restore':
+            return self._t('restore_button'), 'menu_feature_premium'
+        if k == 'settings':
+            return self._t('settings'), 'msg_settings'
+        if k == 'paste':
+            return self._t('paste'), 'msg_log'
+        if k == 'share':
+            return self._t('share'), 'msg_share'
+        if k == 'copy':
+            return self._t('copy_button'), 'msg_copy'
+        if k == 'clear':
+            return self._t('clear'), 'msg_delete'
+        return str(k), 'msg_list_solar'
+
+    def _toggle_panel_button_location(self, key):
+        panel, menu = self._get_panel_buttons_state()
+        if key in panel:
+            panel = [x for x in panel if x != key]
+            if key not in menu:
+                menu.append(key)
+        else:
+            menu = [x for x in menu if x != key]
+            if key not in panel:
+                panel.append(key)
+        self.set_setting('panel_buttons_panel', panel, reload_settings=False)
+        self.set_setting('panel_buttons_menu', menu, reload_settings=True)
+
     def create_settings(self):
         settings = []
-        settings.append(Header(text=t('plugin_settings', lang=self.lang)))
-        settings.append(Switch(
-            key='show_chat_menu',
-            text=t('chat_menu', lang=self.lang),
-            default=self.get_setting('show_chat_menu', True),
-            subtext=t('chat_menu_sub', lang=self.lang),
-            on_change=self._on_chat_switch,
-            link_alias='show_chat_menu'
-        ))
-        settings.append(Switch(
-            key='show_chat_plugins_menu',
-            text=t('chat_plugins_menu', lang=self.lang),
-            default=self.get_setting('show_chat_plugins_menu', False),
-            subtext=t('chat_plugins_menu_sub', lang=self.lang),
-            on_change=self._on_chat_plugins_switch,
-            link_alias='show_chat_plugins_menu'
-        ))
-        settings.append(Switch(
-            key='show_send_button',
-            text=t('send_button', lang=self.lang),
-            default=self.get_setting('show_send_button', True),
-            subtext=t('send_button_sub', lang=self.lang),
-            link_alias='show_send_button'
-        ))
-        settings.append(Input(
-            key='send_cmd',
-            text=t('send_cmd', lang=self.lang),
-            default=self.get_setting('send_cmd', '.plugin'),
-            subtext=t('send_cmd_sub', lang=self.lang),
-            link_alias='send_cmd'
-        ))
-        settings.append(Divider())
-        settings.append(Header(text=t('message_settings', lang=self.lang)))
-        settings.append(Input(
-            key='send_name',
-            text=t('send_name', lang=self.lang),
-            default=self.get_setting('send_name', 'main'),
-            subtext=t('send_name_sub', lang=self.lang),
-            link_alias='send_name'
-        ))
-        settings.append(Input(
-            key='send_message',
-            text=t('send_message', lang=self.lang),
-            default=self.get_setting('send_message', ''),
-            subtext=t('send_message_sub', lang=self.lang),
-            link_alias='send_message'
-        ))
-        settings.append(Divider())
-        settings.append(Header(text=t('contacts', lang=self.lang)))
+        settings.append(Header(text=self._t('settings_section')))
         settings.append(Text(
-            text=t('support_me', lang=self.lang),
-            icon='menu_feature_reactions',
-            accent=True,
-            on_click=self._show_support_me_menu,
-            link_alias='support_me'
+            text=self._t('plugin_settings'),
+            icon='msg_settings',
+            create_sub_fragment=self.create_plugin_settings_submenu,
+            link_alias='plugin_settings_section'
         ))
         settings.append(Text(
-            text=t('channel_1', lang=self.lang),
+            text=self._t('file_creation_section'),
+            icon='msg_addbot',
+            create_sub_fragment=self.create_file_creation_submenu,
+            link_alias='file_creation_section'
+        ))
+        settings.append(Text(
+            text=self._t('text_editor_section'),
+            icon='input_keyboard_solar',
+            create_sub_fragment=self.create_text_editor_submenu,
+            link_alias='text_editor_section'
+        ))
+        settings.append(Divider())
+        settings.append(Header(text=self._t('contacts')))
+        settings.append(Text(
+            text=self._t('channel_1'),
             icon='msg_channel',
             on_click=self._open_channel_link,
             on_long_click=self._copy_channel_link
         ))
         settings.append(Text(
-            text=t('personal_1', lang=self.lang),
+            text=self._t('personal_1'),
             icon='msg_contacts',
             on_click=lambda ctx: self._open_personal_link(ctx),
             on_long_click=self._copy_personal_link
         ))
-        settings.append(Divider())
-        settings.append(Header(text=t('other', lang=self.lang)))
         settings.append(Text(
-            text=t('how_it_works', lang=self.lang),
+            text=self._t('support_me'),
+            icon='menu_feature_reactions',
+            accent=True,
+            on_click=self._show_support_me_menu,
+            link_alias='support_me'
+        ))
+        settings.append(Divider())
+        settings.append(Header(text=self._t('other')))
+        settings.append(Text(
+            text=self._t('how_it_works'),
             icon='msg_info',
             on_click=self._show_how_it_works,
             link_alias='how_it_works'
         ))
         settings.append(Text(
-            text=t('plugin_version', lang=self.lang),
-            icon='msg_settings_14',
+            text=self._t('plugin_version'),
+            icon='msg_settings',
             accent=True,
             on_click=lambda ctx: self._show_version_dialog(ctx),
             link_alias='plugin_version'
         ))
         settings.append(Divider())
-        settings.append(Divider())
         return settings
+
+    def on_plugin_unload(self):
+        if self._badge_manager:
+            self._badge_manager.cleanup()
+        if self._deeplink_hook_ref:
+            try:
+                self.unhook_method(self._deeplink_hook_ref)
+            except Exception:
+                pass
+
+    def _open_panel_buttons_settings(self, ctx=None):
+        try:
+            UniversalFragment = find_class("com.exteragram.messenger.plugins.ui.components.templates.UniversalFragment")
+            delegate = PanelButtonsDelegate(self)
+            f = UniversalFragment(delegate)
+            delegate.fragment_ref = f
+            try:
+                LA = find_class("org.telegram.ui.LaunchActivity")
+                if LA.instance:
+                    LA.instance.presentFragment(f)
+                else:
+                    get_last_fragment().presentFragment(f)
+            except:
+                get_last_fragment().presentFragment(f)
+        except Exception as e:
+            self.log(f"Panel buttons settings error: {e}")
+
+    def create_panel_buttons_submenu(self):
+        return []
+
+
+class PanelButtonsDelegate(dynamic_proxy(find_class("com.exteragram.messenger.plugins.ui.components.templates.UniversalFragment$UniversalFragmentDelegate"))):
+    BUTTON_IDS = {
+        'restore': 101,
+        'settings': 102,
+        'paste': 103,
+        'share': 104,
+        'copy': 105,
+        'clear': 106
+    }
+    SECTION_PANEL_ID = 1
+    SECTION_MENU_ID = 2
+
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self.fragment_ref = None
+
+    def getTitle(self):
+        return None
+
+    def beforeCreateView(self):
+        return None
+
+    def afterCreateView(self, view):
+        try:
+            if view:
+                bg_color = Theme.getColor(Theme.key_windowBackgroundGray)
+                view.setBackgroundColor(bg_color)
+                if self.fragment_ref:
+                    actionBar = self.fragment_ref.getActionBar()
+                    if actionBar:
+                        actionBar.setTitle(self.plugin._t('panel_buttons'))
+                        actionBar.setBackgroundColor(bg_color)
+                        actionBar.setCastShadows(False)
+                        try:
+                            R = find_class("org.telegram.messenger.R")
+                            back_icon = getattr(R.drawable, 'ic_ab_back', 0)
+                            if back_icon:
+                                actionBar.setBackButtonImage(back_icon)
+                        except:
+                            pass
+
+            frag = self.fragment_ref
+            if frag and frag.listView:
+                frag.listView.allowReorder(True)
+
+                class ReorderCallback(dynamic_proxy(jclass("org.telegram.messenger.Utilities$Callback2"))):
+                    def __init__(self, delegate):
+                        super().__init__()
+                        self.delegate = delegate
+
+                    def run(self, section_id, item_list):
+                        self.delegate.on_reorder(section_id, item_list)
+
+                frag.listView.listenReorder(ReorderCallback(self))
+        except Exception as e:
+            self.plugin.log(f"PanelButtonsDelegate afterCreateView error: {e}")
+        return view
+
+    def _get_key_by_id(self, btn_id):
+        for key, id_val in self.BUTTON_IDS.items():
+            if id_val == btn_id:
+                return key
+        return None
+
+    def _is_section_id(self, btn_id):
+        return btn_id in (self.SECTION_PANEL_ID, self.SECTION_MENU_ID)
+
+    def on_reorder(self, section_id, item_list):
+        try:
+            new_keys = []
+            for i in range(item_list.size()):
+                item = item_list.get(i)
+                if hasattr(item, 'id'):
+                    btn_id = int(item.id)
+                    if self._is_section_id(btn_id):
+                        continue
+                    key = self._get_key_by_id(btn_id)
+                    if key:
+                        new_keys.append(key)
+
+            if not new_keys:
+                return
+            if section_id == 0:
+                self.plugin.set_setting('panel_buttons_panel', new_keys, reload_settings=False)
+            elif section_id == 1:
+                self.plugin.set_setting('panel_buttons_menu', new_keys, reload_settings=False)
+            self._refresh_ui()
+        except Exception as e:
+            self.plugin.log(f"on_reorder error: {e}")
+
+    def _refresh_ui(self):
+        try:
+            if self.fragment_ref and self.fragment_ref.listView:
+                run_on_ui_thread(lambda: self.fragment_ref.listView.adapter.update(True))
+        except Exception:
+            pass
+
+    def _get_button_icon_res(self, key):
+        R_drawable = find_class("org.telegram.messenger.R$drawable")
+        icon_map = {
+            'restore': 'menu_feature_premium',
+            'settings': 'msg_settings',
+            'paste': 'msg_log',
+            'share': 'msg_share',
+            'copy': 'msg_copy',
+            'clear': 'msg_delete'
+        }
+        icon_name = icon_map.get(key, 'msg_list_solar')
+        try:
+            return getattr(R_drawable, icon_name)
+        except:
+            return 0
+
+    def fillItems(self, arrayList, adapter):
+        UItem = find_class("org.telegram.ui.Components.UItem")
+        panel, menu = self.plugin._get_panel_buttons_state()
+        adapter.whiteSectionStart()
+        arrayList.add(UItem.asHeader(self.plugin._t('panel_buttons_in_panel')))
+        adapter.reorderSectionStart()
+        for k in panel:
+            if k not in self.BUTTON_IDS:
+                continue
+            title, _ = self.plugin._panel_button_title_icon(k)
+            icon_res = self._get_button_icon_res(k)
+            btn_id = self.BUTTON_IDS[k]
+            item = UItem.asButton(btn_id, icon_res, String(title))
+            arrayList.add(item)
+        adapter.reorderSectionEnd()
+        adapter.whiteSectionEnd()
+        arrayList.add(UItem.asShadow(""))
+        adapter.whiteSectionStart()
+        arrayList.add(UItem.asHeader(self.plugin._t('panel_buttons_in_menu')))
+        adapter.reorderSectionStart()
+        for k in menu:
+            if k not in self.BUTTON_IDS:
+                continue
+            title, _ = self.plugin._panel_button_title_icon(k)
+            icon_res = self._get_button_icon_res(k)
+            btn_id = self.BUTTON_IDS[k]
+            item = UItem.asButton(btn_id, icon_res, String(title))
+            arrayList.add(item)
+        adapter.reorderSectionEnd()
+        adapter.whiteSectionEnd()
+        arrayList.add(UItem.asShadow(self.plugin._t('panel_buttons_hint')))
+
+    def onClick(self, uItem, view, i, f, f2):
+        try:
+            btn_id = int(uItem.id)
+            if self._is_section_id(btn_id):
+                return
+
+            key = self._get_key_by_id(btn_id)
+            if not key:
+                return
+
+            panel, menu = self.plugin._get_panel_buttons_state()
+            if key in panel:
+                self._move_to_menu(key)
+            elif key in menu:
+                self._move_to_panel(key)
+
+            self._refresh_ui()
+        except Exception as e:
+            self.plugin.log(f"onClick error: {e}")
+
+    def _move_to_menu(self, key):
+        panel, menu = self.plugin._get_panel_buttons_state()
+        if key in panel:
+            panel = [x for x in panel if x != key]
+            if key not in menu:
+                menu.append(key)
+            self.plugin.set_setting('panel_buttons_panel', panel, reload_settings=False)
+            self.plugin.set_setting('panel_buttons_menu', menu, reload_settings=False)
+
+    def _move_to_panel(self, key):
+        panel, menu = self.plugin._get_panel_buttons_state()
+        if key in menu:
+            menu = [x for x in menu if x != key]
+            if key not in panel:
+                panel.append(key)
+            self.plugin.set_setting('panel_buttons_menu', menu, reload_settings=False)
+            self.plugin.set_setting('panel_buttons_panel', panel, reload_settings=False)
+
+    def onLongClick(self, uItem, view, i, f, f2):
+        return False
+
+    def onFragmentCreate(self):
+        pass
+
+    def onFragmentDestroy(self):
+        pass
+
+    def onBackPressed(self):
+        return None
+
+    def onMenuItemClick(self, i):
+        pass
+
+
+# Спасибо за некоторые части кода @luvztroy и @shareui!
+
+# Thanks for some code snippets to @luvztroy and @shareui!
