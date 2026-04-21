@@ -1,0 +1,785 @@
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import run_on_queue, send_message
+from markdown_utils import parse_markdown
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Switch, Text
+
+__id__ = "beszel_stats"
+__name__ = "Beszel Stats"
+__description__ = "Reports Beszel traffic, bandwidth, CPU and RAM. Main command: .bz"
+__author__ = "@darkydaff"
+__version__ = "1.3.1"
+__min_version__ = "11.12.0"
+__icon__ = "darkiplug/0"
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    match = re.search(r"-?\d+(\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _fmt_pct(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.1f}%"
+
+
+def _bytes_to_human(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    if value < 0:
+        value = 0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    v = float(value)
+    while v >= 1024 and idx < len(units) - 1:
+        idx += 1
+        v /= 1024.0
+    return f"{v:.2f} {units[idx]}"
+
+
+class BeszelStatsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._auth_token = ""
+        self._auth_token_ts = 0.0
+        self._token_ttl = 8 * 60
+        self._report_cache: Dict[str, Tuple[float, str]] = {}
+        self._report_cache_ttl = 60
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    def create_settings(self):
+        return [
+            Header(text="Beszel / PocketBase"),
+            Input(key="hub_url", text="Hub URL", default="http://beszel.example.org:8090"),
+            Input(key="hub_email", text="Email", default=""),
+            Input(key="hub_password", text="Password", default=""),
+            Input(key="request_timeout", text="Request timeout (sec)", default="15"),
+            Switch(
+                key="include_offline",
+                text="Include offline systems",
+                subtext="If disabled, hides systems marked offline when status is available.",
+                default=True,
+            ),
+            Divider(),
+            Header(text="Commands"),
+            Text(text=".bz", subtext="Full report"),
+            Text(text=".bz refresh", subtext="Force fresh data (no cache)"),
+            Text(text=".bz top <N>", subtext="Top N by bandwidth (Mbps)"),
+            Text(text=".bz server <query>", subtext="Filter by server name/host"),
+            Text(text=".bz sort traffic|cpu|ram|name", subtext="Sort output"),
+            Text(text=".bz today", subtext="Traffic delta since UTC day start"),
+            Text(text=".bz 24h", subtext="Traffic delta for last 24 hours"),
+            Text(text=".bz 7d", subtext="Traffic delta for last 7 days"),
+            Text(text=".bz help", subtext="Show command help in chat"),
+        ]
+
+    def on_send_message_hook(self, account, params):
+        text = getattr(params, "message", None)
+        if not isinstance(text, str):
+            return HookResult()
+        msg = text.strip()
+        if not msg.lower().startswith(".bz"):
+            return HookResult()
+        if msg.lower() == ".bz help":
+            peer = getattr(params, "peer", None)
+            self._send_help(peer)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        force_refresh = msg.lower() == ".bz refresh"
+        options = self._parse_command_options(msg)
+        peer = getattr(params, "peer", None)
+        run_on_queue(lambda: self._run_report(peer, force_refresh=force_refresh, options=options))
+        BulletinHelper.show_info("Fetching Beszel stats...")
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _run_report(self, peer, force_refresh: bool, options: Dict[str, Any]):
+        try:
+            report = self._build_report(force_refresh=force_refresh, options=options)
+            parsed = parse_markdown(report)
+            send_message(
+                {
+                    "peer": peer,
+                    "message": parsed.text,
+                    "entities": [e.to_tlrpc_object() for e in parsed.entities],
+                }
+            )
+        except Exception as e:
+            send_message({"peer": peer, "message": f"Beszel stats error: {e}"})
+
+    def _send_help(self, peer):
+        text = (
+            "*Beszel Stats Help*\n\n"
+            "` .bz ` - full report\n"
+            "` .bz refresh ` - force fresh token/report (bypass cache)\n"
+            "` .bz top <N> ` - top N servers by current Mbps\n"
+            "` .bz server <name_or_host> ` - filter servers\n"
+            "` .bz sort traffic|cpu|ram|name ` - sort output\n"
+            "` .bz today ` - traffic delta since UTC day start\n"
+            "` .bz 24h ` - traffic delta over last 24 hours\n"
+            "` .bz 7d ` - traffic delta over last 7 days\n"
+            "` .bz help ` - show this help\n\n"
+            "_Bandwidth is reported in Mbps (megabits per second)._"
+        )
+        parsed = parse_markdown(text)
+        send_message(
+            {
+                "peer": peer,
+                "message": parsed.text,
+                "entities": [e.to_tlrpc_object() for e in parsed.entities],
+            }
+        )
+
+    def _build_report(self, force_refresh: bool, options: Dict[str, Any]) -> str:
+        hub_url = str(self.get_setting("hub_url", "") or "").strip().rstrip("/")
+        email = str(self.get_setting("hub_email", "") or "").strip()
+        password = str(self.get_setting("hub_password", "") or "")
+        include_offline = bool(self.get_setting("include_offline", True))
+        timeout = int(_safe_float(self.get_setting("request_timeout", 15)) or 15)
+
+        if not hub_url or not email or not password:
+            return (
+                "*Beszel Stats*\n"
+                "Configure `Hub URL`, `Email`, and `Password` in plugin settings first."
+            )
+
+        cache_key = self._cache_key(hub_url, include_offline, options)
+        if not force_refresh:
+            cached = self._report_cache.get(cache_key)
+            if cached and (time.time() - cached[0]) <= self._report_cache_ttl:
+                return cached[1]
+
+        token = self._auth(hub_url, email, password, timeout, force_refresh=force_refresh)
+        systems = self._fetch_collection(hub_url, token, "systems", timeout)
+        systems = self._filter_systems(systems, options.get("server_filter", ""))
+
+        lines = ["*Beszel Monitoring Report*", ""]
+        total_history_bytes = 0.0
+        total_counter_bytes = 0.0
+        total_period_bytes = 0.0
+        has_any_history = False
+        has_any_counter = False
+        has_any_period = False
+
+        rows: List[Dict[str, Any]] = []
+
+        for system in systems:
+            system_id = str(system.get("id", "")).strip()
+            if not system_id:
+                continue
+
+            status = str(system.get("status", "") or "").lower()
+            if not include_offline and status in ("offline", "down", "stopped"):
+                continue
+
+            name = str(system.get("name", system_id))
+            latest = self._fetch_latest_stat(hub_url, token, system_id, timeout)
+            history = self._fetch_history_stats(hub_url, token, system_id, timeout)
+
+            cpu_pct = self._extract_cpu_pct(latest)
+            ram_pct = self._extract_ram_pct(latest)
+            rx_mbps, tx_mbps = self._extract_current_bandwidth_mbps(latest)
+            current_total = (rx_mbps or 0.0) + (tx_mbps or 0.0)
+            total_text = (
+                f"{current_total:.2f}" if (rx_mbps is not None or tx_mbps is not None) else "N/A"
+            )
+
+            history_bytes = self._extract_history_traffic_sum_bytes(history)
+            counter_bytes = self._extract_latest_counter_bytes(latest)
+            period_key = options.get("period_key")
+            period_bytes = self._extract_period_delta_bytes(history, period_key) if period_key else None
+
+            if history_bytes is not None:
+                total_history_bytes += history_bytes
+                has_any_history = True
+            if counter_bytes is not None:
+                total_counter_bytes += counter_bytes
+                has_any_counter = True
+            if period_bytes is not None:
+                total_period_bytes += period_bytes
+                has_any_period = True
+
+            rows.append(
+                {
+                    "name": name,
+                    "bandwidth_mbps": current_total if (rx_mbps is not None or tx_mbps is not None) else None,
+                    "cpu_pct": cpu_pct,
+                    "ram_pct": ram_pct,
+                    "history_bytes": history_bytes,
+                    "counter_bytes": counter_bytes,
+                    "period_bytes": period_bytes,
+                }
+            )
+
+        rows = self._sort_rows(rows, options.get("sort_by", "name"))
+        top_n = options.get("top_n")
+        if isinstance(top_n, int) and top_n > 0:
+            rows = rows[:top_n]
+
+        shown = 0
+        for row in rows:
+            lines.append(f"*{row['name']}*")
+            bw = row["bandwidth_mbps"]
+            lines.append(f"- Bandwidth: `{f'{bw:.2f}' if bw is not None else 'N/A'}` Mbps")
+            lines.append(f"- CPU: `{_fmt_pct(row['cpu_pct'])}` | RAM: `{_fmt_pct(row['ram_pct'])}`")
+            lines.append(
+                f"- Lifetime (reconstructed from history): `{_bytes_to_human(row['history_bytes'])}` | "
+                f"Lifetime (latest cumulative counters): `{_bytes_to_human(row['counter_bytes'])}`"
+            )
+            if options.get("period_key"):
+                lines.append(
+                    f"- Traffic ({options['period_key']}): `{_bytes_to_human(row['period_bytes'])}`"
+                )
+            lines.append("")
+            shown += 1
+
+        if shown == 0:
+            return "*Beszel Monitoring Report*\nNo systems found or all systems filtered out."
+
+        lines.append("*Overall*")
+        lines.append(
+            f"- History sum total: `{_bytes_to_human(total_history_bytes if has_any_history else None)}`"
+        )
+        lines.append(
+            f"- Counter total: `{_bytes_to_human(total_counter_bytes if has_any_counter else None)}`"
+        )
+        if options.get("period_key"):
+            lines.append(
+                f"- {options['period_key']} total: `{_bytes_to_human(total_period_bytes if has_any_period else None)}`"
+            )
+        lines.append("")
+        lines.append("_Tip: use `.bz refresh` to force token refresh._")
+        report = "\n".join(lines)
+        self._report_cache[cache_key] = (time.time(), report)
+        return report
+
+    def _parse_command_options(self, msg: str) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "top_n": None,
+            "server_filter": "",
+            "sort_by": "name",
+            "period_key": None,
+        }
+        parts = msg.strip().split()
+        if len(parts) <= 1:
+            return options
+
+        i = 1
+        while i < len(parts):
+            token = parts[i].lower()
+            if token == "top" and i + 1 < len(parts):
+                try:
+                    options["top_n"] = max(1, int(parts[i + 1]))
+                except Exception:
+                    pass
+                options["sort_by"] = "traffic"
+                i += 2
+                continue
+            if token == "server" and i + 1 < len(parts):
+                options["server_filter"] = " ".join(parts[i + 1 :]).strip()
+                break
+            if token == "sort" and i + 1 < len(parts):
+                sort_key = parts[i + 1].lower()
+                if sort_key in ("traffic", "cpu", "ram", "name"):
+                    options["sort_by"] = sort_key
+                i += 2
+                continue
+            if token in ("today", "24h", "7d"):
+                options["period_key"] = token
+                i += 1
+                continue
+            i += 1
+        return options
+
+    def _auth(
+        self, hub_url: str, email: str, password: str, timeout: int, force_refresh: bool = False
+    ) -> str:
+        if (
+            not force_refresh
+            and self._auth_token
+            and (time.time() - self._auth_token_ts) < self._token_ttl
+        ):
+            return self._auth_token
+
+        body = {"identity": email, "password": password}
+        endpoints = [
+            f"{hub_url}/api/collections/users/auth-with-password",
+            f"{hub_url}/api/collections/_pb_users_auth_/auth-with-password",
+            f"{hub_url}/api/admins/auth-with-password",
+        ]
+
+        last_error = "auth_failed"
+        for endpoint in endpoints:
+            try:
+                response = requests.post(endpoint, json=body, timeout=timeout)
+                if response.status_code == 200:
+                    data = response.json()
+                    token = str(data.get("token", "")).strip()
+                    if token:
+                        self._auth_token = token
+                        self._auth_token_ts = time.time()
+                        return token
+                last_error = f"{response.status_code}"
+            except Exception as e:
+                last_error = str(e)
+        raise RuntimeError(f"Authentication failed ({last_error})")
+
+    def _fetch_collection(
+        self, hub_url: str, token: str, collection: str, timeout: int, page_limit: int = 40
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        headers = {"Authorization": f"Bearer {token}"}
+        page = 1
+        while page <= page_limit:
+            url = f"{hub_url}/api/collections/{collection}/records"
+            response = requests.get(
+                url,
+                headers=headers,
+                params={"page": page, "perPage": 200},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json() or {}
+            items = data.get("items") or []
+            out.extend(items)
+            total_pages = int(data.get("totalPages", 1) or 1)
+            if page >= total_pages:
+                break
+            page += 1
+        return out
+
+    def _fetch_latest_stat(
+        self, hub_url: str, token: str, system_id: str, timeout: int
+    ) -> Dict[str, Any]:
+        headers = {"Authorization": f"Bearer {token}"}
+        filter_expr = f'system="{system_id}"'
+        url = f"{hub_url}/api/collections/system_stats/records"
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"page": 1, "perPage": 1, "sort": "-created", "filter": filter_expr},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        items = (response.json() or {}).get("items") or []
+        return items[0] if items else {}
+
+    def _fetch_history_stats(
+        self, hub_url: str, token: str, system_id: str, timeout: int, max_pages: int = 1000
+    ) -> List[Dict[str, Any]]:
+        headers = {"Authorization": f"Bearer {token}"}
+        filter_expr = f'system="{system_id}"'
+        url = f"{hub_url}/api/collections/system_stats/records"
+        page = 1
+        all_items: List[Dict[str, Any]] = []
+
+        while page <= max_pages:
+            response = requests.get(
+                url,
+                headers=headers,
+                params={
+                    "page": page,
+                    "perPage": 200,
+                    "sort": "-created",
+                    "filter": filter_expr,
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json() or {}
+            items = data.get("items") or []
+            if not items:
+                break
+            all_items.extend(items)
+            total_pages = int(data.get("totalPages", 1) or 1)
+            if page >= total_pages:
+                break
+            page += 1
+        return all_items
+
+    def _flatten_numeric(self, source: Dict[str, Any], out: Dict[str, float], prefix: str = ""):
+        for key, value in (source or {}).items():
+            k = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                self._flatten_numeric(value, out, k)
+            elif isinstance(value, list):
+                for idx, item in enumerate(value):
+                    list_key = f"{k}.{idx}"
+                    if isinstance(item, dict):
+                        self._flatten_numeric(item, out, list_key)
+                    elif isinstance(item, list):
+                        for j, nested in enumerate(item):
+                            num = _safe_float(nested)
+                            if num is not None:
+                                out[f"{list_key}.{j}".lower()] = num
+                    else:
+                        num = _safe_float(item)
+                        if num is not None:
+                            out[list_key.lower()] = num
+            elif isinstance(value, (int, float, str)):
+                num = _safe_float(value)
+                if num is not None:
+                    out[k.lower()] = num
+
+    def _extract_cpu_pct(self, stat: Dict[str, Any]) -> Optional[float]:
+        flat: Dict[str, float] = {}
+        self._flatten_numeric(stat, flat)
+        candidates = [
+            "cpu",
+            "cpu_percent",
+            "cpu_pct",
+            "cpu.usage",
+            "cpu.usage_percent",
+            "stats.cpu",
+            "stats.cpu.percent",
+            "stats.cpu.usage",
+        ]
+        return self._pick_first(flat, candidates)
+
+    def _extract_ram_pct(self, stat: Dict[str, Any]) -> Optional[float]:
+        flat: Dict[str, float] = {}
+        self._flatten_numeric(stat, flat)
+        direct_candidates = [
+            "ram",
+            "ram_percent",
+            "memory_percent",
+            "memory.usage_percent",
+            "stats.mp",
+            "stats.memory.percent",
+            "stats.ram.percent",
+        ]
+        direct = self._pick_first(flat, direct_candidates)
+        if direct is not None:
+            return direct
+
+        used = self._pick_first(
+            flat,
+            [
+                "memory_used",
+                "ram_used",
+                "stats.memory.used",
+                "stats.ram.used",
+            ],
+        )
+        total = self._pick_first(
+            flat,
+            [
+                "memory_total",
+                "ram_total",
+                "stats.memory.total",
+                "stats.ram.total",
+            ],
+        )
+        if used is not None and total and total > 0:
+            return (used / total) * 100.0
+        return None
+
+    def _extract_current_bandwidth_mbps(
+        self, stat: Dict[str, Any]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        flat: Dict[str, float] = {}
+        self._flatten_numeric(stat, flat)
+
+        rx = self._pick_first(
+            flat,
+            [
+                "network.rx_mbps",
+                "net.rx_mbps",
+                "rx_mbps",
+                "rxmbps",
+                "bandwidth.rx_mbps",
+                "stats.nr",
+            ],
+        )
+        tx = self._pick_first(
+            flat,
+            [
+                "network.tx_mbps",
+                "net.tx_mbps",
+                "tx_mbps",
+                "txmbps",
+                "bandwidth.tx_mbps",
+                "stats.ns",
+            ],
+        )
+        if rx is not None or tx is not None:
+            # Beszel `stats.ns/nr` are MB/s; convert to Mbps heuristically.
+            if "stats.ns" in flat or "stats.nr" in flat:
+                return (
+                    rx * 8.0 if rx is not None else None,
+                    tx * 8.0 if tx is not None else None,
+                )
+            return rx, tx
+
+        b0 = self._pick_first(flat, ["stats.b.0", "b.0"])
+        b1 = self._pick_first(flat, ["stats.b.1", "b.1"])
+        if b0 is not None or b1 is not None:
+            return (
+                ((b1 or 0.0) * 8.0 / 1_000_000.0) if b1 is not None else None,
+                ((b0 or 0.0) * 8.0 / 1_000_000.0) if b0 is not None else None,
+            )
+
+        rx_mb_s = self._pick_first(flat, ["network.rx_mb_s", "rx_mb_s", "net.rx_mb_s"])
+        tx_mb_s = self._pick_first(flat, ["network.tx_mb_s", "tx_mb_s", "net.tx_mb_s"])
+        if rx_mb_s is not None or tx_mb_s is not None:
+            return (
+                rx_mb_s * 8.0 if rx_mb_s is not None else None,
+                tx_mb_s * 8.0 if tx_mb_s is not None else None,
+            )
+
+        rx_b_s = self._pick_first(
+            flat,
+            [
+                "network.rx",
+                "network.rx_bps",
+                "rx",
+                "rx_bps",
+                "net.rx",
+                "stats.network.rx",
+            ],
+        )
+        tx_b_s = self._pick_first(
+            flat,
+            [
+                "network.tx",
+                "network.tx_bps",
+                "tx",
+                "tx_bps",
+                "net.tx",
+                "stats.network.tx",
+            ],
+        )
+        # Heuristic: values usually bytes/sec -> convert to Mbps.
+        def to_mbps(value: Optional[float]) -> Optional[float]:
+            if value is None:
+                return None
+            return (value * 8.0) / 1_000_000.0
+
+        return to_mbps(rx_b_s), to_mbps(tx_b_s)
+
+    def _extract_total_counter_from_stat(self, stat: Dict[str, Any]) -> Optional[float]:
+        stats_obj = stat.get("stats") if isinstance(stat, dict) else None
+        if not isinstance(stats_obj, dict):
+            return None
+        ni = stats_obj.get("ni")
+        if not isinstance(ni, dict):
+            return None
+        total = 0.0
+        found = False
+        for iface_data in ni.values():
+            if isinstance(iface_data, list) and len(iface_data) >= 4:
+                rx_total = _safe_float(iface_data[2])
+                tx_total = _safe_float(iface_data[3])
+                if rx_total is not None or tx_total is not None:
+                    total += (rx_total or 0.0) + (tx_total or 0.0)
+                    found = True
+        return total if found else None
+
+    def _extract_history_traffic_sum_bytes(self, stats: List[Dict[str, Any]]) -> Optional[float]:
+        if not stats:
+            return None
+        # Prefer delta-of-counters across historical rows.
+        # This better matches Beszel "all-time" accumulation than integrating rate snapshots.
+        def _created_key(row: Dict[str, Any]) -> str:
+            return str(row.get("created", "") or "")
+
+        rows = sorted(stats, key=_created_key)
+        prev_counter = None
+        delta_sum = 0.0
+        delta_found = False
+
+        for row in rows:
+            current_counter = self._extract_total_counter_from_stat(row)
+            if current_counter is None:
+                continue
+            if prev_counter is not None:
+                delta = current_counter - prev_counter
+                if delta >= 0:
+                    delta_sum += delta
+                else:
+                    # Counter reset/reboot: add current absolute value as a new segment.
+                    delta_sum += current_counter
+                delta_found = True
+            prev_counter = current_counter
+
+        if delta_found:
+            return delta_sum
+
+        # Fallback for schemas without cumulative counters.
+        period_map = {
+            "1m": 60.0,
+            "10m": 600.0,
+            "20m": 1200.0,
+            "120m": 7200.0,
+            "480m": 28800.0,
+        }
+        total = 0.0
+        found = False
+        for row in rows:
+            rec_type = str(row.get("type", "") or "").strip().lower()
+            flat: Dict[str, float] = {}
+            self._flatten_numeric(row, flat)
+            b_tx = self._pick_first(flat, ["stats.b.0", "b.0"])
+            b_rx = self._pick_first(flat, ["stats.b.1", "b.1"])
+            if b_tx is not None or b_rx is not None:
+                period_sec = period_map.get(rec_type, 60.0)
+                total += ((b_tx or 0.0) + (b_rx or 0.0)) * period_sec
+                found = True
+        return total if found else None
+
+    def _extract_latest_counter_bytes(self, latest: Dict[str, Any]) -> Optional[float]:
+        ni_total = self._extract_total_counter_from_stat(latest)
+        if ni_total is not None:
+            return ni_total
+
+        flat: Dict[str, float] = {}
+        self._flatten_numeric(latest, flat)
+        rx = self._pick_first(
+            flat,
+            [
+                "network.rx_counter",
+                "network.rx_total",
+                "rx_counter",
+                "rx_total",
+                "stats.network.rx_counter",
+                "stats.network.rx_total",
+            ],
+        )
+        tx = self._pick_first(
+            flat,
+            [
+                "network.tx_counter",
+                "network.tx_total",
+                "tx_counter",
+                "tx_total",
+                "stats.network.tx_counter",
+                "stats.network.tx_total",
+            ],
+        )
+        if rx is None and tx is None:
+            return None
+        return (rx or 0.0) + (tx or 0.0)
+
+    def _pick_first(self, flat: Dict[str, float], keys: List[str]) -> Optional[float]:
+        for key in keys:
+            low = key.lower()
+            if low in flat:
+                return flat[low]
+        # Fallback match for suffixes
+        for key in keys:
+            low = key.lower()
+            for existing, value in flat.items():
+                if existing.endswith(low):
+                    return value
+        return None
+
+    def _cache_key(self, hub_url: str, include_offline: bool, options: Dict[str, Any]) -> str:
+        return "|".join(
+            [
+                hub_url,
+                "1" if include_offline else "0",
+                str(options.get("top_n")),
+                str(options.get("server_filter", "")).lower(),
+                str(options.get("sort_by", "name")).lower(),
+                str(options.get("period_key")),
+            ]
+        )
+
+    def _filter_systems(self, systems: List[Dict[str, Any]], name_filter: str) -> List[Dict[str, Any]]:
+        f = str(name_filter or "").strip().lower()
+        if not f:
+            return systems
+        out = []
+        for row in systems:
+            name = str(row.get("name", "")).lower()
+            host = str(row.get("host", "")).lower()
+            if f in name or f in host:
+                out.append(row)
+        return out
+
+    def _sort_rows(self, rows: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
+        key = (sort_by or "name").lower()
+        if key == "traffic":
+            return sorted(rows, key=lambda r: r.get("bandwidth_mbps") or -1, reverse=True)
+        if key == "cpu":
+            return sorted(rows, key=lambda r: r.get("cpu_pct") or -1, reverse=True)
+        if key == "ram":
+            return sorted(rows, key=lambda r: r.get("ram_pct") or -1, reverse=True)
+        return sorted(rows, key=lambda r: str(r.get("name", "")).lower())
+
+    def _parse_created_dt(self, row: Dict[str, Any]) -> Optional[datetime]:
+        raw = str(row.get("created", "") or "").strip()
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S.%fZ", "%Y-%m-%d %H:%M:%SZ"):
+            try:
+                return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _extract_period_delta_bytes(
+        self, stats: List[Dict[str, Any]], period_key: Optional[str]
+    ) -> Optional[float]:
+        if not stats or not period_key:
+            return None
+        now = datetime.now(timezone.utc)
+        if period_key == "today":
+            since = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        elif period_key == "24h":
+            since = now - timedelta(hours=24)
+        elif period_key == "7d":
+            since = now - timedelta(days=7)
+        else:
+            return None
+
+        rows = []
+        for row in stats:
+            dt = self._parse_created_dt(row)
+            if dt is None:
+                continue
+            if dt >= since:
+                rows.append((dt, row))
+        if not rows:
+            return None
+        rows.sort(key=lambda x: x[0])
+
+        prev_counter = None
+        total = 0.0
+        found = False
+        for _, row in rows:
+            cur = self._extract_total_counter_from_stat(row)
+            if cur is None:
+                continue
+            if prev_counter is not None:
+                delta = cur - prev_counter
+                if delta >= 0:
+                    total += delta
+                else:
+                    total += cur
+                found = True
+            prev_counter = cur
+        return total if found else None
