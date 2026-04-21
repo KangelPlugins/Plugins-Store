@@ -1,0 +1,414 @@
+__id__ = "n0transcriber"
+__name__ = "n0transcriber"
+__description__ = "Transcribes voice messages via Groq Whisper with optional LLaMA cleanup."
+__author__ = "@n0white"
+__version__ = "1.1.0"
+__icon__ = "supermegahype/26"
+__min_version__ = "12.0.1"
+
+import requests
+import time
+from hook_utils import find_class, get_private_field, set_private_field
+from base_plugin import BasePlugin, MethodReplacement, MethodHook
+from ui.settings import Header, Input, Text, Selector, Divider
+from android_utils import run_on_ui_thread, log
+from client_utils import run_on_queue, get_last_fragment
+from android.content import Intent
+from android.net import Uri
+from java.util import HashMap, Objects
+from ui.bulletin import BulletinHelper
+
+GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_WHISPER_MODEL = "whisper-large-v3"
+
+GROQ_LLM_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_LLM_MODEL = "llama-3.1-8b-instant"
+
+LANGUAGE_CODES  = ["uk", "en", "ru", "pl", "de", "fr", "es", "auto"]
+LANGUAGE_LABELS = ["🇺🇦 Ukrainian", "🇬🇧 English", "🇷🇺 Russian", "🇵🇱 Polish",
+                   "🇩🇪 German", "🇫🇷 French", "🇪🇸 Spanish", "🌐 Auto-detect"]
+
+
+class TestPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
+        ChatMessageCell  = find_class("org.telegram.ui.Cells.ChatMessageCell")
+
+        if TranscribeButton is not None:
+            on_tap_method          = TranscribeButton.getClass().getDeclaredMethod("onTap")
+            update_waveform_method = ChatMessageCell.getClass().getDeclaredMethod("updateWaveform")
+            self.hook_method(on_tap_method, self.CreateTranscribeButtonHook(self))
+            self.hook_method(update_waveform_method, self.CreateUpdateWaveformHook())
+
+        return super().on_plugin_load()
+
+    def open_groq_url(self, view):
+        try:
+            current_fragment = get_last_fragment()
+            if not current_fragment or not current_fragment.getParentActivity():
+                return
+            context = current_fragment.getParentActivity()
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://console.groq.com"))
+            context.startActivity(intent)
+        except Exception as e:
+            log(f"[n0transcriber] open_groq_url error: {e}")
+
+    def create_settings(self):
+        groq_set = len(self.get_setting("groq_token", "")) > 0
+
+        return [
+            Header(text="Groq API"),
+            Input(
+                key="groq_token",
+                text="Groq API Token",
+                icon="menu_privacy" if groq_set else "menu_unlock",
+            ),
+            Text(text="Go to console.groq.com", icon="msg_openin", accent=True, on_click=self.open_groq_url),
+            Text(text="Sign up → API Keys → Create API Key", icon="msg_info"),
+
+            Divider(),
+            Header(text="Recognition Language"),
+            Selector(
+                key="language",
+                text="Audio language",
+                default=0,
+                items=LANGUAGE_LABELS,
+                icon="menu_feature_voice",
+            ),
+
+            Divider(),
+            Header(text="LLaMA Cleanup"),
+            Selector(
+                key="llama_cleanup",
+                text="LLaMA cleanup",
+                default=0,
+                items=["❌ Disabled", "✅ Enabled"],
+                icon="menu_feature_voice",
+            ),
+            Divider(text="Fixes surzhyk, punctuation and capitalisation after transcription"),
+        ]
+
+    class CreateTranscribeButtonHook(MethodReplacement):
+        def __init__(self, plugin_instance):
+            super().__init__()
+            self.plugin = plugin_instance
+
+        def replace_hooked_method(self, param):
+            run_on_queue(lambda: self.onTap(param))
+
+        def onTap(self, param):
+            this         = param.thisObject
+            parent       = get_private_field(this, "parent")
+            shouldBeOpen = get_private_field(this, "shouldBeOpen")
+            loading      = get_private_field(this, "loading")
+
+            if parent is None:
+                return
+
+            set_private_field(this, "clickedToOpen", False)
+            toOpen = not shouldBeOpen
+
+            if not shouldBeOpen:
+                if not loading:
+                    this.setLoading(True, True)
+                else:
+                    set_private_field(this, "pressed", False)
+                    return
+            else:
+                this.setOpen(False, True)
+                this.setLoading(False, True)
+
+            set_private_field(this, "pressed", False)
+
+            if toOpen:
+                set_private_field(this, "clickedToOpen", True)
+
+            self.transcribePressed(param, parent.getMessageObject(), toOpen)
+
+        def transcribePressed(self, param, messageObject, open):
+            groq_token = self.plugin.get_setting("groq_token", "").strip()
+
+            if not groq_token:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    "Set your Groq API token in plugin settings."
+                ))
+                return
+
+            TranscribeButton   = find_class("org.telegram.ui.Components.TranscribeButton")
+            MessagesStorage    = find_class("org.telegram.messenger.MessagesStorage")
+            DialogObject       = find_class("org.telegram.messenger.DialogObject")
+            MessagesController = find_class("org.telegram.messenger.MessagesController")
+            NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+
+            this = param.thisObject
+            transcribeOperationsByDialogPosition = get_private_field(this, "transcribeOperationsByDialogPosition")
+            transcribeOperationsById             = get_private_field(this, "transcribeOperationsById")
+
+            if messageObject is None or messageObject.messageOwner is None or not messageObject.isSent():
+                return
+
+            account   = messageObject.currentAccount
+            peer      = MessagesController.getInstance(account).getInputPeer(messageObject.messageOwner.peer_id)
+            dialogId  = DialogObject.getPeerDialogId(peer)
+            messageId = messageObject.messageOwner.id
+
+            if open:
+                if (messageObject.messageOwner.voiceTranscription is not None
+                        and messageObject.messageOwner.voiceTranscriptionFinal):
+                    TranscribeButton.openVideoTranscription(messageObject)
+                    messageObject.messageOwner.voiceTranscriptionOpen = True
+                    MessagesStorage.getInstance(account).updateMessageVoiceTranscriptionOpen(
+                        dialogId, messageId, messageObject.messageOwner
+                    )
+                    run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
+                        NotificationCenter.voiceTranscriptionUpdate,
+                        messageObject, None, None, True, True
+                    ))
+                    return
+
+                if transcribeOperationsByDialogPosition is None:
+                    set_private_field(this, "transcribeOperationsByDialogPosition", HashMap())
+                transcribeOperationsByDialogPosition = get_private_field(this, "transcribeOperationsByDialogPosition")
+                transcribeOperationsByDialogPosition.put(int(self.reqInfoHash(messageObject)), messageObject)
+
+                if transcribeOperationsById is None:
+                    set_private_field(this, "transcribeOperationsById", HashMap())
+                transcribeOperationsById = get_private_field(this, "transcribeOperationsById")
+                transcribeOperationsById.put(int(self.reqInfoHash(messageObject)), messageObject)
+
+                messageObject.messageOwner.voiceTranscriptionId = messageId
+
+                path = self.get_audio_path(messageObject)
+                if isinstance(path, Exception):
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(
+                        f"Failed to get audio: {path}"
+                    ))
+                    log(f"[n0transcriber] get_audio_path error: {path}")
+                    return
+
+                lang_idx  = self.plugin.get_setting("language", 0)
+                lang_code = LANGUAGE_CODES[lang_idx]
+
+                # Step 1: Groq Whisper transcription
+                text = self.transcribe_groq(path, groq_token, lang_code)
+                if isinstance(text, Exception):
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(
+                        f"Groq error: {str(text)[:150]}"
+                    ))
+                    log(f"[n0transcriber] groq error: {text}")
+                    return
+
+                # Step 2: optional LLaMA cleanup
+                cleanup_on = self.plugin.get_setting("llama_cleanup", 0)
+
+                if cleanup_on == 1:
+                    cleaned = self.cleanup_llama(text, groq_token, lang_code)
+                    if isinstance(cleaned, Exception):
+                        log(f"[n0transcriber] llama cleanup error: {cleaned}")
+                        err_msg = str(cleaned)
+                        run_on_ui_thread(lambda: BulletinHelper.show_error(
+                            f"LLaMA cleanup error: {err_msg[:150]}"
+                        ))
+                    else:
+                        text = "✨ " + cleaned
+
+                finalText = text
+                finalId   = messageId
+
+                TranscribeButton.openVideoTranscription(messageObject)
+                messageObject.messageOwner.voiceTranscriptionOpen  = True
+                messageObject.messageOwner.voiceTranscriptionFinal = True
+                MessagesStorage.getInstance(account).updateMessageVoiceTranscription(
+                    dialogId, messageId, finalText, messageObject.messageOwner
+                )
+                run_on_ui_thread(lambda: this.finishTranscription(messageObject, finalId, finalText))
+                transcribeOperationsByDialogPosition.remove(self.reqInfoHash(messageObject))
+
+            else:
+                if transcribeOperationsByDialogPosition is not None:
+                    transcribeOperationsByDialogPosition.remove(int(self.reqInfoHash(messageObject)))
+                messageObject.messageOwner.voiceTranscriptionOpen = False
+                MessagesStorage.getInstance(account).updateMessageVoiceTranscriptionOpen(
+                    dialogId, messageId, messageObject.messageOwner
+                )
+                run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
+                    NotificationCenter.voiceTranscriptionUpdate,
+                    messageObject, None, None, False, None
+                ))
+
+        def reqInfoHash(self, messageObject):
+            if messageObject is None:
+                return 0
+            return Objects.hash(
+                messageObject.currentAccount,
+                messageObject.getDialogId(),
+                messageObject.getId()
+            )
+
+        def get_audio_path(self, msg):
+            try:
+                UserConfig = find_class("org.telegram.messenger.UserConfig")
+                FileLoader = find_class("org.telegram.messenger.FileLoader")
+
+                current_account = UserConfig.selectedAccount
+                file_loader     = FileLoader.getInstance(current_account)
+                file_path_obj   = file_loader.getPathToMessage(msg.messageOwner)
+
+                if not file_path_obj.exists():
+                    document = msg.messageOwner.media.document
+                    file_loader.loadFile(document, msg, 1, 0)
+
+                for _ in range(30):
+                    if file_path_obj.exists():
+                        break
+                    time.sleep(1)
+                else:
+                    raise TimeoutError("File download timed out.")
+
+                return str(file_path_obj.getAbsolutePath())
+
+            except Exception as e:
+                return e
+
+        def transcribe_groq(self, path, token, lang_code):
+            try:
+                filename = path.split("/")[-1] if "/" in path else path
+                if "." not in filename:
+                    filename += ".ogg"
+
+                # Whisper prompt hint — improves recognition of slang, profanity, brands.
+                # Groq counts bytes (not chars), UTF-8 Cyrillic = 2 bytes/char. Limit: 896 bytes.
+                if lang_code in ("uk", "auto"):
+                    whisper_hint = (
+                        "блять, йобаний, піздець, сука, хуй, єбать, нахуй, блядь, курва, єбло, "
+                        "захуярити, похуй, відїбись, шльондра, залупа, мудак, їбаний, "
+                        "пся крев, пєрдолєний, відпєрдоль, "
+                        "шо, щас, вобщем, короч, ладно, нічо, типу, тіпа, деес, діскорд, окей, го, "
+                        "Київ, Львів, Харків, Дніпро, Одеса, "
+                        "Приват24, Монобанк, Нова Пошта, Телеграм, Дискорд"
+                    )
+                elif lang_code == "ru":
+                    whisper_hint = "блять, ёбаный, пиздец, сука, хуй, ебать, нахуй, блядь, мудак, залупа"
+                else:
+                    whisper_hint = ""
+
+                form_data = {
+                    "model":           (None, GROQ_WHISPER_MODEL),
+                    "response_format": (None, "verbose_json"),
+                    "temperature":     (None, "0"),
+                }
+
+                if lang_code != "auto":
+                    form_data["language"] = (None, lang_code)
+
+                if whisper_hint:
+                    form_data["prompt"] = (None, whisper_hint)
+
+                with open(path, "rb") as f:
+                    files = {**form_data, "file": (filename, f, "audio/ogg")}
+                    response = requests.post(
+                        GROQ_WHISPER_URL,
+                        headers={"Authorization": f"Bearer {token}"},
+                        files=files,
+                        timeout=60,
+                    )
+
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Groq API error {response.status_code}: {response.text[:200]}"
+                    )
+
+                data = response.json()
+
+                # Use verbose_json to filter out low-confidence segments
+                segments = data.get("segments", [])
+                if segments:
+                    text = " ".join(
+                        seg["text"].strip()
+                        for seg in segments
+                        if seg.get("no_speech_prob", 1.0) < 0.6
+                    ).strip()
+                else:
+                    text = data.get("text", "").strip()
+
+                if not text:
+                    raise RuntimeError("Groq returned empty transcription.")
+
+                return text
+
+            except Exception as e:
+                return e
+
+        def cleanup_llama(self, text, api_key, lang_code):
+            # Cleans up surzhyk, punctuation, capitalisation and fixes
+            # English brand names written in Cyrillic.
+            try:
+                if lang_code in ("uk", "auto"):
+                    system_prompt = (
+                        "You are a transcript corrector for Ukrainian voice messages. Rules:\n"
+                        "1. The input is raw speech-to-text output — it may contain broken word order, "
+                        "wrong words that sound similar to the intended ones, missing words, or nonsense "
+                        "phrases caused by mishearing. Your job is to reconstruct what the person most "
+                        "likely actually said, based on context and phonetic similarity.\n"
+                        "2. Fix surzhyk — replace Russian-influenced words with proper Ukrainian.\n"
+                        "3. Add punctuation and fix capitalisation.\n"
+                        "4. If a recognised word makes no sense in context but sounds similar to another "
+                        "word that would make sense — replace it with the correct word.\n"
+                        "5. If a sentence sounds like a jumbled version of a logical thought — reorder "
+                        "or reconstruct it into the most likely intended meaning. Do not invent new "
+                        "information, only clarify what is already implied.\n"
+                        "6. If a word is an English brand, product, service or tech term "
+                        "(e.g. iPhone, YouTube, Google, Telegram, ChatGPT, MacBook, Zoom, "
+                        "Wi-Fi, Discord, OK, check-in) — write it in English with correct "
+                        "capitalisation, even if it appears in Cyrillic or is misspelled.\n"
+                        "7. Do NOT change the tone or add information that is not implied.\n"
+                        "8. Output ONLY the corrected text, no explanations."
+                    )
+                else:
+                    system_prompt = (
+                        "You are a transcript corrector. Fix punctuation, capitalisation, "
+                        "and obvious speech recognition errors. "
+                        "Do NOT change the meaning or tone. Output ONLY the corrected text, no explanations."
+                    )
+
+                payload = {
+                    "model": GROQ_LLM_MODEL,
+                    "max_tokens": 2048,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text},
+                    ],
+                }
+
+                response = requests.post(
+                    GROQ_LLM_URL,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=30,
+                )
+
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Groq LLM API error {response.status_code}: {response.text[:200]}"
+                    )
+
+                cleaned = response.json()["choices"][0]["message"]["content"].strip()
+
+                if not cleaned:
+                    raise RuntimeError("LLaMA returned empty response.")
+
+                log(f"[n0transcriber] LLaMA OK. Raw: {text[:60]} → Clean: {cleaned[:60]}")
+                return cleaned
+
+            except Exception as e:
+                return e
+
+    class CreateUpdateWaveformHook(MethodHook):
+        def after_hooked_method(self, param):
+            this = param.thisObject
+            set_private_field(this, "useTranscribeButton", True)
