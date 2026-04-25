@@ -1,0 +1,544 @@
+
+import json
+from typing import Any, Dict, List, Optional
+
+from base_plugin import (
+    BasePlugin,
+    HookResult,
+    HookStrategy,
+    MenuItemData,
+    MenuItemType,
+    MethodHook,
+)
+from hook_utils import find_class, get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
+
+__id__ = "shadow_ban"
+__name__ = "Shadow Ban"
+__description__ = (
+    "Скрывает сообщения выбранных пользователей лично у вас.\n"
+    "Добавьте человека через его профиль - он ни о чём не узнает.\n\n"
+)
+__author__ = "@kester"
+__version__ = "1.0.2"
+__icon__ = "mne5oxyu/9"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+
+
+# Достаём sender_id из MessageObject всеми возможными способами
+
+def _extract_uid(msg_obj, debug_log=None) -> Optional[int]:
+    """Пробует все известные способы получить user_id отправителя."""
+    try:
+        owner = getattr(msg_obj, "messageOwner", None)
+        if owner is None:
+            if debug_log:
+                debug_log("_extract_uid: messageOwner is None")
+            return None
+
+        if debug_log:
+            # Логируем все поля owner для диагностики
+            try:
+                fields = [f.getName() for f in owner.getClass().getDeclaredFields()]
+                debug_log(f"messageOwner fields: {fields[:30]}")
+            except Exception:
+                pass
+
+        # 1. from_id как TLRPC.Peer (Layer 73+)
+        peer = getattr(owner, "from_id", None)
+        if debug_log:
+            debug_log(f"from_id raw = {peer}, type = {type(peer)}")
+
+        if peer is not None:
+            # Это объект Peer
+            if hasattr(peer, "user_id"):
+                uid = int(getattr(peer, "user_id", 0) or 0)
+                if uid:
+                    if debug_log:
+                        debug_log(f"uid via peer.user_id = {uid}")
+                    return uid
+            # Может быть int напрямую (старый API)
+            try:
+                uid = int(peer)
+                if uid > 0:
+                    if debug_log:
+                        debug_log(f"uid via int(peer) = {uid}")
+                    return uid
+            except Exception:
+                pass
+
+        # 2. Прямое числовое поле from_id
+        try:
+            raw = getattr(owner, "from_id", None)
+            if isinstance(raw, int) and raw > 0:
+                if debug_log:
+                    debug_log(f"uid via raw from_id int = {raw}")
+                return raw
+        except Exception:
+            pass
+
+        # 3. sender_id (некоторые форки)
+        for field in ("sender_id", "senderId"):
+            val = getattr(owner, field, None)
+            if val and int(val) > 0:
+                if debug_log:
+                    debug_log(f"uid via {field} = {val}")
+                return int(val)
+
+        # 4. dialog_id (в личных чатах = user_id)
+        did = getattr(owner, "dialog_id", None)
+        if did and int(did) > 0:
+            if debug_log:
+                debug_log(f"uid via dialog_id = {did}")
+            return int(did)
+
+        # 5. Через MessageObject напрямую
+        for attr in ("fromChatId", "from_chat_id"):
+            val = getattr(msg_obj, attr, None)
+            if val and int(val) > 0:
+                if debug_log:
+                    debug_log(f"uid via msg.{attr} = {val}")
+                return int(val)
+
+        if debug_log:
+            debug_log("_extract_uid: все методы не дали результата")
+    except Exception as e:
+        if debug_log:
+            debug_log(f"_extract_uid exception: {e}")
+    return None
+
+
+
+# Хук на ChatMessageCell.setMessageObject
+
+class CellHook(MethodHook):
+    def __init__(self, plugin: "ShadowBanPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin.get_setting("enabled", True):
+            return
+        try:
+            cell = param.thisObject
+            if cell is None:
+                return
+
+            # Пробуем оба возможных имени приватного поля
+            msg_obj = None
+            for field_name in ("currentMessageObject", "messageObject", "message"):
+                msg_obj = get_private_field(cell, field_name)
+                if msg_obj is not None:
+                    break
+
+            if msg_obj is None:
+                # Последний шанс — из аргументов метода
+                if param.args and len(param.args) > 0:
+                    msg_obj = param.args[0]
+
+            if msg_obj is None:
+                return
+
+            debug = self.plugin._debug_log if self.plugin.get_setting("debug", False) else None
+            uid = _extract_uid(msg_obj, debug)
+
+            if debug:
+                debug(f"CellHook: uid={uid}, banned={uid and self.plugin.is_banned(uid)}")
+
+            if uid and self.plugin.is_banned(uid):
+                # Скрываем ячейку
+                cell.setVisibility(8)  # View.GONE
+                try:
+                    lp = cell.getLayoutParams()
+                    if lp is not None:
+                        lp.height = 0
+                        cell.setLayoutParams(lp)
+                except Exception:
+                    pass
+                self.plugin.log(f"[ShadowBan] Скрыта ячейка от uid={uid}")
+        except Exception as e:
+            self.plugin.log(f"[ShadowBan] CellHook error: {e}")
+
+
+
+# Хук на методы MessagesController — фильтруем ArrayList перед UI
+
+class MCHook(MethodHook):
+    def __init__(self, plugin: "ShadowBanPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("enabled", True):
+            return
+        try:
+            debug = self.plugin._debug_log if self.plugin.get_setting("debug", False) else None
+            for i, arg in enumerate(param.args or []):
+                if arg is None:
+                    continue
+                try:
+                    cls_name = arg.getClass().getName()
+                    if "ArrayList" not in cls_name and "List" not in cls_name:
+                        continue
+                    if arg.size() == 0:
+                        continue
+                    first = arg.get(0)
+                    if first is None or not hasattr(first, "messageOwner"):
+                        continue
+                    # Это список MessageObject — фильтруем
+                    to_remove = []
+                    for j in range(arg.size()):
+                        item = arg.get(j)
+                        if item is None:
+                            continue
+                        uid = _extract_uid(item, debug)
+                        if uid and self.plugin.is_banned(uid):
+                            to_remove.append(item)
+                    for m in to_remove:
+                        arg.remove(m)
+                        self.plugin.log(f"[ShadowBan] MC: удалено сообщение от uid={_extract_uid(m)}")
+                except Exception:
+                    continue
+        except Exception as e:
+            self.plugin.log(f"[ShadowBan] MCHook error: {e}")
+
+
+
+# Диагностический хук - логирует все MessageObject (для дебаг режима)
+
+class DiagHook(MethodHook):
+    def __init__(self, plugin: "ShadowBanPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin.get_setting("debug", False):
+            return
+        try:
+            cell = param.thisObject
+            if cell is None:
+                return
+            msg_obj = None
+            for fn in ("currentMessageObject", "messageObject", "message"):
+                msg_obj = get_private_field(cell, fn)
+                if msg_obj is not None:
+                    break
+            if msg_obj is None and param.args:
+                msg_obj = param.args[0]
+            if msg_obj is None:
+                return
+            uid = _extract_uid(msg_obj, self.plugin._debug_log)
+            self.plugin._debug_log(f"DiagHook: rendered cell, sender uid={uid}")
+        except Exception as e:
+            self.plugin._debug_log(f"DiagHook error: {e}")
+
+
+
+# Главный класс плагина
+
+class ShadowBanPlugin(BasePlugin):
+
+    BANNED_KEY = "banned_v3"
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def on_plugin_load(self):
+        self.log("ShadowBan v3: загрузка…")
+        self._banned_cache: Dict[int, str] = self._load_banned()
+        self._xposed_hooks: list = []
+
+        # Меню профиля
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.PROFILE_ACTION_MENU,
+            text="Теневой бан",
+            on_click=self._on_profile_click,
+            icon="msg_block",
+            subtext="Скрыть / восстановить сообщения",
+            priority=5,
+        ))
+
+        # Уровень 3 (TL update hooks - всегда)
+        self.add_hook("TL_updateNewMessage")
+        self.add_hook("TL_updateNewChannelMessage")
+
+        # Уровень 1 и 2 (Xposed)
+        self._hook_cells()
+        self._hook_mc()
+
+        self.log(f"ShadowBan v3: готов. Xposed-хуков: {len(self._xposed_hooks)}. "
+                 f"Забанено: {len(self._banned_cache)}")
+
+    def on_plugin_unload(self):
+        self.log("ShadowBan v3: выгружен.")
+
+    def _debug_log(self, msg: str):
+        self.log(f"[ShadowBan DBG] {msg}")
+
+    # ── Storage ───────────────────────────────────────────────────────────────
+
+    def _load_banned(self) -> Dict[int, str]:
+        try:
+            return {int(k): v for k, v in json.loads(self.get_setting(self.BANNED_KEY, "{}")).items()}
+        except Exception:
+            return {}
+
+    def _save_banned(self):
+        self.set_setting(
+            self.BANNED_KEY,
+            json.dumps({str(k): v for k, v in self._banned_cache.items()}),
+            reload_settings=True,
+        )
+
+    def is_banned(self, uid: int) -> bool:
+        return uid in self._banned_cache
+
+    def ban_user(self, uid: int, name: str):
+        self._banned_cache[uid] = name
+        self._save_banned()
+        self.log(f"[ShadowBan] Забанен: {name} (id={uid})")
+
+    def unban_user(self, uid: int):
+        name = self._banned_cache.pop(uid, str(uid))
+        self._save_banned()
+        self.log(f"[ShadowBan] Разбанен: {name} (id={uid})")
+
+    def get_banned_list(self) -> Dict[int, str]:
+        return dict(self._banned_cache)
+
+    # ── Xposed: ячейки ────────────────────────────────────────────────────────
+
+    def _hook_cells(self):
+        """
+        Хукаем ChatMessageCell — метод, вызываемый при каждом рендере ячейки.
+        Используем hook_all_methods, чтобы покрыть все перегрузки.
+        """
+        for class_name in (
+            "org.telegram.ui.Cells.ChatMessageCell",
+            "org.telegram.ui.Cells.ChatActionCell",
+        ):
+            try:
+                cls = find_class(class_name)
+                if cls is None:
+                    self.log(f"[ShadowBan] Класс не найден: {class_name}")
+                    continue
+
+                hook = CellHook(self)
+                # setMessageObject - основной метод привязки данных к View
+                for method_name in ("setMessageObject", "setMessage", "bind"):
+                    try:
+                        r = self.hook_all_methods(cls, method_name, hook)
+                        if r:
+                            self._xposed_hooks.extend(r)
+                            self.log(f"[ShadowBan] {class_name}.{method_name}: {len(r)} хуков")
+                    except Exception as e:
+                        self.log(f"[ShadowBan] {class_name}.{method_name}: {e}")
+            except Exception as e:
+                self.log(f"[ShadowBan] _hook_cells ({class_name}): {e}")
+
+    # ── Xposed: MessagesController ────────────────────────────────────────────
+
+    def _hook_mc(self):
+        try:
+            cls = find_class("org.telegram.messenger.MessagesController")
+            if cls is None:
+                self.log("[ShadowBan] MessagesController не найден")
+                return
+            hook = MCHook(self)
+            for name in (
+                "updateInterfaceWithMessages",
+                "processNewDifferenceParams",
+                "processUpdateArray",
+                "addToMessagesAndNotify",
+                "notifyDataSetChanged",
+            ):
+                try:
+                    r = self.hook_all_methods(cls, name, hook)
+                    if r:
+                        self._xposed_hooks.extend(r)
+                        self.log(f"[ShadowBan] MC.{name}: {len(r)}")
+                except Exception:
+                    pass
+        except Exception as e:
+            self.log(f"[ShadowBan] _hook_mc: {e}")
+
+    # ── Уровень 3: TL update hook ─────────────────────────────────────────────
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        if not self.get_setting("enabled", True):
+            return HookResult()
+        if update_name not in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
+            return HookResult()
+        try:
+            msg = getattr(update, "message", None)
+            if msg is None:
+                return HookResult()
+            debug = self._debug_log if self.get_setting("debug", False) else None
+            if debug:
+                debug(f"on_update_hook: {update_name}, msg type={type(msg)}")
+            uid = _extract_uid(type("_Wrap", (), {"messageOwner": msg})(), debug)
+            if uid and self.is_banned(uid):
+                self.log(f"[ShadowBan] Отменён TL-апдейт от uid={uid}")
+                return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self.log(f"[ShadowBan] on_update_hook: {e}")
+        return HookResult()
+
+    # ── Меню профиля ──────────────────────────────────────────────────────────
+
+    def _on_profile_click(self, context: Dict[str, Any]):
+        user = context.get("user")
+        if user is None:
+            BulletinHelper.show_error("Не удалось получить данные пользователя")
+            return
+        uid = int(user.id)
+        fname = str(getattr(user, "first_name", "") or "")
+        lname = str(getattr(user, "last_name", "") or "")
+        name = (fname + " " + lname).strip() or f"id{uid}"
+        self._show_confirm(uid, name, self.is_banned(uid))
+
+    def _show_confirm(self, uid: int, name: str, already_banned: bool):
+        def do():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            act = frag.getParentActivity()
+            if not act:
+                return
+            b = AlertDialogBuilder(act)
+            if already_banned:
+                b.set_title("Убрать из теневого бана?")
+                b.set_message(f"Сообщения от {name} снова будут отображаться у вас.")
+
+                def ok(bld, _):
+                    self.unban_user(uid)
+                    bld.dismiss()
+                    BulletinHelper.show_success(f"{name} убран из теневого бана")
+
+                b.set_positive_button("Убрать из бана", ok)
+            else:
+                b.set_title("Добавить в теневой бан?")
+                b.set_message(
+                    f"Вы перестанете видеть сообщения от {name}.\n"
+                    "Пользователь не получит никакого уведомления."
+                )
+
+                def ok(bld, _):
+                    self.ban_user(uid, name)
+                    bld.dismiss()
+                    BulletinHelper.show_success(f"{name} добавлен в теневой бан")
+
+                b.set_positive_button("В теневой бан", ok)
+                b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            b.set_negative_button("Отмена", lambda bld, _: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(do)
+
+    # ── Настройки ─────────────────────────────────────────────────────────────
+
+    def create_settings(self) -> List[Any]:
+        banned = self.get_banned_list()
+        rows: List[Any] = [
+            Header(text="Основные"),
+            Switch(
+                key="enabled",
+                text="Включить теневой бан",
+                default=True,
+                subtext="Выключите, чтобы временно видеть всё",
+                icon="msg_block",
+            ),
+            Switch(
+                key="debug",
+                text="Режим отладки",
+                default=False,
+                subtext="Пишет в лог структуру сообщений - включите если плагин не работает",
+                icon="msg_info",
+            ),
+            Divider(),
+            Header(text=f"Забаненные пользователи ({len(banned)})"),
+        ]
+
+        if not banned:
+            rows.append(Text(
+                text="Список пуст",
+                subtext="Откройте профиль → «Теневой бан»",
+            ))
+        else:
+            for uid, name in sorted(banned.items(), key=lambda x: x[1].lower()):
+                u, n = uid, name
+                rows.append(Text(
+                    text=n,
+                    subtext=f"ID: {u}  •  нажмите для разбана",
+                    icon="msg_block",
+                    red=True,
+                    on_click=lambda _v, _u=u, _n=n: self._settings_unban(_u, _n),
+                ))
+
+        rows += [
+            Divider(),
+            Text(
+                text="Очистить всё",
+                icon="msg_clear_history",
+                red=True,
+                on_click=self._settings_clear,
+            ),
+        ]
+        return rows
+
+    def _settings_unban(self, uid: int, name: str):
+        def do():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            act = frag.getParentActivity()
+            if not act:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title("Убрать из теневого бана?")
+            b.set_message(f"Сообщения от {name} снова будут видны.")
+
+            def ok(bld, _):
+                self.unban_user(uid)
+                bld.dismiss()
+                BulletinHelper.show_success(f"{name} разбанен")
+                self.set_setting("_ts", str(uid), reload_settings=True)
+
+            b.set_positive_button("Убрать", ok)
+            b.set_negative_button("Отмена", lambda bld, _: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(do)
+
+    def _settings_clear(self, _v=None):
+        if not self._banned_cache:
+            BulletinHelper.show_info("Список уже пуст")
+            return
+
+        def do():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            act = frag.getParentActivity()
+            if not act:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title("Очистить список?")
+            b.set_message("Сообщения от всех пользователей снова станут видны.")
+
+            def ok(bld, _):
+                n = len(self._banned_cache)
+                self._banned_cache.clear()
+                self._save_banned()
+                bld.dismiss()
+                BulletinHelper.show_success(f"Снят теневой бан с {n} пользователей")
+                self.set_setting("_ts", "clear", reload_settings=True)
+
+            b.set_positive_button("Очистить", ok)
+            b.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            b.set_negative_button("Отмена", lambda bld, _: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(do)
