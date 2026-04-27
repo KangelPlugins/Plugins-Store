@@ -1,0 +1,1113 @@
+import time
+from typing import Any, Callable, Optional
+
+from android.view import View
+from android_utils import OnClickListener, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import RequestCallback, send_request
+from hook_utils import find_class, get_private_field
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Selector
+
+from org.telegram.messenger import AndroidUtilities, MediaDataController, R, UserConfig
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui.ActionBar import ActionBarMenuItem, ActionBarMenuSubItem
+
+__id__ = "indexes"
+__name__ = "IndexEs"
+__description__ = "Копирует индекс стикера или премиум эмодзи при долгом нажатии на предпросмотр / при нажатии на пункт в меню предпросмотра"
+__author__ = "@mishabotov & @itskotovski"
+__version__ = "1.0"
+__icon__ = "sfsymbols/619"
+
+_SUPPORTED_PREVIEW_CELLS = {
+    "org.telegram.ui.Cells.StickerEmojiCell",
+    "org.telegram.ui.Cells.StickerCell",
+    "org.telegram.ui.Cells.ContextLinkCell",
+    "org.telegram.ui.Components.EmojiView$ImageViewEmoji",
+    "org.telegram.ui.Components.EmojiPacksAlert$EmojiImageView",
+    "org.telegram.ui.Components.SuggestEmojiView$EmojiImageView",
+}
+
+_SPECIAL_PACK_TITLES = {
+    "recent": "Recent",
+    "fav": "Favorites",
+    "premium": "Premium",
+}
+
+_MODE_AUTOMATIC = 0
+_MODE_MANUAL = 1
+_SETTING_COPY_MODE = "copy_mode"
+_MANUAL_MENU_TAG = f"{__id__}:copy_pack_index"
+_MANUAL_MENU_TEXT = "Копировать индекс в паке"
+_INDEX_ERROR_TEXT = "Не удалось определить индекс"
+_POPUP_LAYOUT_SUFFIX = "ActionBarPopupWindow$ActionBarPopupWindowLayout"
+_MENU_ITEM_SUFFIX = "ActionBarMenuSubItem"
+
+
+def _safe_long(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _class_name(obj: Any) -> str:
+    try:
+        return str(obj.getClass().getName())
+    except Exception:
+        try:
+            return str(obj.__class__.__name__)
+        except Exception:
+            return ""
+
+
+def _class_hierarchy_names(obj: Any):
+    if obj is None:
+        return
+
+    seen = set()
+
+    try:
+        cls = obj.getClass()
+    except Exception:
+        cls = None
+
+    while cls is not None:
+        try:
+            name = str(cls.getName())
+        except Exception:
+            name = None
+        if name and name not in seen:
+            seen.add(name)
+            yield name
+        try:
+            cls = cls.getSuperclass()
+        except Exception:
+            break
+
+    fallback_name = _class_name(obj)
+    if fallback_name and fallback_name not in seen:
+        yield fallback_name
+
+
+def _iter_java_list(items: Any):
+    if items is None:
+        return
+
+    try:
+        size = int(items.size())
+        for index in range(size):
+            yield items.get(index)
+        return
+    except Exception:
+        pass
+
+    try:
+        for item in items:
+            yield item
+    except Exception:
+        return
+
+
+def _arg(args: Any, index: int) -> Any:
+    try:
+        return args[index]
+    except Exception:
+        return None
+
+
+class _CallbackHook(MethodHook):
+    def __init__(
+        self,
+        plugin: "CopyStickerEmojiIndexPlugin",
+        label: str,
+        before: Optional[Callable[[Any], None]] = None,
+        after: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        super().__init__()
+        self.plugin = plugin
+        self.label = label
+        self._before = before
+        self._after = after
+
+    def _run(self, callback: Optional[Callable[[Any], None]], param: Any, stage: str) -> None:
+        if callback is None:
+            return
+        try:
+            callback(param)
+        except Exception as e:
+            self.plugin.log(f"[{__id__}] {self.label} {stage} error: {e}")
+
+    def before_hooked_method(self, param: Any) -> None:
+        self._run(self._before, param, "before-hook")
+
+    def after_hooked_method(self, param: Any) -> None:
+        self._run(self._after, param, "after-hook")
+
+
+class CopyStickerEmojiIndexPlugin(BasePlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self._hook_refs = []
+        self._hooked_preview_runner_classes = set()
+        self._last_copy_key = None
+        self._last_copy_time = 0.0
+        self._pending_popup_viewer = None
+        self._last_preview_context = None
+
+    def on_plugin_load(self) -> None:
+        self._hook_content_preview_viewer()
+        self._hook_action_bar_popup_window()
+
+    def on_plugin_unload(self) -> None:
+        for ref in list(self._hook_refs):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hook_refs.clear()
+        self._hooked_preview_runner_classes.clear()
+        self._clear_pending_popup()
+        self._last_preview_context = None
+
+    def create_settings(self):
+        return [
+            Selector(
+                key=_SETTING_COPY_MODE,
+                text="Режим:",
+                default=self._copy_mode(),
+                items=["Автоматический", "Ручной"],
+                icon="msg_settings",
+            ),
+            Divider(
+                text=(
+                    "Автоматический: индекс копируется сразу при открытии предпросмотра. "
+                    "Ручной: в меню предпросмотра добавляется пункт для копирования."
+                )
+            ),
+        ]
+
+    def _method_signature(self, method: Any) -> str:
+        try:
+            return str(method.toGenericString())
+        except Exception:
+            return f"{method}"
+
+    def _set_accessible(self, method: Any) -> None:
+        try:
+            method.setAccessible(True)
+        except Exception:
+            pass
+
+    def _iter_declared_methods(self, cls: Any):
+        methods = []
+        try:
+            methods.extend(list(cls.getDeclaredMethods()))
+        except Exception:
+            pass
+        try:
+            methods.extend(list(cls.getClass().getDeclaredMethods()))
+        except Exception:
+            pass
+
+        seen = set()
+        for method in methods:
+            signature = self._method_signature(method)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            yield method
+
+    def _iter_matching_methods(self, cls: Any, name: str, arity: int):
+        for method in self._iter_declared_methods(cls):
+            try:
+                if str(method.getName()) != name:
+                    continue
+                if len(method.getParameterTypes()) != arity:
+                    continue
+            except Exception:
+                continue
+            yield method
+
+    def _hook_methods(self, methods: Any, hook: MethodHook) -> int:
+        hooked = 0
+        seen = set()
+        for method in methods:
+            if method is None:
+                continue
+
+            signature = self._method_signature(method)
+            if signature in seen:
+                continue
+            seen.add(signature)
+
+            try:
+                self._set_accessible(method)
+                ref = self.hook_method(method, hook, priority=2147483647)
+            except Exception:
+                continue
+
+            if ref is not None:
+                self._hook_refs.append(ref)
+                hooked += 1
+        return hooked
+
+    def _hook_class_methods(
+        self,
+        class_name: str,
+        method_name: str,
+        arity: int,
+        hook: MethodHook,
+        label: str,
+    ) -> int:
+        cls = find_class(class_name)
+        if cls is None:
+            self.log(f"[{__id__}] {label} class not found")
+            return 0
+
+        hooked = self._hook_methods(self._iter_matching_methods(cls, method_name, arity), hook)
+        if hooked == 0:
+            self.log(f"[{__id__}] {label}.{method_name} hook was not installed")
+        return hooked
+
+    def _copy_mode(self) -> int:
+        mode = _safe_long(self.get_setting(_SETTING_COPY_MODE, _MODE_AUTOMATIC), _MODE_AUTOMATIC)
+        if mode not in (_MODE_AUTOMATIC, _MODE_MANUAL):
+            return _MODE_AUTOMATIC
+        return mode
+
+    def _hook_content_preview_viewer(self) -> None:
+        self._hook_class_methods(
+            "org.telegram.ui.ContentPreviewViewer",
+            "open",
+            10,
+            _CallbackHook(
+                self,
+                "preview hook",
+                after=lambda param: self._after_preview_open(param.thisObject, param.args),
+            ),
+            "ContentPreviewViewer",
+        )
+
+    def _hook_action_bar_popup_window(self) -> None:
+        self._hook_class_methods(
+            "org.telegram.ui.ActionBar.ActionBarPopupWindow",
+            "showAtLocation",
+            4,
+            _CallbackHook(
+                self,
+                "popup show hook",
+                after=lambda param: self._after_popup_show(param.thisObject),
+            ),
+            "ActionBarPopupWindow",
+        )
+
+    def _ensure_preview_menu_hook(self, viewer: Any) -> None:
+        runnable = self._get_field_value(viewer, "showSheetRunnable", allow_callable=True)
+        if runnable is None:
+            self.log(f"[{__id__}] showSheetRunnable not found on viewer")
+            return
+
+        try:
+            runnable_class = runnable.getClass()
+            class_name = str(runnable_class.getName())
+        except Exception:
+            return
+
+        if class_name in self._hooked_preview_runner_classes:
+            return
+
+        direct_method = None
+        try:
+            direct_method = runnable_class.getDeclaredMethod("run")
+        except Exception:
+            pass
+
+        hook = _CallbackHook(
+            self,
+            "preview menu hook",
+            before=lambda param: self._before_preview_menu_run(param.thisObject),
+            after=lambda param: self._after_preview_menu_run(param.thisObject),
+        )
+        if self._hook_methods([direct_method, *self._iter_matching_methods(runnable_class, "run", 0)], hook):
+            self._hooked_preview_runner_classes.add(class_name)
+        else:
+            self.log(f"[{__id__}] preview menu runnable hook failed ({class_name})")
+
+    def _set_pending_popup(self, viewer: Any) -> None:
+        self._pending_popup_viewer = viewer
+
+    def _clear_pending_popup(self) -> None:
+        self._pending_popup_viewer = None
+
+    def _popup_owner(self, popup_window: Any) -> Any:
+        viewer = self._pending_popup_viewer
+        if viewer is None or popup_window is None:
+            return None
+
+        expected_popup = self._get_field_value(viewer, "popupWindow")
+        if expected_popup is popup_window or expected_popup == popup_window:
+            return viewer
+        return None
+
+    def _after_preview_open(self, viewer: Any, args: Any) -> None:
+        self._ensure_preview_menu_hook(viewer)
+
+        context = self._capture_preview_context(viewer, args)
+        mode = self._copy_mode()
+        if mode != _MODE_MANUAL:
+            self._clear_pending_popup()
+
+        if mode != _MODE_AUTOMATIC or context is None:
+            return
+
+        index = context.get("index")
+        if index is None:
+            if self._request_remote_index(
+                context["document"],
+                context["preview_cell"],
+                context["parent_object"],
+                context["account"],
+            ):
+                return
+            if self._has_class_in_hierarchy(
+                context["preview_cell"],
+                "org.telegram.ui.Cells.StickerEmojiCell",
+                "org.telegram.ui.Cells.StickerCell",
+                "org.telegram.ui.Cells.ContextLinkCell",
+            ):
+                self.log(
+                    f"[{__id__}] sticker index not found: "
+                    f"cell={_class_name(context['preview_cell'])}, "
+                    f"parent={_class_name(context['parent_object'])}, "
+                    f"document_id={context['document_id']}"
+                )
+            return
+
+        self._copy_index(context["document_id"], index)
+
+    def _capture_preview_context(self, viewer: Any, args: Any = None):
+        document, preview_cell, parent_object, account = self._get_current_preview_context(viewer, args)
+        document_id = self._document_id(document)
+        if document_id == 0 or not self._is_supported_preview_cell(preview_cell):
+            self._last_preview_context = None
+            return None
+
+        context = {
+            "viewer": viewer,
+            "document": document,
+            "preview_cell": preview_cell,
+            "parent_object": parent_object,
+            "account": account,
+            "document_id": document_id,
+            "index": self._resolve_document_index(document, preview_cell, parent_object, account),
+        }
+        self._last_preview_context = context
+        return context
+
+    def _is_current_context(self, viewer: Any, context: Any) -> bool:
+        if context is None or context.get("viewer") != viewer:
+            return False
+
+        current_document = self._get_field_value(viewer, "currentDocument")
+        current_document_id = self._document_id(current_document)
+        if current_document_id == 0:
+            return False
+
+        return current_document_id == int(context.get("document_id") or 0)
+
+    def _context_for_viewer(self, viewer: Any):
+        context = self._last_preview_context
+        if self._is_current_context(viewer, context):
+            return context
+        return self._capture_preview_context(viewer)
+
+    def _before_preview_menu_run(self, runnable: Any) -> None:
+        viewer = self._get_field_value(runnable, "this$0")
+        if viewer is None or self._copy_mode() != _MODE_MANUAL:
+            self._clear_pending_popup()
+            return
+
+        if self._should_offer_manual_menu_item(viewer):
+            self._set_pending_popup(viewer)
+        else:
+            self._clear_pending_popup()
+
+    def _after_preview_menu_run(self, runnable: Any) -> None:
+        viewer = self._get_field_value(runnable, "this$0")
+        try:
+            if viewer is None:
+                self.log(f"[{__id__}] preview menu run finished without viewer")
+                return
+
+            if self._copy_mode() != _MODE_MANUAL or not self._should_offer_manual_menu_item(viewer):
+                return
+
+            popup_window = self._get_field_value(viewer, "popupWindow")
+            popup_layout = self._popup_layout_from_window(popup_window)
+            if popup_layout is None:
+                popup_layout = self._find_popup_layout(self._get_field_value(viewer, "popupLayout"))
+
+            if popup_layout is None:
+                self.log(f"[{__id__}] preview menu run: popup layout not found")
+                return
+
+            if self._inject_manual_menu_item(viewer, popup_window, popup_layout) and popup_window is not None:
+                self._resize_popup_window(popup_window)
+        finally:
+            self._clear_pending_popup()
+
+    def _after_popup_show(self, popup_window: Any) -> None:
+        if self._copy_mode() != _MODE_MANUAL:
+            self._clear_pending_popup()
+            return
+
+        viewer = self._popup_owner(popup_window)
+        if viewer is None or not self._should_offer_manual_menu_item(viewer):
+            return
+
+        popup_layout = self._popup_layout_from_window(popup_window)
+        if popup_layout is None:
+            self._clear_pending_popup()
+            self.log(f"[{__id__}] popup hook: popup layout not found")
+            return
+
+        if self._inject_manual_menu_item(viewer, popup_window, popup_layout):
+            self._resize_popup_window(popup_window)
+        self._clear_pending_popup()
+
+    def _get_current_preview_context(self, viewer: Any, args: Any = None):
+        document = self._get_field_value(viewer, "currentDocument")
+        preview_cell = self._get_field_value(viewer, "currentPreviewCell")
+        parent_object = self._get_field_value(viewer, "parentObject")
+
+        if document is None:
+            document = _arg(args, 0)
+        if parent_object is None:
+            parent_object = _arg(args, 7)
+
+        return document, preview_cell, parent_object, self._resolve_account(viewer)
+
+    def _should_offer_manual_menu_item(self, viewer: Any, args: Any = None) -> bool:
+        document, preview_cell, _parent_object, _account = self._get_current_preview_context(viewer, args)
+        return self._document_id(document) != 0 and self._is_supported_preview_cell(preview_cell)
+
+    def _popup_layout_from_window(self, popup_window: Any) -> Any:
+        if popup_window is None:
+            return None
+        try:
+            return self._find_popup_layout(popup_window.getContentView())
+        except Exception:
+            return None
+
+    def _find_popup_layout(self, view: Any) -> Any:
+        if view is None:
+            return None
+
+        if _class_name(view).endswith(_POPUP_LAYOUT_SUFFIX):
+            return view
+
+        try:
+            child_count = int(view.getChildCount())
+        except Exception:
+            child_count = 0
+
+        for index in range(child_count):
+            try:
+                child = view.getChildAt(index)
+            except Exception:
+                child = None
+            found = self._find_popup_layout(child)
+            if found is not None:
+                return found
+        return None
+
+    def _popup_linear_layout(self, popup_layout: Any) -> Any:
+        try:
+            return get_private_field(popup_layout, "linearLayout")
+        except Exception:
+            return None
+
+    def _popup_items_count(self, popup_layout: Any, linear_layout: Any = None) -> int:
+        count = _safe_long(getattr(popup_layout, "getItemsCount", lambda: 0)(), 0)
+        if count > 0:
+            return count
+
+        if linear_layout is None:
+            linear_layout = self._popup_linear_layout(popup_layout)
+        try:
+            return int(linear_layout.getChildCount()) if linear_layout is not None else 0
+        except Exception:
+            return 0
+
+    def _popup_item(self, popup_layout: Any, index: int, linear_layout: Any = None) -> Any:
+        try:
+            item = popup_layout.getItemAt(index)
+        except Exception:
+            item = None
+        if item is not None:
+            return item
+
+        if linear_layout is not None:
+            try:
+                return linear_layout.getChildAt(index)
+            except Exception:
+                pass
+        return None
+
+    def _is_popup_menu_item(self, item: Any) -> bool:
+        return item is not None and _class_name(item).endswith(_MENU_ITEM_SUFFIX)
+
+    def _popup_menu_indices(self, popup_layout: Any, linear_layout: Any = None):
+        if linear_layout is None:
+            linear_layout = self._popup_linear_layout(popup_layout)
+
+        indices = []
+        total = self._popup_items_count(popup_layout, linear_layout)
+        for index in range(total):
+            if self._is_popup_menu_item(self._popup_item(popup_layout, index, linear_layout)):
+                indices.append(index)
+        return indices
+
+    def _create_manual_menu_item(self, popup_layout: Any, resources_provider: Any, is_first: bool):
+        try:
+            cell = ActionBarMenuItem.addItem(
+                popup_layout,
+                R.drawable.msg_copy,
+                _MANUAL_MENU_TEXT,
+                False,
+                resources_provider,
+            )
+            if cell is not None:
+                return cell
+        except Exception:
+            pass
+
+        try:
+            cell = ActionBarMenuSubItem(popup_layout.getContext(), is_first, True, resources_provider)
+        except Exception:
+            try:
+                cell = ActionBarMenuSubItem(popup_layout.getContext(), is_first, True)
+            except Exception:
+                return None
+
+        try:
+            cell.setMinimumWidth(AndroidUtilities.dp(196))
+        except Exception:
+            pass
+
+        try:
+            cell.setTextAndIcon(_MANUAL_MENU_TEXT, R.drawable.msg_copy)
+        except Exception:
+            try:
+                cell.setTextAndIcon(_MANUAL_MENU_TEXT, 0)
+            except Exception:
+                return None
+        return cell
+
+    def _attach_popup_item(self, cell: Any, linear_layout: Any, insert_index: int, total: int) -> bool:
+        try:
+            parent = cell.getParent()
+        except Exception:
+            parent = None
+
+        if parent is None:
+            try:
+                linear_layout.addView(cell, insert_index)
+            except Exception:
+                try:
+                    linear_layout.addView(cell)
+                except Exception as e:
+                    self.log(f"[{__id__}] manual menu inject: addView failed: {e}")
+                    return False
+            return True
+
+        if insert_index >= total:
+            return True
+
+        try:
+            parent.removeView(cell)
+            linear_layout.addView(cell, insert_index)
+            return True
+        except Exception as e:
+            self.log(f"[{__id__}] manual menu inject: reorder failed: {e}")
+            return False
+
+    def _inject_manual_menu_item(self, viewer: Any, popup_window: Any, popup_layout: Any) -> bool:
+        try:
+            if popup_layout.findViewWithTag(_MANUAL_MENU_TAG) is not None:
+                return False
+        except Exception:
+            pass
+
+        linear_layout = self._popup_linear_layout(popup_layout)
+        if linear_layout is None:
+            self.log(f"[{__id__}] manual menu inject: linearLayout not found")
+            return False
+
+        menu_indices = self._popup_menu_indices(popup_layout, linear_layout)
+        total = self._popup_items_count(popup_layout, linear_layout)
+        insert_index = menu_indices[-1] + 1 if menu_indices else total
+        resources_provider = self._get_field_value(viewer, "resourcesProvider")
+
+        cell = self._create_manual_menu_item(popup_layout, resources_provider, len(menu_indices) == 0)
+        if cell is None:
+            self.log(f"[{__id__}] manual menu inject: cell is None")
+            return False
+
+        if not self._attach_popup_item(cell, linear_layout, insert_index, total):
+            return False
+
+        try:
+            cell.setTag(_MANUAL_MENU_TAG)
+        except Exception:
+            pass
+        try:
+            cell.setContentDescription(_MANUAL_MENU_TEXT)
+        except Exception:
+            pass
+
+        def _click(_view=None, target_viewer=viewer, target_popup=popup_window):
+            try:
+                self._copy_current_preview_index(target_viewer)
+            except Exception as e:
+                self.log(f"[{__id__}] manual copy click error: {e}")
+            try:
+                if target_popup is not None:
+                    target_popup.dismiss()
+            except Exception:
+                pass
+
+        try:
+            cell.setOnClickListener(OnClickListener(_click))
+        except Exception as e:
+            self.log(f"[{__id__}] manual menu inject: setOnClickListener failed: {e}")
+            return False
+
+        self._refresh_popup_menu_item_backgrounds(popup_layout)
+        self._remeasure_popup_layout(popup_layout)
+        return True
+
+    def _refresh_popup_menu_item_backgrounds(self, popup_layout: Any) -> None:
+        linear_layout = self._popup_linear_layout(popup_layout)
+        menu_indices = self._popup_menu_indices(popup_layout, linear_layout)
+        if not menu_indices:
+            return
+
+        first_index = menu_indices[0]
+        last_index = menu_indices[-1]
+        for index in menu_indices:
+            item = self._popup_item(popup_layout, index, linear_layout)
+            if item is None:
+                continue
+            try:
+                item.updateSelectorBackground(index == first_index, index == last_index, 12)
+            except Exception:
+                try:
+                    item.updateSelectorBackground(index == first_index, index == last_index)
+                except Exception:
+                    pass
+
+    def _measure_popup_view(self, view: Any, refresh: bool = False) -> bool:
+        if view is None:
+            return False
+
+        try:
+            size = View.MeasureSpec.makeMeasureSpec(AndroidUtilities.dp(1000), View.MeasureSpec.AT_MOST)
+            view.measure(size, size)
+        except Exception:
+            return False
+
+        if refresh:
+            try:
+                view.requestLayout()
+            except Exception:
+                pass
+            try:
+                view.invalidate()
+            except Exception:
+                pass
+        return True
+
+    def _remeasure_popup_layout(self, popup_layout: Any) -> None:
+        self._measure_popup_view(popup_layout, refresh=True)
+
+    def _resize_popup_window(self, popup_window: Any) -> None:
+        try:
+            content_view = popup_window.getContentView()
+        except Exception:
+            content_view = None
+        if not self._measure_popup_view(content_view):
+            return
+
+        try:
+            width = int(content_view.getMeasuredWidth())
+            height = int(content_view.getMeasuredHeight())
+        except Exception:
+            return
+
+        if width <= 0 or height <= 0:
+            return
+
+        try:
+            popup_window.update(width, height)
+        except Exception:
+            pass
+
+    def _show_index_error(self) -> None:
+        BulletinHelper.show_error(_INDEX_ERROR_TEXT)
+
+    def _copy_current_preview_index(self, viewer: Any) -> bool:
+        context = self._context_for_viewer(viewer)
+        if context is None:
+            self._show_index_error()
+            self.log(f"[{__id__}] manual copy: preview context is missing")
+            return False
+
+        index = context.get("index")
+        if index is None:
+            index = self._resolve_document_index(
+                context["document"],
+                context["preview_cell"],
+                context["parent_object"],
+                context["account"],
+            )
+            context["index"] = index
+
+        if index is None:
+            requested = self._request_remote_index(
+                context["document"],
+                context["preview_cell"],
+                context["parent_object"],
+                context["account"],
+            )
+            if not requested:
+                self._show_index_error()
+                self.log(f"[{__id__}] manual copy: remote request was not started")
+            return requested
+
+        self._copy_index(context["document_id"], index)
+        return True
+
+    def _document_id(self, document: Any) -> int:
+        return _safe_long(getattr(document, "id", 0), 0)
+
+    def _is_supported_preview_cell(self, preview_cell: Any) -> bool:
+        return preview_cell is not None and any(
+            class_name in _SUPPORTED_PREVIEW_CELLS for class_name in _class_hierarchy_names(preview_cell)
+        )
+
+    def _has_class_in_hierarchy(self, obj: Any, *class_names: str) -> bool:
+        if obj is None or not class_names:
+            return False
+        targets = set(class_names)
+        return any(name in targets for name in _class_hierarchy_names(obj))
+
+    def _get_field_value(self, obj: Any, field_name: str, allow_callable: bool = False) -> Any:
+        if obj is None or not field_name:
+            return None
+
+        try:
+            value = get_private_field(obj, field_name)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+
+        try:
+            value = getattr(obj, field_name)
+            if allow_callable or not callable(value):
+                return value
+        except Exception:
+            pass
+        return None
+
+    def _get_preview_cell_parent(self, preview_cell: Any) -> Any:
+        if preview_cell is None:
+            return None
+        try:
+            return preview_cell.getParentObject()
+        except Exception:
+            return None
+
+    def _is_input_sticker_set(self, obj: Any) -> bool:
+        class_name = _class_name(obj)
+        return "TL_inputStickerSet" in class_name and not class_name.endswith("TL_inputStickerSetEmpty")
+
+    def _coerce_input_sticker_set(self, sticker_set: Any) -> Any:
+        if sticker_set is None:
+            return None
+        if self._is_input_sticker_set(sticker_set):
+            return sticker_set
+
+        try:
+            sticker_set = MediaDataController.getInputStickerSet(sticker_set)
+        except Exception:
+            return None
+
+        if sticker_set is None or _class_name(sticker_set).endswith("TL_inputStickerSetEmpty"):
+            return None
+        return sticker_set
+
+    def _input_sticker_set_from_object(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if self._is_input_sticker_set(obj):
+            return obj
+
+        for field_name in ("set", "stickerset"):
+            input_sticker_set = self._coerce_input_sticker_set(self._get_field_value(obj, field_name))
+            if input_sticker_set is not None:
+                return input_sticker_set
+        return None
+
+    def _input_sticker_set_from_document(self, document: Any) -> Any:
+        if document is None:
+            return None
+        try:
+            return self._coerce_input_sticker_set(MediaDataController.getInputStickerSet(document))
+        except Exception:
+            return None
+
+    def _resolve_input_sticker_set(self, document: Any, preview_cell: Any, parent_object: Any) -> Any:
+        for candidate in (
+            parent_object,
+            self._get_preview_cell_parent(preview_cell),
+            self._get_field_value(preview_cell, "pack"),
+        ):
+            input_sticker_set = self._input_sticker_set_from_object(candidate)
+            if input_sticker_set is not None:
+                return input_sticker_set
+        return self._input_sticker_set_from_document(document)
+
+    def _resolve_document_index(
+        self,
+        document: Any,
+        preview_cell: Any,
+        parent_object: Any,
+        account: int,
+    ) -> Optional[int]:
+        document_id = self._document_id(document)
+        if document_id == 0:
+            return None
+
+        index = self._index_from_parent(parent_object, document_id)
+        if index is not None:
+            return index
+
+        index = self._index_from_parent(self._get_preview_cell_parent(preview_cell), document_id)
+        if index is not None:
+            return index
+
+        index = self._index_from_emoji_view_pack(preview_cell, document_id)
+        if index is not None:
+            return index
+
+        index = self._index_from_media_data(document, preview_cell, parent_object, document_id, account)
+        if index is not None:
+            return index
+
+        return self._index_from_loaded_sets(document_id, account)
+
+    def _index_from_emoji_view_pack(self, preview_cell: Any, document_id: int) -> Optional[int]:
+        if not self._has_class_in_hierarchy(preview_cell, "org.telegram.ui.Components.EmojiView$ImageViewEmoji"):
+            return None
+        try:
+            pack = get_private_field(preview_cell, "pack")
+        except Exception:
+            pack = None
+        return self._index_from_parent(pack, document_id)
+
+    def _index_from_parent(self, parent_object: Any, document_id: int) -> Optional[int]:
+        for items in (
+            parent_object,
+            self._get_field_value(parent_object, "documents"),
+            self._get_field_value(parent_object, "stickers"),
+            self._get_field_value(parent_object, "covers"),
+        ):
+            index = self._find_document_index(items, document_id)
+            if index is not None:
+                return index
+        return None
+
+    def _media_controller(self, account: int) -> Any:
+        try:
+            return MediaDataController.getInstance(account)
+        except Exception:
+            return None
+
+    def _index_from_media_data(
+        self,
+        document: Any,
+        preview_cell: Any,
+        parent_object: Any,
+        document_id: int,
+        account: int,
+    ) -> Optional[int]:
+        controller = self._media_controller(account)
+        if controller is None:
+            return None
+
+        input_sticker_set = self._resolve_input_sticker_set(document, preview_cell, parent_object)
+        if input_sticker_set is not None:
+            try:
+                sticker_set = controller.getStickerSet(input_sticker_set, True)
+            except Exception:
+                sticker_set = None
+            index = self._find_document_index(self._get_field_value(sticker_set, "documents"), document_id)
+            if index is not None:
+                return index
+
+        try:
+            set_id = _safe_long(MediaDataController.getStickerSetId(document), 0)
+            if set_id == 0:
+                return None
+            sticker_set = controller.getStickerSetById(set_id)
+        except Exception:
+            return None
+
+        return self._find_document_index(getattr(sticker_set, "documents", None), document_id)
+
+    def _index_from_loaded_sets(self, document_id: int, account: int) -> Optional[int]:
+        controller = self._media_controller(account)
+        if controller is None:
+            return None
+
+        set_types = (
+            MediaDataController.TYPE_IMAGE,
+            MediaDataController.TYPE_FEATURED,
+            MediaDataController.TYPE_EMOJIPACKS,
+            MediaDataController.TYPE_FEATURED_EMOJIPACKS,
+            MediaDataController.TYPE_EMOJI,
+        )
+        for set_type in set_types:
+            try:
+                sticker_sets = controller.getStickerSets(set_type)
+            except Exception:
+                sticker_sets = None
+
+            for sticker_set in _iter_java_list(sticker_sets):
+                index = self._find_document_index(getattr(sticker_set, "documents", None), document_id)
+                if index is not None:
+                    return index
+        return None
+
+    def _apply_remote_sticker_set(self, sticker_set: Any, document_id: int, cell_class: str) -> None:
+        if sticker_set is None:
+            self.log(
+                f"[{__id__}] remote sticker set load returned null: "
+                f"cell={cell_class}, document_id={document_id}"
+            )
+            return
+
+        index = self._find_document_index(getattr(sticker_set, "documents", None), document_id)
+        if index is None:
+            self.log(
+                f"[{__id__}] remote sticker set loaded but document missing: "
+                f"cell={cell_class}, document_id={document_id}, set={self._pack_title(sticker_set)}"
+            )
+            return
+
+        context = self._last_preview_context
+        if context is not None and int(context.get("document_id", 0) or 0) == document_id:
+            context["index"] = index
+        self._copy_index(document_id, index)
+
+    def _request_remote_index(self, document: Any, preview_cell: Any, parent_object: Any, account: int) -> bool:
+        input_sticker_set = self._resolve_input_sticker_set(document, preview_cell, parent_object)
+        document_id = self._document_id(document)
+        if input_sticker_set is None or document_id == 0:
+            return False
+
+        cell_class = _class_name(preview_cell)
+
+        def _on_response(response: Any, error: Any) -> None:
+            def _apply() -> None:
+                if error is not None:
+                    try:
+                        error_text = str(getattr(error, "text", "") or getattr(error, "error_message", "") or error)
+                    except Exception:
+                        error_text = str(error)
+                    self.log(
+                        f"[{__id__}] remote sticker set request failed: "
+                        f"cell={cell_class}, document_id={document_id}, error={error_text}"
+                    )
+                    return
+                self._apply_remote_sticker_set(response, document_id, cell_class)
+
+            run_on_ui_thread(_apply)
+
+        try:
+            request = TLRPC.TL_messages_getStickerSet()
+            request.stickerset = input_sticker_set
+            request.hash = 0
+            send_request(request, RequestCallback(_on_response))
+            return True
+        except Exception as e:
+            self.log(f"[{__id__}] remote sticker set request error: {e}")
+            return False
+
+    def _find_document_index(self, items: Any, document_id: int) -> Optional[int]:
+        if items is None:
+            return None
+        for index, item in enumerate(_iter_java_list(items)):
+            if self._document_id(item) == document_id:
+                return index
+        return None
+
+    def _resolve_account(self, viewer: Any) -> int:
+        account = _safe_long(self._get_field_value(viewer, "currentAccount", allow_callable=True), -1)
+        return account if account >= 0 else UserConfig.selectedAccount
+
+    def _pack_title(self, parent_object: Any) -> Optional[str]:
+        if parent_object is None:
+            return None
+
+        try:
+            if isinstance(parent_object, str):
+                return _SPECIAL_PACK_TITLES.get(parent_object.lower(), parent_object)
+        except Exception:
+            pass
+
+        try:
+            value = str(parent_object)
+            if value in _SPECIAL_PACK_TITLES:
+                return _SPECIAL_PACK_TITLES[value]
+        except Exception:
+            pass
+
+        try:
+            sticker_set = getattr(parent_object, "set", None)
+            for field_name in ("title", "short_name"):
+                value = getattr(sticker_set, field_name, None)
+                if value:
+                    return str(value)
+        except Exception:
+            pass
+
+        try:
+            title = getattr(parent_object, "title", None)
+            if title:
+                return str(title)
+        except Exception:
+            pass
+        return None
+
+    def _copy_index(self, document_id: int, index: int) -> None:
+        copy_key = f"{document_id}:{index}"
+        now = time.time()
+        if copy_key == self._last_copy_key and now - self._last_copy_time < 0.75:
+            return
+
+        self._last_copy_key = copy_key
+        self._last_copy_time = now
+
+        def _action() -> None:
+            try:
+                if AndroidUtilities.addToClipboard(str(index)):
+                    BulletinHelper.show_copied_to_clipboard(f"Индекс {index} скопирован")
+            except Exception as e:
+                self.log(f"[{__id__}] clipboard error: {e}")
+
+        run_on_ui_thread(_action)
