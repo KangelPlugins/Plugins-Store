@@ -1,0 +1,442 @@
+__id__ = "online_notifier"
+__name__ = "Online Notifier"
+__description__ = "Отслеживает онлайн выбранных пользователей и присылает системные уведомления, когда они заходят в Telegram"
+__author__ = "@KUNSESHBOY (fork by @Kaktusik_A)"
+__version__ = "1.0.7"
+__min_version__ = "12.5.1"
+__icon__ = "StormChat7tv/58"
+
+import time
+import threading
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment
+
+from org.telegram.messenger import LocaleController, UserConfig, MessagesController, ApplicationLoader
+from ui.bulletin import BulletinHelper
+from ui.settings import Text, Input, Switch, Header
+
+from android.content import Context, Intent
+from android.app import PendingIntent, NotificationManager, NotificationChannel, Notification
+from java import jclass
+
+# ─────────────────────────────────────────────
+#  Кэш констант Android (один раз при загрузке)
+# ─────────────────────────────────────────────
+
+try:
+    _SDK_INT = int(jclass("android.os.Build$VERSION").SDK_INT)
+except Exception:
+    _SDK_INT = 0
+
+_CHANNEL_ID = "online_notifier_channel"
+
+# ─────────────────────────────────────────────
+#  Вспомогательные функции
+# ─────────────────────────────────────────────
+
+def _get_account():
+    return int(UserConfig.selectedAccount)
+
+def _get_user(user_id):
+    try:
+        return MessagesController.getInstance(_get_account()).getUser(user_id)
+    except Exception:
+        return None
+
+def _is_online(user):
+    """Проверяет онлайн-статус. Возвращает True, если пользователь онлайн."""
+    try:
+        if user is None:
+            return False
+        status = user.status
+        if status is None:
+            return False
+        if status.getClass().getSimpleName() == "TL_userStatusOnline":
+            return int(status.expires) > int(time.time())
+        return False
+    except Exception:
+        return False
+
+def _display_name(user):
+    try:
+        first = str(user.first_name or "")
+        last  = str(user.last_name  or "")
+        name  = (first + " " + last).strip()
+        return name if name else f"id{user.id}"
+    except Exception:
+        return "Unknown"
+
+def _generate_notification_id(user_id):
+    return abs(hash(str(user_id))) % 0x7FFFFFFF
+
+def _parse_ids(raw: str) -> list:
+    """Парсит строку с ID пользователей в список int."""
+    ids = []
+    for part in raw.replace(",", " ").split():
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            ids.append(int(part))
+    return ids
+
+# ─────────────────────────────────────────────
+#  Класс трекера с системными уведомлениями
+# ─────────────────────────────────────────────
+
+class OnlineNotifier:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._stop_event = threading.Event()
+        self._last_state = {}          # user_id -> bool
+        self._lock = threading.Lock()  # защита _last_state от гонки потоков
+
+        # Кэш Android-объектов — создаём один раз
+        self._notif_manager  = None
+        self._channel_created = False
+        self._app_icon        = None
+
+        # Кэш настроек — обновляется перед каждым циклом опроса
+        self._tracked_ids: list  = []
+        self._interval_sec: float = 5.0
+        self._refresh_settings()
+
+    # ── Настройки ────────────────────────────
+
+    def _refresh_settings(self):
+        """Читает настройки один раз на цикл вместо get_setting() на каждого юзера."""
+        try:
+            raw = str(self.plugin.get_setting("TRACK_IDS", "") or "")
+            self._tracked_ids = _parse_ids(raw)
+        except Exception:
+            self._tracked_ids = []
+        try:
+            ms = max(1000, int(self.plugin.get_setting("POLL_INTERVAL_MS", 5000)))
+            self._interval_sec = ms / 1000.0
+        except Exception:
+            self._interval_sec = 5.0
+
+    # ── Поток опроса ─────────────────────────
+
+    def start(self):
+        self._stop_event.clear()
+
+        def _loop():
+            self._refresh_settings()
+            self._poll_all()
+            while not self._stop_event.wait(self._interval_sec):
+                self._refresh_settings()
+                self._poll_all()
+
+        threading.Thread(target=_loop, daemon=True, name="OnlineNotifier").start()
+        self.plugin.log(f"OnlineNotifier: started (interval={int(self._interval_sec * 1000)} ms)")
+
+    def stop(self):
+        self._stop_event.set()
+        self.plugin.log("OnlineNotifier: stopped")
+
+    # ── Android-объекты (ленивый кэш) ────────
+
+    def _get_notif_manager(self, ctx):
+        if self._notif_manager is None:
+            self._notif_manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
+        return self._notif_manager
+
+    def _ensure_channel(self, manager):
+        """Создаёт канал уведомлений ровно один раз, а не на каждое уведомление."""
+        if self._channel_created or _SDK_INT < 26:
+            return
+        try:
+            ch = NotificationChannel(_CHANNEL_ID, "Online Tracker", NotificationManager.IMPORTANCE_HIGH)
+            ch.setDescription("Уведомления о входе пользователей в Telegram")
+            manager.createNotificationChannel(ch)
+            self._channel_created = True
+        except Exception as e:
+            self.plugin.log(f"Channel create error: {e}")
+
+    def _get_app_icon(self, ctx):
+        if self._app_icon is None:
+            try:
+                self._app_icon = ctx.getApplicationInfo().icon
+            except Exception:
+                try:
+                    self._app_icon = ctx.getResources().getIdentifier(
+                        "ic_dialog_info", "drawable", "android"
+                    )
+                except Exception:
+                    self._app_icon = 0
+        return self._app_icon
+
+    # ── Логика опроса ────────────────────────
+
+    def _poll_all(self):
+        # Читаем настройки один раз на весь цикл — не дёргаем get_setting() в цикле
+        debug          = self.plugin.get_setting("DEBUG_LOG",         False)
+        notify_enabled = self.plugin.get_setting("NOTIFY_ENABLED",    True)
+        only_online    = self.plugin.get_setting("NOTIFY_ONLY_ONLINE", True)
+
+        for uid in self._tracked_ids:
+            try:
+                user   = _get_user(uid)
+                online = _is_online(user)
+                self._on_status_change(uid, online, user, debug, notify_enabled, only_online)
+            except Exception as e:
+                self.plugin.log(f"Poll error uid={uid}: {e}")
+
+    def _on_status_change(self, user_id, is_online, user=None,
+                          debug=False, notify_enabled=True, only_online=True):
+        with self._lock:
+            prev    = self._last_state.get(user_id)
+            changed = (prev != is_online)
+            if changed:
+                self._last_state[user_id] = is_online
+
+        if not changed:
+            if debug:
+                name = _display_name(user) if user else f"id{user_id}"
+                self.plugin.log(f"[DEBUG] {name} ({user_id}) остаётся {'онлайн' if is_online else 'офлайн'}")
+            return
+
+        name = _display_name(user) if user else f"id{user_id}"
+        self.plugin.log(f"[STATUS] {name} ({user_id}) -> {'онлайн' if is_online else 'офлайн'}")
+
+        if notify_enabled and (not only_online or is_online):
+            self._send_android_notification(name, user_id, is_online)
+
+    def _send_android_notification(self, name, user_id, is_online):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                return
+
+            manager  = self._get_notif_manager(ctx)
+            self._ensure_channel(manager)
+            app_icon = self._get_app_icon(ctx)
+
+            text    = f"{name} сейчас онлайн" if is_online else f"{name} офлайн"
+            ticker  = f"{name} {'зашёл в Telegram' if is_online else 'вышел из сети'}"
+            n_id    = _generate_notification_id(user_id)
+
+            try:
+                launch_intent = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName())
+                if launch_intent is None:
+                    launch_intent = Intent()
+                else:
+                    launch_intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+            except Exception:
+                launch_intent = Intent()
+
+            flags = PendingIntent.FLAG_UPDATE_CURRENT
+            if _SDK_INT >= 31:
+                try:
+                    flags |= PendingIntent.FLAG_IMMUTABLE
+                except AttributeError:
+                    flags |= 0x04000000
+
+            pending = PendingIntent.getActivity(ctx, n_id, launch_intent, flags)
+
+            # SDK_INT уже закэширован — не вызываем jclass() снова
+            if _SDK_INT >= 26:
+                builder = Notification.Builder(ctx, _CHANNEL_ID)
+            else:
+                builder = Notification.Builder(ctx)
+
+            (builder
+                .setSmallIcon(app_icon)
+                .setContentTitle("Online Tracker")
+                .setContentText(text)
+                .setTicker(ticker)
+                .setWhen(int(time.time() * 1000))
+                .setAutoCancel(True)
+                .setContentIntent(pending))
+
+            manager.notify(n_id, builder.build())
+
+        except Exception as e:
+            self.plugin.log(f"Failed to send notification: {e}")
+
+    def force_check_all(self):
+        """Принудительная проверка — уведомляет только при реальных изменениях статуса."""
+        debug          = self.plugin.get_setting("DEBUG_LOG",         False)
+        notify_enabled = self.plugin.get_setting("NOTIFY_ENABLED",    True)
+        only_online    = self.plugin.get_setting("NOTIFY_ONLY_ONLINE", True)
+
+        for uid in self._tracked_ids:
+            try:
+                user   = _get_user(uid)
+                online = _is_online(user)
+                self._on_status_change(uid, online, user, debug, notify_enabled, only_online)
+            except Exception as e:
+                self.plugin.log(f"force_check_all error uid={uid}: {e}")
+
+
+# ─────────────────────────────────────────────
+#  Плагин
+# ─────────────────────────────────────────────
+
+class Plugin(BasePlugin):
+
+    def __init__(self):
+        self.tracker = None
+        self.strings = {}
+
+    def _load_strings(self):
+        try:
+            is_ru = LocaleController.getInstance().getCurrentLocale().getLanguage() == "ru"
+        except Exception:
+            is_ru = False
+
+        if is_ru:
+            self.strings = {
+                "s_general":              "Основное",
+                "s_hint":                 "Введите Telegram ID через запятую",
+                "TRACK_IDS":              "ID пользователей",
+                "POLL_INTERVAL_MS":       "Интервал опроса (мс)",
+                "NOTIFY_ENABLED":         "Уведомлять о событиях",
+                "NOTIFY_ONLY_ONLINE":     "Только при входе в онлайн",
+                "NOTIFY_ONLY_ONLINE_SUB": "Не показывать уведомления при выходе из сети",
+                "DEBUG_LOG":              "Подробный лог",
+                "DEBUG_LOG_SUB":          "Писать в лог статус каждого опроса (даже без изменений)",
+                "TEST_BUTTON":            "🔄 Проверить сейчас",
+                "menu_add":               "🔔 Отслеживать онлайн",
+                "menu_remove":            "🔕 Не отслеживать онлайн",
+                "added":                  "Пользователь добавлен в список отслеживания",
+                "removed":                "Пользователь удалён из списка отслеживания",
+            }
+        else:
+            self.strings = {
+                "s_general":              "General",
+                "s_hint":                 "Enter Telegram user IDs separated by comma",
+                "TRACK_IDS":             "User IDs",
+                "POLL_INTERVAL_MS":       "Poll interval (ms)",
+                "NOTIFY_ENABLED":         "Notify on events",
+                "NOTIFY_ONLY_ONLINE":     "Only when user comes online",
+                "NOTIFY_ONLY_ONLINE_SUB": "Don't notify when user goes offline",
+                "DEBUG_LOG":              "Debug Log",
+                "DEBUG_LOG_SUB":          "Log status on every poll (even if no change)",
+                "TEST_BUTTON":            "🔄 Check Now",
+                "menu_add":               "🔔 Track online status",
+                "menu_remove":            "🔕 Stop tracking",
+                "added":                  "User added to tracking list",
+                "removed":                "User removed from tracking list",
+            }
+
+    def on_plugin_load(self):
+        try:
+            self._load_strings()
+            self.create_settings()
+            self._start_tracker()
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                    text=self.strings["menu_add"],
+                    icon="msg_online",
+                    on_click=self._toggle_tracking,
+                    item_id="track_toggle",
+                    condition="user != null"
+                )
+            )
+        except Exception as e:
+            self.log(f"on_plugin_load error: {e}")
+
+    def on_plugin_unload(self):
+        self._stop_tracker()
+
+    def create_settings(self):
+        s = self.strings
+        return [
+            Header(text=s["s_general"]),
+            Text(text=s["s_hint"]),
+            Input(
+                key="TRACK_IDS",
+                text=s["TRACK_IDS"],
+                default="",
+                on_change=lambda _: self._restart_tracker(),
+            ),
+            Input(
+                key="POLL_INTERVAL_MS",
+                text=s["POLL_INTERVAL_MS"],
+                default="5000",
+                on_change=lambda _: self._restart_tracker(),
+            ),
+            Switch(key="NOTIFY_ENABLED",    text=s["NOTIFY_ENABLED"],    default=True),
+            Switch(
+                key="NOTIFY_ONLY_ONLINE",
+                text=s["NOTIFY_ONLY_ONLINE"],
+                default=True,
+                subtext=s["NOTIFY_ONLY_ONLINE_SUB"],
+            ),
+            Switch(
+                key="DEBUG_LOG",
+                text=s["DEBUG_LOG"],
+                default=False,
+                subtext=s["DEBUG_LOG_SUB"],
+            ),
+            Text(
+                text=s["TEST_BUTTON"],
+                icon="msg_forward",
+                on_click=lambda v: self._manual_check(),
+            ),
+        ]
+
+    def _toggle_tracking(self, context):
+        try:
+            user = context.get("user")
+            if not user:
+                return
+            user_id = user.id
+            name    = _display_name(user)
+
+            ids = self._get_current_ids()
+            if user_id in ids:
+                ids.remove(user_id)
+                message = self.strings["removed"]
+            else:
+                ids.append(user_id)
+                message = self.strings["added"]
+
+            self.set_setting("TRACK_IDS", ", ".join(str(x) for x in ids))
+            BulletinHelper.show_info(f"{name}: {message}")
+            self._restart_tracker()
+        except Exception as e:
+            self.log(f"Toggle tracking error: {e}")
+
+    def _get_current_ids(self):
+        raw = str(self.get_setting("TRACK_IDS", "") or "")
+        return _parse_ids(raw)
+
+    def _manual_check(self):
+        if self.tracker:
+            self.tracker.force_check_all()
+            BulletinHelper.show_info("Проверка выполнена")
+        else:
+            BulletinHelper.show_error("Трекер не запущен")
+
+    def _start_tracker(self):
+        if self.tracker is not None:
+            self.tracker.stop()
+        self.tracker = OnlineNotifier(self)
+        self.tracker.start()
+
+    def _stop_tracker(self):
+        if self.tracker is not None:
+            self.tracker.stop()
+            self.tracker = None
+
+    def _restart_tracker(self):
+        self.log("Restarting tracker")
+        self._stop_tracker()
+        self._start_tracker()
+
+    def is_online(self, user_id):
+        if self.tracker is None:
+            return None
+        with self.tracker._lock:
+            return self.tracker._last_state.get(user_id)
+
+    def force_check(self, user_id):
+        if self.tracker is None:
+            return None
+        user   = _get_user(user_id)
+        online = _is_online(user)
+        self.tracker._on_status_change(user_id, online, user)
+        return online
