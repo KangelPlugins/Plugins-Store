@@ -13,20 +13,38 @@
 # @@@@@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@@@@
 
+import json
 import re
+import threading
+import traceback
 from typing import Any
 from base_plugin import BasePlugin, HookResult, HookStrategy
-from ui.settings import Header, Selector
+from ui.settings import Header, Selector, Text
 from ui.bulletin import BulletinHelper
-from android_utils import run_on_ui_thread
+from ui.alert import AlertDialogBuilder
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment
 
 __id__ = "censor_swear"
 __name__ = "говорим ,kznm правильно"
 __description__ = "скрывает маты посредством смены раскладки\n\n.censor - вкл/выкл"
 __icon__ = "feature_plugins/2"
 __author__ = "@feature_plugins"
-__version__ = "1.2"
+__version__ = "1.3"
 __min_version__ = "12.1.1"
+__requirements__ = "pymorphy3, pymorphy3-dicts-ru"
+WHITELIST_SETTING = "generated_whitelist"
+PYMORPHY_INSTALL_HINT = "Установи pymorphy3 и pymorphy3-dicts-ru или обнови ExteraGram"
+WHITELIST_SAFE_STEMS = (
+    "алгебр", "рубеж", "щебен", "жреби", "хлеб", "учеб", "учёб",
+    "целеб", "волшеб", "лечеб", "греб", "мебел", "небо", "небес",
+    "щебет", "требов", "погреб", "жеребец", "стебел", "лебед",
+    "ребен", "ребён", "ребят", "колеб", "серебр", "амёб", "дебат",
+    "кебаб", "икебан", "оскорб", "потреб", "употреб", "расслаб",
+    "ослаб", "сабл", "рубл", "грабл", "дробл", "влюбл", "ансамбл",
+    "корабл", "страху", "штриху", "психу", "пахуч", "похуд", "чешу",
+    "скипидар", "эпизод",
+)
 
 
 class SmartCensor:
@@ -38,19 +56,19 @@ class SmartCensor:
         "strict_re",
         "extended_re",
         "mode",
+        "whitelist",
+        "safe_stems",
     )
 
-    def __init__(self, mode: str = "strict"):
+    def __init__(self, mode: str = "strict", whitelist=None):
         ru = "ёйцукенгшщзхъфывапролджэячсмитьбюЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ"
         en = "`qwertyuiop[]asdfghjkl;'zxcvbnm,.`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>"
         self.trans_map = str.maketrans(ru, en)
         self.en_to_ru_map = str.maketrans(en, ru)
         self.word_pattern = re.compile(r"(?iu)\b[a-zа-яё]+\b")
 
-        self.safe_prefixes = (
-            "хлеб", "потреб", "греб", "щеб", "стеб", "неб", "себ", "теб", "хреб",
-            "колеб", "переб", "рубл", "сабл", "влюбл", "оскорбл",
-        )
+        self.safe_prefixes = WHITELIST_SAFE_STEMS
+        self.safe_stems = WHITELIST_SAFE_STEMS
 
         self.strict_re = re.compile(
             r"(?iu)("
@@ -76,10 +94,14 @@ class SmartCensor:
         )
 
         self.mode = "strict"
+        self.whitelist = set(whitelist or ())
         self.set_mode(mode)
 
     def set_mode(self, mode: str) -> None:
         self.mode = "extended" if mode == "extended" else "strict"
+
+    def set_whitelist(self, whitelist) -> None:
+        self.whitelist = set(whitelist or ())
 
     def _normalize_for_check(self, token: str) -> str:
         raw = token.lower().translate(self.en_to_ru_map)
@@ -105,7 +127,14 @@ class SmartCensor:
             return False
         if normalized.startswith(self.safe_prefixes):
             return False
+        if normalized in self.whitelist:
+            return False
+        if any(stem in normalized for stem in self.safe_stems):
+            return False
 
+        return self._matches_profane(normalized)
+
+    def _matches_profane(self, normalized: str) -> bool:
         matcher = self.strict_re if self.mode == "strict" else self.extended_re
         return bool(matcher.search(normalized))
 
@@ -123,11 +152,24 @@ class CensorPlugin(BasePlugin):
     def on_plugin_load(self):
         self.enabled = bool(self._get_setting_safe("enabled", True))
         self.mode = self._normalize_mode(self._get_setting_safe("mode", "strict"))
-        self.censor = SmartCensor(self.mode)
+        self.whitelist = self._load_whitelist()
+        self.whitelist_generation_running = False
+        self.whitelist_generation_progress = 0
+        self.whitelist_generation_logged_progress = -1
+        self.whitelist_loading = None
+        self.censor = SmartCensor(self.mode, self.whitelist)
         self.add_on_send_message_hook()
+        self._log(f"loaded: enabled={self.enabled}, mode={self.mode}, whitelist={len(self.whitelist)}")
 
     def create_settings(self):
         mode_default = 1 if self.mode == "extended" else 0
+        whitelist = getattr(self, "whitelist", self._load_whitelist())
+        progress = getattr(self, "whitelist_generation_progress", 0)
+        whitelist_text = (
+            f"Whitelist генерируется: {progress}%"
+            if getattr(self, "whitelist_generation_running", False)
+            else f"Whitelist: {len(whitelist)} слов"
+        )
         return [
             Header(text="Censor"),
             Selector(
@@ -136,15 +178,136 @@ class CensorPlugin(BasePlugin):
                 items=["Strict (только мат)", "Extended (грубая лексика)"],
                 default=mode_default,
                 on_change=self._on_mode_change,
-            )
+            ),
+            Text(
+                text="Сгенерировать whitelist",
+                icon="msg_retry",
+                on_click=lambda v: self._generate_whitelist(),
+            ),
+            Text(
+                text=whitelist_text,
+                icon="msg_info",
+            ),
         ]
 
     def _show_enabled_bulletin(self):
         message = "Цензор включен" if self.enabled else "Цензор выключен"
+        self._show_info(message)
+
+    def _show_info(self, message: str):
         try:
             run_on_ui_thread(lambda: BulletinHelper.show_info(message))
         except Exception:
             pass
+
+    def _show_success(self, message: str):
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_success(message))
+        except Exception:
+            self._show_info(message)
+
+    def _show_error(self, message: str):
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+        except Exception:
+            self._show_info(message)
+
+    def _log(self, message: str):
+        try:
+            self.log(f"[{__id__}] {message}")
+        except Exception:
+            try:
+                log(f"[{__id__}] {message}")
+            except Exception:
+                pass
+
+    def _import_pymorphy3(self):
+        try:
+            import pymorphy3
+            return pymorphy3
+        except ImportError:
+            self._log("pymorphy3 import failed: package is not installed")
+            self._show_error(PYMORPHY_INSTALL_HINT)
+        except Exception as e:
+            self._log(f"pymorphy3 import failed: {e}")
+            self._log(traceback.format_exc())
+            self._show_error(f"Не удалось загрузить pymorphy3: {e}")
+        return None
+
+    def _create_morph_analyzer(self, pymorphy3):
+        try:
+            return pymorphy3.MorphAnalyzer()
+        except Exception as e:
+            self._log(f"MorphAnalyzer init failed: {e}")
+            self._log(traceback.format_exc())
+            self._show_error(f"Не удалось открыть словарь pymorphy3. {PYMORPHY_INSTALL_HINT}")
+        return None
+
+    def _show_whitelist_progress(self):
+        self._log("show whitelist progress dialog")
+
+        def _do():
+            try:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity is None:
+                    self._log("progress dialog fallback: no active activity")
+                    self._show_info("Генерирую whitelist, это может занять пару минут")
+                    return
+
+                self.whitelist_loading = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_LOADING)
+                self.whitelist_loading.set_title("Генерация whitelist")
+                self.whitelist_loading.set_message("Сканирую словарь pymorphy3...")
+                self.whitelist_loading.set_cancelable(False)
+                self.whitelist_loading.set_canceled_on_touch_outside(False)
+                self.whitelist_loading.set_on_cancel_listener(None)
+                self.whitelist_loading.show()
+
+                dialog = self.whitelist_loading.get_dialog()
+                if dialog and dialog.isShowing():
+                    dialog.setCancelable(False)
+                    dialog.setCanceledOnTouchOutside(False)
+
+                self.whitelist_loading.set_progress(0)
+            except Exception:
+                self.whitelist_loading = None
+                self._log("progress dialog fallback: failed to create loading dialog")
+                self._show_info("Генерирую whitelist, это может занять пару минут")
+
+        run_on_ui_thread(_do)
+
+    def _update_whitelist_progress(self, progress: int):
+        self.whitelist_generation_progress = max(0, min(100, int(progress)))
+        logged_progress = getattr(self, "whitelist_generation_logged_progress", -1)
+        rounded_progress = (self.whitelist_generation_progress // 10) * 10
+        if rounded_progress > logged_progress or self.whitelist_generation_progress == 100:
+            self.whitelist_generation_logged_progress = rounded_progress
+            self._log(f"whitelist generation progress: {self.whitelist_generation_progress}%")
+
+        def _do():
+            try:
+                loading = getattr(self, "whitelist_loading", None)
+                if loading and loading.get_dialog() and loading.get_dialog().isShowing():
+                    loading.set_progress(self.whitelist_generation_progress)
+            except Exception:
+                pass
+
+        run_on_ui_thread(_do)
+
+    def _dismiss_whitelist_progress(self):
+        self._log("dismiss whitelist progress dialog")
+
+        def _do():
+            try:
+                loading = getattr(self, "whitelist_loading", None)
+                if loading and loading.get_dialog() and loading.get_dialog().isShowing():
+                    loading.dismiss()
+            except Exception:
+                pass
+            self.whitelist_loading = None
+
+        run_on_ui_thread(_do)
+
 
     def _on_mode_change(self, new_index: int):
         index = int(new_index) if new_index is not None else 0
@@ -171,10 +334,127 @@ class CensorPlugin(BasePlugin):
     def _normalize_mode(self, mode: str) -> str:
         return "extended" if str(mode).lower() == "extended" else "strict"
 
+    def _load_whitelist(self):
+        raw = self._get_setting_safe(WHITELIST_SETTING, "[]")
+        try:
+            data = json.loads(raw if isinstance(raw, str) else "[]")
+        except Exception:
+            self._log("failed to parse saved whitelist, using empty set")
+            data = []
+        if not isinstance(data, list):
+            return set()
+        return {str(word) for word in data if isinstance(word, str) and word}
+
+    def _save_whitelist(self, whitelist) -> None:
+        self._log(f"saving whitelist: {len(whitelist)} words")
+        self._set_setting_safe(
+            WHITELIST_SETTING,
+            json.dumps(sorted(whitelist), ensure_ascii=False, separators=(",", ":")),
+            reload_settings=True,
+        )
+
     def _set_mode(self, mode: str) -> None:
         self.mode = self._normalize_mode(mode)
         self.censor.set_mode(self.mode)
         self._set_setting_safe("mode", self.mode)
+
+    def _get_dictionary_total(self, dictionary) -> int:
+        for attr in ("words", "lexemes"):
+            try:
+                value = getattr(dictionary, attr)
+                total = len(value)
+                if total > 0:
+                    self._log(f"dictionary total from {attr}: {total}")
+                    return total
+            except Exception:
+                pass
+        self._log("dictionary total is unknown")
+        return 0
+
+    def _extract_dictionary_word(self, entry) -> str:
+        if isinstance(entry, str):
+            return entry
+        try:
+            for value in entry:
+                if isinstance(value, str) and re.search(r"(?iu)[а-яё]", value):
+                    return value
+        except Exception:
+            pass
+        return ""
+
+    def _generate_whitelist(self):
+        if getattr(self, "whitelist_generation_running", False):
+            self._log("whitelist generation skipped: already running")
+            self._show_info("Whitelist уже генерируется")
+            return
+
+        pymorphy3 = self._import_pymorphy3()
+        if pymorphy3 is None:
+            return
+
+        self._log("whitelist generation started")
+        self.whitelist_generation_running = True
+        self.whitelist_generation_progress = 0
+        self.whitelist_generation_logged_progress = -1
+        self._show_whitelist_progress()
+
+        def _worker():
+            try:
+                generator = SmartCensor("extended")
+                morph = self._create_morph_analyzer(pymorphy3)
+                if morph is None:
+                    return
+                self._log("MorphAnalyzer initialized")
+                total = self._get_dictionary_total(morph.dictionary)
+                self._log("using iter_known_words source")
+                entries = morph.dictionary.iter_known_words()
+                if total <= 0:
+                    self._log("materializing dictionary entries to calculate total")
+                    entries = list(entries)
+                    total = len(entries)
+                    self._log(f"dictionary total after materializing: {total}")
+                whitelist = set()
+                processed = 0
+
+                for entry in entries:
+                    processed += 1
+                    if total > 0 and processed % 1000 == 0:
+                        self._update_whitelist_progress(processed * 100 // total)
+
+                    word = self._extract_dictionary_word(entry)
+                    if processed <= 3:
+                        self._log(f"dictionary sample #{processed}: {word}")
+
+                    if not word:
+                        continue
+                    normalized = generator._normalize_for_check(word)
+                    if not normalized:
+                        continue
+                    if (
+                        generator._matches_profane(normalized)
+                        and any(stem in normalized for stem in generator.safe_stems)
+                    ):
+                        whitelist.add(normalized)
+
+                self.whitelist = whitelist
+                self.censor.set_whitelist(whitelist)
+                self._update_whitelist_progress(100)
+                self.whitelist_generation_running = False
+                self._log(f"whitelist generation finished: processed={processed}, whitelist={len(whitelist)}")
+                self._save_whitelist(whitelist)
+                self._show_success(f"Whitelist готов: {len(whitelist)} слов")
+            except ImportError:
+                self._log("whitelist generation failed: pymorphy3 is not installed")
+                self._show_error("pymorphy3 не установлен")
+            except Exception as e:
+                self._log(f"whitelist generation failed: {e}")
+                self._log(traceback.format_exc())
+                self._show_error(f"Не удалось сгенерировать whitelist: {e}")
+            finally:
+                self.whitelist_generation_running = False
+                self._dismiss_whitelist_progress()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _handle_toggle_command(self, params: Any):
         text = params.message
@@ -183,6 +463,9 @@ class CensorPlugin(BasePlugin):
             return None
 
         if len(parts) < 2:
+            self.enabled = not self.enabled
+            self._set_setting_safe("enabled", self.enabled, reload_settings=True)
+            self._show_enabled_bulletin()
             return HookResult(strategy=HookStrategy.CANCEL)
 
         action = parts[1].lower()
@@ -226,8 +509,8 @@ class CensorPlugin(BasePlugin):
 # @@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@
-# @@@@@@@@@@@@@@
-# @@@@@@@@@@@@@@
+# @@@@@@@@@@@@@@@
+# @@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@
 # @@@@@@@@@@@@@@@@
