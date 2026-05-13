@@ -1,0 +1,1344 @@
+import hashlib
+import json
+import os
+import re
+import threading
+import zipfile
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, run_on_queue
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Text
+
+from java import jclass
+from java.lang import Boolean, Integer, Object
+from java.nio import ByteBuffer
+from org.telegram.messenger import ApplicationLoader, BuildVars, FileLoader, MessageObject
+
+__id__ = "bot_login"
+__name__ = "Bot Login"
+__description__ = "Log in to bot accounts using their API token.\nUse plugin settings or open the login page, tap the three-dot menu, and choose \"Log in as bot\"."
+__author__ = "@kvucoPlugins"
+__version__ = "1.1"
+__icon__ = "PISUN424242/9"
+__app_version__ = ">=12.6.4"
+__sdk_version__ = ">=1.4.3.3"
+
+CORE_EXTENSION = ".core"
+CORE_FORMAT = "core"
+CORE_FORMAT_VERSION = 1
+LOADER_VERSION = 1
+MIN_DEX_BYTES = 512
+MAX_CORE_BYTES = 16 * 1024 * 1024
+MAX_MANIFEST_BYTES = 128 * 1024
+SHA256_HEX_LENGTH = 64
+CORE_FILE_ICON = 16
+FALLBACK_DEX_DIR_SUFFIX = "_dex"
+CORE_STORE_MARKER = ".core-loader-store"
+CORE_FILE_ALIASES = ("BotLogin", "Bot Login")
+
+ENTRY_CLASS = "com.extera.plugins.botlogin.BotLoginCore"
+
+CORE_ERROR_MESSAGES = {
+    "app_too_old": "client version is too old for this core",
+    "core_file_too_large": "core file is too large",
+    "core_not_installed": "core is not installed",
+    "core_version_mismatch": "core version does not match manifest",
+    "invalid_dex_magic": "invalid DEX file",
+    "invalid_sha256": "invalid DEX sha256 in manifest",
+    "loader_too_old": "plugin loader is too old for this core",
+    "missing_core_file": "core file is missing",
+    "missing_dex": "core package does not contain DEX",
+    "missing_manifest": "core package does not contain manifest",
+    "plugin_too_old": "plugin version is too old for this core",
+    "sha256_mismatch": "DEX sha256 mismatch",
+    "wrong_core_format": "wrong core format",
+    "wrong_entry_class": "core entry class does not match this plugin",
+    "wrong_plugin_id": "core belongs to another plugin",
+}
+
+Activity = jclass("android.app.Activity")
+AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+BaseFragment = jclass("org.telegram.ui.ActionBar.BaseFragment")
+ChatActivity = jclass("org.telegram.ui.ChatActivity")
+ChatMessageCell = jclass("org.telegram.ui.Cells.ChatMessageCell")
+JavaFile = jclass("java.io.File")
+PluginsController = jclass("com.exteragram.messenger.plugins.PluginsController")
+PythonPluginsEngine = jclass("com.exteragram.messenger.plugins.PythonPluginsEngine")
+ResourcesProvider = jclass("org.telegram.ui.ActionBar.Theme$ResourcesProvider")
+String = jclass("java.lang.String")
+UtilitiesCallback = jclass("org.telegram.messenger.Utilities$Callback")
+
+
+def sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def is_valid_sha256(value):
+    if not value:
+        return False
+    digest = str(value).strip().lower()
+    if len(digest) != SHA256_HEX_LENGTH:
+        return False
+    return all(ch in "0123456789abcdef" for ch in digest)
+
+
+def json_compact(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def display_core_version(value):
+    text = str(value or "").strip()
+    if not text:
+        return "installed"
+    if text.lower().startswith("v"):
+        return text
+    return f"v{text}"
+
+
+def version_tuple(value):
+    parts = [int(part) for part in re.findall(r"\d+", str(value or ""))]
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def version_less(left, right):
+    left_parts = version_tuple(left)
+    right_parts = version_tuple(right)
+    max_len = max(len(left_parts), len(right_parts))
+    left_parts = left_parts + (0,) * (max_len - len(left_parts))
+    right_parts = right_parts + (0,) * (max_len - len(right_parts))
+    return left_parts < right_parts
+
+
+def current_app_version():
+    try:
+        return str(BuildVars.BUILD_VERSION_STRING or "")
+    except Exception:
+        return ""
+
+
+def java_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        pass
+    try:
+        return int(value.intValue())
+    except Exception:
+        return default
+
+
+def manifest_int(value, default, error_key):
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except Exception:
+        raise ValueError(error_key)
+
+
+def normalized_core_name(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def core_file_stem(file_name):
+    name = os.path.basename(str(file_name or ""))
+    if not name.lower().endswith(CORE_EXTENSION):
+        return ""
+    return name[: -len(CORE_EXTENSION)]
+
+
+def core_file_name_targets_plugin(file_name, spec=None):
+    stem = normalized_core_name(core_file_stem(file_name))
+    if not stem:
+        return False
+    plugin_id = getattr(spec, "plugin_id", __id__)
+    candidates = [plugin_id, __name__]
+    candidates.extend(CORE_FILE_ALIASES)
+    allowed = set()
+    for candidate in candidates:
+        normalized = normalized_core_name(candidate)
+        if normalized:
+            allowed.add(normalized)
+    return stem in allowed
+
+
+def write_atomic(path, data):
+    tmp = f"{path}.tmp"
+    mode = "wb" if isinstance(data, (bytes, bytearray)) else "w"
+    kwargs = {} if mode == "wb" else {"encoding": "utf-8"}
+    with open(tmp, mode, **kwargs) as handle:
+        handle.write(data)
+    os.replace(tmp, path)
+
+
+def read_json_file(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.loads(handle.read())
+
+
+def read_bytes_file(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def describe_error(prefix, exc):
+    key = str(exc or "")
+    detail = CORE_ERROR_MESSAGES.get(key, key or exc.__class__.__name__)
+    return f"{prefix}: {detail}"
+
+
+def safe_remove_tree(path, root=None):
+    try:
+        if not path or not os.path.exists(path):
+            return
+        target = os.path.abspath(path)
+        if root:
+            base = os.path.abspath(root)
+            if target == base or not target.startswith(base + os.sep):
+                return
+        if os.path.isdir(target) and not os.path.islink(target):
+            for current, dirs, files in os.walk(target, topdown=False):
+                for name in files:
+                    try:
+                        os.remove(os.path.join(current, name))
+                    except Exception:
+                        pass
+                for name in dirs:
+                    try:
+                        os.rmdir(os.path.join(current, name))
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(target)
+            except Exception:
+                pass
+        else:
+            try:
+                os.remove(target)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def message_document_name(message_object):
+    if message_object is None:
+        return ""
+    try:
+        document = message_object.getDocument()
+        if document is not None:
+            name = FileLoader.getDocumentFileName(document)
+            if name:
+                return str(name)
+    except Exception:
+        pass
+    try:
+        name = message_object.getFileName()
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    return ""
+
+
+def is_core_message(message_object):
+    return message_document_name(message_object).lower().endswith(CORE_EXTENSION)
+
+
+def is_core_path(path):
+    return str(path or "").lower().endswith(CORE_EXTENSION)
+
+
+def java_file_path(java_file):
+    try:
+        if java_file is not None and java_file.exists():
+            return str(java_file.getAbsolutePath())
+    except Exception:
+        pass
+    return None
+
+
+def resolve_message_file_path(message_object):
+    if message_object is None:
+        return None
+    try:
+        message_object.checkMediaExistance(False)
+    except Exception:
+        pass
+
+    try:
+        owner = message_object.messageOwner
+        attach_path = str(getattr(owner, "attachPath", "") or "")
+        if attach_path and os.path.exists(attach_path):
+            return attach_path
+    except Exception:
+        pass
+
+    try:
+        if message_object.mediaExists():
+            path = java_file_path(
+                FileLoader.getInstance(message_object.currentAccount).getPathToMessage(
+                    message_object.messageOwner
+                )
+            )
+            if path:
+                return path
+    except Exception:
+        pass
+
+    try:
+        document = message_object.getDocument()
+        if document is not None:
+            path = java_file_path(
+                FileLoader.getInstance(message_object.currentAccount).getPathToAttach(
+                    document,
+                    None,
+                    False,
+                    True,
+                )
+            )
+            if path:
+                return path
+    except Exception:
+        pass
+
+    return None
+
+
+def request_message_download(message_object):
+    try:
+        document = message_object.getDocument()
+        if document is None:
+            return False
+        message_object.putInDownloadsStore = True
+        message_object.loadingCancelled = False
+        try:
+            cache_type = 2 if message_object.shouldEncryptPhotoOrVideo() else 0
+        except Exception:
+            cache_type = 0
+        FileLoader.getInstance(message_object.currentAccount).loadFile(
+            document,
+            message_object,
+            FileLoader.PRIORITY_NORMAL_UP,
+            cache_type,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def show_error_ui(message):
+    run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+
+
+def declared_method(java_class, name, *args):
+    method = java_class.getClass().getDeclaredMethod(name, *args)
+    try:
+        method.setAccessible(True)
+    except Exception:
+        pass
+    return method
+
+
+def refresh_plugin_settings(plugin_id):
+    try:
+        PluginsController.getInstance().loadPluginSettings(str(plugin_id))
+    except Exception:
+        pass
+
+
+def refresh_visible_chat_rows_once():
+    try:
+        fragment = get_last_fragment()
+        if fragment is None:
+            return False
+        try:
+            if str(fragment.getClass().getName()) != "org.telegram.ui.ChatActivity":
+                return False
+        except Exception:
+            pass
+        declared_method(ChatActivity, "updateVisibleRows").invoke(fragment)
+        return True
+    except Exception:
+        return False
+
+
+def refresh_visible_chat_rows():
+    for delay in (0, 250, 1000):
+        run_on_ui_thread(refresh_visible_chat_rows_once, delay)
+
+
+class CoreSpec:
+    def __init__(
+        self,
+        plugin_id,
+        entry_class,
+        bridge_signatures,
+        settings_provider=None,
+        plugin_version=None,
+        loader_version=LOADER_VERSION,
+    ):
+        self.plugin_id = plugin_id
+        self.entry_class = entry_class
+        self.bridge_signatures = dict(bridge_signatures or {})
+        self.settings_provider = settings_provider
+        self.plugin_version = str(plugin_version or "")
+        self.loader_version = int(loader_version)
+
+    @property
+    def required_bridge(self):
+        return tuple(self.bridge_signatures.keys())
+
+    def settings_payload(self):
+        if callable(self.settings_provider):
+            payload = self.settings_provider()
+            return payload if isinstance(payload, dict) else {}
+        return {}
+
+
+class CoreManifest:
+    def __init__(self, data):
+        self.data = data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def from_json_bytes(data):
+        return CoreManifest(json.loads(data.decode("utf-8")))
+
+    @staticmethod
+    def from_file(path):
+        return CoreManifest(read_json_file(path))
+
+    def to_json(self):
+        return json.dumps(self.data, ensure_ascii=False, indent=2)
+
+    @property
+    def dex_path(self):
+        return str(((self.data.get("dex") or {}).get("path")) or "classes.dex").replace("\\", "/")
+
+    @property
+    def dex_sha256(self):
+        return str(((self.data.get("dex") or {}).get("sha256")) or "").strip().lower()
+
+    @property
+    def dex_size(self):
+        return manifest_int((self.data.get("dex") or {}).get("size"), 0, "invalid_dex_size")
+
+    @property
+    def version_code(self):
+        return manifest_int(self.data.get("version_code"), 0, "invalid_version_code")
+
+    @property
+    def version_text(self):
+        return display_core_version(self.data.get("version_name"))
+
+    def validate_for_install(self, spec, dex_bytes):
+        if self.data.get("format") != CORE_FORMAT:
+            raise ValueError("wrong_core_format")
+        if manifest_int(self.data.get("format_version"), 0, "invalid_format_version") != CORE_FORMAT_VERSION:
+            raise ValueError("unsupported_format_version")
+        if self.version_code <= 0:
+            raise ValueError("invalid_version_code")
+        if not str(self.data.get("version_name") or "").strip():
+            raise ValueError("invalid_version_name")
+        if str(self.data.get("plugin_id") or "") != spec.plugin_id:
+            raise ValueError("wrong_plugin_id")
+        min_loader_version = manifest_int(
+            self.data.get("min_loader_version"), 1, "invalid_min_loader_version"
+        )
+        if min_loader_version > spec.loader_version:
+            raise ValueError("loader_too_old")
+        min_plugin_version = str(self.data.get("min_plugin_version") or "")
+        if min_plugin_version and spec.plugin_version and version_less(spec.plugin_version, min_plugin_version):
+            raise ValueError("plugin_too_old")
+        min_app_version = str(self.data.get("min_app_version") or "")
+        app_version = current_app_version()
+        if min_app_version and app_version and version_less(app_version, min_app_version):
+            raise ValueError("app_too_old")
+        if str(self.data.get("entry_class") or "") != spec.entry_class:
+            raise ValueError("wrong_entry_class")
+
+        self.validate_dex_bytes(dex_bytes)
+
+        manifest_bridge = set(str(item) for item in (self.data.get("bridge") or []))
+        for name in spec.required_bridge:
+            if name not in manifest_bridge:
+                raise ValueError(f"missing_bridge_{name}")
+
+    def validate_dex_bytes(self, dex_bytes):
+        if len(dex_bytes) < MIN_DEX_BYTES:
+            raise ValueError("dex_too_small")
+        if not dex_bytes.startswith(b"dex\n"):
+            raise ValueError("invalid_dex_magic")
+        if not is_valid_sha256(self.dex_sha256):
+            raise ValueError("invalid_sha256")
+        if sha256_hex(dex_bytes) != self.dex_sha256:
+            raise ValueError("sha256_mismatch")
+        if self.dex_size > 0 and self.dex_size != len(dex_bytes):
+            raise ValueError("size_mismatch")
+
+
+class CorePackage:
+    def __init__(self, manifest, dex_bytes, source_path=None):
+        self.manifest = manifest
+        self.dex_bytes = dex_bytes
+        self.source_path = source_path
+
+    @staticmethod
+    def _entries_by_name(archive):
+        entries_by_name = {}
+        for entry in archive.infolist():
+            name = str(entry.filename or "").replace("\\", "/")
+            if not name or name.startswith("/") or ".." in name.split("/"):
+                raise ValueError("invalid_zip_path")
+            if entry.is_dir():
+                raise ValueError("unexpected_zip_entry")
+            if name in entries_by_name:
+                raise ValueError("duplicate_zip_entry")
+            entries_by_name[name] = entry
+        return entries_by_name
+
+    @staticmethod
+    def _read_manifest(archive, entries_by_name):
+        manifest_info = entries_by_name.get("manifest.json")
+        if manifest_info is None:
+            raise ValueError("missing_manifest")
+        if manifest_info.file_size <= 0 or manifest_info.file_size > MAX_MANIFEST_BYTES:
+            raise ValueError("invalid_manifest_size")
+        return CoreManifest.from_json_bytes(archive.read(manifest_info))
+
+    @staticmethod
+    def peek_manifest(path):
+        if not path or not os.path.exists(path):
+            raise ValueError("missing_core_file")
+        if os.path.getsize(path) > MAX_CORE_BYTES:
+            raise ValueError("core_file_too_large")
+
+        with zipfile.ZipFile(path, "r") as archive:
+            return CorePackage._read_manifest(archive, CorePackage._entries_by_name(archive))
+
+    @staticmethod
+    def read(path):
+        if not path or not os.path.exists(path):
+            raise ValueError("missing_core_file")
+        if os.path.getsize(path) > MAX_CORE_BYTES:
+            raise ValueError("core_file_too_large")
+
+        with zipfile.ZipFile(path, "r") as archive:
+            entries_by_name = CorePackage._entries_by_name(archive)
+            manifest = CorePackage._read_manifest(archive, entries_by_name)
+            dex_path = manifest.dex_path
+            if dex_path.startswith("/") or ".." in dex_path.split("/"):
+                raise ValueError("invalid_dex_path")
+
+            allowed_entries = {"manifest.json", dex_path, "CHANGELOG.md", "LICENSE.txt", "README.md"}
+            unexpected_entries = set(entries_by_name.keys()) - allowed_entries
+            if unexpected_entries:
+                raise ValueError("unexpected_zip_entry")
+
+            dex_info = entries_by_name.get(dex_path)
+            if dex_info is None:
+                raise ValueError("missing_dex")
+
+            if dex_info.file_size < MIN_DEX_BYTES or dex_info.file_size > MAX_CORE_BYTES:
+                raise ValueError("invalid_dex_size")
+            dex_bytes = archive.read(dex_info)
+
+        return CorePackage(manifest, dex_bytes, source_path=path)
+
+
+def core_path_targets_plugin(path, spec=None, display_name=None):
+    if not path and not display_name:
+        return False
+    path_targets = is_core_path(path)
+    name_targets = is_core_path(display_name)
+    if not path_targets and not name_targets:
+        return False
+
+    if path and os.path.exists(path):
+        try:
+            manifest = CorePackage.peek_manifest(path)
+            manifest_plugin_id = str(manifest.data.get("plugin_id") or "")
+            if manifest_plugin_id:
+                return manifest_plugin_id == getattr(spec, "plugin_id", __id__)
+        except Exception:
+            pass
+
+    return core_file_name_targets_plugin(path, spec) or core_file_name_targets_plugin(display_name, spec)
+
+
+def core_path_foreign_plugin_id(path, spec=None):
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        manifest = CorePackage.peek_manifest(path)
+        manifest_plugin_id = str(manifest.data.get("plugin_id") or "")
+        if manifest_plugin_id and manifest_plugin_id != getattr(spec, "plugin_id", __id__):
+            return manifest_plugin_id
+    except Exception:
+        pass
+    return ""
+
+
+def get_private_field_silent(obj, field_name, default=None):
+    if obj is None:
+        return default
+    try:
+        cls = obj.getClass()
+    except Exception:
+        cls = None
+    while cls is not None:
+        try:
+            field = cls.getDeclaredField(field_name)
+            field.setAccessible(True)
+            return field.get(obj)
+        except Exception:
+            try:
+                cls = cls.getSuperclass()
+            except Exception:
+                cls = None
+    return default
+
+
+class CoreStore:
+    def __init__(self, plugin_id):
+        self.plugin_id = plugin_id
+        self.root_dir = self._resolve_root_dir()
+        self.legacy_root_dir = self._resolve_legacy_root_dir()
+        os.makedirs(self.root_dir, exist_ok=True)
+
+        self.active_dex_path = os.path.join(self.root_dir, "active.dex")
+        self.active_manifest_path = os.path.join(self.root_dir, "active.manifest.json")
+        self.active_sha_path = os.path.join(self.root_dir, "active.sha256")
+        self.previous_dex_path = os.path.join(self.root_dir, "previous.dex")
+        self.previous_manifest_path = os.path.join(self.root_dir, "previous.manifest.json")
+        self.previous_sha_path = os.path.join(self.root_dir, "previous.sha256")
+        self.marker_path = os.path.join(self.root_dir, CORE_STORE_MARKER)
+
+        self._migrate_legacy_store()
+        self.ensure_marker()
+
+    @staticmethod
+    def resolve_cache_root():
+        try:
+            ctx = ApplicationLoader.applicationContext
+            base = None
+            try:
+                if ctx is not None:
+                    base = ctx.getFilesDir()
+            except Exception:
+                base = None
+            if base is None and ctx is not None:
+                try:
+                    base = ctx.getExternalFilesDir(None)
+                except Exception:
+                    base = None
+            if base is not None:
+                return os.path.join(str(base.getAbsolutePath()), "plugins_dex_cache")
+        except Exception:
+            pass
+        return os.path.join(os.environ.get("HOME", os.getcwd()), "plugins_dex_cache")
+
+    @staticmethod
+    def resolve_legacy_external_cache_root():
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx is not None:
+                base = ctx.getExternalFilesDir(None)
+                if base is not None:
+                    return os.path.join(str(base.getAbsolutePath()), "plugins_dex_cache")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def cache_roots():
+        roots = []
+        seen = set()
+        for root in (CoreStore.resolve_cache_root(), CoreStore.resolve_legacy_external_cache_root()):
+            if not root:
+                continue
+            normalized = os.path.abspath(root)
+            if normalized not in seen:
+                roots.append(root)
+                seen.add(normalized)
+        return roots
+
+    def _resolve_root_dir(self):
+        return os.path.join(self.resolve_cache_root(), self.plugin_id)
+
+    def _resolve_legacy_root_dir(self):
+        root = self.resolve_legacy_external_cache_root()
+        if not root:
+            return None
+        path = os.path.join(root, self.plugin_id)
+        return None if os.path.abspath(path) == os.path.abspath(self.root_dir) else path
+
+    def _migrate_legacy_store(self):
+        if not self.legacy_root_dir or not os.path.isdir(self.legacy_root_dir):
+            return
+        try:
+            for name in (
+                "active.dex",
+                "active.manifest.json",
+                "active.sha256",
+                "previous.dex",
+                "previous.manifest.json",
+                "previous.sha256",
+            ):
+                src = os.path.join(self.legacy_root_dir, name)
+                dst = os.path.join(self.root_dir, name)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    write_atomic(dst, read_bytes_file(src))
+            write_atomic(self.marker_path, "core-loader-store\n")
+            legacy_root = os.path.dirname(self.legacy_root_dir)
+            safe_remove_tree(self.legacy_root_dir, legacy_root)
+        except Exception:
+            pass
+
+    def ensure_marker(self):
+        try:
+            write_atomic(self.marker_path, "core-loader-store\n")
+        except Exception:
+            pass
+
+    def has_active(self):
+        return os.path.exists(self.active_dex_path) and os.path.exists(self.active_manifest_path)
+
+    def read_active(self):
+        if not self.has_active():
+            raise ValueError("core_not_installed")
+        dex_bytes = read_bytes_file(self.active_dex_path)
+        manifest = CoreManifest.from_file(self.active_manifest_path)
+        manifest.validate_dex_bytes(dex_bytes)
+        return CorePackage(manifest, dex_bytes, source_path=self.active_dex_path)
+
+    def read_active_manifest(self):
+        try:
+            if os.path.exists(self.active_manifest_path):
+                return CoreManifest.from_file(self.active_manifest_path)
+        except Exception:
+            pass
+        return None
+
+    def save_active(self, package):
+        write_atomic(self.active_dex_path, package.dex_bytes)
+        write_atomic(self.active_manifest_path, package.manifest.to_json())
+        write_atomic(self.active_sha_path, sha256_hex(package.dex_bytes) + "\n")
+
+    def backup_active(self):
+        for src, dst in (
+            (self.active_dex_path, self.previous_dex_path),
+            (self.active_manifest_path, self.previous_manifest_path),
+            (self.active_sha_path, self.previous_sha_path),
+        ):
+            try:
+                if os.path.exists(src):
+                    os.replace(src, dst)
+                elif os.path.exists(dst):
+                    os.remove(dst)
+            except Exception:
+                pass
+
+    def restore_previous(self):
+        required = (
+            (self.previous_dex_path, self.active_dex_path),
+            (self.previous_manifest_path, self.active_manifest_path),
+        )
+        if not all(os.path.exists(src) for src, _ in required):
+            return False
+
+        restored_required = 0
+        for src, dst in required:
+            try:
+                os.replace(src, dst)
+                restored_required += 1
+            except Exception:
+                pass
+
+        if restored_required != len(required):
+            self.clear_active()
+            return False
+
+        try:
+            if os.path.exists(self.previous_sha_path):
+                os.replace(self.previous_sha_path, self.active_sha_path)
+            elif os.path.exists(self.active_sha_path):
+                os.remove(self.active_sha_path)
+        except Exception:
+            pass
+        return True
+
+    def clear(self, remove_dir=False):
+        for path in (
+            self.active_dex_path,
+            self.active_manifest_path,
+            self.active_sha_path,
+            self.previous_dex_path,
+            self.previous_manifest_path,
+            self.previous_sha_path,
+            self.marker_path if remove_dir else None,
+        ):
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        if remove_dir:
+            safe_remove_tree(self.root_dir, os.path.dirname(self.root_dir))
+
+    def clear_active(self):
+        for path in (self.active_dex_path, self.active_manifest_path, self.active_sha_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+    def has_previous(self):
+        return os.path.exists(self.previous_dex_path) and os.path.exists(self.previous_manifest_path)
+
+    def installed_version_text(self):
+        try:
+            return self.read_active().manifest.version_text
+        except Exception:
+            return "not installed"
+
+
+def plugin_registry_contains(plugin_id):
+    try:
+        plugins = PluginsController.getInstance().plugins
+        if plugins is None:
+            return True
+        try:
+            if plugins.size() <= 0:
+                return True
+        except Exception:
+            pass
+        return bool(plugins.containsKey(str(plugin_id)))
+    except Exception:
+        return True
+
+
+def is_core_store_path(path):
+    try:
+        if not os.path.isdir(path):
+            return False
+        if os.path.exists(os.path.join(path, CORE_STORE_MARKER)):
+            return True
+        for name in ("active.manifest.json", "previous.manifest.json"):
+            manifest_path = os.path.join(path, name)
+            if os.path.exists(manifest_path):
+                data = read_json_file(manifest_path)
+                if isinstance(data, dict) and data.get("format") == CORE_FORMAT:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def garbage_collect_orphaned_cores():
+    try:
+        for root in CoreStore.cache_roots():
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                if is_core_store_path(path) and not plugin_registry_contains(name):
+                    safe_remove_tree(path, root)
+    except Exception:
+        pass
+
+
+class CoreRuntime:
+    def __init__(self, spec):
+        self.spec = spec
+        self.dex_class = None
+        self.dex_loader = None
+        self.loaded = False
+
+    def reset(self):
+        self.dex_class = None
+        self.dex_loader = None
+        self.loaded = False
+
+    def start(self, dex_bytes, manifest=None):
+        try:
+            self.unload()
+            self._load_class(dex_bytes)
+            self.verify_bridge()
+            self.verify_core_version(manifest)
+            self.method("load").invoke(None)
+            self.loaded = True
+        except Exception:
+            self.unload()
+            raise
+
+    def unload(self):
+        try:
+            if self.dex_class is not None:
+                self.method("unload").invoke(None)
+        except Exception:
+            pass
+        finally:
+            self.reset()
+
+    def invoke(self, method_name, *args):
+        if self.dex_class is None or not self.loaded:
+            raise RuntimeError("core_not_loaded")
+        return self.method(method_name).invoke(None, *args)
+
+    def method(self, name):
+        param_types = self.spec.bridge_signatures.get(name, ())
+        method = self.dex_class.getDeclaredMethod(name, *param_types)
+        method.setAccessible(True)
+        return method
+
+    def verify_bridge(self):
+        for name in self.spec.required_bridge:
+            self.method(name)
+
+    def verify_core_version(self, manifest):
+        if manifest is None or manifest.version_code <= 0:
+            return
+        version_value = self.method("getVersion").invoke(None)
+        loaded_version = java_int(version_value, default=-1)
+        if loaded_version != int(manifest.version_code):
+            raise ValueError("core_version_mismatch")
+
+    def _load_class(self, dex_bytes):
+        ctx = ApplicationLoader.applicationContext
+        if ctx is None:
+            raise RuntimeError("no_context")
+
+        in_memory_error = None
+        try:
+            InMemoryDexClassLoader = jclass("dalvik.system.InMemoryDexClassLoader")
+            self.dex_loader = InMemoryDexClassLoader(ByteBuffer.wrap(dex_bytes), ctx.getClassLoader())
+            self.dex_class = self.dex_loader.loadClass(self.spec.entry_class)
+            return
+        except Exception as exc:
+            in_memory_error = exc
+
+        try:
+            DexClassLoader = jclass("dalvik.system.DexClassLoader")
+            _, out_dir = self._fallback_dex_paths()
+            os.makedirs(out_dir, exist_ok=True)
+            dex_file = os.path.join(out_dir, "active.dex")
+            with open(dex_file, "wb") as handle:
+                handle.write(dex_bytes)
+            self.dex_loader = DexClassLoader(dex_file, out_dir, None, ctx.getClassLoader())
+            self.dex_class = self.dex_loader.loadClass(self.spec.entry_class)
+        except Exception as exc:
+            raise RuntimeError(f"dex_load_failed: in_memory={in_memory_error}; fallback={exc}")
+
+    def _fallback_dex_paths(self):
+        ctx = ApplicationLoader.applicationContext
+        if ctx is None:
+            raise RuntimeError("no_context")
+        code_cache = ctx.getCodeCacheDir() or ctx.getFilesDir()
+        root = str(code_cache.getAbsolutePath())
+        return root, os.path.join(root, f"{self.spec.plugin_id}{FALLBACK_DEX_DIR_SUFFIX}")
+
+    def clear_fallback_cache(self):
+        try:
+            root, out_dir = self._fallback_dex_paths()
+            safe_remove_tree(out_dir, root)
+        except Exception:
+            pass
+
+
+class TelegramCoreInstaller:
+    def __init__(self, loader):
+        self.loader = loader
+
+    def install_from_message(self, message_object):
+        if not is_core_message(message_object):
+            self.loader.error("This is not a .core file")
+            return
+
+        if not self.loader.begin_operation("install"):
+            return
+
+        path = resolve_message_file_path(message_object)
+        if path:
+            self.loader.install_file_async(path, operation_started=True)
+            return
+
+        if not request_message_download(message_object):
+            self.loader.info("Download the .core file first, then tap the file again")
+            self.loader.finish_operation("install")
+            return
+
+        self.loader.info("Downloading core...")
+        self._wait_for_download(message_object)
+
+    def _wait_for_download(self, message_object, attempts_left=120):
+        if not self.loader.active:
+            self.loader.finish_operation("install")
+            return
+        path = resolve_message_file_path(message_object)
+        if path:
+            self.loader.install_file_async(path, operation_started=True)
+            return
+        if attempts_left > 0:
+            run_on_ui_thread(lambda: self._wait_for_download(message_object, attempts_left - 1), 500)
+            return
+        self.loader.error("Core download timed out")
+        self.loader.finish_operation("install")
+
+
+class CoreLoader:
+    def __init__(self, spec):
+        self.spec = spec
+        self.store = CoreStore(spec.plugin_id)
+        self.runtime = CoreRuntime(spec)
+        self.telegram = TelegramCoreInstaller(self)
+        self.lock = threading.RLock()
+        self.operation_lock = threading.RLock()
+        self.operation = None
+        self.active = True
+
+    def dispose(self):
+        self.active = False
+
+    def ui(self, fn):
+        if self.active:
+            run_on_ui_thread(fn)
+
+    def info(self, message):
+        self.ui(lambda: BulletinHelper.show_info(message))
+
+    def error(self, message):
+        self.ui(lambda: BulletinHelper.show_error(message))
+
+    def success(self, message):
+        self.ui(lambda: BulletinHelper.show_success(message))
+
+    def installed_version_text(self):
+        return self.store.installed_version_text()
+
+    def claims_core_message(self, message_object):
+        if not is_core_message(message_object):
+            return False
+        path = resolve_message_file_path(message_object)
+        if path:
+            return core_path_targets_plugin(path, self.spec, message_document_name(message_object))
+        return core_file_name_targets_plugin(message_document_name(message_object), self.spec)
+
+    def claims_core_path(self, path, display_name=None):
+        return core_path_targets_plugin(path, self.spec, display_name)
+
+    def begin_operation(self, name):
+        with self.operation_lock:
+            if not self.active:
+                return False
+            if self.operation is not None:
+                self.info(f"Core operation already running: {self.operation}")
+                return False
+            self.operation = name
+            return True
+
+    def finish_operation(self, name):
+        with self.operation_lock:
+            if self.operation == name:
+                self.operation = None
+
+    def load_installed(self, show_error=False):
+        with self.lock:
+            try:
+                package = self.store.read_active()
+                package.manifest.validate_for_install(self.spec, package.dex_bytes)
+                self.runtime.start(package.dex_bytes, package.manifest)
+                return True
+            except Exception as exc:
+                self.runtime.unload()
+                if self.store.has_previous() and self.store.restore_previous():
+                    try:
+                        package = self.store.read_active()
+                        package.manifest.validate_for_install(self.spec, package.dex_bytes)
+                        self.runtime.start(package.dex_bytes, package.manifest)
+                        if show_error:
+                            self.info("Restored previous core")
+                        return True
+                    except Exception:
+                        self.runtime.unload()
+                if show_error:
+                    self.error(describe_error("Core load failed", exc))
+                return False
+
+    def install_file_async(self, path, operation_started=False):
+        if not operation_started and not self.begin_operation("install"):
+            return
+
+        def worker():
+            try:
+                if not self.active:
+                    return
+                package = CorePackage.read(path)
+                if not self.active:
+                    return
+                self.install_package(package)
+            except Exception as exc:
+                self.error(describe_error("Core install failed", exc))
+            finally:
+                self.finish_operation("install")
+
+        run_on_queue(worker)
+
+    def install_message(self, message_object):
+        self.telegram.install_from_message(message_object)
+
+    def install_package(self, package):
+        with self.lock:
+            if not self.active:
+                raise RuntimeError("loader_disposed")
+            package.manifest.validate_for_install(self.spec, package.dex_bytes)
+            should_reload_previous = self.runtime.loaded
+
+            try:
+                self.runtime.unload()
+                self.store.backup_active()
+                self.store.save_active(package)
+                self.runtime.start(package.dex_bytes, package.manifest)
+            except Exception:
+                self.runtime.unload()
+                restored = self.store.restore_previous()
+                if not restored:
+                    self.store.clear_active()
+                if restored and should_reload_previous:
+                    self.load_installed(show_error=False)
+                raise
+
+        self.success(f"Core installed {package.manifest.version_text}")
+        refresh_plugin_settings(self.spec.plugin_id)
+
+    def unload(self):
+        with self.lock:
+            self.runtime.unload()
+
+    def invoke(self, method_name, *args):
+        with self.lock:
+            if not self.runtime.loaded and not self.load_installed(show_error=True):
+                return None
+            return self.runtime.invoke(method_name, *args)
+
+    def delete_installed_core(self):
+        with self.lock:
+            self.active = False
+            self.runtime.unload()
+            self.runtime.clear_fallback_cache()
+            self.store.clear(remove_dir=True)
+
+
+class BotLoginPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.loader = None
+
+    def _hook_optional(self, key, java_class, method_name, hook, *args):
+        try:
+            self.hook_method(declared_method(java_class, method_name, *args), hook)
+            return True
+        except Exception:
+            return False
+
+    def on_plugin_load(self):
+        garbage_collect_orphaned_cores()
+        self.loader = CoreLoader(
+            spec=CoreSpec(
+                plugin_id=__id__,
+                entry_class=ENTRY_CLASS,
+                plugin_version=__version__,
+                bridge_signatures={
+                    "load": (),
+                    "unload": (),
+                    "getVersion": (),
+                    "openBotLogin": (Object,),
+                },
+            ),
+        )
+        self.loader.load_installed(show_error=False)
+
+        self._hook_optional(
+            "open_document",
+            AndroidUtilities,
+            "openDocument",
+            self.OpenDocumentHook(self),
+            MessageObject,
+            Activity,
+            BaseFragment,
+        )
+        self._hook_optional(
+            "open_view_message",
+            AndroidUtilities,
+            "openForView",
+            self.OpenForViewHook(self),
+            MessageObject,
+            Activity,
+            ResourcesProvider,
+            Boolean.TYPE,
+        )
+        self._hook_optional(
+            "open_view_file",
+            AndroidUtilities,
+            "openForView",
+            self.OpenFileForViewHook(self),
+            JavaFile,
+            String,
+            String,
+            Activity,
+            ResourcesProvider,
+            Boolean.TYPE,
+        )
+        self._hook_optional(
+            "file_icon",
+            ChatMessageCell,
+            "getFileIcon",
+            self.FileIconHook(),
+        )
+        self._hook_optional(
+            "delete_cleanup",
+            PythonPluginsEngine,
+            "deletePlugin",
+            self.DeletePluginHook(self),
+            String,
+            UtilitiesCallback,
+        )
+        refresh_visible_chat_rows()
+
+    def on_plugin_unload(self):
+        if self.loader:
+            self.loader.unload()
+            self.loader.dispose()
+            self.loader = None
+
+    def install_core_from_file(self, file_path):
+        if not self.loader:
+            show_error_ui("Loader is not ready")
+            return
+        self.loader.install_file_async(str(file_path))
+
+    def open_bot_login(self, view=None):
+        if not self.loader:
+            show_error_ui("Loader is not ready")
+            return
+        fragment = get_last_fragment()
+        if fragment is None:
+            show_error_ui("No active screen to open Bot Login")
+            return
+        self.loader.invoke("openBotLogin", fragment)
+
+    def create_settings(self):
+        version = self.loader.installed_version_text() if self.loader else "not installed"
+        return [
+            Header(text="Bot Login"),
+            Text(text="Log in as bot", icon="menu_bots_add", accent=True, on_click=self.open_bot_login),
+            Text(text=f"Installed core: {version}", icon="msg_info"),
+        ]
+
+    def _show_foreign_core_error(self, path):
+        foreign_plugin_id = core_path_foreign_plugin_id(path, self.loader.spec if self.loader else None)
+        if not foreign_plugin_id:
+            return False
+        if plugin_registry_contains(foreign_plugin_id):
+            return False
+        show_error_ui(f"Core belongs to another plugin: {foreign_plugin_id}")
+        return True
+
+    def _install_core_message(self, message_object):
+        if not is_core_message(message_object):
+            return False
+        path = resolve_message_file_path(message_object)
+        if self.loader and not self.loader.claims_core_message(message_object):
+            if self._show_foreign_core_error(path):
+                return True
+            return False
+        if not self.loader and not core_file_name_targets_plugin(message_document_name(message_object)):
+            return False
+        if not self.loader:
+            show_error_ui("Loader is not ready")
+            return True
+        self.loader.install_message(message_object)
+        return True
+
+    def _install_core_file_path(self, path, display_name=None):
+        if not path or not (is_core_path(path) or is_core_path(display_name)):
+            return False
+        if self.loader and not self.loader.claims_core_path(path, display_name):
+            if self._show_foreign_core_error(path):
+                return True
+            return False
+        if not self.loader and not core_path_targets_plugin(path, None, display_name):
+            return False
+        if not self.loader:
+            show_error_ui("Loader is not ready")
+            return True
+        self.loader.install_file_async(str(path))
+        return True
+
+    def _delete_installed_core_for_plugin(self, plugin_id):
+        if str(plugin_id or "") != __id__:
+            return
+        if self.loader:
+            self.loader.delete_installed_core()
+
+    class DeletePluginHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                self.plugin._delete_installed_core_for_plugin(param.args[0])
+            except Exception:
+                pass
+
+    class OpenDocumentHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                if self.plugin._install_core_message(param.args[0]):
+                    param.setResult(None)
+            except Exception as exc:
+                show_error_ui(describe_error("Install core failed", exc))
+                param.setResult(None)
+
+    class OpenForViewHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                if self.plugin._install_core_message(param.args[0]):
+                    param.setResult(Boolean(True))
+            except Exception as exc:
+                show_error_ui(describe_error("Install core failed", exc))
+                param.setResult(Boolean(True))
+
+    class OpenFileForViewHook(MethodHook):
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                path = java_file_path(param.args[0])
+                display_name = str(param.args[1] or "")
+                if self.plugin._install_core_file_path(path, display_name):
+                    param.setResult(Boolean(True))
+            except Exception as exc:
+                show_error_ui(describe_error("Install core failed", exc))
+                param.setResult(Boolean(True))
+
+    class FileIconHook(MethodHook):
+        def after_hooked_method(self, param):
+            try:
+                message_object = get_private_field_silent(param.thisObject, "currentMessageObject")
+                if is_core_message(message_object):
+                    param.setResult(Integer(CORE_FILE_ICON))
+            except Exception:
+                pass
