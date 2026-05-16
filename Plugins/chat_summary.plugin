@@ -1,0 +1,455 @@
+from typing import Any, List
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import (
+    get_last_fragment, get_messages_controller,
+    run_on_queue, send_request, PLUGINS_QUEUE,
+)
+from android_utils import run_on_ui_thread, log, OnClickListener
+from ui.settings import Header, Divider, Selector, Input, Text
+from ui.bulletin import BulletinHelper
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.ActionBar import Theme
+
+__id__          = "chat_summary"
+__name__        = "Chat Summary"
+__description__ = "Summarize any chat using AI — OpenAI, Anthropic, Gemini, Ollama or a custom endpoint."
+__author__      = "@aaxnet"
+__version__     = "1.0.0"
+__icon__        = "KOSHAKIEBANIYE/44"
+__app_version__ = ">=12.5.1"
+__requirements__ = ["requests"]
+
+# ── Providers ──────────────────────────────────────────────────────────────────
+PROVIDER_OPENAI    = 0
+PROVIDER_ANTHROPIC = 1
+PROVIDER_GEMINI    = 2
+PROVIDER_OLLAMA    = 3
+PROVIDER_CUSTOM    = 4
+
+PROVIDERS = [
+    "OpenAI (GPT-4o)",
+    "Anthropic (Claude)",
+    "Gemini",
+    "Ollama (local, no key)",
+    "Custom endpoint",
+]
+
+# ── Style ──────────────────────────────────────────────────────────────────────
+STYLE_BRIEF    = 0
+STYLE_DETAILED = 1
+STYLE_BULLETS  = 2
+
+STYLES = ["Краткий", "Подробный", "По пунктам"]
+
+# ── Language ───────────────────────────────────────────────────────────────────
+LANG_AUTO = 0
+LANG_RU   = 1
+LANG_EN   = 2
+
+LANGS = ["Авто", "Русский", "English"]
+
+# ── Message count ──────────────────────────────────────────────────────────────
+MSG_COUNTS       = [50, 100, 200, 500]
+MSG_COUNT_LABELS = ["50 сообщений", "100 сообщений", "200 сообщений", "500 сообщений"]
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _resolve_color(key: str, fallback: int) -> int:
+    try:
+        return Theme.getColor(getattr(Theme, key))
+    except Exception:
+        return fallback
+
+
+def _get_system_prompt(style: int, lang: int) -> str:
+    lang_map = {
+        LANG_AUTO: "Respond in the same language as the conversation.",
+        LANG_RU:   "Respond in Russian.",
+        LANG_EN:   "Respond in English.",
+    }
+    style_map = {
+        STYLE_BRIEF:    "Write a concise 2–3 sentence summary of the key points.",
+        STYLE_DETAILED: "Write a detailed summary covering all important topics discussed.",
+        STYLE_BULLETS:  "Write a bullet-point list of the main topics and decisions.",
+    }
+    return (
+        "You are a helpful assistant that summarizes Telegram chat conversations. "
+        f"{style_map.get(style, '')} {lang_map.get(lang, '')} "
+        "Focus only on content. Do not include meta-commentary."
+    )
+
+
+def _build_messages_text(messages) -> str:
+    lines = []
+    for msg in reversed(list(messages)):
+        try:
+            sender = "Unknown"
+            if hasattr(msg, "messageOwner") and msg.messageOwner:
+                fid = getattr(msg.messageOwner, "from_id", None)
+                if fid is not None:
+                    if hasattr(fid, "user_id"):
+                        sender = f"User{fid.user_id}"
+                    elif hasattr(fid, "channel_id"):
+                        sender = f"Channel{fid.channel_id}"
+            text = ""
+            if hasattr(msg, "messageText") and msg.messageText:
+                text = str(msg.messageText)
+            elif hasattr(msg, "messageOwner") and msg.messageOwner:
+                raw = getattr(msg.messageOwner, "message", None)
+                if raw:
+                    text = str(raw)
+            if text.strip():
+                lines.append(f"{sender}: {text}")
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+
+def _show_result_dialog(act, summary: str):
+    try:
+        from org.telegram.ui.ActionBar import AlertDialog as AD
+        builder = AD.Builder(act)
+        builder.setTitle("Summary")
+        builder.setMessage(summary)
+        builder.setPositiveButton("OK", None)
+        builder.show()
+    except Exception as e:
+        log(f"chat_summary: show_result_dialog error: {e}")
+
+
+# ── API callers ────────────────────────────────────────────────────────────────
+
+def _call_openai(api_key: str, model: str, system: str, content: str, url: str = None) -> str:
+    import requests
+    model = model or "gpt-4o"
+    url   = url or "https://api.openai.com/v1/chat/completions"
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": model, "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": content},
+        ]},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _call_anthropic(api_key: str, model: str, system: str, content: str) -> str:
+    import requests
+    model = model or "claude-sonnet-4-20250514"
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": content}],
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["content"][0]["text"]
+
+
+def _call_gemini(api_key: str, model: str, system: str, content: str) -> str:
+    import requests
+    model = model or "gemini-2.0-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    r = requests.post(
+        url,
+        json={"contents": [{"parts": [{"text": f"{system}\n\n{content}"}]}]},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _call_ollama(model: str, system: str, content: str) -> str:
+    import requests
+    model = model or "llama3"
+    r = requests.post(
+        "http://localhost:11434/api/chat",
+        json={"model": model, "stream": False, "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": content},
+        ]},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()["message"]["content"]
+
+
+def _call_api(provider: int, api_key: str, model: str,
+              system: str, content: str, custom_url: str) -> str:
+    if provider == PROVIDER_OPENAI:
+        return _call_openai(api_key, model, system, content)
+    if provider == PROVIDER_ANTHROPIC:
+        return _call_anthropic(api_key, model, system, content)
+    if provider == PROVIDER_GEMINI:
+        return _call_gemini(api_key, model, system, content)
+    if provider == PROVIDER_OLLAMA:
+        return _call_ollama(model, system, content)
+    if provider == PROVIDER_CUSTOM:
+        return _call_openai(api_key, model, system, content, url=custom_url)
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+# ── Plugin ─────────────────────────────────────────────────────────────────────
+
+class ChatSummaryPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Summarize Chat",
+            subtext="Summarize with AI",
+            icon="msg_info",
+            on_click=self._on_menu_click,
+        ))
+        self.log("chat_summary: loaded")
+
+    def on_plugin_unload(self):
+        self.log("chat_summary: unloaded")
+
+    # ── Menu click ─────────────────────────────────────────────────────────────
+
+    def _on_menu_click(self, context):
+        dialog_id = context.get("dialog_id")
+        if not dialog_id:
+            return
+        fragment = context.get("fragment") or get_last_fragment()
+        if not fragment:
+            return
+        act = fragment.getParentActivity()
+        if not act:
+            return
+        run_on_ui_thread(lambda: self._show_count_sheet(act, dialog_id))
+
+    # ── Bottom sheet: pick message count ──────────────────────────────────────
+
+    def _show_count_sheet(self, act, dialog_id):
+        try:
+            from android.widget import LinearLayout, TextView
+            from android.view import Gravity
+            from android.util import TypedValue
+            from android.graphics.drawable import GradientDrawable
+            from org.telegram.ui.ActionBar import BottomSheet
+
+            dp = AndroidUtilities.dp
+            sheet_ref = [None]
+
+            def on_pick(idx):
+                if sheet_ref[0]:
+                    sheet_ref[0].dismiss()
+                self.set_setting("msg_count", idx)
+                BulletinHelper.show_info("Fetching messages…")
+                run_on_queue(
+                    lambda: self._fetch_and_summarize(act, dialog_id),
+                    PLUGINS_QUEUE, 0,
+                )
+
+            wrapper = LinearLayout(act)
+            wrapper.setOrientation(LinearLayout.VERTICAL)
+            wrapper.setPadding(dp(20), dp(16), dp(20), dp(16))
+            try:
+                wrapper.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground))
+            except Exception:
+                pass
+
+            title_tv = TextView(act)
+            title_tv.setText("Сколько сообщений проанализировать?")
+            title_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+            title_tv.setGravity(Gravity.CENTER)
+            title_tv.setTextColor(_resolve_color("key_dialogTextBlack", 0xFF212121))
+            try:
+                title_tv.setTypeface(AndroidUtilities.bold())
+            except Exception:
+                pass
+            lp_title = LinearLayout.LayoutParams(-1, -2)
+            lp_title.bottomMargin = dp(16)
+            wrapper.addView(title_tv, lp_title)
+
+            for i, label in enumerate(MSG_COUNT_LABELS):
+                btn = TextView(act)
+                btn.setText(label)
+                btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+                btn.setGravity(Gravity.CENTER)
+                btn.setPadding(dp(16), dp(14), dp(16), dp(14))
+                btn.setClickable(True)
+                btn.setFocusable(True)
+                btn.setTextColor(_resolve_color("key_windowBackgroundWhiteBlackText", 0xFF212121))
+
+                bg = GradientDrawable()
+                bg.setCornerRadius(dp(12))
+                bg.setColor(_resolve_color("key_windowBackgroundWhite", 0xFFF5F5F5))
+                btn.setBackground(bg)
+
+                idx = i
+                btn.setOnClickListener(OnClickListener(lambda v, i=idx: on_pick(i)))
+
+                lp = LinearLayout.LayoutParams(-1, -2)
+                if i < len(MSG_COUNT_LABELS) - 1:
+                    lp.bottomMargin = dp(8)
+                wrapper.addView(btn, lp)
+
+            builder = BottomSheet.Builder(act)
+            builder.setCustomView(wrapper)
+            sheet = builder.create()
+            sheet_ref[0] = sheet
+            sheet.show()
+
+        except Exception as e:
+            log(f"chat_summary: count sheet error: {e}")
+
+    # ── Fetch messages via TL_messages_getHistory ──────────────────────────────
+
+    def _fetch_and_summarize(self, act, dialog_id):
+        try:
+            from org.telegram.tgnet import TLRPC
+
+            count_idx = self.get_setting("msg_count", 1)
+            count = MSG_COUNTS[count_idx] if 0 <= count_idx < len(MSG_COUNTS) else 100
+
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = get_messages_controller().getInputPeer(dialog_id)
+            req.offset_id   = 0
+            req.offset_date = 0
+            req.add_offset  = 0
+            req.limit       = count
+            req.max_id      = 0
+            req.min_id      = 0
+            req.hash        = 0
+
+            plugin_ref = [self]
+            act_ref    = [act]
+
+            def on_response(response, error):
+                if error:
+                    err_text = error.text if error else "unknown"
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Fetch error: {err_text}"))
+                    return
+                try:
+                    text = _build_messages_text(response.messages)
+                    if not text.strip():
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("No text messages found."))
+                        return
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("Summarizing…"))
+                    run_on_queue(
+                        lambda: plugin_ref[0]._summarize(act_ref[0], text),
+                        PLUGINS_QUEUE, 0,
+                    )
+                except Exception as ex:
+                    log(f"chat_summary: parse error: {ex}")
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Failed to parse messages."))
+
+            send_request(req, on_response)
+
+        except Exception as e:
+            log(f"chat_summary: fetch error: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Failed to start fetch."))
+
+    # ── Call AI API ────────────────────────────────────────────────────────────
+
+    def _summarize(self, act, text: str):
+        try:
+            provider        = self.get_setting("provider",         PROVIDER_OPENAI)
+            api_key         = self.get_setting("api_key",          "") or ""
+            model           = self.get_setting("model",            "") or ""
+            style           = self.get_setting("style",            STYLE_BRIEF)
+            lang            = self.get_setting("lang",             LANG_AUTO)
+            custom_url      = self.get_setting("custom_endpoint",  "") or ""
+
+            system  = _get_system_prompt(style, lang)
+            content = f"Chat conversation to summarize:\n\n{text}"
+
+            result = _call_api(provider, api_key, model, system, content, custom_url)
+            run_on_ui_thread(lambda: _show_result_dialog(act, result))
+
+        except Exception as e:
+            err = str(e)
+            log(f"chat_summary: summarize error: {err}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"AI error: {err[:100]}"))
+
+    # ── Settings ───────────────────────────────────────────────────────────────
+
+    def _provider_sub_page(self) -> List[Any]:
+        provider = self.get_setting("provider", PROVIDER_OPENAI)
+        items: List[Any] = [
+            Header(text="Provider Settings"),
+            Input(
+                key="api_key",
+                text="API Key",
+                subtext="Not required for Ollama",
+                icon="msg_secret",
+                default="",
+            ),
+            Input(
+                key="model",
+                text="Model",
+                subtext="gpt-4o / claude-sonnet-4-20250514 / gemini-2.0-flash / llama3",
+                icon="msg_topic",
+                default="",
+            ),
+        ]
+        if provider == PROVIDER_CUSTOM:
+            items.append(Input(
+                key="custom_endpoint",
+                text="Custom Endpoint",
+                subtext="OpenAI-compatible URL",
+                icon="msg_link",
+                default="",
+            ))
+        return items
+
+    def create_settings(self) -> List[Any]:
+        provider = self.get_setting("provider", PROVIDER_OPENAI)
+        label    = PROVIDERS[provider] if 0 <= provider < len(PROVIDERS) else "?"
+
+        return [
+            Header(text="Chat Summary"),
+            Selector(
+                key="provider",
+                text="AI Provider",
+                default=PROVIDER_OPENAI,
+                items=PROVIDERS,
+                icon="msg_robot",
+                on_change=lambda _: self.set_setting("provider", _, reload_settings=True),
+            ),
+            Text(
+                text="Provider & API Key",
+                subtext=label,
+                icon="msg_settings",
+                create_sub_fragment=self._provider_sub_page,
+            ),
+            Divider(),
+            Selector(
+                key="style",
+                text="Summary Style",
+                default=STYLE_BRIEF,
+                items=STYLES,
+                icon="msg_list",
+            ),
+            Selector(
+                key="lang",
+                text="Language",
+                default=LANG_AUTO,
+                items=LANGS,
+                icon="msg_translate",
+            ),
+            Selector(
+                key="msg_count",
+                text="Messages to fetch",
+                default=1,
+                items=MSG_COUNT_LABELS,
+                icon="msg_discussion",
+            ),
+        ]
