@@ -1,0 +1,667 @@
+__id__ = "text2voice"
+__name__ = "text2voice"
+__description__ = "Команда .v текст: превращает текст в аудио и отправляет как голосовое."
+__author__ = "@bsod4ik_plugins"
+__version__ = "1.0.2"
+__icon__ = "msg_voicechat"
+__app_version__ = ">=12.2.10"
+__sdk_version__ = ">=1.4.3.3"
+
+import os
+import json
+import threading
+import time
+import traceback
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+
+from java import dynamic_proxy, jclass
+from java.io import File as JFile
+from java.util import HashMap, Locale
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from android_utils import run_on_ui_thread
+from hook_utils import find_class
+from ui.settings import Divider, Header, Input, Switch, Text
+
+try:
+    from ui.settings import Selector
+except Exception:
+    Selector = None
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
+    BulletinHelper = None
+
+from org.telegram.messenger import ApplicationLoader, SendMessagesHelper, UserConfig
+from org.telegram.tgnet import TLRPC
+
+
+TextToSpeech = jclass("android.speech.tts.TextToSpeech")
+Bundle = jclass("android.os.Bundle")
+
+CACHE_DIR = "/sdcard/Download/text2voice"
+LOG_PATH = os.path.join(CACHE_DIR, "text2voice.log")
+MAX_TEXT_LEN = 900
+SYNTH_TIMEOUT_SEC = 45
+PROVIDERS = ["Android TTS", "Google Translate TTS", "FreeTTS API"]
+
+
+class Text2VoicePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._tts = None
+        self._tts_ready = threading.Event()
+        self._tts_failed = False
+        self._tts_lock = threading.RLock()
+        self._logs = []
+
+    def on_plugin_load(self):
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            self.add_on_send_message_hook()
+            self._log("send hook added")
+        except Exception as e:
+            self._log("send hook error: %s" % e)
+
+        self._init_tts()
+        self._log("plugin loaded")
+
+    def on_plugin_unload(self):
+        try:
+            if self._tts is not None:
+                self._tts.shutdown()
+        except Exception:
+            pass
+        self._tts = None
+        self._tts_ready.clear()
+        self._logs.clear()
+
+    def create_settings(self):
+        try:
+            return self._create_settings()
+        except Exception as e:
+            self._log("create_settings error: %s\n%s" % (e, traceback.format_exc()))
+            return [
+                Header(text="text2voice"),
+                Switch(key="enabled", text="Включить команду", default=True, icon="msg_settings"),
+                Text(text="Копировать все логи", icon="msg_copy", on_click=lambda _: self.copy_logs()),
+                Text(text="Ошибка настроек. Нажми копировать логи и пришли их.", icon="msg_info"),
+            ]
+
+    def _create_settings(self):
+        return [
+            Header(text="text2voice"),
+            Switch(
+                key="enabled",
+                text="Включить команду",
+                subtext="Команда .v текст отправляет голосовое",
+                default=True,
+                icon="msg_voicechat",
+            ),
+            Input(
+                key="command",
+                text="Команда",
+                subtext="Пиши: .v текст",
+                default=".v",
+            ),
+            self._provider_setting_item(),
+            Input(
+                key="max_len",
+                text="Максимум символов",
+                subtext="FreeTTS API принимает до 1000 символов, Google режется на чанки",
+                default=str(MAX_TEXT_LEN),
+            ),
+            Input(
+                key="google_lang",
+                text="Язык Google TTS",
+                subtext="ru, en, uk, de и т.д.",
+                default="ru",
+            ),
+            Input(
+                key="freetts_voice",
+                text="Голос FreeTTS",
+                subtext="ru-RU-DmitryNeural, ru-RU-SvetlanaNeural, en-US-JennyNeural",
+                default="ru-RU-DmitryNeural",
+            ),
+            Input(
+                key="freetts_rate",
+                text="Скорость FreeTTS",
+                subtext="Формат: +0%, -20%, +25%",
+                default="+0%",
+            ),
+            Input(
+                key="speech_rate",
+                text="Скорость Android TTS",
+                subtext="1.0 - обычная скорость",
+                default="1.0",
+            ),
+            Text(text="Показать логи", icon="msg_log", on_click=self.show_logs),
+            Text(text="Копировать все логи", icon="msg_copy", on_click=lambda _: self.copy_logs()),
+            Divider(),
+            Text(text="Google TTS и FreeTTS работают без API ключа через интернет. У FreeTTS на бесплатном режиме может быть аудио-хвост сервиса.", icon="msg_info"),
+        ]
+
+    def _provider_setting_item(self):
+        if Selector is not None:
+            return Selector(
+                key="provider_index",
+                text="Провайдер",
+                default=self._provider_index(),
+                items=PROVIDERS,
+                icon="msg_settings",
+                on_change=self._set_provider_index,
+            )
+        return Input(
+            key="provider_index",
+            text="Провайдер",
+            subtext="0 = Android TTS, 1 = Google TTS, 2 = FreeTTS API",
+            default=str(self._provider_index()),
+        )
+
+    def on_send_message_hook(self, account, params):
+        try:
+            if not self.get_setting("enabled", True):
+                return HookResult()
+
+            if not params or not hasattr(params, "message") or not params.message:
+                return HookResult()
+
+            message = str(params.message).strip()
+            command = str(self.get_setting("command", ".v") or ".v").strip() or ".v"
+            prefix = command + " "
+            if message.lower() != command.lower() and not message.lower().startswith(prefix.lower()):
+                return HookResult()
+
+            text = ""
+            if message.lower().startswith(prefix.lower()):
+                text = message[len(prefix):].strip()
+
+            if not text:
+                self._show_error("Напиши текст после .v")
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            limit = self._safe_int(self.get_setting("max_len", str(MAX_TEXT_LEN)), MAX_TEXT_LEN, 1, 4000)
+            if len(text) > limit:
+                text = text[:limit].strip()
+            if self._provider_index() == 2 and len(text) > 1000:
+                text = text[:1000].strip()
+
+            send_ctx = {
+                "peer": getattr(params, "peer", None),
+                "reply_to_msg": getattr(params, "replyToMsg", getattr(params, "replyToMsgId", None)),
+                "reply_to_top": getattr(params, "replyToTopMsg", getattr(params, "replyToTopMsgId", None)),
+            }
+            threading.Thread(
+                target=self._tts_and_send,
+                args=(int(account), send_ctx, text),
+                daemon=True,
+            ).start()
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self._log("on_send_message_hook error: %s\n%s" % (e, traceback.format_exc()))
+            return HookResult()
+
+    def _init_tts(self):
+        def _ui():
+            try:
+                plugin = self
+
+                class InitListener(dynamic_proxy(jclass("android.speech.tts.TextToSpeech$OnInitListener"))):
+                    def __init__(self):
+                        super().__init__()
+
+                    def onInit(self, status):
+                        try:
+                            if int(status) == int(TextToSpeech.SUCCESS):
+                                try:
+                                    plugin._tts.setLanguage(Locale.getDefault())
+                                except Exception:
+                                    pass
+                                plugin._tts_ready.set()
+                                plugin._tts_failed = False
+                                plugin._log("tts ready")
+                            else:
+                                plugin._tts_failed = True
+                                plugin._log("tts init failed: %s" % status)
+                        except Exception as e:
+                            plugin._tts_failed = True
+                            plugin._log("tts init callback error: %s" % e)
+
+                self._tts = TextToSpeech(ApplicationLoader.applicationContext, InitListener())
+            except Exception as e:
+                self._tts_failed = True
+                self._log("tts init error: %s" % e)
+
+        run_on_ui_thread(_ui)
+
+    def _tts_and_send(self, account, send_ctx, text):
+        try:
+            peer_id = self._peer_to_id(account, send_ctx.get("peer"))
+            if peer_id == 0:
+                self._show_error("Не удалось определить чат")
+                self._log("invalid peer")
+                return
+
+            provider = self._provider_index()
+            if provider == 1:
+                path = os.path.join(CACHE_DIR, "t2v_%s.mp3" % uuid.uuid4().hex)
+                ok = self._synthesize_google(text, path)
+            elif provider == 2:
+                path = os.path.join(CACHE_DIR, "t2v_%s.mp3" % uuid.uuid4().hex)
+                ok = self._synthesize_freetts(text, path)
+            else:
+                if self._tts is None and not self._tts_failed:
+                    self._init_tts()
+
+                if not self._tts_ready.wait(8):
+                    self._show_error("TTS еще не готов или не установлен")
+                    self._log("tts not ready")
+                    return
+
+                path = os.path.join(CACHE_DIR, "t2v_%s.wav" % uuid.uuid4().hex)
+                ok = self._synthesize_to_file(text, path)
+            if not ok:
+                self._show_error("Не удалось создать голосовое")
+                return
+
+            self._send_voice_file(account, peer_id, path, send_ctx, text)
+        except Exception as e:
+            self._log("tts job error: %s\n%s" % (e, traceback.format_exc()))
+            self._show_error("Ошибка text2voice")
+
+    def _synthesize_to_file(self, text, path):
+        utterance_id = "text2voice_%s" % uuid.uuid4().hex
+        plugin = self
+
+        with self._tts_lock:
+            done = threading.Event()
+            result = {"rc": None, "error": None}
+
+            def _ui_synth():
+                try:
+                    rate = plugin._safe_float(plugin.get_setting("speech_rate", "1.0"), 1.0, 0.2, 3.0)
+                    try:
+                        plugin._tts.setSpeechRate(float(rate))
+                    except Exception:
+                        pass
+                    bundle = Bundle()
+                    rc = plugin._tts.synthesizeToFile(str(text), bundle, JFile(path), utterance_id)
+                    result["rc"] = int(rc)
+                    if int(rc) != int(TextToSpeech.SUCCESS):
+                        result["error"] = "synthesize rc=%s" % rc
+                except Exception as e:
+                    result["error"] = str(e)
+                finally:
+                    done.set()
+
+            run_on_ui_thread(_ui_synth)
+            if not done.wait(5):
+                self._log("tts call timeout")
+                return False
+            if result.get("error"):
+                self._log("tts failed: %s" % result.get("error"))
+                return False
+            if result.get("rc") is not None and int(result.get("rc")) != int(TextToSpeech.SUCCESS):
+                self._log("tts failed rc: %s" % result.get("rc"))
+                return False
+
+            last_size = -1
+            stable_count = 0
+            deadline = time.time() + SYNTH_TIMEOUT_SEC
+            while time.time() < deadline:
+                try:
+                    size = os.path.getsize(path) if os.path.exists(path) else 0
+                except Exception:
+                    size = 0
+                if size > 128 and size == last_size:
+                    stable_count += 1
+                    if stable_count >= 3:
+                        break
+                else:
+                    stable_count = 0
+                    last_size = size
+                time.sleep(0.35)
+
+        try:
+            ok = os.path.exists(path) and os.path.getsize(path) > 128
+            if not ok:
+                self._log("tts output missing or too small")
+            return ok
+        except Exception:
+            return False
+
+    def _synthesize_google(self, text, path):
+        try:
+            lang = str(self.get_setting("google_lang", "ru") or "ru").strip() or "ru"
+            chunks = self._split_tts_text(str(text), 180)
+            if not chunks:
+                return False
+            wrote = 0
+            with open(path, "wb") as f:
+                for index, chunk in enumerate(chunks):
+                    url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=%s&q=%s" % (
+                        urllib.parse.quote(lang),
+                        urllib.parse.quote(chunk),
+                    )
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req, timeout=25) as resp:
+                        content = resp.read()
+                    if not content or len(content) < 128:
+                        self._log("google tts chunk too small: %s" % index)
+                        return False
+                    f.write(content)
+                    wrote += len(content)
+                    time.sleep(0.12)
+            self._log("google tts mp3 generated: %s bytes, chunks=%s" % (wrote, len(chunks)))
+            return wrote > 512
+        except Exception as e:
+            self._log("google tts error: %s\n%s" % (e, traceback.format_exc()))
+            return False
+
+    def _split_tts_text(self, text, limit):
+        words = str(text or "").split()
+        chunks = []
+        cur = ""
+        for word in words:
+            if not cur:
+                cur = word
+            elif len(cur) + 1 + len(word) <= limit:
+                cur += " " + word
+            else:
+                chunks.append(cur)
+                cur = word
+            while len(cur) > limit:
+                chunks.append(cur[:limit])
+                cur = cur[limit:]
+        if cur:
+            chunks.append(cur)
+        return chunks
+
+    def _synthesize_freetts(self, text, path):
+        try:
+            voice = str(self.get_setting("freetts_voice", "ru-RU-DmitryNeural") or "ru-RU-DmitryNeural").strip()
+            rate = str(self.get_setting("freetts_rate", "+0%") or "+0%").strip()
+            if not rate:
+                rate = "+0%"
+            payload = json.dumps({
+                "text": str(text),
+                "voice": voice,
+                "rate": rate,
+                "pitch": "+0Hz",
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://freetts.org/api/tts",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "ExteraGram-text2voice/1.0",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            data = json.loads(body)
+            file_id = str(data.get("file_id", "") or "").strip()
+            if not file_id:
+                self._log("freetts no file_id: %s" % body[:300])
+                return False
+
+            audio_req = urllib.request.Request(
+                "https://freetts.org/api/audio/%s" % file_id,
+                headers={"User-Agent": "ExteraGram-text2voice/1.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(audio_req, timeout=45) as audio_resp:
+                content = audio_resp.read()
+            if not content or len(content) < 512:
+                self._log("freetts audio too small")
+                return False
+            with open(path, "wb") as f:
+                f.write(content)
+            self._log("freetts mp3 generated: %s bytes" % len(content))
+            return True
+        except Exception as e:
+            self._log("freetts error: %s\n%s" % (e, traceback.format_exc()))
+            return False
+
+    def _send_voice_file(self, account, peer_id, path, send_ctx, text):
+        reply_msg = send_ctx.get("reply_to_msg")
+        reply_top = send_ctx.get("reply_to_top")
+
+        def _ui_send():
+            try:
+                doc = self._build_voice_doc(path, text)
+                extra = HashMap()
+                extra.put("originalPath", path)
+
+                SendMessageParams = find_class("org.telegram.messenger.SendMessagesHelper$SendMessageParams")
+                if SendMessageParams is None:
+                    raise RuntimeError("SendMessageParams unavailable")
+
+                send_params = SendMessageParams.of(
+                    doc,
+                    None,
+                    path,
+                    int(peer_id),
+                    reply_msg,
+                    reply_top,
+                    None,
+                    None,
+                    None,
+                    extra,
+                    True,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    False,
+                )
+                SendMessagesHelper.getInstance(int(account)).sendMessage(send_params)
+                self._log("voice sent, reply=%s, path=%s" % (reply_msg is not None, path))
+            except Exception as e:
+                self._log("send voice error: %s\n%s" % (e, traceback.format_exc()))
+                self._show_error("Не удалось отправить голосовое")
+
+        run_on_ui_thread(_ui_send)
+
+    def _build_voice_doc(self, path, text):
+        doc = TLRPC.TL_document()
+        doc.id = 0
+        doc.access_hash = 0
+        doc.file_reference = bytearray()
+        doc.date = int(time.time())
+        doc.dc_id = 0
+        doc.size = int(JFile(path).length())
+        lower = str(path).lower()
+        if lower.endswith(".mp3"):
+            doc.mime_type = "audio/mpeg"
+        else:
+            doc.mime_type = "audio/wav"
+
+        fname = TLRPC.TL_documentAttributeFilename()
+        fname.file_name = os.path.basename(path)
+        doc.attributes.add(fname)
+
+        audio = TLRPC.TL_documentAttributeAudio()
+        audio.duration = self._audio_duration(path)
+        audio.voice = True
+        audio.title = "text2voice"
+        doc.attributes.add(audio)
+        return doc
+
+    def _audio_duration(self, path):
+        if str(path).lower().endswith(".mp3"):
+            try:
+                size = os.path.getsize(path)
+                return max(1, int(size / 16000))
+            except Exception:
+                return 1
+        try:
+            with wave.open(path, "rb") as wf:
+                frames = float(wf.getnframes())
+                rate = float(wf.getframerate())
+                if rate > 0:
+                    return max(1, int(round(frames / rate)))
+        except Exception:
+            pass
+        try:
+            size = os.path.getsize(path)
+            return max(1, int(size / 32000))
+        except Exception:
+            return 1
+
+    def _peer_to_id(self, account, peer):
+        try:
+            if isinstance(peer, (int, float)):
+                return int(peer)
+        except Exception:
+            pass
+
+        try:
+            if peer is not None and "InputPeerSelf" in str(peer):
+                return int(UserConfig.getInstance(int(account)).getClientUserId())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(peer, "user_id") and peer.user_id:
+                return int(peer.user_id)
+            if hasattr(peer, "chat_id") and peer.chat_id:
+                return -int(peer.chat_id)
+            if hasattr(peer, "channel_id") and peer.channel_id:
+                return -int(peer.channel_id)
+        except Exception:
+            pass
+
+        try:
+            if peer is not None and str(peer).isdigit():
+                return int(str(peer))
+        except Exception:
+            pass
+
+        try:
+            from client_utils import get_last_fragment
+            frag = get_last_fragment()
+            if frag is not None and hasattr(frag, "getDialogId"):
+                return int(frag.getDialogId())
+        except Exception:
+            pass
+
+        return 0
+
+    def _show_error(self, text):
+        try:
+            if BulletinHelper is not None:
+                BulletinHelper.show_error(str(text))
+        except Exception:
+            pass
+        self._log(str(text))
+
+    def _log(self, message):
+        try:
+            line = "[%s] %s" % (time.strftime("%H:%M:%S"), str(message))
+        except Exception:
+            line = str(message)
+        self._logs.append(line)
+        if len(self._logs) > 200:
+            self._logs = self._logs[-200:]
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        try:
+            self.log("[text2voice] " + line)
+        except Exception:
+            pass
+
+    def show_logs(self, _view=None):
+        text = "\n".join(self._logs[-120:]) if self._logs else "Логи пустые"
+
+        def _ui():
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+                frag = get_last_fragment()
+                act = frag.getParentActivity() if frag else None
+                if act is None:
+                    return
+                b = AlertDialogBuilder(act)
+                b.set_title("text2voice logs")
+                b.set_message(text)
+                b.set_positive_button("Close", lambda d, _w: d.dismiss())
+                b.show()
+            except Exception:
+                pass
+
+        run_on_ui_thread(_ui)
+
+    def copy_logs(self, _view=None):
+        parts = []
+        try:
+            if os.path.exists(LOG_PATH):
+                with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                    parts.append(f.read())
+        except Exception:
+            pass
+        if self._logs:
+            parts.append("\n".join(self._logs))
+        text = "\n".join([p.strip() for p in parts if p and p.strip()]) or "Логи пустые"
+
+        def _ui():
+            try:
+                from android.content import ClipData, Context
+                ctx = ApplicationLoader.applicationContext
+                svc = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+                svc.setPrimaryClip(ClipData.newPlainText("text2voice_logs", text))
+                if BulletinHelper is not None:
+                    try:
+                        BulletinHelper.show_copied_to_clipboard()
+                    except Exception:
+                        pass
+                self._log("logs copied")
+            except Exception as e:
+                self._log("copy logs failed: %s\n%s" % (e, traceback.format_exc()))
+
+        run_on_ui_thread(_ui)
+
+    def _provider_index(self):
+        return self._safe_int(self.get_setting("provider_index", "0"), 0, 0, len(PROVIDERS) - 1)
+
+    def _set_provider_index(self, value):
+        try:
+            text = str(value)
+            if text in PROVIDERS:
+                self.set_setting("provider_index", PROVIDERS.index(text))
+                return
+        except Exception:
+            pass
+        self.set_setting("provider_index", self._safe_int(value, 0, 0, len(PROVIDERS) - 1))
+
+    def _safe_int(self, value, default, minimum, maximum):
+        try:
+            parsed = int(str(value).strip())
+        except Exception:
+            parsed = int(default)
+        return max(int(minimum), min(int(maximum), parsed))
+
+    def _safe_float(self, value, default, minimum, maximum):
+        try:
+            parsed = float(str(value).strip())
+        except Exception:
+            parsed = float(default)
+        return max(float(minimum), min(float(maximum), parsed))
