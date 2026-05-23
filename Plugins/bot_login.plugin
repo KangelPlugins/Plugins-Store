@@ -1,1344 +1,147 @@
-import hashlib
-import json
-import os
-import re
-import threading
-import zipfile
+import base64
+import zlib
 
 from android_utils import run_on_ui_thread
-from base_plugin import BasePlugin, MethodHook
-from client_utils import get_last_fragment, run_on_queue
+from base_plugin import BasePlugin
+from client_utils import get_last_fragment
 from ui.bulletin import BulletinHelper
 from ui.settings import Header, Text
 
 from java import jclass
-from java.lang import Boolean, Integer, Object
-from java.nio import ByteBuffer
-from org.telegram.messenger import ApplicationLoader, BuildVars, FileLoader, MessageObject
+from org.telegram.messenger import ApplicationLoader
 
 __id__ = "bot_login"
 __name__ = "Bot Login"
 __description__ = "Log in to bot accounts using their API token.\nUse plugin settings or open the login page, tap the three-dot menu, and choose \"Log in as bot\"."
 __author__ = "@kvucoPlugins"
-__version__ = "1.2"
+__version__ = "1.3"
 __icon__ = "PISUN424242/9"
-__app_version__ = ">=12.5.1"
+__app_version__ = ">= 12.5.1"
 __sdk_version__ = ">=1.4.3.3"
 
-CORE_EXTENSION = ".core"
-CORE_FORMAT = "core"
-CORE_FORMAT_VERSION = 1
-LOADER_VERSION = 1
-MIN_DEX_BYTES = 512
-MAX_CORE_BYTES = 16 * 1024 * 1024
-MAX_MANIFEST_BYTES = 128 * 1024
-SHA256_HEX_LENGTH = 64
-CORE_FILE_ICON = 16
-FALLBACK_DEX_DIR_SUFFIX = "_dex"
-CORE_STORE_MARKER = ".core-loader-store"
-CORE_FILE_ALIASES = ("BotLogin", "Bot Login")
-
 ENTRY_CLASS = "com.extera.plugins.botlogin.BotLoginCore"
-
-CORE_ERROR_MESSAGES = {
-    "app_too_old": "client version is too old for this core",
-    "core_file_too_large": "core file is too large",
-    "core_not_installed": "core is not installed",
-    "core_version_mismatch": "core version does not match manifest",
-    "invalid_dex_magic": "invalid DEX file",
-    "invalid_sha256": "invalid DEX sha256 in manifest",
-    "loader_too_old": "plugin loader is too old for this core",
-    "missing_core_file": "core file is missing",
-    "missing_dex": "core package does not contain DEX",
-    "missing_manifest": "core package does not contain manifest",
-    "plugin_too_old": "plugin version is too old for this core",
-    "sha256_mismatch": "DEX sha256 mismatch",
-    "wrong_core_format": "wrong core format",
-    "wrong_entry_class": "core entry class does not match this plugin",
-    "wrong_plugin_id": "core belongs to another plugin",
-}
-
-Activity = jclass("android.app.Activity")
-AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
-BaseFragment = jclass("org.telegram.ui.ActionBar.BaseFragment")
-ChatActivity = jclass("org.telegram.ui.ChatActivity")
-ChatMessageCell = jclass("org.telegram.ui.Cells.ChatMessageCell")
-JavaFile = jclass("java.io.File")
-PluginsController = jclass("com.exteragram.messenger.plugins.PluginsController")
-PythonPluginsEngine = jclass("com.exteragram.messenger.plugins.PythonPluginsEngine")
-ResourcesProvider = jclass("org.telegram.ui.ActionBar.Theme$ResourcesProvider")
-String = jclass("java.lang.String")
-UtilitiesCallback = jclass("org.telegram.messenger.Utilities$Callback")
-
-
-def sha256_hex(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def is_valid_sha256(value):
-    if not value:
-        return False
-    digest = str(value).strip().lower()
-    if len(digest) != SHA256_HEX_LENGTH:
-        return False
-    return all(ch in "0123456789abcdef" for ch in digest)
-
-
-def json_compact(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def display_core_version(value):
-    text = str(value or "").strip()
-    if not text:
-        return "installed"
-    if text.lower().startswith("v"):
-        return text
-    return f"v{text}"
-
-
-def version_tuple(value):
-    parts = [int(part) for part in re.findall(r"\d+", str(value or ""))]
-    while parts and parts[-1] == 0:
-        parts.pop()
-    return tuple(parts)
-
-
-def version_less(left, right):
-    left_parts = version_tuple(left)
-    right_parts = version_tuple(right)
-    max_len = max(len(left_parts), len(right_parts))
-    left_parts = left_parts + (0,) * (max_len - len(left_parts))
-    right_parts = right_parts + (0,) * (max_len - len(right_parts))
-    return left_parts < right_parts
-
-
-def current_app_version():
-    try:
-        return str(BuildVars.BUILD_VERSION_STRING or "")
-    except Exception:
-        return ""
-
-
-def java_int(value, default=0):
-    try:
-        return int(value)
-    except Exception:
-        pass
-    try:
-        return int(value.intValue())
-    except Exception:
-        return default
-
-
-def manifest_int(value, default, error_key):
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except Exception:
-        raise ValueError(error_key)
-
-
-def normalized_core_name(value):
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-
-
-def core_file_stem(file_name):
-    name = os.path.basename(str(file_name or ""))
-    if not name.lower().endswith(CORE_EXTENSION):
-        return ""
-    return name[: -len(CORE_EXTENSION)]
-
-
-def core_file_name_targets_plugin(file_name, spec=None):
-    stem = normalized_core_name(core_file_stem(file_name))
-    if not stem:
-        return False
-    plugin_id = getattr(spec, "plugin_id", __id__)
-    candidates = [plugin_id, __name__]
-    candidates.extend(CORE_FILE_ALIASES)
-    allowed = set()
-    for candidate in candidates:
-        normalized = normalized_core_name(candidate)
-        if normalized:
-            allowed.add(normalized)
-    return stem in allowed
-
-
-def write_atomic(path, data):
-    tmp = f"{path}.tmp"
-    mode = "wb" if isinstance(data, (bytes, bytearray)) else "w"
-    kwargs = {} if mode == "wb" else {"encoding": "utf-8"}
-    with open(tmp, mode, **kwargs) as handle:
-        handle.write(data)
-    os.replace(tmp, path)
-
-
-def read_json_file(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.loads(handle.read())
-
-
-def read_bytes_file(path):
-    with open(path, "rb") as handle:
-        return handle.read()
-
-
-def describe_error(prefix, exc):
-    key = str(exc or "")
-    detail = CORE_ERROR_MESSAGES.get(key, key or exc.__class__.__name__)
-    return f"{prefix}: {detail}"
-
-
-def safe_remove_tree(path, root=None):
-    try:
-        if not path or not os.path.exists(path):
-            return
-        target = os.path.abspath(path)
-        if root:
-            base = os.path.abspath(root)
-            if target == base or not target.startswith(base + os.sep):
-                return
-        if os.path.isdir(target) and not os.path.islink(target):
-            for current, dirs, files in os.walk(target, topdown=False):
-                for name in files:
-                    try:
-                        os.remove(os.path.join(current, name))
-                    except Exception:
-                        pass
-                for name in dirs:
-                    try:
-                        os.rmdir(os.path.join(current, name))
-                    except Exception:
-                        pass
-            try:
-                os.rmdir(target)
-            except Exception:
-                pass
-        else:
-            try:
-                os.remove(target)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def message_document_name(message_object):
-    if message_object is None:
-        return ""
-    try:
-        document = message_object.getDocument()
-        if document is not None:
-            name = FileLoader.getDocumentFileName(document)
-            if name:
-                return str(name)
-    except Exception:
-        pass
-    try:
-        name = message_object.getFileName()
-        if name:
-            return str(name)
-    except Exception:
-        pass
-    return ""
-
-
-def is_core_message(message_object):
-    return message_document_name(message_object).lower().endswith(CORE_EXTENSION)
-
-
-def is_core_path(path):
-    return str(path or "").lower().endswith(CORE_EXTENSION)
-
-
-def java_file_path(java_file):
-    try:
-        if java_file is not None and java_file.exists():
-            return str(java_file.getAbsolutePath())
-    except Exception:
-        pass
-    return None
-
-
-def resolve_message_file_path(message_object):
-    if message_object is None:
-        return None
-    try:
-        message_object.checkMediaExistance(False)
-    except Exception:
-        pass
-
-    try:
-        owner = message_object.messageOwner
-        attach_path = str(getattr(owner, "attachPath", "") or "")
-        if attach_path and os.path.exists(attach_path):
-            return attach_path
-    except Exception:
-        pass
-
-    try:
-        if message_object.mediaExists():
-            path = java_file_path(
-                FileLoader.getInstance(message_object.currentAccount).getPathToMessage(
-                    message_object.messageOwner
-                )
-            )
-            if path:
-                return path
-    except Exception:
-        pass
-
-    try:
-        document = message_object.getDocument()
-        if document is not None:
-            path = java_file_path(
-                FileLoader.getInstance(message_object.currentAccount).getPathToAttach(
-                    document,
-                    None,
-                    False,
-                    True,
-                )
-            )
-            if path:
-                return path
-    except Exception:
-        pass
-
-    return None
-
-
-def request_message_download(message_object):
-    try:
-        document = message_object.getDocument()
-        if document is None:
-            return False
-        message_object.putInDownloadsStore = True
-        message_object.loadingCancelled = False
-        try:
-            cache_type = 2 if message_object.shouldEncryptPhotoOrVideo() else 0
-        except Exception:
-            cache_type = 0
-        FileLoader.getInstance(message_object.currentAccount).loadFile(
-            document,
-            message_object,
-            FileLoader.PRIORITY_NORMAL_UP,
-            cache_type,
-        )
-        return True
-    except Exception:
-        return False
+DEX_BEGIN = "__DEX_BEGIN__"
+DEX_END = "__DEX_END__"
 
 
 def show_error_ui(message):
-    run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+    run_on_ui_thread(lambda: BulletinHelper.show_error(str(message)))
 
 
-def declared_method(java_class, name, *args):
-    method = java_class.getClass().getDeclaredMethod(name, *args)
-    try:
-        method.setAccessible(True)
-    except Exception:
-        pass
-    return method
-
-
-def refresh_plugin_settings(plugin_id):
-    try:
-        PluginsController.getInstance().loadPluginSettings(str(plugin_id))
-    except Exception:
-        pass
-
-
-def refresh_visible_chat_rows_once():
-    try:
-        fragment = get_last_fragment()
-        if fragment is None:
-            return False
-        try:
-            if str(fragment.getClass().getName()) != "org.telegram.ui.ChatActivity":
-                return False
-        except Exception:
-            pass
-        declared_method(ChatActivity, "updateVisibleRows").invoke(fragment)
-        return True
-    except Exception:
-        return False
-
-
-def refresh_visible_chat_rows():
-    for delay in (0, 250, 1000):
-        run_on_ui_thread(refresh_visible_chat_rows_once, delay)
-
-
-class CoreSpec:
-    def __init__(
-        self,
-        plugin_id,
-        entry_class,
-        bridge_signatures,
-        settings_provider=None,
-        plugin_version=None,
-        loader_version=LOADER_VERSION,
-    ):
-        self.plugin_id = plugin_id
+class Dex:
+    def __init__(self, entry_class):
         self.entry_class = entry_class
-        self.bridge_signatures = dict(bridge_signatures or {})
-        self.settings_provider = settings_provider
-        self.plugin_version = str(plugin_version or "")
-        self.loader_version = int(loader_version)
+        self.clazz = None
 
-    @property
-    def required_bridge(self):
-        return tuple(self.bridge_signatures.keys())
-
-    def settings_payload(self):
-        if callable(self.settings_provider):
-            payload = self.settings_provider()
-            return payload if isinstance(payload, dict) else {}
-        return {}
-
-
-class CoreManifest:
-    def __init__(self, data):
-        self.data = data if isinstance(data, dict) else {}
-
-    @staticmethod
-    def from_json_bytes(data):
-        return CoreManifest(json.loads(data.decode("utf-8")))
-
-    @staticmethod
-    def from_file(path):
-        return CoreManifest(read_json_file(path))
-
-    def to_json(self):
-        return json.dumps(self.data, ensure_ascii=False, indent=2)
-
-    @property
-    def dex_path(self):
-        return str(((self.data.get("dex") or {}).get("path")) or "classes.dex").replace("\\", "/")
-
-    @property
-    def dex_sha256(self):
-        return str(((self.data.get("dex") or {}).get("sha256")) or "").strip().lower()
-
-    @property
-    def dex_size(self):
-        return manifest_int((self.data.get("dex") or {}).get("size"), 0, "invalid_dex_size")
-
-    @property
-    def version_code(self):
-        return manifest_int(self.data.get("version_code"), 0, "invalid_version_code")
-
-    @property
-    def version_text(self):
-        return display_core_version(self.data.get("version_name"))
-
-    def validate_for_install(self, spec, dex_bytes):
-        if self.data.get("format") != CORE_FORMAT:
-            raise ValueError("wrong_core_format")
-        if manifest_int(self.data.get("format_version"), 0, "invalid_format_version") != CORE_FORMAT_VERSION:
-            raise ValueError("unsupported_format_version")
-        if self.version_code <= 0:
-            raise ValueError("invalid_version_code")
-        if not str(self.data.get("version_name") or "").strip():
-            raise ValueError("invalid_version_name")
-        if str(self.data.get("plugin_id") or "") != spec.plugin_id:
-            raise ValueError("wrong_plugin_id")
-        min_loader_version = manifest_int(
-            self.data.get("min_loader_version"), 1, "invalid_min_loader_version"
-        )
-        if min_loader_version > spec.loader_version:
-            raise ValueError("loader_too_old")
-        min_plugin_version = str(self.data.get("min_plugin_version") or "")
-        if min_plugin_version and spec.plugin_version and version_less(spec.plugin_version, min_plugin_version):
-            raise ValueError("plugin_too_old")
-        min_app_version = str(self.data.get("min_app_version") or "")
-        app_version = current_app_version()
-        if min_app_version and app_version and version_less(app_version, min_app_version):
-            raise ValueError("app_too_old")
-        if str(self.data.get("entry_class") or "") != spec.entry_class:
-            raise ValueError("wrong_entry_class")
-
-        self.validate_dex_bytes(dex_bytes)
-
-        manifest_bridge = set(str(item) for item in (self.data.get("bridge") or []))
-        for name in spec.required_bridge:
-            if name not in manifest_bridge:
-                raise ValueError(f"missing_bridge_{name}")
-
-    def validate_dex_bytes(self, dex_bytes):
-        if len(dex_bytes) < MIN_DEX_BYTES:
-            raise ValueError("dex_too_small")
-        if not dex_bytes.startswith(b"dex\n"):
-            raise ValueError("invalid_dex_magic")
-        if not is_valid_sha256(self.dex_sha256):
-            raise ValueError("invalid_sha256")
-        if sha256_hex(dex_bytes) != self.dex_sha256:
-            raise ValueError("sha256_mismatch")
-        if self.dex_size > 0 and self.dex_size != len(dex_bytes):
-            raise ValueError("size_mismatch")
-
-
-class CorePackage:
-    def __init__(self, manifest, dex_bytes, source_path=None):
-        self.manifest = manifest
-        self.dex_bytes = dex_bytes
-        self.source_path = source_path
-
-    @staticmethod
-    def _entries_by_name(archive):
-        entries_by_name = {}
-        for entry in archive.infolist():
-            name = str(entry.filename or "").replace("\\", "/")
-            if not name or name.startswith("/") or ".." in name.split("/"):
-                raise ValueError("invalid_zip_path")
-            if entry.is_dir():
-                raise ValueError("unexpected_zip_entry")
-            if name in entries_by_name:
-                raise ValueError("duplicate_zip_entry")
-            entries_by_name[name] = entry
-        return entries_by_name
-
-    @staticmethod
-    def _read_manifest(archive, entries_by_name):
-        manifest_info = entries_by_name.get("manifest.json")
-        if manifest_info is None:
-            raise ValueError("missing_manifest")
-        if manifest_info.file_size <= 0 or manifest_info.file_size > MAX_MANIFEST_BYTES:
-            raise ValueError("invalid_manifest_size")
-        return CoreManifest.from_json_bytes(archive.read(manifest_info))
-
-    @staticmethod
-    def peek_manifest(path):
-        if not path or not os.path.exists(path):
-            raise ValueError("missing_core_file")
-        if os.path.getsize(path) > MAX_CORE_BYTES:
-            raise ValueError("core_file_too_large")
-
-        with zipfile.ZipFile(path, "r") as archive:
-            return CorePackage._read_manifest(archive, CorePackage._entries_by_name(archive))
-
-    @staticmethod
-    def read(path):
-        if not path or not os.path.exists(path):
-            raise ValueError("missing_core_file")
-        if os.path.getsize(path) > MAX_CORE_BYTES:
-            raise ValueError("core_file_too_large")
-
-        with zipfile.ZipFile(path, "r") as archive:
-            entries_by_name = CorePackage._entries_by_name(archive)
-            manifest = CorePackage._read_manifest(archive, entries_by_name)
-            dex_path = manifest.dex_path
-            if dex_path.startswith("/") or ".." in dex_path.split("/"):
-                raise ValueError("invalid_dex_path")
-
-            allowed_entries = {"manifest.json", dex_path, "CHANGELOG.md", "LICENSE.txt", "README.md"}
-            unexpected_entries = set(entries_by_name.keys()) - allowed_entries
-            if unexpected_entries:
-                raise ValueError("unexpected_zip_entry")
-
-            dex_info = entries_by_name.get(dex_path)
-            if dex_info is None:
-                raise ValueError("missing_dex")
-
-            if dex_info.file_size < MIN_DEX_BYTES or dex_info.file_size > MAX_CORE_BYTES:
-                raise ValueError("invalid_dex_size")
-            dex_bytes = archive.read(dex_info)
-
-        return CorePackage(manifest, dex_bytes, source_path=path)
-
-
-def core_path_targets_plugin(path, spec=None, display_name=None):
-    if not path and not display_name:
-        return False
-    path_targets = is_core_path(path)
-    name_targets = is_core_path(display_name)
-    if not path_targets and not name_targets:
-        return False
-
-    if path and os.path.exists(path):
-        try:
-            manifest = CorePackage.peek_manifest(path)
-            manifest_plugin_id = str(manifest.data.get("plugin_id") or "")
-            if manifest_plugin_id:
-                return manifest_plugin_id == getattr(spec, "plugin_id", __id__)
-        except Exception:
-            pass
-
-    return core_file_name_targets_plugin(path, spec) or core_file_name_targets_plugin(display_name, spec)
-
-
-def core_path_foreign_plugin_id(path, spec=None):
-    if not path or not os.path.exists(path):
-        return ""
-    try:
-        manifest = CorePackage.peek_manifest(path)
-        manifest_plugin_id = str(manifest.data.get("plugin_id") or "")
-        if manifest_plugin_id and manifest_plugin_id != getattr(spec, "plugin_id", __id__):
-            return manifest_plugin_id
-    except Exception:
-        pass
-    return ""
-
-
-def get_private_field_silent(obj, field_name, default=None):
-    if obj is None:
-        return default
-    try:
-        cls = obj.getClass()
-    except Exception:
-        cls = None
-    while cls is not None:
-        try:
-            field = cls.getDeclaredField(field_name)
-            field.setAccessible(True)
-            return field.get(obj)
-        except Exception:
-            try:
-                cls = cls.getSuperclass()
-            except Exception:
-                cls = None
-    return default
-
-
-class CoreStore:
-    def __init__(self, plugin_id):
-        self.plugin_id = plugin_id
-        self.root_dir = self._resolve_root_dir()
-        self.legacy_root_dir = self._resolve_legacy_root_dir()
-        os.makedirs(self.root_dir, exist_ok=True)
-
-        self.active_dex_path = os.path.join(self.root_dir, "active.dex")
-        self.active_manifest_path = os.path.join(self.root_dir, "active.manifest.json")
-        self.active_sha_path = os.path.join(self.root_dir, "active.sha256")
-        self.previous_dex_path = os.path.join(self.root_dir, "previous.dex")
-        self.previous_manifest_path = os.path.join(self.root_dir, "previous.manifest.json")
-        self.previous_sha_path = os.path.join(self.root_dir, "previous.sha256")
-        self.marker_path = os.path.join(self.root_dir, CORE_STORE_MARKER)
-
-        self._migrate_legacy_store()
-        self.ensure_marker()
-
-    @staticmethod
-    def resolve_cache_root():
-        try:
-            ctx = ApplicationLoader.applicationContext
-            base = None
-            try:
-                if ctx is not None:
-                    base = ctx.getFilesDir()
-            except Exception:
-                base = None
-            if base is None and ctx is not None:
-                try:
-                    base = ctx.getExternalFilesDir(None)
-                except Exception:
-                    base = None
-            if base is not None:
-                return os.path.join(str(base.getAbsolutePath()), "plugins_dex_cache")
-        except Exception:
-            pass
-        return os.path.join(os.environ.get("HOME", os.getcwd()), "plugins_dex_cache")
-
-    @staticmethod
-    def resolve_legacy_external_cache_root():
-        try:
-            ctx = ApplicationLoader.applicationContext
-            if ctx is not None:
-                base = ctx.getExternalFilesDir(None)
-                if base is not None:
-                    return os.path.join(str(base.getAbsolutePath()), "plugins_dex_cache")
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def cache_roots():
-        roots = []
-        seen = set()
-        for root in (CoreStore.resolve_cache_root(), CoreStore.resolve_legacy_external_cache_root()):
-            if not root:
-                continue
-            normalized = os.path.abspath(root)
-            if normalized not in seen:
-                roots.append(root)
-                seen.add(normalized)
-        return roots
-
-    def _resolve_root_dir(self):
-        return os.path.join(self.resolve_cache_root(), self.plugin_id)
-
-    def _resolve_legacy_root_dir(self):
-        root = self.resolve_legacy_external_cache_root()
-        if not root:
-            return None
-        path = os.path.join(root, self.plugin_id)
-        return None if os.path.abspath(path) == os.path.abspath(self.root_dir) else path
-
-    def _migrate_legacy_store(self):
-        if not self.legacy_root_dir or not os.path.isdir(self.legacy_root_dir):
+    def load(self):
+        if self.clazz is not None:
             return
+        ctx = ApplicationLoader.applicationContext
+        if ctx is None:
+            raise RuntimeError("application context is not ready")
+        ByteBuffer = jclass("java.nio.ByteBuffer")
+        InMemoryDexClassLoader = jclass("dalvik.system.InMemoryDexClassLoader")
+        loader = InMemoryDexClassLoader(ByteBuffer.wrap(self._read_payload()), ctx.getClassLoader())
+        self.clazz = loader.loadClass(self.entry_class)
         try:
-            for name in (
-                "active.dex",
-                "active.manifest.json",
-                "active.sha256",
-                "previous.dex",
-                "previous.manifest.json",
-                "previous.sha256",
-            ):
-                src = os.path.join(self.legacy_root_dir, name)
-                dst = os.path.join(self.root_dir, name)
-                if os.path.exists(src) and not os.path.exists(dst):
-                    write_atomic(dst, read_bytes_file(src))
-            write_atomic(self.marker_path, "core-loader-store\n")
-            legacy_root = os.path.dirname(self.legacy_root_dir)
-            safe_remove_tree(self.legacy_root_dir, legacy_root)
+            self.call("load")
         except Exception:
-            pass
-
-    def ensure_marker(self):
-        try:
-            write_atomic(self.marker_path, "core-loader-store\n")
-        except Exception:
-            pass
-
-    def has_active(self):
-        return os.path.exists(self.active_dex_path) and os.path.exists(self.active_manifest_path)
-
-    def read_active(self):
-        if not self.has_active():
-            raise ValueError("core_not_installed")
-        dex_bytes = read_bytes_file(self.active_dex_path)
-        manifest = CoreManifest.from_file(self.active_manifest_path)
-        manifest.validate_dex_bytes(dex_bytes)
-        return CorePackage(manifest, dex_bytes, source_path=self.active_dex_path)
-
-    def read_active_manifest(self):
-        try:
-            if os.path.exists(self.active_manifest_path):
-                return CoreManifest.from_file(self.active_manifest_path)
-        except Exception:
-            pass
-        return None
-
-    def save_active(self, package):
-        write_atomic(self.active_dex_path, package.dex_bytes)
-        write_atomic(self.active_manifest_path, package.manifest.to_json())
-        write_atomic(self.active_sha_path, sha256_hex(package.dex_bytes) + "\n")
-
-    def backup_active(self):
-        for src, dst in (
-            (self.active_dex_path, self.previous_dex_path),
-            (self.active_manifest_path, self.previous_manifest_path),
-            (self.active_sha_path, self.previous_sha_path),
-        ):
             try:
-                if os.path.exists(src):
-                    os.replace(src, dst)
-                elif os.path.exists(dst):
-                    os.remove(dst)
+                self.call("unload")
             except Exception:
                 pass
-
-    def restore_previous(self):
-        required = (
-            (self.previous_dex_path, self.active_dex_path),
-            (self.previous_manifest_path, self.active_manifest_path),
-        )
-        if not all(os.path.exists(src) for src, _ in required):
-            return False
-
-        restored_required = 0
-        for src, dst in required:
-            try:
-                os.replace(src, dst)
-                restored_required += 1
-            except Exception:
-                pass
-
-        if restored_required != len(required):
-            self.clear_active()
-            return False
-
-        try:
-            if os.path.exists(self.previous_sha_path):
-                os.replace(self.previous_sha_path, self.active_sha_path)
-            elif os.path.exists(self.active_sha_path):
-                os.remove(self.active_sha_path)
-        except Exception:
-            pass
-        return True
-
-    def clear(self, remove_dir=False):
-        for path in (
-            self.active_dex_path,
-            self.active_manifest_path,
-            self.active_sha_path,
-            self.previous_dex_path,
-            self.previous_manifest_path,
-            self.previous_sha_path,
-            self.marker_path if remove_dir else None,
-        ):
-            try:
-                if path and os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-        if remove_dir:
-            safe_remove_tree(self.root_dir, os.path.dirname(self.root_dir))
-
-    def clear_active(self):
-        for path in (self.active_dex_path, self.active_manifest_path, self.active_sha_path):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-
-    def has_previous(self):
-        return os.path.exists(self.previous_dex_path) and os.path.exists(self.previous_manifest_path)
-
-    def installed_version_text(self):
-        try:
-            return self.read_active().manifest.version_text
-        except Exception:
-            return "not installed"
-
-
-def plugin_registry_contains(plugin_id):
-    try:
-        plugins = PluginsController.getInstance().plugins
-        if plugins is None:
-            return True
-        try:
-            if plugins.size() <= 0:
-                return True
-        except Exception:
-            pass
-        return bool(plugins.containsKey(str(plugin_id)))
-    except Exception:
-        return True
-
-
-def is_core_store_path(path):
-    try:
-        if not os.path.isdir(path):
-            return False
-        if os.path.exists(os.path.join(path, CORE_STORE_MARKER)):
-            return True
-        for name in ("active.manifest.json", "previous.manifest.json"):
-            manifest_path = os.path.join(path, name)
-            if os.path.exists(manifest_path):
-                data = read_json_file(manifest_path)
-                if isinstance(data, dict) and data.get("format") == CORE_FORMAT:
-                    return True
-    except Exception:
-        return False
-    return False
-
-
-def garbage_collect_orphaned_cores():
-    try:
-        for root in CoreStore.cache_roots():
-            if not os.path.isdir(root):
-                continue
-            for name in os.listdir(root):
-                path = os.path.join(root, name)
-                if is_core_store_path(path) and not plugin_registry_contains(name):
-                    safe_remove_tree(path, root)
-    except Exception:
-        pass
-
-
-class CoreRuntime:
-    def __init__(self, spec):
-        self.spec = spec
-        self.dex_class = None
-        self.dex_loader = None
-        self.loaded = False
-
-    def reset(self):
-        self.dex_class = None
-        self.dex_loader = None
-        self.loaded = False
-
-    def start(self, dex_bytes, manifest=None):
-        try:
-            self.unload()
-            self._load_class(dex_bytes)
-            self.verify_bridge()
-            self.verify_core_version(manifest)
-            self.method("load").invoke(None)
-            self.loaded = True
-        except Exception:
-            self.unload()
+            self.clazz = None
             raise
 
     def unload(self):
         try:
-            if self.dex_class is not None:
-                self.method("unload").invoke(None)
+            if self.clazz is not None:
+                self.call("unload")
         except Exception:
             pass
-        finally:
-            self.reset()
+        self.clazz = None
 
-    def invoke(self, method_name, *args):
-        if self.dex_class is None or not self.loaded:
-            raise RuntimeError("core_not_loaded")
-        return self.method(method_name).invoke(None, *args)
+    def call(self, method_name, *args):
+        if self.clazz is None:
+            self.load()
+        matches = []
+        for method in self.clazz.getDeclaredMethods():
+            if str(method.getName()) != method_name or len(method.getParameterTypes()) != len(args):
+                continue
+            method.setAccessible(True)
+            matches.append(method)
+        if len(matches) > 1:
+            raise RuntimeError(f"ambiguous core method: {method_name}/{len(args)}")
+        if matches:
+            return matches[0].invoke(None, *args)
+        raise RuntimeError(f"core method not found: {method_name}/{len(args)}")
 
-    def method(self, name):
-        param_types = self.spec.bridge_signatures.get(name, ())
-        method = self.dex_class.getDeclaredMethod(name, *param_types)
-        method.setAccessible(True)
-        return method
-
-    def verify_bridge(self):
-        for name in self.spec.required_bridge:
-            self.method(name)
-
-    def verify_core_version(self, manifest):
-        if manifest is None or manifest.version_code <= 0:
-            return
-        version_value = self.method("getVersion").invoke(None)
-        loaded_version = java_int(version_value, default=-1)
-        if loaded_version != int(manifest.version_code):
-            raise ValueError("core_version_mismatch")
-
-    def _load_class(self, dex_bytes):
-        ctx = ApplicationLoader.applicationContext
-        if ctx is None:
-            raise RuntimeError("no_context")
-
-        in_memory_error = None
+    def _read_payload(self):
         try:
-            InMemoryDexClassLoader = jclass("dalvik.system.InMemoryDexClassLoader")
-            self.dex_loader = InMemoryDexClassLoader(ByteBuffer.wrap(dex_bytes), ctx.getClassLoader())
-            self.dex_class = self.dex_loader.loadClass(self.spec.entry_class)
-            return
+            text = open(__file__, "r", encoding="utf-8").read()
+            block = text.split(f"# {DEX_BEGIN}", 1)[1].split(f"# {DEX_END}", 1)[0]
+            payload = "".join(line.strip()[1:].strip() for line in block.splitlines() if line.strip().startswith("#"))
         except Exception as exc:
-            in_memory_error = exc
+            raise RuntimeError(f"embedded dex read failed: {exc}")
+
+        if not payload:
+            raise RuntimeError("embedded dex payload not found")
 
         try:
-            DexClassLoader = jclass("dalvik.system.DexClassLoader")
-            _, out_dir = self._fallback_dex_paths()
-            os.makedirs(out_dir, exist_ok=True)
-            dex_file = os.path.join(out_dir, "active.dex")
-            with open(dex_file, "wb") as handle:
-                handle.write(dex_bytes)
-            self.dex_loader = DexClassLoader(dex_file, out_dir, None, ctx.getClassLoader())
-            self.dex_class = self.dex_loader.loadClass(self.spec.entry_class)
+            dex_bytes = zlib.decompress(base64.b64decode(payload))
         except Exception as exc:
-            raise RuntimeError(f"dex_load_failed: in_memory={in_memory_error}; fallback={exc}")
+            raise RuntimeError(f"embedded dex decode failed: {exc}")
 
-    def _fallback_dex_paths(self):
-        ctx = ApplicationLoader.applicationContext
-        if ctx is None:
-            raise RuntimeError("no_context")
-        code_cache = ctx.getCodeCacheDir() or ctx.getFilesDir()
-        root = str(code_cache.getAbsolutePath())
-        return root, os.path.join(root, f"{self.spec.plugin_id}{FALLBACK_DEX_DIR_SUFFIX}")
-
-    def clear_fallback_cache(self):
-        try:
-            root, out_dir = self._fallback_dex_paths()
-            safe_remove_tree(out_dir, root)
-        except Exception:
-            pass
-
-
-class TelegramCoreInstaller:
-    def __init__(self, loader):
-        self.loader = loader
-
-    def install_from_message(self, message_object):
-        if not is_core_message(message_object):
-            self.loader.error("This is not a .core file")
-            return
-
-        if not self.loader.begin_operation("install"):
-            return
-
-        path = resolve_message_file_path(message_object)
-        if path:
-            self.loader.install_file_async(path, operation_started=True)
-            return
-
-        if not request_message_download(message_object):
-            self.loader.info("Download the .core file first, then tap the file again")
-            self.loader.finish_operation("install")
-            return
-
-        self.loader.info("Downloading core...")
-        self._wait_for_download(message_object)
-
-    def _wait_for_download(self, message_object, attempts_left=120):
-        if not self.loader.active:
-            self.loader.finish_operation("install")
-            return
-        path = resolve_message_file_path(message_object)
-        if path:
-            self.loader.install_file_async(path, operation_started=True)
-            return
-        if attempts_left > 0:
-            run_on_ui_thread(lambda: self._wait_for_download(message_object, attempts_left - 1), 500)
-            return
-        self.loader.error("Core download timed out")
-        self.loader.finish_operation("install")
-
-
-class CoreLoader:
-    def __init__(self, spec):
-        self.spec = spec
-        self.store = CoreStore(spec.plugin_id)
-        self.runtime = CoreRuntime(spec)
-        self.telegram = TelegramCoreInstaller(self)
-        self.lock = threading.RLock()
-        self.operation_lock = threading.RLock()
-        self.operation = None
-        self.active = True
-
-    def dispose(self):
-        self.active = False
-
-    def ui(self, fn):
-        if self.active:
-            run_on_ui_thread(fn)
-
-    def info(self, message):
-        self.ui(lambda: BulletinHelper.show_info(message))
-
-    def error(self, message):
-        self.ui(lambda: BulletinHelper.show_error(message))
-
-    def success(self, message):
-        self.ui(lambda: BulletinHelper.show_success(message))
-
-    def installed_version_text(self):
-        return self.store.installed_version_text()
-
-    def claims_core_message(self, message_object):
-        if not is_core_message(message_object):
-            return False
-        path = resolve_message_file_path(message_object)
-        if path:
-            return core_path_targets_plugin(path, self.spec, message_document_name(message_object))
-        return core_file_name_targets_plugin(message_document_name(message_object), self.spec)
-
-    def claims_core_path(self, path, display_name=None):
-        return core_path_targets_plugin(path, self.spec, display_name)
-
-    def begin_operation(self, name):
-        with self.operation_lock:
-            if not self.active:
-                return False
-            if self.operation is not None:
-                self.info(f"Core operation already running: {self.operation}")
-                return False
-            self.operation = name
-            return True
-
-    def finish_operation(self, name):
-        with self.operation_lock:
-            if self.operation == name:
-                self.operation = None
-
-    def load_installed(self, show_error=False):
-        with self.lock:
-            try:
-                package = self.store.read_active()
-                package.manifest.validate_for_install(self.spec, package.dex_bytes)
-                self.runtime.start(package.dex_bytes, package.manifest)
-                return True
-            except Exception as exc:
-                self.runtime.unload()
-                if self.store.has_previous() and self.store.restore_previous():
-                    try:
-                        package = self.store.read_active()
-                        package.manifest.validate_for_install(self.spec, package.dex_bytes)
-                        self.runtime.start(package.dex_bytes, package.manifest)
-                        if show_error:
-                            self.info("Restored previous core")
-                        return True
-                    except Exception:
-                        self.runtime.unload()
-                if show_error:
-                    self.error(describe_error("Core load failed", exc))
-                return False
-
-    def install_file_async(self, path, operation_started=False):
-        if not operation_started and not self.begin_operation("install"):
-            return
-
-        def worker():
-            try:
-                if not self.active:
-                    return
-                package = CorePackage.read(path)
-                if not self.active:
-                    return
-                self.install_package(package)
-            except Exception as exc:
-                self.error(describe_error("Core install failed", exc))
-            finally:
-                self.finish_operation("install")
-
-        run_on_queue(worker)
-
-    def install_message(self, message_object):
-        self.telegram.install_from_message(message_object)
-
-    def install_package(self, package):
-        with self.lock:
-            if not self.active:
-                raise RuntimeError("loader_disposed")
-            package.manifest.validate_for_install(self.spec, package.dex_bytes)
-            should_reload_previous = self.runtime.loaded
-
-            try:
-                self.runtime.unload()
-                self.store.backup_active()
-                self.store.save_active(package)
-                self.runtime.start(package.dex_bytes, package.manifest)
-            except Exception:
-                self.runtime.unload()
-                restored = self.store.restore_previous()
-                if not restored:
-                    self.store.clear_active()
-                if restored and should_reload_previous:
-                    self.load_installed(show_error=False)
-                raise
-
-        self.success(f"Core installed {package.manifest.version_text}")
-        refresh_plugin_settings(self.spec.plugin_id)
-
-    def unload(self):
-        with self.lock:
-            self.runtime.unload()
-
-    def invoke(self, method_name, *args):
-        with self.lock:
-            if not self.runtime.loaded and not self.load_installed(show_error=True):
-                return None
-            return self.runtime.invoke(method_name, *args)
-
-    def delete_installed_core(self):
-        with self.lock:
-            self.active = False
-            self.runtime.unload()
-            self.runtime.clear_fallback_cache()
-            self.store.clear(remove_dir=True)
+        return dex_bytes
 
 
 class BotLoginPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        self.loader = None
-
-    def _hook_optional(self, key, java_class, method_name, hook, *args):
-        try:
-            self.hook_method(declared_method(java_class, method_name, *args), hook)
-            return True
-        except Exception:
-            return False
+        self.dex = None
 
     def on_plugin_load(self):
-        garbage_collect_orphaned_cores()
-        self.loader = CoreLoader(
-            spec=CoreSpec(
-                plugin_id=__id__,
-                entry_class=ENTRY_CLASS,
-                plugin_version=__version__,
-                bridge_signatures={
-                    "load": (),
-                    "unload": (),
-                    "getVersion": (),
-                    "openBotLogin": (Object,),
-                },
-            ),
-        )
-        self.loader.load_installed(show_error=False)
-
-        self._hook_optional(
-            "open_document",
-            AndroidUtilities,
-            "openDocument",
-            self.OpenDocumentHook(self),
-            MessageObject,
-            Activity,
-            BaseFragment,
-        )
-        self._hook_optional(
-            "open_view_message",
-            AndroidUtilities,
-            "openForView",
-            self.OpenForViewHook(self),
-            MessageObject,
-            Activity,
-            ResourcesProvider,
-            Boolean.TYPE,
-        )
-        self._hook_optional(
-            "open_view_file",
-            AndroidUtilities,
-            "openForView",
-            self.OpenFileForViewHook(self),
-            JavaFile,
-            String,
-            String,
-            Activity,
-            ResourcesProvider,
-            Boolean.TYPE,
-        )
-        self._hook_optional(
-            "file_icon",
-            ChatMessageCell,
-            "getFileIcon",
-            self.FileIconHook(),
-        )
-        self._hook_optional(
-            "delete_cleanup",
-            PythonPluginsEngine,
-            "deletePlugin",
-            self.DeletePluginHook(self),
-            String,
-            UtilitiesCallback,
-        )
-        refresh_visible_chat_rows()
+        self.dex = Dex(ENTRY_CLASS)
+        self._load_core(show_error=True)
 
     def on_plugin_unload(self):
-        if self.loader:
-            self.loader.unload()
-            self.loader.dispose()
-            self.loader = None
-
-    def install_core_from_file(self, file_path):
-        if not self.loader:
-            show_error_ui("Loader is not ready")
-            return
-        self.loader.install_file_async(str(file_path))
+        if self.dex:
+            self.dex.unload()
+            self.dex = None
 
     def open_bot_login(self, view=None):
-        if not self.loader:
-            show_error_ui("Loader is not ready")
+        if not self._load_core(show_error=True):
             return
         fragment = get_last_fragment()
         if fragment is None:
             show_error_ui("No active screen to open Bot Login")
             return
-        self.loader.invoke("openBotLogin", fragment)
+        try:
+            self.dex.call("openBotLogin", fragment)
+        except Exception as exc:
+            self.log(f"openBotLogin failed: {exc}")
+            show_error_ui(f"Bot Login failed: {exc}")
 
     def create_settings(self):
-        version = self.loader.installed_version_text() if self.loader else "not installed"
-        return [
+        items = [
             Header(text="Bot Login"),
             Text(text="Log in as bot", icon="menu_bots_add", accent=True, on_click=self.open_bot_login),
-            Text(text=f"Installed core: {version}", icon="msg_info"),
         ]
+        return items
 
-    def _show_foreign_core_error(self, path):
-        foreign_plugin_id = core_path_foreign_plugin_id(path, self.loader.spec if self.loader else None)
-        if not foreign_plugin_id:
-            return False
-        if plugin_registry_contains(foreign_plugin_id):
-            return False
-        show_error_ui(f"Core belongs to another plugin: {foreign_plugin_id}")
-        return True
-
-    def _install_core_message(self, message_object):
-        if not is_core_message(message_object):
-            return False
-        path = resolve_message_file_path(message_object)
-        if self.loader and not self.loader.claims_core_message(message_object):
-            if self._show_foreign_core_error(path):
-                return True
-            return False
-        if not self.loader and not core_file_name_targets_plugin(message_document_name(message_object)):
-            return False
-        if not self.loader:
-            show_error_ui("Loader is not ready")
+    def _load_core(self, show_error=False):
+        if self.dex is None:
+            self.dex = Dex(ENTRY_CLASS)
+        try:
+            self.dex.load()
             return True
-        self.loader.install_message(message_object)
-        return True
-
-    def _install_core_file_path(self, path, display_name=None):
-        if not path or not (is_core_path(path) or is_core_path(display_name)):
+        except Exception as exc:
+            self.log(f"Embedded DEX load failed: {exc}")
+            if show_error:
+                show_error_ui(f"Bot Login core load failed: {exc}")
             return False
-        if self.loader and not self.loader.claims_core_path(path, display_name):
-            if self._show_foreign_core_error(path):
-                return True
-            return False
-        if not self.loader and not core_path_targets_plugin(path, None, display_name):
-            return False
-        if not self.loader:
-            show_error_ui("Loader is not ready")
-            return True
-        self.loader.install_file_async(str(path))
-        return True
 
-    def _delete_installed_core_for_plugin(self, plugin_id):
-        if str(plugin_id or "") != __id__:
-            return
-        if self.loader:
-            self.loader.delete_installed_core()
 
-    class DeletePluginHook(MethodHook):
-        def __init__(self, plugin):
-            self.plugin = plugin
-
-        def before_hooked_method(self, param):
-            try:
-                self.plugin._delete_installed_core_for_plugin(param.args[0])
-            except Exception:
-                pass
-
-    class OpenDocumentHook(MethodHook):
-        def __init__(self, plugin):
-            self.plugin = plugin
-
-        def before_hooked_method(self, param):
-            try:
-                if self.plugin._install_core_message(param.args[0]):
-                    param.setResult(None)
-            except Exception as exc:
-                show_error_ui(describe_error("Install core failed", exc))
-                param.setResult(None)
-
-    class OpenForViewHook(MethodHook):
-        def __init__(self, plugin):
-            self.plugin = plugin
-
-        def before_hooked_method(self, param):
-            try:
-                if self.plugin._install_core_message(param.args[0]):
-                    param.setResult(Boolean(True))
-            except Exception as exc:
-                show_error_ui(describe_error("Install core failed", exc))
-                param.setResult(Boolean(True))
-
-    class OpenFileForViewHook(MethodHook):
-        def __init__(self, plugin):
-            self.plugin = plugin
-
-        def before_hooked_method(self, param):
-            try:
-                path = java_file_path(param.args[0])
-                display_name = str(param.args[1] or "")
-                if self.plugin._install_core_file_path(path, display_name):
-                    param.setResult(Boolean(True))
-            except Exception as exc:
-                show_error_ui(describe_error("Install core failed", exc))
-                param.setResult(Boolean(True))
-
-    class FileIconHook(MethodHook):
-        def after_hooked_method(self, param):
-            try:
-                message_object = get_private_field_silent(param.thisObject, "currentMessageObject")
-                if is_core_message(message_object):
-                    param.setResult(Integer(CORE_FILE_ICON))
-            except Exception:
-                pass
+# __DEX_BEGIN__
+# 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
+# __DEX_END__
