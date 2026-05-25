@@ -1,0 +1,899 @@
+# плагин для работы с автозаменой [шорткатами]
+# автор: @chizumeij
+# мой канал: @meijinolife
+# разработка начата 11 мая 2026 года
+
+# @@@@@@@@@@@@@@@@@@@@@@@@@@@#kW@=     .--::::-===+++++++++++++++++++++++++++++++++++++==e#W@@@@@@@@@
+# @@@@@@@@@@@@@@@@@@@@@@@@@#=:W@@-     ....::--====++++=+++++++++++++++++++++++++++++++++++k$%@@@@@@@
+# @@@@@@@@@@@@@@@@@@@@@@%k:  :@@@e       .....:::---======++++++++++++++++++++++++++++++++++k$k$W@@@@
+# @@@@@@@@@@@@@@@@@@@@@k#W.   #%+.   ..       ...:::-----===++++++++++=+++++++++++++++++++++=+$#k$W@@
+# @@@@@@@@@@@@@@@@@@@@k$@@-   ...-+k#k:        .....::::---========+++==++++++++++++++++++===--k#%k$W
+# @@@@@@@@@@@@@@@@@@%= e@@#   .-k%WW%+-             .....:::---=======+==++++++++++++++++===-::-k@@%k
+# @@@@@@@@@@@@@@@@@e   .#%e.:e$%WWW%e$.                 ....:::-----====-==++==+++=+=+=+==--::.+%@@@@
+# @@@@@@@@@@@@@@@%e      :-k%WWWWWW$k@+                    ....:::::::--:---==-=======-----::..-#@@@@
+# @@@@@@@@@@@@@@%k:     -k%WWWWWWW#e%@%                         .  ..:::::::-:::------:::::..=#W%k$kk
+# @@@@@@@@@@@@@#%k  . :k%WWWWWWWW%#e@@@= .                           .......:.:.::::::....-$kkk-  .
+# @@@@@@@@@@@@$#W- - =%WWWWWWWWWW#$e@@@$==--            .                    ........:-+kk-=:
+# @@@@@@@@@@@#kW%e=.+WWWWWWWWWWW#%+$@@@$W$$= ... ...  . ..                         :---:.
+# @@@@@@@@@@W=#%%k:+WWWWWWWWWWW%#%:$k+=e@@W=.::. .-:..   ...            :
+# @@@@@@@@@@e-==e=-WWWWWWWWWWWW#%#.e::.-@@@=.::..:%e.........           -
+# @@@@@@@@@W.   =:%WWWWWWWWWWWW$Wk.-::::#@W-::---+@%+.::........        :=
+# @@@@@@@@@$    .kWWWWWWWWWWWW##W+:::--:-$#::::=-+@@#+-::...... ..:.    .e.
+# @@@@@@@@@$:.  :WWWWWWWWWWWWW#WW=-:---:-++---:e=+@@W#k-:.::::....e-    :#-
+# @@@@@@@@@#-   eWWWWWWWWWWWW%#W%-=:===:=-=--=-$+=W%$##k-::::...:.+e.   =W+
+# @@@@@@@@@$:   #WWWWWWWWWWWW#%W%-=:===:====-==#e+$e-=kk+:::... ..-+:   +@k.
+# @@@@@@@@@kk  .%WWWWW%#keeekk%W#-=:===-=====-e$k+e+-:-++-:::..  ..::   e@k-
+# @@@@@@@@@kW. :WWWWWWWWWW%%#k%W#--=-++:=+===-k$%ek-=::---:-:::  ....   k@$=.
+# @@@@@@@@@k@+ :WWWWWWWWWWWW%#WW$--k-++-=++===$##=e---:-------:.  ...   $W$+:
+# @@@@@@@@@kWW..%WWWWWWWWWWW%#WW#--#+-+-=+++=e$%%$+k-=-------::-:  .   .#$e=:
+# @@@@@@@@@#k%= k$$$#%WWWWWW%#WW#--%$-==-+++=$$%WWe%+--e-----:--+      :$=-::
+# @@@@@@@@@@k$#+.=+==--+k#W%#$%%%=-%#k-=-++==$#WWW#k%=-+k-=----:$.     -e.  :
+# @@@@@@@@@@@%%$.+@@W=...:=k$e$#%e-%###+:=+=e$%WWWWk%#-:$k----:-$+     =-  ..
+# @@@@@@@@@@@@@$=-%@@$%#-  .+k$$%#=%%$W%+=+=$$##%WW%$W#-+#$=---:$$.    +.  ..
+# @@@@@@@@@@@@@%kW#%W==%$-.::=#WWW#%%#WWW+==$kkk$%%W#%W%k$$#+:-:k#+   .=   :
+# @@@@@@@@@@@@@#kWW%%#e$#$$$e=e%WWWWW%WWW%ekk+==--=+ee$%%%$#Wk::$$$.  ..   :    ..  .:--
+# @@@@@@@@@@@@@$kWWWWWWWW%#$kk%WWWWWWWWWWWW%$k$#$$e:. .--=+k%W$:k##e       :    =e=e$$#$+
+# @@@@@@@@@@@@@e$%%%%%%%WWWW%%%WWWWWWWWWWWWW@@@@@@W%#e:.=:..:-eek#$%:     ..    e$$$$e+++.
+# @@@@@@@@@@@@@+$%%%###%%WWWW%##%%WWWWWWWWWWW@WWWW#-+kekk-.=+=---e$W$     :.   .$ke$kk$$$:
+# @@@@@@@@@@@@@ek%%#####%%WW$k###%WWWWWWWWWWWW#$$$$kk$$##$kkkk$e::=#$     :    :k+kkkkkkk=
+# @@@@@@@@@@@@@$eW%%###%%WWW%%WWWWWWWWWWWWWWWW%%%WWWW%%%###$$$$e$%#%+     :    +ee$$$ek#$k
+# @@@@@@@@@@@@@W=WWWWWWWWWWWWWWWWWWWWWWW%W%%%%###%##%%%WW%%%W%%%WWWW-    ..    e+k#$$$$k$#-
+# @@@@@@@@@@@@@@$eWWWWWWWWWWWWWWWWWWWWWW%%%%###%#%%%%%###%%%%WWWWWW%.    :    .ek$$$kkkk#k.
+# @@@@@@@@@@@@@@@ekWWWWWWWWWWWWWWWWWWWWWWWWWWW%WW%%%###%%%%%%%%WWWW$     :    -kekkkk$$$e.
+# @@@@@@@@@@@@@@@W+eWWWWWWWWW%%%%WWWWWWWWWWWWWWWWWWWWWWW%%%%WWWWWWW+     .    +$$$$$#$+:
+# @@@@@@@@@@@@@@@%e :$WWWWWWW$.+W%####%%WWWWWWWWWWWWWWWWWWWWWWWWWW%.    ..   .$#$$$$e:
+# @@@@@@@@@@@@@@@%e   =#WWWWWWk+%@@@@WW%####%WW%%W%%#k%WWWWWWWWWWWk     .    :=:::.
+# @@@@@@@@@@@@@@@#+    .+%WWWWW#$#@@@@@@@@@W%%W%$kke+#WWWWWWWWWWWW:     .    +:
+# @@@@@@@@@@@@@@W#=    . :$WWWWW%##%W@@@@@W%%$%$+=+$WWWWWWWWWWWW@$     ..   .$e-k$$e.          ......
+# @@@@@@@@@@@@@@W#:    +-  =#WWWWWW%###%WW@@W%$$#%WWWWWWWWWWWWW#k:     ..   -##+..=$+         .::::::
+# @@@@@@@@@@@@@@%#     k%.  .e%WWWWWWW%%%#WW%%WWWWWWWWWWWWW#k=:.:  .........+#$$e. +%+ :====:. :---::
+# @@@@@@@@@@@@@@#k     $@#.   :$WWWWWWWWWWWWWWWWWWWW%#$k+-.  .-e- .::.::::..k$$$#ke#%%k+$%%%%#=.==---
+# @@@@@@@@@@@@@W#+     %@@%-    +$%WWWWWWW%%##$k+=-:.      :+k$k  .::::::-:=$$$$ek%%%%%#==$%%%%e-====
+# @@@@@@@@@@@@@%%-    .W@@@@#::$W#kk$$$$kek$#%#$e:     ..-ek$$#=  :------=:e#$ke$%%%%%%%%==e%%%We-+++
+# @@@@@@@@@@@@@#%     :@@@@@#$@@@@@@@@@%#W@@@#%@@#=.-.:+k$$$$$k..::------=-$kek%%%%%%%%%%+k=$WWWWk=++
+# @@@@@@@@@@@@W%$     =@@@@$$@@@@@@@@@##@@@W$W@##%%e+k$$$$$$$#= =---------=e+#%%%%%%%%%%$+WkkWWW@@%kk
+
+# реализация .hct  частично взята из Text Animation >> @mihailkotovski & @mishabotov
+
+import re
+import json
+import time
+import os
+import socket
+import struct
+import urllib.request
+import threading
+from typing import Any, List, Dict, Optional, Callable
+from datetime import datetime
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, Divider, Text, Input, Switch, Selector
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from android_utils import log, run_on_ui_thread
+from java import dynamic_proxy, jclass, jarray, jint, jlong
+from android.widget import LinearLayout, CheckBox, TextView
+from android.content.res import ColorStateList
+from android.content import Intent, IntentFilter
+from android.os import SystemClock
+from org.telegram.ui.Components import LayoutHelper, EditTextBoldCursor
+from org.telegram.messenger import UserConfig, MessagesController, FileLoader, AndroidUtilities, ApplicationLoader, SharedConfig
+from org.telegram.ui.ActionBar import Theme
+
+from client_utils import get_last_fragment, get_messages_controller, get_user_config
+
+__id__ = "EasyShortcuts"
+__name__ = "Easy Shortcuts"
+__description__ = "Ultimate text automation with triggers, collections."
+__author__ = "@meiji_dev • @meijinolife"
+__icon__ = "MeijiPlugins/2"
+__min_version__ = "11.12.0"
+__version__ = "1.3.9"
+
+class Locales:
+    en = {
+        "my_shortcuts": "My Shortcuts",
+        "no_shortcuts": "No shortcuts. Click '+' to add.",
+        "add_shortcut": "+ Add Shortcut",
+        "new_shortcut_title": "New Shortcut",
+        "pattern_hint": "Pattern",
+        "replacement_hint": "Replacement",
+        "regex_filter": "Regex Filter",
+        "save": "Save",
+        "cancel": "Cancel",
+        "pattern_help_title": "Pattern",
+        "replacement_help_title": "Replacement",
+        "error_empty_pattern": "Pattern cannot be empty",
+        "shortcut_added": "Shortcut '{p}' added",
+        "shortcut_deleted": "Shortcut deleted",
+        "edit_shortcut": "Edit Shortcut",
+        "delete_shortcut": "Delete Shortcut",
+        "general_settings": "General",
+        "language": "Language",
+        "collections": "Collections",
+        "add_collection": "+ Add Collection",
+        "new_collection_title": "New Collection",
+        "coll_name_hint": "Collection Name",
+        "import_hct": "Import (.hct)",
+        "export_all": "Export All (.hct)",
+        "readable_format": "Readable Format",
+        "duplicate_warn": "Conflict: pattern used in {loc}",
+        "import_mode": "Import Mode",
+        "merge": "Add to current",
+        "overwrite": "Overwrite",
+        "export_coll": "Export Collection",
+        "delete_coll": "Delete Collection",
+        "rename_coll": "Rename",
+        "coll_deleted": "Collection deleted",
+        "enabled": "Enabled",
+        "trigger_on": "ON Trigger",
+        "trigger_off": "OFF Trigger",
+        "active_trigger": "Collection '{name}' ENABLED",
+        "inactive_trigger": "Collection '{name}' DISABLED",
+        "loading_hct": "Loading .hct...",
+        "load_success": "Imported successfully",
+        "load_error": "Failed to load: {e}",
+        "reply_to_load": "Reply to .hct file to load",
+        "report_title": "═══ Report ═══",
+        "report_new": "[new] installed: {}",
+        "report_dub": "[dub] duplicates: {}",
+        "report_err": "[err] errors: {}",
+        "help": "Help",
+        "help_title": "How to use Message Shortcuts",
+        "help_text": (
+            "This plugin automates text replacement when sending messages.\n\n"
+            "📌 Core Concepts:\n"
+            "• Pattern — the trigger text you type (e.g. ':m').\n"
+            "• Replacement — the text that replaces the pattern.\n\n"
+            "⚙️ Regex Filter:\n"
+            "If enabled, the pattern is treated as a Regular Expression. "
+            "This also enables global replacement (all matches in the text are replaced, not just isolated words).\n\n"
+            "📂 Collections:\n"
+            "Group shortcuts into collections. You can assign 'ON Trigger' and 'OFF Trigger' to each collection. "
+            "Sending a message that exactly matches a trigger will toggle the collection on or off.\n\n"
+            "📥 Import & Export:\n"
+            "You can export your shortcuts to .hct files. "
+            "To import, simply reply to an .hct file with the command .loadhtc"
+        ),
+        "variables_title": "✨ Variables",
+        "variables_text": (
+            "👤 YOU (Sender):\n"
+            "• {me} — Your first name\n"
+            "• {id} — Your Telegram ID\n\n"
+            "💬 CHAT CONTEXT:\n"
+            "• {cid} / {peer} — Current chat ID\n"
+            "• {ct} / {chat} — Chat title / User name\n"
+            "• {cu} — Chat @username (if any)\n"
+            "• {cm} — Group members count\n"
+            "• {clink} — Direct t.me link (or tg:// fallback)\n\n"
+            "↩️ REPLY CONTEXT (If replying):\n"
+            "• {rid} — Author's ID\n"
+            "• {rn} — Author's name\n"
+            "• {ru} — Author's @username\n"
+            "• {rt} — Text of the message being replied to\n"
+            "• {rmid} — Message ID of the reply target\n"
+            "• {rlink} — Deep link to the replied message\n\n"
+            "📱 SYSTEM & TIME:\n"
+            "• {bat} — Battery level (%)\n"
+            "• {uptime} — System uptime (HHh MMm)\n"
+            "• {ping} — Telegram DC latency (ms)\n"
+            "• {ts} — Unix Timestamp\n"
+            "• {time} / {date} — Current HH:MM / DD.MM.YYYY\n"
+            "• {h}, {m}, {s} — Hour, Minute, Second\n"
+            "• {D}, {M}, {Y} — Day, Month, Year\n"
+            "• {day} / {month} — Current Day / Month name"
+        ),
+        "btn_variables": "Variables",
+        "btn_back": "Back"
+    }
+    ru = {
+        "my_shortcuts": "Мои шорткаты",
+        "no_shortcuts": "Нет шорткатов. Нажмите '+', чтобы добавить.",
+        "add_shortcut": "Добавить шорткат",
+        "new_shortcut_title": "Новый шорткат",
+        "pattern_hint": "Паттерн",
+        "replacement_hint": "Замена",
+        "regex_filter": "Regex фильтр",
+        "save": "Сохранить",
+        "cancel": "Отмена",
+        "pattern_help_title": "Паттерн",
+        "replacement_help_title": "Замена",
+        "error_empty_pattern": "Паттерн не может быть пустым",
+        "shortcut_added": "Шорткат '{p}' добавлен",
+        "shortcut_deleted": "Шорткат удален",
+        "edit_shortcut": "Редактировать",
+        "delete_shortcut": "Удалить шорткат",
+        "general_settings": "Общие",
+        "language": "Язык",
+        "collections": "Коллекции",
+        "add_collection": "+ Добавить коллекцию",
+        "new_collection_title": "Новая коллекция",
+        "coll_name_hint": "Название коллекции",
+        "import_hct": "Импорт (.hct)",
+        "export_all": "Экспорт всего (.hct)",
+        "readable_format": "Читаемый формат",
+        "duplicate_warn": "Конфликт: паттерн занят в {loc}",
+        "import_mode": "Режим импорта",
+        "merge": "Добавить к текущим",
+        "overwrite": "Перезаписать всё",
+        "export_coll": "Экспорт коллекции",
+        "delete_coll": "Удалить коллекцию",
+        "rename_coll": "Переименовать",
+        "coll_deleted": "Коллекция удалена",
+        "enabled": "Включена",
+        "trigger_on": "Триггер ВКЛ",
+        "trigger_off": "Триггер ВЫКЛ",
+        "active_trigger": "Коллекция '{name}' ВКЛЮЧЕНА",
+        "inactive_trigger": "Коллекция '{name}' ВЫКЛЮЧЕНА",
+        "loading_hct": "Загрузка .hct...",
+        "load_success": "Импорт успешно завершен",
+        "load_error": "Ошибка загрузки: {e}",
+        "reply_to_load": "Ответьте на .hct файл для загрузки",
+        "report_title": "═══ Report ═══",
+        "report_new": "[new] установлено {}",
+        "report_dub": "[dub] дубликатов {}",
+        "report_err": "[err] ошибок {}",
+        "help": "Помощь",
+        "help_title": "Как использовать Message Shortcuts",
+        "help_text": (
+            "Этот плагин автоматизирует замену текста при отправке сообщений.\n\n"
+            "📌 Основные понятия:\n"
+            "• Паттерн — текст-триггер, который вы печатаете (напр. ':м').\n"
+            "• Замена — текст, на который будет заменен паттерн.\n\n"
+            "⚙️ Regex фильтр:\n"
+            "Если включен, паттерн обрабатывается как регулярное выражение. "
+            "Это также включает глобальную замену (заменятся все совпадения в тексте, а не только отдельные слова).\n\n"
+            "📂 Коллекции:\n"
+            "Группируйте шорткаты в коллекции. Каждой можно задать 'Триггер ВКЛ' и 'Триггер ВЫКЛ'. "
+            "Отправка сообщения, точно совпадающего с триггером, включит или выключит коллекцию.\n\n"
+            "📥 Импорт и Экспорт:\n"
+            "Вы можете экспортировать шорткаты в .hct файлы. "
+            "Для импорта просто ответьте на .hct файл командой .loadhtc"
+        ),
+        "variables_title": "✨ Переменные",
+        "variables_text": (
+            "👤 ВЫ (Отправитель):\n"
+            "• {me} — Ваше имя\n"
+            "• {id} — Ваш Telegram ID\n\n"
+            "💬 КОНТЕКСТ ЧАТА:\n"
+            "• {cid} / {peer} — ID текущего чата\n"
+            "• {ct} / {chat} — Название чата или имя собеседника\n"
+            "• {cu} — Юзернейм чата (если есть)\n"
+            "• {cm} — Количество участников группы\n"
+            "• {clink} — Прямая ссылка (t.me или tg://)\n\n"
+            "↩️ КОНТЕКСТ РЕПЛАЯ (Если есть):\n"
+            "• {rid} — ID автора сообщения\n"
+            "• {rn} — Имя автора сообщения\n"
+            "• {ru} — Юзернейм автора (@)\n"
+            "• {rt} — Текст сообщения, на которое вы отвечаете\n"
+            "• {rmid} — ID сообщения реплая\n"
+            "• {rlink} — Ссылка на сообщение реплая\n\n"
+            "📱 СИСТЕМА И ВРЕМЯ:\n"
+            "• {bat} — Заряд батареи (%)\n"
+            "• {uptime} — Время работы системы (ЧЧч ММм)\n"
+            "• {ping} — Пинг до серверов Telegram (мс)\n"
+            "• {ts} — Unix Timestamp\n"
+            "• {time} / {date} — Текущие ЧЧ:ММ / ДД.ММ.ГГГГ\n"
+            "• {h}, {m}, {s} — Часы, Минуты, Секунды\n"
+            "• {D}, {M}, {Y} — День, Месяц, Год\n"
+            "• {day} / {month} — Название дня недели / месяца"
+        ),
+        "btn_variables": "Переменные",
+        "btn_back": "Назад"
+    }
+    default = en
+
+class MessageShortcuts(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._watchers = {}
+        self._skip_next_change = False
+        self.L = Locales.ru
+        self._all_shortcuts_cache = []
+        self._base_vars_cache = {}
+        self._cached_ping = "calc..."
+
+    def _get_current_locale(self):
+        lang_set = self.get_setting("language", "en")
+        if isinstance(lang_set, int):
+            lang_set = ["en", "ru"][lang_set] if 0 <= lang_set < 2 else "en"
+        return getattr(Locales, lang_set, Locales.default)
+
+    def on_plugin_load(self):
+        self.L = self._get_current_locale()
+        self._cached_ping = "calc..."
+        
+        shortcuts = self.get_setting("shortcuts", [])
+        if not any(s.get("pattern") == ":cch" for s in shortcuts):
+            shortcuts.append({"pattern": ":cch", "replacement": "@meijinolife", "is_regex": False})
+            self.set_setting("shortcuts", shortcuts, reload_settings=False)
+
+        self._refresh_shortcuts_cache()
+        self._start_ping_monitor()
+
+        SendMessagesHelper = find_class("org.telegram.messenger.SendMessagesHelper")
+        ChatActivityEnterView = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+        if SendMessagesHelper:
+            try:
+                helper_class = SendMessagesHelper.getClass()
+                SendMessageParams = find_class("org.telegram.messenger.SendMessagesHelper$SendMessageParams")
+                send_message_method = helper_class.getDeclaredMethod("sendMessage", SendMessageParams.getClass())
+                self.hook_method(send_message_method, SendHook(self))
+            except Exception as e: log(f"Error: {e}")
+        if ChatActivityEnterView:
+            try:
+                self.hook_all_constructors(ChatActivityEnterView.getClass(), ConstructorHook(self))
+                MessageObject = find_class("org.telegram.messenger.MessageObject")
+                ReplyQuote = find_class("org.telegram.ui.ChatActivity$ReplyQuote")
+                method = ChatActivityEnterView.getClass().getDeclaredMethod("setReplyingMessageObject", MessageObject, ReplyQuote, MessageObject)
+                method.setAccessible(True)
+                self.hook_method(method, ReplyHook(self))
+            except Exception as e: log(f"Error: {e}")
+
+    def _start_ping_monitor(self):
+        def monitor():
+            while True:
+                try:
+                    self._cached_ping = self._get_ping()
+                    time.sleep(5)
+                except Exception as e: 
+                    log(f"PingMonitorErr: {e}")
+                    time.sleep(5)
+        t = threading.Thread(target=monitor, name="PingMonitor", daemon=True)
+        t.start()
+
+    def on_plugin_unload(self):
+        self._watchers.clear()
+
+    def _refresh_shortcuts_cache(self):
+        shortcuts = self.get_setting("shortcuts", [])
+        colls = self.get_setting("collections", [])
+        combined = list(shortcuts)
+        for coll in colls:
+            if coll.get("enabled", True): combined.extend(coll.get("shortcuts", []))
+        
+        self._compiled_shortcuts = []
+        for s in combined:
+            p = s.get('pattern', '')
+            if not p: continue
+            is_reg = s.get('is_regex', False)
+            try:
+                reg_p = p if is_reg else r'(^|\s)' + re.escape(p) + r'(?=$|\s)'
+                self._compiled_shortcuts.append({
+                    "pattern": p,
+                    "compiled": re.compile(reg_p),
+                    "replacement": s.get('replacement', ''),
+                    "is_regex": is_reg
+                })
+            except Exception as e: log(f"CompErr: {p} -> {e}")
+
+    def _get_ping(self) -> str:
+        try:
+            dc_id = 2
+            try:
+                config = get_user_config().getClientConfig()
+                if config: dc_id = config.datacenterId
+            except Exception as e: log(f"PingErr: {e}")
+            dcs = {1: "149.154.175.50", 2: "149.154.167.51", 3: "149.154.175.100", 4: "149.154.167.91", 5: "91.108.56.115"}
+            target = dcs.get(dc_id, "149.154.167.51")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.5)
+            p = getattr(SharedConfig, "currentProxy", None)
+            ts = time.perf_counter()
+            if SharedConfig.isProxyEnabled() and p and not getattr(p, "secret", ""):
+                s.connect((p.address, p.port))
+                s.send(b"\x05\x01\x00")
+                auth_resp = s.recv(2)
+                if auth_resp and len(auth_resp) > 1 and auth_resp[1] == 0x02:
+                    u, pw = getattr(p, "username", "").encode(), getattr(p, "password", "").encode()
+                    s.send(b"\x01" + bytes([len(u)]) + u + bytes([len(pw)]) + pw)
+                    s.recv(2)
+                s.send(b"\x05\x01\x00\x01" + socket.inet_aton(target) + struct.pack(">H", 443))
+                s.recv(10)
+            else:
+                s.connect((target, 443))
+            ping_ms = int((time.perf_counter() - ts) * 1000)
+            s.close()
+            return f"{ping_ms}ms"
+        except Exception as e: return "timeout"
+
+    def _get_shortcuts(self) -> List[Dict[str, Any]]: return self.get_setting("shortcuts", [])
+    def _save_shortcuts(self, shortcuts: List[Dict[str, Any]], reload: bool = True):
+        self.set_setting("shortcuts", shortcuts, reload_settings=reload)
+        self._refresh_shortcuts_cache()
+    def _get_collections(self) -> List[Dict[str, Any]]: return self.get_setting("collections", [])
+    def _save_collections(self, colls: List[Dict[str, Any]], reload: bool = True):
+        self.set_setting("collections", colls, reload_settings=reload)
+        self._refresh_shortcuts_cache()
+
+    def _find_conflict(self, pattern: str, current_id: Optional[str] = None) -> Optional[str]:
+        s_list = self._get_shortcuts()
+        for i, s in enumerate(s_list):
+            if s.get("pattern") == pattern and current_id != f"main:{i}": return "Main List"
+        c_list = self._get_collections()
+        for ci, coll in enumerate(c_list):
+            for i, s in enumerate(coll.get("shortcuts", [])):
+                if s.get("pattern") == pattern and current_id != f"coll:{ci}:{i}": return coll.get("name", "Coll")
+        return None
+
+    def _get_base_variables(self) -> Dict[str, str]:
+        me = get_user_config().getCurrentUser()
+        me_id = str(me.id) if me else "0"
+        if not hasattr(self, "_base_vars_cache") or self._base_vars_cache.get("{id}") != me_id:
+            self._base_vars_cache = {
+                "{me}": str(me.first_name) if me else "Me",
+                "{id}": me_id
+            }
+        return dict(self._base_vars_cache)
+
+    def _get_variables(self, dialog_id: int = 0, reply_to: Any = None) -> Dict[str, str]:
+        vmap = self._get_base_variables()
+        now = datetime.now()
+        vmap.update({
+            "{time}": now.strftime("%H:%M"), "{date}": now.strftime("%d.%m.%Y"),
+            "{ts}": str(int(time.time())), "{day}": now.strftime("%A"), "{month}": now.strftime("%B"),
+            "{h}": now.strftime("%H"), "{m}": now.strftime("%M"), "{s}": now.strftime("%S"),
+            "{D}": now.strftime("%d"), "{M}": now.strftime("%m"), "{Y}": now.strftime("%Y"),
+            "{ping}": getattr(self, "_cached_ping", "calc...")
+        })
+
+        if dialog_id:
+            try:
+                mc = get_messages_controller()
+                did_long = jlong(dialog_id)
+                vmap.update({"{cid}": str(dialog_id), "{peer}": str(dialog_id), "{chatid}": str(dialog_id)})
+                if dialog_id > 0:
+                    u = mc.getUser(did_long)
+                    if u:
+                        vmap["{ct}"] = vmap["{chat}"] = str(u.first_name) or "User"
+                        vmap["{cu}"] = str(u.username) if u.username else ""
+                        vmap["{clink}"] = f"https://t.me/{u.username}" if u.username else f"tg://chat?id={dialog_id}"
+                else:
+                    peer_id = -dialog_id
+                    c = mc.getChat(jlong(peer_id))
+                    if c:
+                        vmap["{ct}"] = vmap["{chat}"] = str(c.title) or "Group"
+                        vmap["{cu}"] = str(c.username) if hasattr(c, "username") and c.username else ""
+                        if vmap["{cu}"]: vmap["{clink}"] = f"https://t.me/{vmap['{cu}']}"
+                        else: vmap["{clink}"] = f"tg://chat?id={peer_id}"
+                        
+                        count = getattr(c, "participants_count", 0)
+                        if count == 0:
+                            cf = mc.getChatFull(jlong(peer_id))
+                            if cf: count = getattr(cf, "participants_count", 0)
+                        vmap["{cm}"] = str(count)
+            except Exception as e: log(f"VarErr(Chat): {e}")
+
+        if reply_to:
+            try:
+                mo = getattr(reply_to, "messageOwner", reply_to)
+                mc = get_messages_controller()
+                rid = 0
+                if hasattr(reply_to, "getFromChatId"): rid = reply_to.getFromChatId()
+                elif hasattr(mo, "from_id"):
+                    p = mo.from_id
+                    if hasattr(p, "user_id") and p.user_id: rid = p.user_id
+                    elif hasattr(p, "chat_id") and p.chat_id: rid = -p.chat_id
+                    elif hasattr(p, "channel_id") and p.channel_id: rid = -p.channel_id
+                
+                vmap.update({"{rid}": str(rid), "{rmid}": str(getattr(mo, "id", 0))})
+                if rid != 0:
+                    rid_long = jlong(rid)
+                    if rid > 0:
+                        ru = mc.getUser(rid_long)
+                        if ru:
+                            vmap["{rn}"] = str(ru.first_name) or "User"
+                            vmap["{ru}"] = str(ru.username) if ru.username else ""
+                    else:
+                        rc = mc.getChat(jlong(-rid))
+                        if rc:
+                            vmap["{rn}"] = str(rc.title) or "Group"
+                            vmap["{ru}"] = str(rc.username) if hasattr(rc, "username") and rc.username else ""
+
+                vmap["{rt}"] = str(getattr(reply_to, "messageText", getattr(mo, "message", "")))
+                if vmap["{rmid}"] != "0" and dialog_id:
+                    vmap["{rlink}"] = f"tg://privatepost?channel={-dialog_id if dialog_id < 0 else dialog_id}&post={vmap['{rmid}']}"
+            except Exception as e: log(f"VarErr(Reply): {e}")
+
+        try:
+            filt = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            batt = ApplicationLoader.applicationContext.registerReceiver(None, filt)
+            if batt:
+                lvl, scale = batt.getIntExtra("level", -1), batt.getIntExtra("scale", -1)
+                vmap["{bat}"] = str(int((lvl/float(scale))*100)) if lvl != -1 and scale != -1 else "0"
+        except Exception as e: 
+            log(f"BattErr: {e}")
+            vmap["{bat}"] = "0"
+
+        try:
+            ms = SystemClock.elapsedRealtime()
+            vmap["{uptime}"] = f"{int(ms/(3600000))}h {int((ms%3600000)/60000)}m"
+        except Exception as e: 
+            log(f"UptimeErr: {e}")
+            vmap["{uptime}"] = "0h 0m"
+        return vmap
+
+    def _apply_variables(self, text: str, dialog_id: int = 0, reply_to: Any = None) -> str:
+        if "{" not in text: return text
+        vmap = self._get_variables(dialog_id, reply_to)
+        for k, v in vmap.items():
+            if k in text: text = text.replace(k, v)
+        return text
+
+    def _extract_context(self, source: Any) -> tuple:
+        did = 0
+        reply_to = None
+
+        def extract_did(f):
+            if hasattr(f, "getDialogId"): d = f.getDialogId()
+            else: d = 0
+            if not d:
+                args = f.getArguments()
+                if args: d = args.getLong("dialog_id", 0) or args.getLong("user_id", 0) or -args.getLong("chat_id", 0)
+            return d
+
+        if hasattr(source, "getDialogId"): did = source.getDialogId()
+        if not did and hasattr(source, "parentFragment") and source.parentFragment:
+            did = extract_did(source.parentFragment)
+        
+        if not did and hasattr(source, "dialog_id"): did = source.dialog_id
+        if not did and hasattr(source, "peer"):
+            try: did = get_messages_controller().getPeerDialogId(source.peer)
+            except Exception as e: log(f"CtxErr: {e}")
+            
+        if not did:
+            f = get_last_fragment()
+            if f: did = extract_did(f)
+
+        if hasattr(source, "getReplyingMessageObject"): reply_to = source.getReplyingMessageObject()
+        elif hasattr(source, "replyToMsg"): reply_to = source.replyToMsg
+        elif hasattr(source, "replyingMessageObject"): reply_to = source.replyingMessageObject
+        elif hasattr(source, "reply_to_msg_id") or hasattr(source, "reply_to_msg_id_long"):
+            rid = getattr(source, "reply_to_msg_id", 0) or getattr(source, "reply_to_msg_id_long", 0)
+            if rid:
+                f = get_last_fragment()
+                if f and hasattr(f, "getMessageObject"): reply_to = f.getMessageObject(jlong(rid))
+        return int(did) if did else 0, reply_to
+
+    def _handle_commands(self, text: str, params: Any, msg_obj: Any = None) -> bool:
+        if not text or not text.startswith(".loadhtc"): return False
+        def do_load(content):
+            try:
+                data = json.loads(content)
+                run_on_ui_thread(lambda: self._process_import(data))
+                return True
+            except Exception as e:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(self.L["load_error"].format(e=str(e))))
+                return False
+        parts = text.split(None, 1)
+        if len(parts) > 1:
+            url = parts[1]
+            def download():
+                try:
+                    with urllib.request.urlopen(url) as r:
+                        c = r.read().decode('utf-8'); do_load(c)
+                except Exception as e: run_on_ui_thread(lambda: BulletinHelper.show_error(str(e)))
+            threading.Thread(target=download).start(); return True
+        if msg_obj:
+            try:
+                mo = getattr(msg_obj, "messageOwner", msg_obj)
+                res_path = FileLoader.getInstance(UserConfig.selectedAccount).getPathToMessage(mo)
+                if not res_path:
+                    doc = getattr(msg_obj, "getDocument", lambda: None)() or getattr(getattr(mo, "media", None), "document", None)
+                    if doc: res_path = FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(doc, True)
+                if res_path and os.path.exists(res_path.getAbsolutePath()):
+                    with open(res_path.getAbsolutePath(), 'r', encoding='utf-8') as f: return do_load(f.read())
+            except Exception as e: log(f"LoadErr: {e}")
+        BulletinHelper.show_error(self.L["reply_to_load"]); return True
+
+    def _on_lang_change(self, idx):
+        lang = ["en", "ru"][idx]
+        self.L = getattr(Locales, lang, Locales.default)
+        self.set_setting("language", lang, reload_settings=True)
+
+    def _show_shortcut_dialog(self, title: str, on_save: Callable, ns: Optional[Dict] = None):
+        activity = get_last_fragment().getParentActivity()
+        builder = AlertDialogBuilder(activity).set_title(title)
+        txt_c, hint_c, acc_c = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText), Theme.getColor(Theme.key_windowBackgroundWhiteHintText), Theme.getColor(Theme.key_windowBackgroundWhiteBlueText)
+        layout = LinearLayout(activity); layout.setOrientation(LinearLayout.VERTICAL)
+        layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(8), AndroidUtilities.dp(24), AndroidUtilities.dp(8))
+        def add_in(h, val=""):
+            et = EditTextBoldCursor(activity); et.setHint(h); et.setTextColor(txt_c); et.setHintTextColor(hint_c); et.setText(val)
+            et.setBackground(None); et.setCursorColor(acc_c); et.setLineColors(hint_c, acc_c, acc_c)
+            layout.addView(et, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 8)); return et
+        p_in = add_in(self.L["pattern_hint"], ns["pattern"] if ns else "")
+        r_in = add_in(self.L["replacement_hint"], ns["replacement"] if ns else "")
+        cb = CheckBox(activity); cb.setText(self.L["regex_filter"]); cb.setTextColor(hint_c); cb.setChecked(ns["is_regex"] if ns else False)
+        try:
+            states = jarray(jarray(jint))([jarray(jint)([0x010100a0, 0x0101009e]), jarray(jint)([0x0101009e])])
+            cb.setButtonTintList(ColorStateList(states, jarray(jint)([acc_c, hint_c])))
+        except Exception as e: log(f"CbErr: {e}")
+        layout.addView(cb, LayoutHelper.createLinear(-1, -2, 0, 4, 0, 8)); builder.set_view(layout)
+        builder.set_positive_button(self.L["save"], lambda b, w: on_save(p_in.getText().toString().strip(), r_in.getText().toString().strip(), cb.isChecked(), b))
+        builder.set_negative_button(self.L["cancel"], lambda b, w: b.dismiss()).show()
+
+    def _add_shortcut(self, coll_idx: Optional[int] = None):
+        def on_save(p, r, is_reg, b):
+            if not p: return BulletinHelper.show_error(self.L["error_empty_pattern"])
+            ns = {"pattern": p, "replacement": r, "is_regex": is_reg}
+            if coll_idx is None:
+                slist = self._get_shortcuts(); slist.append(ns); self._save_shortcuts(slist)
+            else:
+                clist = self._get_collections(); clist[coll_idx].setdefault("shortcuts", []).append(ns); self._save_collections(clist)
+            b.dismiss()
+        run_on_ui_thread(lambda: self._show_shortcut_dialog(self.L["new_shortcut_title"], on_save))
+
+    def _add_collection(self):
+        activity = get_last_fragment().getParentActivity()
+        def show_dialog():
+            builder = AlertDialogBuilder(activity).set_title(self.L["new_collection_title"])
+            txt_c, hint_c, acc_c = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText), Theme.getColor(Theme.key_windowBackgroundWhiteHintText), Theme.getColor(Theme.key_windowBackgroundWhiteBlueText)
+            ni = EditTextBoldCursor(activity); ni.setHint(self.L["coll_name_hint"]); ni.setTextColor(txt_c); ni.setHintTextColor(hint_c)
+            ni.setBackground(None); ni.setCursorColor(acc_c); ni.setLineColors(hint_c, acc_c, acc_c)
+            layout = LinearLayout(activity); layout.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(8), AndroidUtilities.dp(24), AndroidUtilities.dp(8))
+            layout.addView(ni, LayoutHelper.createLinear(-1, -2)); builder.set_view(layout)
+            def on_save(b, w):
+                n = ni.getText().toString().strip()
+                if n:
+                    clist = self._get_collections(); clist.append({"name": n, "shortcuts": [], "enabled": True, "trigger_on": "", "trigger_off": ""}); self._save_collections(clist)
+                b.dismiss()
+            builder.set_positive_button(self.L["save"], on_save).set_negative_button(self.L["cancel"], lambda b, w: b.dismiss()).show()
+        run_on_ui_thread(show_dialog)
+
+    def _show_help(self):
+        activity = get_last_fragment().getParentActivity()
+        def show_msg(title, text, next_btn=None, next_fn=None):
+            b = AlertDialogBuilder(activity).set_title(title)
+            tv = TextView(activity); tv.setText(text); tv.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(12), AndroidUtilities.dp(24), AndroidUtilities.dp(12))
+            tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)); tv.setTextSize(1, 15.0)
+            b.set_view(tv).set_positive_button("OK", lambda b, w: b.dismiss())
+            if next_btn: b.set_neutral_button(next_btn, next_fn)
+            b.show()
+        run_on_ui_thread(lambda: show_msg(self.L["help_title"], self.L["help_text"], self.L.get("btn_variables"), lambda b, w: (b.dismiss(), show_msg(self.L.get("variables_title"), self.L.get("variables_text"), self.L.get("btn_back"), lambda b2, w2: (b2.dismiss(), self._show_help())))))
+
+    def _export_hct(self, data: Dict[str, Any], fname: str):
+        try:
+            cache_dir = ApplicationLoader.applicationContext.getExternalCacheDir() or ApplicationLoader.applicationContext.getCacheDir()
+            path = os.path.join(cache_dir.getAbsolutePath(), fname)
+            with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2, ensure_ascii=not self.get_setting("export_readable", False))
+            uri = jclass("androidx.core.content.FileProvider").getUriForFile(ApplicationLoader.applicationContext, ApplicationLoader.getApplicationId() + ".provider", jclass("java.io.File")(path))
+            intent = Intent(Intent.ACTION_SEND).setType("application/octet-stream").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            get_last_fragment().getParentActivity().startActivity(Intent.createChooser(intent, "Export .hct"))
+        except Exception as e: log(f"Export error: {e}")
+
+    def _process_import(self, data: Dict[str, Any]):
+        activity = get_last_fragment().getParentActivity()
+        def show_mode():
+            builder = AlertDialogBuilder(activity).set_title(self.L["import_mode"])
+            def handle(ov):
+                stats = {"new": 0, "dub": 0, "err": 0}
+                try:
+                    current_s, current_c = self._get_shortcuts(), self._get_collections()
+                    if ov:
+                        if "shortcuts" in data:
+                            for ns in data["shortcuts"]:
+                                for i, s in enumerate(current_s):
+                                    if s.get("pattern") == ns.get("pattern"):
+                                        current_s[i] = ns; break
+                                else:
+                                    current_s.append(ns); stats["new"] += 1
+                        if "collections" in data:
+                            for nc in data["collections"]:
+                                for i, c in enumerate(current_c):
+                                    if c.get("name") == nc.get("name"):
+                                        current_c[i] = nc; break
+                                else:
+                                    current_c.append(nc); stats["new"] += 1
+                    else:
+                        for ns in data.get("shortcuts", []):
+                            if not any(x['pattern']==ns['pattern'] and x['replacement']==ns['replacement'] for x in current_s):
+                                current_s.append(ns); stats["new"] += 1
+                            else: stats["dub"] += 1
+                        for nc in data.get("collections", []):
+                            if not any(x['name'] == nc['name'] for x in current_c):
+                                current_c.append(nc); stats["new"] += 1
+                            else: stats["dub"] += 1
+                    self._save_shortcuts(current_s, False); self._save_collections(current_c, True)
+                except Exception as e: stats["err"] += 1; log(f"Import error: {e}")
+                run_on_ui_thread(lambda: AlertDialogBuilder(activity).set_title(self.L["report_title"]).set_message(f"{self.L['report_new'].format(stats['new'])}\n{self.L['report_dub'].format(stats['dub'])}\n{self.L['report_err'].format(stats['err'])}").set_positive_button("OK", lambda b, w: b.dismiss()).show(), 200)
+            builder.set_positive_button(self.L["merge"], lambda b, w: handle(False)).set_negative_button(self.L["overwrite"], lambda b, w: handle(True)).show()
+        run_on_ui_thread(show_mode)
+
+    def create_settings(self) -> List[Any]:
+        try:
+            self.L = self._get_current_locale()
+            shortcuts, colls = self._get_shortcuts(), self._get_collections()
+            settings = [
+                Header(text=self.L["language"]),
+                Selector(key="language_selection", text=self.L["language"], icon="msg_language", default=(0 if self.get_setting("language", "en")=="en" else 1), items=["English", "Русский"], on_change=self._on_lang_change),
+                Text(text=self.L["help"], icon="msg_help", on_click=lambda v: self._show_help()),
+                Header(text=self.L["my_shortcuts"])
+            ]
+            for i, s in enumerate(shortcuts):
+                conf = self._find_conflict(s.get("pattern"), f"main:{i}")
+                settings.append(Text(text=f"{s.get('pattern')} \u2192 {s.get('replacement')}", icon="msg_edit", red=(conf is not None), create_sub_fragment=lambda idx=i: self._create_edit_page(idx)))
+            settings.extend([
+                Text(text=self.L["add_shortcut"], icon="msg_add", on_click=lambda v: self._add_shortcut()),
+                Header(text=self.L["collections"])
+            ])
+            for i, c in enumerate(colls):
+                settings.append(Text(text=c.get("name", ""), icon=("msg_folders" if c.get("enabled", True) else "msg_archive"), create_sub_fragment=lambda idx=i: self._create_coll_page(idx)))
+            settings.extend([
+                Text(text=self.L["add_collection"], icon="msg_add", on_click=lambda v: self._add_collection()),
+                Header(text=self.L["export_all"]),
+                Switch(key="export_readable", text=self.L["readable_format"], default=self.get_setting("export_readable", False)),
+                Text(text=self.L["export_all"], icon="msg_share", on_click=lambda v: self._export_hct({"shortcuts": shortcuts, "collections": colls}, "all_shortcuts.hct"))
+            ])
+            return settings
+        except Exception as e: log(f"Err: {e}"); return [Header(text=f"Error: {e}")]
+
+    def _create_edit_page(self, index: int, coll_idx: Optional[int] = None) -> List[Any]:
+        try:
+            if coll_idx is None:
+                slist = self._get_shortcuts(); loc_id = f"main:{index}"
+            else:
+                clist = self._get_collections(); slist = clist[coll_idx].get("shortcuts", []); loc_id = f"coll:{coll_idx}:{index}"
+            if index >= len(slist): return [Header(text="Error")]
+            s = slist[index]; conf = self._find_conflict(s.get("pattern"), loc_id)
+            def update(f, v, idx=index, cidx=coll_idx):
+                if cidx is None:
+                    ss = self._get_shortcuts(); ss[idx][f] = v; self._save_shortcuts(ss, False)
+                else:
+                    cc = self._get_collections(); cc[cidx]["shortcuts"][idx][f] = v; self._save_collections(cc, False)
+            res = [Header(text=self.L["edit_shortcut"])]
+            if conf: res.append(Text(text=self.L["duplicate_warn"].format(loc=conf), red=True))
+            res.extend([
+                Input(key=f"p_{loc_id}", text=self.L["pattern_help_title"], default=s['pattern'], on_change=lambda v: update('pattern', v)),
+                Input(key=f"r_{loc_id}", text=self.L["replacement_help_title"], default=s['replacement'], on_change=lambda v: update('replacement', v)),
+                Switch(key=f"reg_{loc_id}", text=self.L["regex_filter"], default=s['is_regex'], on_change=lambda v: update('is_regex', v)),
+                Divider(), Text(text=self.L["delete_shortcut"], red=True, on_click=lambda v: self._delete_shortcut(index, coll_idx))
+            ])
+            return res
+        except Exception as e: return [Header(text=f"Error: {e}")]
+
+    def _create_coll_page(self, ci: int) -> List[Any]:
+        try:
+            clist = self._get_collections()
+            if ci >= len(clist): return [Header(text="Error")]
+            coll = clist[ci]; slist = coll.get("shortcuts", [])
+            def update_coll(f, v, idx=ci):
+                cc = self._get_collections(); cc[idx][f] = v; self._save_collections(cc, False)
+            res = [
+                Header(text=coll.get("name")),
+                Input(key=f"coll_name_{ci}", text=self.L["coll_name_hint"], default=coll.get("name"), on_change=lambda v: update_coll("name", v)),
+                Switch(key=f"coll_en_{ci}", text=self.L["enabled"], default=coll.get("enabled", True), on_change=lambda v: update_coll("enabled", v)),
+                Input(key=f"coll_t_on_{ci}", text=self.L["trigger_on"], default=coll.get("trigger_on", ""), on_change=lambda v: update_coll("trigger_on", v)),
+                Input(key=f"coll_t_off_{ci}", text=self.L["trigger_off"], default=coll.get("trigger_off", ""), on_change=lambda v: update_coll("trigger_off", v)),
+                Divider()
+            ]
+            for i, s in enumerate(slist):
+                conf = self._find_conflict(s.get("pattern"), f"coll:{ci}:{i}")
+                res.append(Text(text=f"{s.get('pattern')} \u2192 {s.get('replacement')}", icon="msg_edit", red=(conf is not None), create_sub_fragment=lambda idx=i, cidx=ci: self._create_edit_page(idx, cidx)))
+            res.append(Text(text=self.L["add_shortcut"], icon="msg_add", on_click=lambda v: self._add_shortcut(ci)))
+            res.extend([
+                Divider(),
+                Text(text=self.L["export_coll"], icon="msg_share", on_click=lambda v: self._export_hct({"collections": [coll]}, f"{coll.get('name')}.hct")),
+                Text(text=self.L["delete_coll"], red=True, on_click=lambda v: self._delete_coll(ci))
+            ])
+            return res
+        except Exception as e: return [Header(text=f"Error: {e}")]
+
+    def _delete_shortcut(self, i, ci=None):
+        if ci is None:
+            ss = self._get_shortcuts(); ss.pop(i); self._save_shortcuts(ss)
+        else:
+            cc = self._get_collections(); cc[ci]["shortcuts"].pop(i); self._save_collections(cc)
+        BulletinHelper.show_success(self.L["shortcut_deleted"])
+        if get_last_fragment(): get_last_fragment().finishFragment()
+
+    def _delete_coll(self, idx):
+        cc = self._get_collections(); cc.pop(idx); self._save_collections(cc)
+        BulletinHelper.show_success(self.L["coll_deleted"])
+        if get_last_fragment(): get_last_fragment().finishFragment()
+
+    def _handle_triggers(self, text: str) -> Optional[str]:
+        colls = self.get_setting("collections", [])
+        text_strip = text.strip()
+        for coll in colls:
+            on_t = coll.get("trigger_on", "").strip()
+            off_t = coll.get("trigger_off", "").strip()
+            if on_t and text_strip == on_t:
+                if not coll.get("enabled"):
+                    coll["enabled"] = True
+                    self._save_collections(colls)
+                    BulletinHelper.show_success(self.L["active_trigger"].format(name=coll.get("name")))
+                return ""
+            if off_t and text_strip == off_t:
+                if coll.get("enabled"):
+                    coll["enabled"] = False
+                    self._save_collections(colls)
+                    BulletinHelper.show_success(self.L["inactive_trigger"].format(name=coll.get("name")))
+                return ""
+        return None
+
+    def process_text(self, text: str, dialog_id: int, reply_to: Any = None, cursor_pos: int = -1) -> str:
+        if not text: return text
+        if (trigger_res := self._handle_triggers(text)) is not None: return trigger_res
+        
+        if cursor_pos != -1:
+            for s in self._compiled_shortcuts:
+                if not s['is_regex']:
+                    p, plen = s['pattern'], len(s['pattern'])
+                    if cursor_pos >= plen and text[cursor_pos-plen:cursor_pos] == p:
+                        if cursor_pos == plen or text[cursor_pos-plen-1].isspace():
+                            return text[:cursor_pos-plen] + self._apply_variables(s['replacement'], dialog_id, reply_to) + text[cursor_pos:]
+                else:
+                    try:
+                        matches = list(s['compiled'].finditer(text[:cursor_pos]))
+                        if matches and matches[-1].end() == cursor_pos:
+                            m = matches[-1]
+                            return text[:m.start()] + self._apply_variables(m.expand(s['replacement']), dialog_id, reply_to) + text[cursor_pos:]
+                    except Exception as e: log(f"ProcessErr: {e}")
+            return text
+
+        new_text = text
+        for s in self._compiled_shortcuts:
+            if not s['is_regex'] and s['pattern'] not in new_text: continue
+            try:
+                def repl_fn(m, repl=s['replacement']):
+                    res = m.expand(repl) if s['is_regex'] else repl
+                    return self._apply_variables(res, dialog_id, reply_to)
+                if s['is_regex']: new_text = s['compiled'].sub(repl_fn, new_text)
+                else: new_text = s['compiled'].sub(lambda m: m.group(1) + repl_fn(m), new_text)
+            except Exception as e: log(f"ProcessErr: {e}")
+        return new_text
+
+    def attach_watcher(self, eview):
+        if not eview or id(eview) in self._watchers: return
+        did, _ = self._extract_context(eview)
+        watcher = self._create_watcher_class()(eview, did)
+        eview.addTextChangedListener(watcher); self._watchers[id(eview)] = watcher
+
+    def _create_watcher_class(self):
+        plugin = self
+        class ShortcutsTextWatcher(dynamic_proxy(jclass("android.text.TextWatcher"))):
+            def __init__(self, eview, did):
+                super().__init__(); self.eview, self.did, self._last = eview, did, ""
+            def beforeTextChanged(self, s, start, count, after): pass
+            def afterTextChanged(self, s): pass
+            def onTextChanged(self, s, start, before, count):
+                if plugin._skip_next_change: plugin._skip_next_change = False; return
+                text = str(s) if s else ""
+                if not text or text == self._last: return
+                if plugin._handle_triggers(text) == "":
+                    plugin._skip_next_change = True
+                    try: self.eview.setFieldText("")
+                    except Exception as e: log(f"CtxErr: {e}")
+                    return
+                if not self.did: self.did, _ = plugin._extract_context(self.eview)
+                reply = None
+                try: reply = self.eview.getReplyingMessageObject()
+                except Exception as e: log(f"CtxErr: {e}")
+                new_text = plugin.process_text(text, self.did, reply, cursor_pos=start+count)
+                if new_text != text:
+                    self._last = new_text
+                    run_on_ui_thread(lambda: (setattr(plugin, "_skip_next_change", True), self.eview.setFieldText(new_text)))
+        return ShortcutsTextWatcher
+
+class ConstructorHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param): self.plugin.attach_watcher(param.thisObject)
+class ReplyHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param): self.plugin.attach_watcher(param.thisObject)
+class SendHook(MethodHook):
+    def __init__(self, plugin: MessageShortcuts): self.plugin = plugin
+    def before_hooked_method(self, param):
+        try:
+            params = param.args[0]
+            if not params or not (msg := getattr(params, "message", None)): return
+            did, reply = self.plugin._extract_context(params)
+            if str(msg).startswith(".loadhtc") and self.plugin._handle_commands(str(msg), params, reply):
+                param.setResult(None); return
+            if (proc := self.plugin.process_text(str(msg), did, reply)) != str(msg):
+                if proc == "" and str(msg) != "": param.setResult(None); return
+                params.message = proc
+            if hasattr(params, "caption") and params.caption:
+                if (cproc := self.plugin.process_text(str(params.caption), did, reply)) != str(params.caption): params.caption = cproc
+        except Exception as e: log(f"SendHookErr: {e}")
