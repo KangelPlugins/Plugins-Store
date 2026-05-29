@@ -1,38 +1,91 @@
-from typing import Any, List, Dict
-from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
-from client_utils import get_messages_controller
-from hook_utils import set_private_field, get_private_field
+from typing import Any, Dict, List, Optional
+
 from android_utils import log, run_on_ui_thread
-from java.lang import Integer
-from java.lang import Long as JLong, Boolean as JBoolean
+from base_plugin import AppEvent, BasePlugin, HookResult, MethodHook
+from hook_utils import get_private_field, set_private_field
 from java import jclass
+from java.lang import Boolean as JBoolean
+from java.lang import Integer
+from java.lang import Long as JLong
 from org.telegram.messenger import MessagesController, UserConfig
+from ui.settings import Text
 
 
 __id__ = "misha_unlimited_pins"
 __name__ = "Unlimited Pins"
-__version__ = "1.0.0"
+__version__ = "2.0"
 __author__ = "@mihailkotovski & @mishabotov"
-__description__ = "Allows pinning any number of chats."
-__min_version__ = "12.1.1"
+__description__ = "позволяет закреплять больше чатов, чем обычно"
 __icon__ = "EmojiAnimations/12"
 
 
 DEFAULT_MAX = 100000
+MAX_INT = 2147483647
+MAX_RESTORED_PINS_PER_FOLDER = 300
 PINS_STATE_FILE = "unlimited_pins_state.json"
+PINS_STATE_VERSION = 3
 RESTORE_MAX_ATTEMPTS = 20
+
+LIMIT_FIELDS = (
+    "maxPinnedDialogsCountDefault",
+    "maxPinnedDialogsCountPremium",
+    "maxFolderPinnedDialogsCountDefault",
+    "maxFolderPinnedDialogsCountPremium",
+    "dialogFiltersPinnedLimitDefault",
+    "dialogFiltersPinnedLimitPremium",
+)
+
+PIN_UPDATE_HOOKS = (
+    "TL_updatePinnedDialogs",
+    "TL_updateDialogPinned",
+)
+
+PIN_REQUEST_HOOKS = (
+    "TL_messages_getPinnedDialogs",
+    "TL_messages_toggleDialogPin",
+    "TL_messages_reorderPinnedDialogs",
+    "TL_help_getAppConfig",
+)
+
+
+def _java_size(items: Any) -> int:
+    try:
+        return int(items.size())
+    except Exception:
+        try:
+            return len(items)
+        except Exception:
+            return 0
+
+
+def _java_get(items: Any, index: int) -> Any:
+    try:
+        return items.get(index)
+    except Exception:
+        return items[index]
 
 
 class UnlimitedPins(BasePlugin):
 
     def __init__(self):
         super().__init__()
-        self._original_limits: List[int] = []
-        self._restore_attempts: int = 0
+        self._original_limits: Dict[str, List[int]] = {}
+        self._restore_attempts: Dict[str, int] = {}
         self._hook_refs: List[Any] = []
+        self._protocol_hook_names: List[str] = []
         self._restored_folders: Dict[str, bool] = {}
+        self._restored_filters: Dict[str, bool] = {}
         self._in_restore: bool = False
         self._save_debounce_pending: bool = False
+        self._restore_all_pending: bool = False
+        self._restore_generation: int = 0
+        self._loaded: bool = False
+
+    def _is_enabled(self) -> bool:
+        return self._loaded
+
+    def _blocks_server_pin_sync(self) -> bool:
+        return self._is_enabled() and bool(self.get_setting("block_server_updates", False))
 
     def _get_cache_dir(self) -> str:
         try:
@@ -48,19 +101,22 @@ class UnlimitedPins(BasePlugin):
             os.makedirs(fallback, exist_ok=True)
             return fallback
 
+    def _copy_default(self, default: Any) -> Any:
+        import json
+        return json.loads(json.dumps(default))
+
     def _read_json_file(self, file_name: str, default: Any):
         try:
             import os, json
             path = os.path.join(self._get_cache_dir(), file_name)
             if not os.path.exists(path):
-                import json as _json
-                return _json.loads(_json.dumps(default))
+                return self._copy_default(default)
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            return data if isinstance(data, dict) else self._copy_default(default)
         except Exception as e:
             log(f"[UnlimitedPins] JSON read error for {file_name}: {e}")
-            import json as _json
-            return _json.loads(_json.dumps(default))
+            return self._copy_default(default)
 
     def _write_json_file(self, file_name: str, data: Any):
         try:
@@ -70,6 +126,21 @@ class UnlimitedPins(BasePlugin):
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
             log(f"[UnlimitedPins] JSON write error for {file_name}: {e}")
+
+    def _read_state(self) -> Dict[str, Any]:
+        return self._read_json_file(PINS_STATE_FILE, {"accounts": {}, "filters": {}})
+
+    def _parse_max_value(self, value: Any = None) -> int:
+        raw = self.get_setting("max_value", str(DEFAULT_MAX)) if value is None else value
+        try:
+            parsed = int(str(raw).strip())
+        except Exception:
+            log(f"[UnlimitedPins] Invalid max_value={raw!r}, using {DEFAULT_MAX}")
+            return DEFAULT_MAX
+        if parsed < 1:
+            return DEFAULT_MAX
+        return min(parsed, MAX_INT)
+
     def _list_active_accounts(self) -> List[int]:
         accounts: List[int] = []
         try:
@@ -84,63 +155,167 @@ class UnlimitedPins(BasePlugin):
             pass
         if not accounts:
             try:
-                accounts = [UserConfig.selectedAccount]
+                accounts = [int(UserConfig.selectedAccount)]
             except Exception:
                 accounts = [0]
         return accounts
 
+    def _get_controller(self, account_id: int) -> Optional[Any]:
+        try:
+            return MessagesController.getInstance(int(account_id))
+        except Exception:
+            return None
+
     def _list_folder_ids(self, account_id: int) -> List[int]:
-        folder_ids: List[int] = [0]
+        folder_ids = [0]
         try:
             mc = MessagesController.getInstance(account_id)
-            filters = getattr(mc, "dialogFilters", None)
-            if filters is not None:
+            dialogs_by_folder = getattr(mc, "dialogsByFolder", None)
+            for i in range(_java_size(dialogs_by_folder)):
                 try:
-                    size = filters.size() if hasattr(filters, "size") else len(filters)
-                    for i in range(size):
-                        try:
-                            folder_id = int(filters.get(i).id if hasattr(filters, "get") else filters[i].id)
-                            if folder_id not in folder_ids:
-                                folder_ids.append(folder_id)
-                        except Exception:
-                            pass
+                    folder_id = int(dialogs_by_folder.keyAt(i))
+                    if folder_id not in folder_ids:
+                        folder_ids.append(folder_id)
+                except Exception:
+                    pass
+            dialogs = getattr(mc, "allDialogs", None)
+            size = _java_size(dialogs)
+            for i in range(size):
+                try:
+                    folder_id = int(getattr(_java_get(dialogs, i), "folder_id", 0) or 0)
+                    if folder_id not in folder_ids:
+                        folder_ids.append(folder_id)
                 except Exception:
                     pass
         except Exception:
             pass
         return folder_ids
-    def _collect_pinned_for_folder(self, account_id: int, folder_id: int) -> List[int]:
+
+    def _list_dialog_filters(self, account_id: int) -> List[Any]:
+        try:
+            mc = MessagesController.getInstance(account_id)
+            filters = getattr(mc, "dialogFilters", None)
+            return [_java_get(filters, i) for i in range(_java_size(filters))]
+        except Exception:
+            return []
+
+    def _find_dialog_filter(self, account_id: int, filter_id: int) -> Optional[Any]:
+        for dialog_filter in self._list_dialog_filters(account_id):
+            try:
+                if int(getattr(dialog_filter, "id", -1)) == int(filter_id):
+                    return dialog_filter
+            except Exception:
+                pass
+        return None
+
+    def _normalize_folder_pin_entries(self, items: Any) -> List[Dict[str, int]]:
+        raw_items = list(items or [])
+        result: List[Dict[str, int]] = []
+        for index, item in enumerate(raw_items):
+            try:
+                if isinstance(item, dict):
+                    dialog_id = int(item.get("id", item.get("dialog_id")))
+                    pinned_num = int(item.get("num", item.get("pinned_num", len(raw_items) - index)))
+                else:
+                    dialog_id = int(item)
+                    pinned_num = len(raw_items) - index
+                if dialog_id and pinned_num > 0:
+                    result.append({"id": dialog_id, "num": pinned_num})
+            except Exception:
+                pass
+        result.sort(key=lambda entry: -entry["num"])
+        return result
+
+    def _normalize_filter_pin_entries(self, items: Any) -> List[Dict[str, int]]:
+        raw_items = list(items or [])
+        result: List[Dict[str, int]] = []
+        for index, item in enumerate(raw_items):
+            try:
+                if isinstance(item, dict):
+                    dialog_id = int(item.get("id", item.get("dialog_id")))
+                    pinned_num = int(item.get("num", item.get("pinned_num", index)))
+                else:
+                    dialog_id = int(item)
+                    pinned_num = index
+                if dialog_id:
+                    result.append({"id": dialog_id, "num": pinned_num})
+            except Exception:
+                pass
+        result.sort(key=lambda entry: entry["num"])
+        return result
+
+    def _entry_ids(self, entries: Any) -> List[int]:
         result: List[int] = []
+        for entry in entries or []:
+            try:
+                result.append(int(entry.get("id") if isinstance(entry, dict) else entry))
+            except Exception:
+                pass
+        return result
+
+    def _collect_folder_pin_entries(self, account_id: int, folder_id: int) -> List[Dict[str, int]]:
+        result: List[Dict[str, int]] = []
         try:
             mc = MessagesController.getInstance(account_id)
             dialogs = mc.getDialogs(folder_id)
-            size = dialogs.size() if hasattr(dialogs, "size") else len(dialogs)
-            for i in range(size):
-                d = dialogs.get(i) if hasattr(dialogs, "get") else dialogs[i]
-                if getattr(d, "isFolder", False):
+            for i in range(_java_size(dialogs)):
+                dialog = _java_get(dialogs, i)
+                if getattr(dialog, "isFolder", False):
                     continue
-                if getattr(d, "pinned", False):
+                if getattr(dialog, "pinned", False):
                     try:
-                        result.append(int(d.id))
+                        result.append({"id": int(dialog.id), "num": int(getattr(dialog, "pinnedNum", 0) or 0)})
                     except Exception:
                         pass
                 else:
                     break
         except Exception as e:
             log(f"[UnlimitedPins] collect pinned error a={account_id} f={folder_id}: {e}")
-        return result
+        return self._normalize_folder_pin_entries(result)
 
-    def _collect_all_pins(self) -> Dict[str, Dict[str, List[int]]]:
-        data: Dict[str, Dict[str, List[int]]] = {}
+    def _collect_pinned_for_folder(self, account_id: int, folder_id: int) -> List[int]:
+        return self._entry_ids(self._collect_folder_pin_entries(account_id, folder_id))
+
+    def _collect_filter_pin_entries(self, dialog_filter: Any) -> List[Dict[str, int]]:
+        sparse = getattr(dialog_filter, "pinnedDialogs", None)
+        items: List[Any] = []
+        try:
+            for i in range(_java_size(sparse)):
+                items.append({"id": int(sparse.keyAt(i)), "num": int(sparse.valueAt(i))})
+        except Exception:
+            return []
+        return self._normalize_filter_pin_entries(items)
+
+    def _collect_filter_pins(self, dialog_filter: Any) -> List[int]:
+        return self._entry_ids(self._collect_filter_pin_entries(dialog_filter))
+
+    def _collect_all_pins(self) -> Dict[str, Dict[str, List[Dict[str, int]]]]:
+        data: Dict[str, Dict[str, List[Dict[str, int]]]] = {}
         try:
             for acc in self._list_active_accounts():
-                folders = self._list_folder_ids(acc)
-                per_acc: Dict[str, List[int]] = {}
-                for fid in folders:
-                    per_acc[str(fid)] = self._collect_pinned_for_folder(acc, fid)
+                per_acc: Dict[str, List[Dict[str, int]]] = {}
+                for folder_id in self._list_folder_ids(acc):
+                    per_acc[str(folder_id)] = self._collect_folder_pin_entries(acc, folder_id)
                 data[str(acc)] = per_acc
         except Exception as e:
             log(f"[UnlimitedPins] collect all pins error: {e}")
+        return data
+
+    def _collect_all_filter_pins(self) -> Dict[str, Dict[str, List[Dict[str, int]]]]:
+        data: Dict[str, Dict[str, List[Dict[str, int]]]] = {}
+        try:
+            for acc in self._list_active_accounts():
+                per_acc: Dict[str, List[Dict[str, int]]] = {}
+                for dialog_filter in self._list_dialog_filters(acc):
+                    try:
+                        filter_id = int(getattr(dialog_filter, "id", 0) or 0)
+                        if filter_id:
+                            per_acc[str(filter_id)] = self._collect_filter_pin_entries(dialog_filter)
+                    except Exception:
+                        pass
+                data[str(acc)] = per_acc
+        except Exception as e:
+            log(f"[UnlimitedPins] collect filter pins error: {e}")
         return data
 
     def _save_pinned_state(self) -> None:
@@ -148,8 +323,9 @@ class UnlimitedPins(BasePlugin):
             return
         try:
             state = {
-                "version": 1,
+                "version": PINS_STATE_VERSION,
                 "accounts": self._collect_all_pins(),
+                "filters": self._collect_all_filter_pins(),
             }
             self._write_json_file(PINS_STATE_FILE, state)
             log("[UnlimitedPins] Saved pinned chats state")
@@ -158,77 +334,233 @@ class UnlimitedPins(BasePlugin):
 
     def _schedule_save(self, delay: int = 600) -> None:
         try:
-            if self._in_restore or not self.get_setting("persist_pins", True):
+            if self._in_restore or not self._is_enabled() or not self.get_setting("persist_pins", True):
                 return
             if self._save_debounce_pending:
                 return
             self._save_debounce_pending = True
+
             def _do_save():
                 try:
-                    self._save_pinned_state()
+                    if self._is_enabled():
+                        self._save_pinned_state()
                 finally:
                     self._save_debounce_pending = False
+
             run_on_ui_thread(_do_save, delay=delay)
         except Exception:
             pass
 
-    def _restore_folder_from_state(self, account_id: int, folder_id: int, desired_ids: List[int]) -> None:
-        try:
-            if len(desired_ids) > 300:
-                desired_ids = desired_ids[:300]
+    def _cancel_pending_restore(self) -> None:
+        self._restore_generation += 1
+        self._restore_all_pending = False
+        self._restored_folders.clear()
+        self._restored_filters.clear()
 
-            mc = MessagesController.getInstance(account_id)
-            current_ids = self._collect_pinned_for_folder(account_id, folder_id)
-            if current_ids == desired_ids:
+    def _pin_dialog_local(self, controller: Any, dialog_id: int, pin: bool) -> bool:
+        try:
+            return bool(controller.pinDialog(JLong(dialog_id), JBoolean(pin), None, JLong(-1)))
+        except Exception:
+            try:
+                return bool(controller.pinDialog(dialog_id, pin, None, -1))
+            except Exception:
+                return False
+
+    def _get_dialog_by_id(self, controller: Any, dialog_id: int) -> Optional[Any]:
+        try:
+            dialogs_dict = getattr(controller, "dialogs_dict", None)
+            if dialogs_dict is None:
+                return None
+            try:
+                return dialogs_dict.get(JLong(dialog_id))
+            except Exception:
+                return dialogs_dict.get(dialog_id)
+        except Exception:
+            return None
+
+    def _new_java_array_list(self) -> Any:
+        return jclass("java.util.ArrayList")()
+
+    def _persist_folder_pin_numbers(self, account_id: int, pin_numbers: Dict[int, int]) -> None:
+        if not pin_numbers:
+            return
+        try:
+            dids = self._new_java_array_list()
+            pinned = self._new_java_array_list()
+            for did, pin_num in pin_numbers.items():
+                dids.add(JLong(int(did)))
+                pinned.add(Integer(int(pin_num)))
+            jclass("org.telegram.messenger.MessagesStorage").getInstance(int(account_id)).setDialogsPinned(dids, pinned)
+        except Exception as e:
+            log(f"[UnlimitedPins] persist pin numbers failed a={account_id}: {e}")
+
+    def _notify_dialogs_need_reload(self, account_id: int) -> None:
+        try:
+            notification_center = jclass("org.telegram.messenger.NotificationCenter")
+            notification_center.getInstance(int(account_id)).postNotificationName(notification_center.dialogsNeedReload)
+        except Exception:
+            pass
+
+    def _apply_folder_pin_entries(self, account_id: int, folder_id: int, desired_entries: List[Dict[str, int]]) -> None:
+        controller = MessagesController.getInstance(account_id)
+        fresh_ids = self._collect_pinned_for_folder(account_id, folder_id)
+        desired_ids = self._entry_ids(desired_entries)
+        desired_by_id = {int(entry["id"]): int(entry["num"]) for entry in desired_entries}
+        pin_numbers: Dict[int, int] = {}
+
+        for did in [item for item in fresh_ids if item not in desired_by_id]:
+            dialog = self._get_dialog_by_id(controller, did)
+            if dialog is None:
+                self._pin_dialog_local(controller, did, False)
+            else:
+                try:
+                    dialog.pinned = False
+                    dialog.pinnedNum = 0
+                    pin_numbers[int(did)] = 0
+                except Exception:
+                    self._pin_dialog_local(controller, did, False)
+
+        for did in desired_ids:
+            pin_num = desired_by_id.get(did)
+            if pin_num is None:
+                continue
+            dialog = self._get_dialog_by_id(controller, did)
+            if dialog is None:
+                self._pin_dialog_local(controller, did, True)
+                dialog = self._get_dialog_by_id(controller, did)
+            if dialog is None:
+                continue
+            try:
+                dialog.pinned = True
+                dialog.pinnedNum = int(pin_num)
+                pin_numbers[int(did)] = int(pin_num)
+            except Exception:
+                pass
+
+        try:
+            controller.sortDialogs(None)
+        except Exception:
+            pass
+        self._persist_folder_pin_numbers(account_id, pin_numbers)
+        self._notify_dialogs_need_reload(account_id)
+
+    def _restore_folder_from_state(self, account_id: int, folder_id: int, desired_items: List[Any], force: bool = False) -> None:
+        try:
+            if not self._is_enabled() or (not force and not self.get_setting("restore_pins_on_start", True)):
+                return
+            desired_entries = self._normalize_folder_pin_entries(list(desired_items or [])[:MAX_RESTORED_PINS_PER_FOLDER])
+            key = f"{account_id}:{folder_id}"
+            if not force and self._restored_folders.get(key):
                 return
 
+            current_entries = self._collect_folder_pin_entries(account_id, folder_id)
+            if current_entries == desired_entries:
+                self._restored_folders[key] = True
+                self._restore_attempts.pop(key, None)
+                return
+
+            attempt = int(self._restore_attempts.get(key, 0))
+            if attempt >= RESTORE_MAX_ATTEMPTS:
+                log(f"[UnlimitedPins] Restore skipped after {attempt} attempts for acc={account_id} folder={folder_id}")
+                self._restored_folders[key] = True
+                return
+            self._restore_attempts[key] = attempt + 1
+
             def _batch_restore():
+                if not self._is_enabled():
+                    return
                 self._in_restore = True
                 try:
-                    current_set = set(current_ids)
-                    desired_set = set(desired_ids)
-                    to_unpin = [did for did in current_ids if did not in desired_set]
-                    for did in to_unpin:
-                        try:
-                            mc.pinDialog(JLong(did), False, None, JLong(-1))
-                        except Exception:
-                            try:
-                                mc.pinDialog(did, False, None, -1)
-                            except Exception:
-                                pass
-
-                    if [d for d in current_ids if d in desired_set] != [d for d in desired_ids if d in current_set]:
-                        shared = [d for d in current_ids if d in desired_set]
-                        for did in shared:
-                            try:
-                                mc.pinDialog(JLong(did), False, None, JLong(-1))
-                            except Exception:
-                                try:
-                                    mc.pinDialog(did, False, None, -1)
-                                except Exception:
-                                    pass
-
-                    for did in desired_ids:
-                        try:
-                            mc.pinDialog(JLong(did), True, None, JLong(-1))
-                        except Exception:
-                            try:
-                                mc.pinDialog(did, True, None, -1)
-                            except Exception:
-                                pass
+                    self._apply_folder_pin_entries(account_id, folder_id, desired_entries)
                 finally:
                     self._in_restore = False
-                log(f"[UnlimitedPins] Restored pinned order for acc={account_id} folder={folder_id} count={len(desired_ids)}")
+                run_on_ui_thread(lambda: self._verify_folder_restore(account_id, folder_id, desired_entries, force), delay=700)
 
             run_on_ui_thread(_batch_restore)
         except Exception as e:
             log(f"[UnlimitedPins] restore folder error a={account_id} f={folder_id}: {e}")
 
-    def _restore_from_saved_state(self) -> None:
+    def _verify_folder_restore(self, account_id: int, folder_id: int, desired_items: List[Any], force: bool = False) -> None:
+        key = f"{account_id}:{folder_id}"
         try:
-            if not self.get_setting("restore_pins_on_start", True):
+            if not self._is_enabled():
                 return
-            data = self._read_json_file(PINS_STATE_FILE, {"accounts": {}})
+            desired_entries = self._normalize_folder_pin_entries(desired_items)
+            if self._collect_folder_pin_entries(account_id, folder_id) == desired_entries:
+                self._restored_folders[key] = True
+                self._restore_attempts.pop(key, None)
+                log(f"[UnlimitedPins] Restored pinned order for acc={account_id} folder={folder_id} count={len(desired_entries)}")
+                return
+            self._restore_folder_from_state(account_id, folder_id, desired_entries, force=force)
+        except Exception as e:
+            log(f"[UnlimitedPins] verify restore error a={account_id} f={folder_id}: {e}")
+
+    def _clear_sparse_int_array(self, sparse: Any) -> None:
+        try:
+            sparse.clear()
+            return
+        except Exception:
+            pass
+        keys: List[int] = []
+        try:
+            for i in range(_java_size(sparse)):
+                keys.append(int(sparse.keyAt(i)))
+            for key in keys:
+                sparse.delete(JLong(key))
+        except Exception:
+            pass
+
+    def _restore_filter_from_state(self, account_id: int, filter_id: int, desired_items: List[Any], force: bool = False) -> None:
+        try:
+            if not self._is_enabled() or (not force and not self.get_setting("restore_pins_on_start", True)):
+                return
+            key = f"filter:{account_id}:{filter_id}"
+            if not force and self._restored_filters.get(key):
+                return
+
+            dialog_filter = self._find_dialog_filter(account_id, filter_id)
+            if dialog_filter is None:
+                attempt = int(self._restore_attempts.get(key, 0))
+                if attempt < RESTORE_MAX_ATTEMPTS:
+                    self._restore_attempts[key] = attempt + 1
+                    run_on_ui_thread(lambda: self._restore_filter_from_state(account_id, filter_id, desired_items, force), delay=1000)
+                return
+
+            desired_entries = self._normalize_filter_pin_entries(list(desired_items or [])[:MAX_RESTORED_PINS_PER_FOLDER])
+            if self._collect_filter_pin_entries(dialog_filter) == desired_entries:
+                self._restored_filters[key] = True
+                self._restore_attempts.pop(key, None)
+                return
+
+            sparse = getattr(dialog_filter, "pinnedDialogs", None)
+            self._clear_sparse_int_array(sparse)
+            for entry in desired_entries:
+                try:
+                    sparse.put(JLong(int(entry["id"])), Integer(int(entry["num"])))
+                except Exception:
+                    sparse.put(int(entry["id"]), int(entry["num"]))
+
+            controller = MessagesController.getInstance(account_id)
+            try:
+                controller.onFilterUpdate(dialog_filter)
+            except Exception:
+                pass
+            self._restored_filters[key] = True
+            self._restore_attempts.pop(key, None)
+            log(f"[UnlimitedPins] Restored filter pins acc={account_id} filter={filter_id} count={len(desired_entries)}")
+        except Exception as e:
+            log(f"[UnlimitedPins] restore filter error a={account_id} filter={filter_id}: {e}")
+
+    def _restore_from_saved_state(self, force: bool = False) -> None:
+        try:
+            if not force and not self.get_setting("restore_pins_on_start", True):
+                return
+            if force:
+                self._restored_folders.clear()
+                self._restored_filters.clear()
+                self._restore_attempts.clear()
+
+            data = self._read_state()
             accounts_map = data.get("accounts", {}) or {}
             for acc_key, folders_map in accounts_map.items():
                 try:
@@ -239,126 +571,286 @@ class UnlimitedPins(BasePlugin):
                     continue
                 for folder_key, dialog_ids in folders_map.items():
                     try:
-                        fid = int(folder_key)
-                        key = f"{acc_id}:{fid}"
-                        if self._restored_folders.get(key):
-                            continue
-                        self._restore_folder_from_state(acc_id, fid, list(dialog_ids or []))
-                        self._restored_folders[key] = True
+                        self._restore_folder_from_state(acc_id, int(folder_key), list(dialog_ids or []), force=force)
+                    except Exception:
+                        pass
+
+            filters_map = data.get("filters", {}) or {}
+            for acc_key, per_acc_filters in filters_map.items():
+                try:
+                    acc_id = int(acc_key)
+                except Exception:
+                    continue
+                if not isinstance(per_acc_filters, dict):
+                    continue
+                for filter_key, dialog_ids in per_acc_filters.items():
+                    try:
+                        self._restore_filter_from_state(acc_id, int(filter_key), list(dialog_ids or []), force=force)
                     except Exception:
                         pass
         except Exception as e:
             log(f"[UnlimitedPins] restore pins error: {e}")
+
+    def _schedule_restore_from_saved_state(self, delay: int = 800, force: bool = False) -> None:
+        if self._restore_all_pending and not force:
+            return
+        if force:
+            self._restore_generation += 1
+        generation = self._restore_generation
+        self._restore_all_pending = True
+
+        def _restore() -> None:
+            try:
+                if generation != self._restore_generation:
+                    return
+                if self._is_enabled():
+                    self._restored_folders.clear()
+                    self._restored_filters.clear()
+                    self._restore_from_saved_state(force=force)
+            finally:
+                if generation == self._restore_generation:
+                    self._restore_all_pending = False
+
+        try:
+            run_on_ui_thread(_restore, delay=delay)
+        except Exception:
+            self._restore_all_pending = False
+
+    def _merge_saved_pins_into_server_list(self, storage: Any, dids: Any, folder_id: int) -> None:
+        if not self._is_enabled() or not self.get_setting("persist_pins", True):
+            return
+        try:
+            account_id = int(get_private_field(storage, "currentAccount"))
+        except Exception:
+            try:
+                account_id = int(UserConfig.selectedAccount)
+            except Exception:
+                account_id = 0
+
+        data = self._read_state()
+        desired = ((data.get("accounts", {}) or {}).get(str(account_id)) or {}).get(str(folder_id)) or []
+        if not desired:
+            return
+
+        existing = set()
+        try:
+            for i in range(_java_size(dids)):
+                existing.add(int(_java_get(dids, i)))
+        except Exception:
+            pass
+
+        added = 0
+        for did in self._entry_ids(self._normalize_folder_pin_entries(desired))[:MAX_RESTORED_PINS_PER_FOLDER]:
+            try:
+                did_int = int(did)
+                if did_int in existing:
+                    continue
+                try:
+                    dids.add(JLong(did_int))
+                except Exception:
+                    dids.add(did_int)
+                existing.add(did_int)
+                added += 1
+            except Exception:
+                pass
+        if added:
+            log(f"[UnlimitedPins] Kept {added} local pins during server cleanup for acc={account_id} folder={folder_id}")
+
     class _PinDialogHook(MethodHook):
-        def __init__(self, plugin: 'UnlimitedPins'):
+        def __init__(self, plugin: "UnlimitedPins"):
             self.plugin = plugin
+
         def after_hooked_method(self, param):
             try:
-                if self.plugin.get_setting("persist_pins", True) and not self.plugin._in_restore:
+                if self.plugin.get_setting("persist_pins", True) and self.plugin._is_enabled() and not self.plugin._in_restore:
+                    self.plugin._cancel_pending_restore()
                     self.plugin._schedule_save()
             except Exception:
                 pass
 
     class _ReorderPinnedHook(MethodHook):
-        def __init__(self, plugin: 'UnlimitedPins'):
+        def __init__(self, plugin: "UnlimitedPins"):
             self.plugin = plugin
+
         def after_hooked_method(self, param):
             try:
-                if self.plugin.get_setting("persist_pins", True) and not self.plugin._in_restore:
+                if self.plugin.get_setting("persist_pins", True) and self.plugin._is_enabled() and not self.plugin._in_restore:
+                    self.plugin._cancel_pending_restore()
                     self.plugin._schedule_save()
             except Exception:
                 pass
 
-    class _GetDialogsHook(MethodHook):
-        def __init__(self, plugin: 'UnlimitedPins'):
+    class _UnpinExceptHook(MethodHook):
+        def __init__(self, plugin: "UnlimitedPins"):
             self.plugin = plugin
-        def after_hooked_method(self, param):
+
+        def before_hooked_method(self, param):
             try:
-                if not self.plugin.get_setting("restore_pins_on_start", True):
-                    return
-                mc_instance = param.thisObject
-                try:
-                    account_id = int(get_private_field(mc_instance, "currentAccount"))
-                except Exception:
-                    account_id = UserConfig.selectedAccount
-                try:
-                    folder_id = int(param.args[0])
-                except Exception:
-                    folder_id = 0
-                key = f"{account_id}:{folder_id}"
-                if self.plugin._restored_folders.get(key):
-                    return
-                data = self.plugin._read_json_file(PINS_STATE_FILE, {"accounts": {}})
-                acc_map = (data.get("accounts", {}) or {}).get(str(account_id)) or {}
-                desired = acc_map.get(str(folder_id))
-                if isinstance(desired, list) and desired:
-                    self.plugin._restore_folder_from_state(account_id, folder_id, list(desired))
-                self.plugin._restored_folders[key] = True
+                folder_id = int(param.args[1])
+                self.plugin._merge_saved_pins_into_server_list(param.thisObject, param.args[0], folder_id)
             except Exception:
                 pass
+
+        def after_hooked_method(self, param):
+            try:
+                if self.plugin._is_enabled() and self.plugin.get_setting("restore_pins_on_start", True):
+                    self.plugin._schedule_restore_from_saved_state(delay=900)
+            except Exception:
+                pass
+
+    class _FilterSaveHook(MethodHook):
+        def __init__(self, plugin: "UnlimitedPins"):
+            self.plugin = plugin
+
+        def after_hooked_method(self, param):
+            try:
+                if self.plugin._is_enabled() and self.plugin.get_setting("persist_pins", True) and not self.plugin._in_restore:
+                    self.plugin._schedule_save()
+            except Exception:
+                pass
+
+    class _ApplyAppConfigHook(MethodHook):
+        def __init__(self, plugin: "UnlimitedPins"):
+            self.plugin = plugin
+
+        def after_hooked_method(self, param):
+            try:
+                if self.plugin._is_enabled():
+                    self.plugin._reapply_limits_after_config(param.thisObject)
+            except Exception as e:
+                log(f"[UnlimitedPins] reapply limits after app config failed: {e}")
+
+    def _remember_hook(self, ref: Any) -> None:
+        if ref is not None:
+            self._hook_refs.append(ref)
 
     def _install_hooks(self) -> None:
         try:
             MC = jclass("org.telegram.messenger.MessagesController")
+            Storage = jclass("org.telegram.messenger.MessagesStorage")
+            ArrayList = jclass("java.util.ArrayList")
+            InputPeer = jclass("org.telegram.tgnet.TLRPC$InputPeer")
+            JsonObject = jclass("org.telegram.tgnet.TLRPC$TL_jsonObject")
+            DialogFilter = jclass("org.telegram.messenger.MessagesController$DialogFilter")
+
             try:
-                pin_method = MC.getClass().getDeclaredMethod(
-                    "pinDialog",
-                    JLong.TYPE,
-                    JBoolean.TYPE,
-                    jclass("org.telegram.tgnet.TLRPC$InputPeer"),
-                    JLong.TYPE,
-                )
-                pin_method.setAccessible(True)
-                self._hook_refs.append(self.hook_method(pin_method, UnlimitedPins._PinDialogHook(self)))
+                method = MC.getClass().getDeclaredMethod("pinDialog", JLong.TYPE, JBoolean.TYPE, InputPeer, JLong.TYPE)
+                method.setAccessible(True)
+                self._remember_hook(self.hook_method(method, UnlimitedPins._PinDialogHook(self)))
             except Exception as e:
                 log(f"[UnlimitedPins] hook pinDialog failed: {e}")
 
             try:
-                reorder_method = MC.getClass().getDeclaredMethod(
-                    "reorderPinnedDialogs",
-                    Integer.TYPE,
-                    jclass("java.util.ArrayList"),
-                    JLong.TYPE,
-                )
-                reorder_method.setAccessible(True)
-                self._hook_refs.append(self.hook_method(reorder_method, UnlimitedPins._ReorderPinnedHook(self)))
+                method = MC.getClass().getDeclaredMethod("reorderPinnedDialogs", Integer.TYPE, ArrayList, JLong.TYPE)
+                method.setAccessible(True)
+                self._remember_hook(self.hook_method(method, UnlimitedPins._ReorderPinnedHook(self)))
             except Exception as e:
                 log(f"[UnlimitedPins] hook reorderPinnedDialogs failed: {e}")
 
             try:
-                get_dialogs_method = MC.getClass().getDeclaredMethod("getDialogs", Integer.TYPE)
-                get_dialogs_method.setAccessible(True)
-                self._hook_refs.append(self.hook_method(get_dialogs_method, UnlimitedPins._GetDialogsHook(self)))
+                method = MC.getClass().getDeclaredMethod("applyAppConfig", JsonObject)
+                method.setAccessible(True)
+                self._remember_hook(self.hook_method(method, UnlimitedPins._ApplyAppConfigHook(self)))
             except Exception as e:
-                log(f"[UnlimitedPins] hook getDialogs failed: {e}")
+                log(f"[UnlimitedPins] hook applyAppConfig failed: {e}")
+
+            try:
+                method = MC.getClass().getDeclaredMethod("onFilterUpdate", DialogFilter)
+                method.setAccessible(True)
+                self._remember_hook(self.hook_method(method, UnlimitedPins._FilterSaveHook(self)))
+            except Exception as e:
+                log(f"[UnlimitedPins] hook onFilterUpdate failed: {e}")
+
+            try:
+                method = Storage.getClass().getDeclaredMethod("unpinAllDialogsExceptNew", ArrayList, Integer.TYPE)
+                method.setAccessible(True)
+                self._remember_hook(self.hook_method(method, UnlimitedPins._UnpinExceptHook(self)))
+            except Exception as e:
+                log(f"[UnlimitedPins] hook unpinAllDialogsExceptNew failed: {e}")
+
+            self._hook_filter_save_to_server()
         except Exception as e:
             log(f"[UnlimitedPins] install hooks error: {e}")
-    def _read_current_limits(self) -> List[int]:
-        controller = get_messages_controller()
+
+    def _hook_filter_save_to_server(self) -> None:
+        try:
+            filter_create = jclass("org.telegram.ui.FilterCreateActivity")
+            for method in list(filter_create.getClass().getDeclaredMethods()):
+                try:
+                    if method.getName() == "saveFilterToServer":
+                        method.setAccessible(True)
+                        self._remember_hook(self.hook_method(method, UnlimitedPins._FilterSaveHook(self)))
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"[UnlimitedPins] hook saveFilterToServer failed: {e}")
+
+    def _register_protocol_hooks(self) -> None:
+        for name in PIN_UPDATE_HOOKS + PIN_REQUEST_HOOKS:
+            try:
+                self.add_hook(name)
+                self._protocol_hook_names.append(name)
+            except Exception as e:
+                log(f"[UnlimitedPins] add_hook {name} failed: {e}")
+
+    def _unregister_protocol_hooks(self) -> None:
+        for name in list(self._protocol_hook_names):
+            try:
+                self.remove_hook(name)
+            except Exception:
+                pass
+        self._protocol_hook_names.clear()
+
+    def _read_limits_for_controller(self, controller: Any) -> List[int]:
+        return [int(getattr(controller, field, 0) or 0) for field in LIMIT_FIELDS]
+
+    def _set_limit_fields(self, controller: Any, values: List[int]) -> None:
+        for field, value in zip(LIMIT_FIELDS, values):
+            try:
+                if not set_private_field(controller, field, Integer(int(value))):
+                    setattr(controller, field, int(value))
+            except Exception:
+                try:
+                    setattr(controller, field, int(value))
+                except Exception as e:
+                    log(f"[UnlimitedPins] Failed to set {field}: {e}")
+
+    def _read_current_limits(self) -> Dict[str, List[int]]:
+        result: Dict[str, List[int]] = {}
+        for account_id in self._list_active_accounts():
+            controller = self._get_controller(account_id)
+            if controller is not None:
+                result[str(account_id)] = self._read_limits_for_controller(controller)
+        return result
+
+    def _account_id_from_controller(self, controller: Any) -> int:
+        try:
+            return int(get_private_field(controller, "currentAccount"))
+        except Exception:
+            try:
+                return int(UserConfig.selectedAccount)
+            except Exception:
+                return 0
+
+    def _reapply_limits_after_config(self, controller: Any) -> None:
+        account_id = self._account_id_from_controller(controller)
+        self._original_limits[str(account_id)] = self._read_limits_for_controller(controller)
+        self._apply_limits_to_account(account_id, self._parse_max_value())
+
+    def _apply_limits_to_account(self, account_id: int, value: int) -> None:
+        controller = self._get_controller(account_id)
         if controller is None:
-            return []
-        return [
-            int(getattr(controller, "maxPinnedDialogsCountDefault", 0) or 0),
-            int(getattr(controller, "maxPinnedDialogsCountPremium", 0) or 0),
-            int(getattr(controller, "maxFolderPinnedDialogsCountDefault", 0) or 0),
-            int(getattr(controller, "maxFolderPinnedDialogsCountPremium", 0) or 0),
-            int(getattr(controller, "dialogFiltersPinnedLimitDefault", 0) or 0),
-            int(getattr(controller, "dialogFiltersPinnedLimitPremium", 0) or 0),
-        ]
+            log(f"[UnlimitedPins] MessagesController is None for account {account_id}")
+            return
+        key = str(account_id)
+        if key not in self._original_limits:
+            self._original_limits[key] = self._read_limits_for_controller(controller)
+        self._set_limit_fields(controller, [value] * len(LIMIT_FIELDS))
 
     def _apply_limits(self, value: int) -> None:
-        controller = get_messages_controller()
-        if controller is None:
-            log("[UnlimitedPins] MessagesController is None, cannot apply limits")
-            return
-
         try:
-            set_private_field(controller, "maxPinnedDialogsCountDefault", Integer(value))
-            set_private_field(controller, "maxPinnedDialogsCountPremium", Integer(value))
-            set_private_field(controller, "maxFolderPinnedDialogsCountDefault", Integer(value))
-            set_private_field(controller, "maxFolderPinnedDialogsCountPremium", Integer(value))
-            set_private_field(controller, "dialogFiltersPinnedLimitDefault", Integer(value))
-            set_private_field(controller, "dialogFiltersPinnedLimitPremium", Integer(value))
+            for account_id in self._list_active_accounts():
+                self._apply_limits_to_account(account_id, value)
             log(f"[UnlimitedPins] Applied max pinned limits = {value}")
         except Exception as e:
             log(f"[UnlimitedPins] Failed to apply limits: {e}")
@@ -366,125 +858,114 @@ class UnlimitedPins(BasePlugin):
     def _restore_limits(self) -> None:
         if not self._original_limits:
             return
+        for account_key, values in list(self._original_limits.items()):
+            try:
+                controller = self._get_controller(int(account_key))
+                if controller is not None and len(values) == len(LIMIT_FIELDS):
+                    self._set_limit_fields(controller, values)
+            except Exception as e:
+                log(f"[UnlimitedPins] Failed to restore limits for account {account_key}: {e}")
+        log("[UnlimitedPins] Restored original pinned limits")
 
-        controller = get_messages_controller()
-        if controller is None:
-            return
-        try:
-            d_def, d_pre, f_def, f_pre, df_def, df_pre = self._original_limits
-            set_private_field(controller, "maxPinnedDialogsCountDefault", Integer(d_def))
-            set_private_field(controller, "maxPinnedDialogsCountPremium", Integer(d_pre))
-            set_private_field(controller, "maxFolderPinnedDialogsCountDefault", Integer(f_def))
-            set_private_field(controller, "maxFolderPinnedDialogsCountPremium", Integer(f_pre))
-            set_private_field(controller, "dialogFiltersPinnedLimitDefault", Integer(df_def))
-            set_private_field(controller, "dialogFiltersPinnedLimitPremium", Integer(df_pre))
-            log("[UnlimitedPins] Restored original pinned limits")
-        except Exception as e:
-            log(f"[UnlimitedPins] Failed to restore limits: {e}")
+    def _unhook_methods(self) -> None:
+        for ref in list(self._hook_refs):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hook_refs.clear()
 
     def on_plugin_load(self):
         try:
+            self._loaded = True
             self._original_limits = self._read_current_limits()
-            max_value = int(self.get_setting("max_value", str(DEFAULT_MAX))) if isinstance(self.get_setting("max_value", DEFAULT_MAX), str) else int(self.get_setting("max_value", DEFAULT_MAX))
-            if self.get_setting("enabled", True):
-                self._apply_limits(max_value)
+            self._register_protocol_hooks()
             self._install_hooks()
+            if self._is_enabled():
+                self._apply_limits(self._parse_max_value())
+                self._schedule_restore_from_saved_state(delay=1000)
             log("[UnlimitedPins] Loaded")
         except Exception as e:
             log(f"[UnlimitedPins] on_plugin_load error: {e}")
 
     def on_plugin_unload(self):
         try:
+            self._loaded = False
             if self.get_setting("persist_pins", True):
                 self._save_pinned_state()
+            self._unhook_methods()
+            self._unregister_protocol_hooks()
             if self.get_setting("restore_on_unload", True):
                 self._restore_limits()
+            self._restore_attempts.clear()
+            self._restored_folders.clear()
+            self._restored_filters.clear()
             log("[UnlimitedPins] Unloaded")
         except Exception as e:
             log(f"[UnlimitedPins] on_plugin_unload error: {e}")
 
-    def _on_enabled_change(self, new_value: bool):
-        try:
-            if new_value:
-                max_value = int(self.get_setting("max_value", DEFAULT_MAX))
-                self._apply_limits(max_value)
-            else:
-                self._restore_limits()
-        except Exception as e:
-            log(f"[UnlimitedPins] enabled change error: {e}")
-
     def _on_max_value_change(self, new_value: str):
         try:
-            value = int(new_value)
-            if value < 1:
-                value = DEFAULT_MAX
-            if self.get_setting("enabled", True):
+            value = self._parse_max_value(new_value)
+            if self._is_enabled():
                 self._apply_limits(value)
         except Exception as e:
             log(f"[UnlimitedPins] max_value change error: {e}")
 
+    def on_app_event(self, event_type: AppEvent) -> None:
+        try:
+            if event_type in (AppEvent.START, AppEvent.RESUME) and self._is_enabled():
+                self._apply_limits(self._parse_max_value())
+                self._schedule_restore_from_saved_state(delay=800)
+        except Exception as e:
+            log(f"[UnlimitedPins] app event error: {e}")
+
     def create_settings(self):
         return [
-            Header(text="Unlimited Pins"),
-            Switch(
-                key="enabled",
-                text="Enable unlimited pinned chats",
-                icon="msg_pin",
-                default=True,
-                on_change=self._on_enabled_change,
-            ),
-            Input(
-                key="max_value",
-                text="Custom max pinned count",
-                icon="msg_stats",
-                default=str(DEFAULT_MAX),
-                subtext="Applied to dialogs and folders while plugin enabled",
-                on_change=self._on_max_value_change,
-            ),
-            Switch(
-                key="persist_pins",
-                text="Remember pinned chats and order",
-                subtext="Save pins per account/folder and restore on start",
-                icon="msg_pin",
-                default=True,
-            ),
-            Switch(
-                key="restore_pins_on_start",
-                text="Restore pins on app start",
-                icon="msg_pin",
-                default=True,
-            ),
-            Switch(
-                key="block_server_updates",
-                text="Block server pinned updates",
-                subtext="Prevents server updates from overriding local unlimited pins",
-                icon="msg_limit_channels",
-                default=False,
-            ),
-            Switch(
-                key="restore_on_unload",
-                text="Restore original limits on unload",
-                icon="msg_revert",
-                default=True,
-            ),
-            Divider(),
-            Text(text="Changes take effect immediately while enabled.", icon="msg_info"),
-            Text(text="Restore pins now", icon="msg_pin", on_click=lambda: self._restore_from_saved_state()),
+            Text(text="вернуть закрепы", icon="msg_pin", on_click=lambda _view=None: self._restore_from_saved_state(force=True)),
         ]
+
+    def pre_request_hook(self, request_name: str, account: int, request: Any) -> HookResult:
+        try:
+            if (
+                request_name in ("TL_messages_toggleDialogPin", "TL_messages_reorderPinnedDialogs")
+                and self._is_enabled()
+                and self.get_setting("persist_pins", True)
+                and not self._in_restore
+            ):
+                self._cancel_pending_restore()
+                self._schedule_save(delay=250)
+        except Exception as e:
+            log(f"[UnlimitedPins] pre_request_hook error: {e}")
+        return HookResult()
+
+    def post_request_hook(self, request_name: str, account: int, response: Any, error: Any) -> HookResult:
+        try:
+            if not self._is_enabled():
+                return HookResult()
+            if request_name == "TL_help_getAppConfig":
+                self._apply_limits(self._parse_max_value())
+            elif request_name == "TL_messages_getPinnedDialogs":
+                self._schedule_restore_from_saved_state(delay=900)
+            elif request_name in ("TL_messages_toggleDialogPin", "TL_messages_reorderPinnedDialogs"):
+                self._schedule_save(delay=1000)
+        except Exception as e:
+            log(f"[UnlimitedPins] post_request_hook error: {e}")
+        return HookResult()
 
     def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
         try:
-            if update_name in ("TL_updatePinnedDialogs", "TL_updateDialogPinned"):
+            if update_name in PIN_UPDATE_HOOKS:
+                if not self._is_enabled():
+                    return HookResult()
+                if self._blocks_server_pin_sync():
+                    log(f"[UnlimitedPins] Restoring after server update {update_name}")
+                    self._schedule_restore_from_saved_state(delay=700)
+                    self._schedule_save(delay=1800)
+                    return HookResult()
                 if self.get_setting("persist_pins", True) and not self._in_restore:
-                    try:
-                        self._schedule_save()
-                    except Exception:
-                        pass
-                if self.get_setting("block_server_updates", False):
-                    log(f"[UnlimitedPins] Blocking update {update_name}")
-                    return HookResult(strategy=HookStrategy.CANCEL)
+                    self._schedule_restore_from_saved_state(delay=700)
+                    self._schedule_save(delay=1800)
         except Exception as e:
             log(f"[UnlimitedPins] on_update_hook error: {e}")
         return HookResult()
-
-
