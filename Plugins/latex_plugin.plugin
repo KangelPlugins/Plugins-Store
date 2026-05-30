@@ -1,0 +1,1621 @@
+# плагин для работы с двигателем рендера математических формул и текста
+# автор: @chizumeij
+# мой канал: @meijinolife
+# разработка начата 11 мая 2026 года
+
+# @@@@@@@@@@@@@@@@@@@@@@@@@@@#kW@=     .--::::-===+++++++++++++++++++++++++++++++++++++==e#W@@@@@@@@@
+# @@@@@@@@@@@@@@@@@@@@@@@@@#=:W@@-     ....::--====++++=+++++++++++++++++++++++++++++++++++k$%@@@@@@@
+# @@@@@@@@@@@@@@@@@@@@@@%k:  :@@@e       .....:::---======++++++++++++++++++++++++++++++++++k$k$W@@@@
+# @@@@@@@@@@@@@@@@@@@@@k#W.   #%+.   ..       ...:::-----===++++++++++=+++++++++++++++++++++=+$#k$W@@
+# @@@@@@@@@@@@@@@@@@@@k$@@-   ...-+k#k:        .....::::---========+++==++++++++++++++++++===--k#%k$W
+# @@@@@@@@@@@@@@@@@@%= e@@#   .-k%WW%+-             .....:::---=======+==++++++++++++++++===-::-k@@%k
+# @@@@@@@@@@@@@@@@@e   .#%e.:e$%WWW%e$.                 ....:::-----====-==++==+++=+=+=+==--::.+%@@@@
+# @@@@@@@@@@@@@@@%e      :-k%WWWWWW$k@+                    ....:::::::--:---==-=======-----::..-#@@@@
+# @@@@@@@@@@@@@@%k:     -k%WWWWWWW#e%@%                         .  ..:::::::-:::------:::::..=#W%k$kk
+# @@@@@@@@@@@@@#%k  . :k%WWWWWWWW%#e@@@= .                           .......:.:.::::::....-$kkk-  .
+# @@@@@@@@@@@@$#W- - =%WWWWWWWWWW#$e@@@$==--            .                    ........:-+kk-=:
+# @@@@@@@@@@@#kW%e=.+WWWWWWWWWWW#%+$@@@$W$$= ... ...  . ..                         :---:.
+# @@@@@@@@@@W=#%%k:+WWWWWWWWWWW%#%:$k+=e@@W=.::. .-:..   ...            :
+# @@@@@@@@@@e-==e=-WWWWWWWWWWWW#%#.e::.-@@@=.::..:%e.........           -
+# @@@@@@@@@W.   =:%WWWWWWWWWWWW$Wk.-::::#@W-::---+@%+.::........        :=
+# @@@@@@@@@$    .kWWWWWWWWWWWW##W+:::--:-$#::::=-+@@#+-::...... ..:.    .e.
+# @@@@@@@@@$:.  :WWWWWWWWWWWWW#WW=-:---:-++---:e=+@@W#k-:.::::....e-    :#-
+# @@@@@@@@@#-   eWWWWWWWWWWWW%#W%-=:===:=-=--=-$+=W%$##k-::::...:.+e.   =W+
+# @@@@@@@@@$:   #WWWWWWWWWWWW#%W%-=:===:====-==#e+$e-=kk+:::... ..-+:   +@k.
+# @@@@@@@@@kk  .%WWWWW%#keeekk%W#-=:===-=====-e$k+e+-:-++-:::..  ..::   e@k-
+# @@@@@@@@@kW. :WWWWWWWWWW%%#k%W#--=-++:=+===-k$%ek-=::---:-:::  ....   k@$=.
+# @@@@@@@@@k@+ :WWWWWWWWWWWW%#WW$--k-++-=++===$##=e---:-------:.  ...   $W$+:
+# @@@@@@@@@kWW..%WWWWWWWWWWW%#WW#--#+-+-=+++=e$%%$+k-=-------::-:  .   .#$e=:
+# @@@@@@@@@#k%= k$$$#%WWWWWW%#WW#--%$-==-+++=$$%WWe%+--e-----:--+      :$=-::
+# @@@@@@@@@@k$#+.=+==--+k#W%#$%%%=-%#k-=-++==$#WWW#k%=-+k-=----:$.     -e.  :
+# @@@@@@@@@@@%%$.+@@W=...:=k$e$#%e-%###+:=+=e$%WWWWk%#-:$k----:-$+     =-  ..
+# @@@@@@@@@@@@@$=-%@@$%#-  .+k$$%#=%%$W%+=+=$$##%WW%$W#-+#$=---:$$.    +.  ..
+# @@@@@@@@@@@@@%kW#%W==%$-.::=#WWW#%%#WWW+==$kkk$%%W#%W%k$$#+:-:k#+   .=   :
+# @@@@@@@@@@@@@#kWW%%#e$#$$$e=e%WWWWW%WWW%ekk+==--=+ee$%%%$#Wk::$$$.  ..   :    ..  .:--
+# @@@@@@@@@@@@@$kWWWWWWWW%#$kk%WWWWWWWWWWWW%$k$#$$e:. .--=+k%W$:k##e       :    =e=e$$#$+
+# @@@@@@@@@@@@@e$%%%%%%%WWWW%%%WWWWWWWWWWWWW@@@@@@W%#e:.=:..:-eek#$%:     ..    e$$$$e+++.
+# @@@@@@@@@@@@@+$%%%###%%WWWW%##%%WWWWWWWWWWW@WWWW#-+kekk-.=+=---e$W$     :.   .$ke$kk$$$:
+# @@@@@@@@@@@@@ek%%#####%%WW$k###%WWWWWWWWWWWW#$$$$kk$$##$kkkk$e::=#$     :    :k+kkkkkkk=
+# @@@@@@@@@@@@@$eW%%###%%WWW%%WWWWWWWWWWWWWWWW%%%WWWW%%%###$$$$e$%#%+     :    +ee$$$ek#$k
+# @@@@@@@@@@@@@W=WWWWWWWWWWWWWWWWWWWWWWW%W%%%%###%##%%%WW%%%W%%%WWWW-    ..    e+k#$$$$k$#-
+# @@@@@@@@@@@@@@$eWWWWWWWWWWWWWWWWWWWWWW%%%%###%#%%%%%###%%%%WWWWWW%.    :    .ek$$$kkkk#k.
+# @@@@@@@@@@@@@@@ekWWWWWWWWWWWWWWWWWWWWWWWWWWW%WW%%%###%%%%%%%%WWWW$     :    -kekkkk$$$e.
+# @@@@@@@@@@@@@@@W+eWWWWWWWWW%%%%WWWWWWWWWWWWWWWWWWWWWWW%%%%WWWWWWW+     .    +$$$$$#$+:
+# @@@@@@@@@@@@@@@%e :$WWWWWWW$.+W%####%%WWWWWWWWWWWWWWWWWWWWWWWWWW%.    ..   .$#$$$$e:
+# @@@@@@@@@@@@@@@%e   =#WWWWWWk+%@@@@WW%####%WW%%W%%#k%WWWWWWWWWWWk     .    :=:::.
+# @@@@@@@@@@@@@@@#+    .+%WWWWW#$#@@@@@@@@@W%%W%$kke+#WWWWWWWWWWWW:     .    +:
+# @@@@@@@@@@@@@@W#=    . :$WWWWW%##%W@@@@@W%%$%$+=+$WWWWWWWWWWWW@$     ..   .$e-k$$e.          ......
+# @@@@@@@@@@@@@@W#:    +-  =#WWWWWW%###%WW@@W%$$#%WWWWWWWWWWWWW#k:     ..   -##+..=$+         .::::::
+# @@@@@@@@@@@@@@%#     k%.  .e%WWWWWWW%%%#WW%%WWWWWWWWWWWWW#k=:.:  .........+#$$e. +%+ :====:. :---::
+# @@@@@@@@@@@@@@#k     $@#.   :$WWWWWWWWWWWWWWWWWWWW%#$k+-.  .-e- .::.::::..k$$$#ke#%%k+$%%%%#=.==---
+# @@@@@@@@@@@@@W#+     %@@%-    +$%WWWWWWW%%##$k+=-:.      :+k$k  .::::::-:=$$$$ek%%%%%#==$%%%%e-====
+# @@@@@@@@@@@@@%%-    .W@@@@#::$W#kk$$$$kek$#%#$e:     ..-ek$$#=  :------=:e#$ke$%%%%%%%%==e%%%We-+++
+# @@@@@@@@@@@@@#%     :@@@@@#$@@@@@@@@@%#W@@@#%@@#=.-.:+k$$$$$k..::------=-$kek%%%%%%%%%%+k=$WWWWk=++
+# @@@@@@@@@@@@W%$     =@@@@$$@@@@@@@@@##@@@W$W@##%%e+k$$$$$$$#= =---------=e+#%%%%%%%%%%$+WkkWWW@@%kk
+
+
+import urllib.request
+import urllib.parse
+from threading import Thread
+import re
+import os
+import hashlib
+import xml.etree.ElementTree as ET
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import log, run_on_ui_thread, OnClickListener
+from hook_utils import find_class
+from java import dynamic_proxy
+
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+
+from android.graphics import Color
+from android.view import Gravity
+from android.widget import LinearLayout, TextView, EditText, ImageView
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import LayoutHelper
+from org.telegram.messenger import AndroidUtilities
+
+__id__ = "latex_plugin"
+__name__ = "LaTeX"
+__description__ = "Native LaTeX rendering for chats. Wrap your formulas in $$...$$ (e.g. $$E=mc^2$$) to see them rendered inline. Type '.ltx' to open a smart cheat sheet with live preview and quick inserts. Supports custom colors via \\color{} and features fast SVG caching."
+__author__ = "@meiji_dev • @meijinolife"
+__icon__ = "MeijiPlugins/3"
+__min_version__ = "11.12.0"
+__version__ = "1.2.0"
+
+# Helper functions for namespace-independent SVG parsing
+def clean_tag(tag):
+    return tag.split('}', 1)[1] if '}' in tag else tag
+
+def clean_attrib(attrib):
+    return {k.split('}', 1)[1] if '}' in k else k: v for k, v in attrib.items()}
+
+def find_all_defs_paths(root):
+    paths = {}
+    for el in root.iter():
+        tag = clean_tag(el.tag)
+        if tag == 'path':
+            attrs = clean_attrib(el.attrib)
+            path_id = attrs.get('id')
+            path_d = attrs.get('d')
+            if path_id and path_d:
+                paths[path_id] = path_d
+    return paths
+
+def parse_svg_path(path_str, android_path):
+    """Parse SVG path string coordinates and draw onto an Android Path object."""
+    try:
+        tokens = re.findall(r'([A-Za-z])|(-?\d*\.?\d+(?:[eE][-+]?\d+)?)', path_str)
+        commands = []
+        for cmd, val in tokens:
+            if cmd:
+                commands.append(cmd)
+            else:
+                commands.append(float(val))
+        
+        i = 0
+        last_x, last_y = 0.0, 0.0
+        last_cx, last_cy = 0.0, 0.0
+        last_cmd = ''
+        current_cmd = ''
+        n = len(commands)
+        while i < n:
+            token = commands[i]
+            if isinstance(token, str):
+                current_cmd = token
+                i += 1
+                if i >= n and current_cmd not in ('Z', 'z'):
+                    break
+            
+            if current_cmd in ('M', 'm'):
+                if i + 1 < n:
+                    x, y = commands[i], commands[i+1]
+                    if current_cmd == 'm':
+                        x += last_x
+                        y += last_y
+                    android_path.moveTo(float(x), float(y))
+                    last_x, last_y = x, y
+                    i += 2
+                    current_cmd = 'L' if current_cmd == 'M' else 'l'
+                else:
+                    break
+            elif current_cmd in ('L', 'l'):
+                if i + 1 < n:
+                    x, y = commands[i], commands[i+1]
+                    if current_cmd == 'l':
+                        x += last_x
+                        y += last_y
+                    android_path.lineTo(float(x), float(y))
+                    last_x, last_y = x, y
+                    i += 2
+                else:
+                    break
+            elif current_cmd in ('H', 'h'):
+                if i < n:
+                    x = commands[i]
+                    if current_cmd == 'h':
+                        x += last_x
+                    android_path.lineTo(float(x), float(last_y))
+                    last_x = x
+                    i += 1
+                else:
+                    break
+            elif current_cmd in ('V', 'v'):
+                if i < n:
+                    y = commands[i]
+                    if current_cmd == 'v':
+                        y += last_y
+                    android_path.lineTo(float(last_x), float(y))
+                    last_y = y
+                    i += 1
+                else:
+                    break
+            elif current_cmd in ('C', 'c'):
+                if i + 5 < n:
+                    x1, y1 = commands[i], commands[i+1]
+                    x2, y2 = commands[i+2], commands[i+3]
+                    x, y = commands[i+4], commands[i+5]
+                    if current_cmd == 'c':
+                        x1 += last_x
+                        y1 += last_y
+                        x2 += last_x
+                        y2 += last_y
+                        x += last_x
+                        y += last_y
+                    android_path.cubicTo(float(x1), float(y1), float(x2), float(y2), float(x), float(y))
+                    last_cx, last_cy = x2, y2
+                    last_x, last_y = x, y
+                    i += 6
+                else:
+                    break
+            elif current_cmd in ('S', 's'):
+                if i + 3 < n:
+                    x2, y2 = commands[i], commands[i+1]
+                    x, y = commands[i+2], commands[i+3]
+                    if current_cmd == 's':
+                        x2 += last_x
+                        y2 += last_y
+                        x += last_x
+                        y += last_y
+                    if last_cmd in ('C', 'c', 'S', 's'):
+                        x1 = 2 * last_x - last_cx
+                        y1 = 2 * last_y - last_cy
+                    else:
+                        x1, y1 = last_x, last_y
+                    android_path.cubicTo(float(x1), float(y1), float(x2), float(y2), float(x), float(y))
+                    last_cx, last_cy = x2, y2
+                    last_x, last_y = x, y
+                    i += 4
+                else:
+                    break
+            elif current_cmd in ('Q', 'q'):
+                if i + 3 < n:
+                    x1, y1 = commands[i], commands[i+1]
+                    x, y = commands[i+2], commands[i+3]
+                    if current_cmd == 'q':
+                        x1 += last_x
+                        y1 += last_y
+                        x += last_x
+                        y += last_y
+                    android_path.quadTo(float(x1), float(y1), float(x), float(y))
+                    last_cx, last_cy = x1, y1
+                    last_x, last_y = x, y
+                    i += 4
+                else:
+                    break
+            elif current_cmd in ('Z', 'z'):
+                android_path.close()
+            else:
+                # Unhandled command, break out to prevent infinite loop
+                break
+                
+            # Update last_cmd only if we successfully parsed args
+            last_cmd = current_cmd
+    except Exception as e:
+        log(f"parse_svg_path error: {e}")
+
+def multiply_matrix(m1, m2):
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return (
+        a1*a2 + c1*b2,
+        b1*a2 + d1*b2,
+        a1*c2 + c1*d2,
+        b1*c2 + d1*d2,
+        a1*e2 + c1*f2 + e1,
+        b1*e2 + d1*f2 + f1
+    )
+
+def parse_transform(transform_str, initial_matrix=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)):
+    m = initial_matrix
+    if not transform_str:
+        return m
+    for tr in re.finditer(r'(matrix|translate|scale)\(([^)]+)\)', transform_str):
+        cmd = tr.group(1)
+        args = [float(v) for v in tr.group(2).replace(',', ' ').split()]
+        if cmd == 'matrix' and len(args) == 6:
+            m = multiply_matrix(m, tuple(args))
+        elif cmd == 'translate':
+            tx = args[0]
+            ty = args[1] if len(args) > 1 else 0.0
+            m = multiply_matrix(m, (1.0, 0.0, 0.0, 1.0, tx, ty))
+        elif cmd == 'scale':
+            sx = args[0]
+            sy = args[1] if len(args) > 1 else sx
+            m = multiply_matrix(m, (sx, 0.0, 0.0, sy, 0.0, 0.0))
+    return m
+
+CSS_COLORS = {
+    # Basic
+    'black': (255, 0, 0, 0),
+    'white': (255, 255, 255, 255),
+    'red': (255, 255, 0, 0),
+    'green': (255, 0, 128, 0),
+    'blue': (255, 0, 0, 255),
+    'yellow': (255, 255, 255, 0),
+    'orange': (255, 255, 165, 0),
+    'purple': (255, 128, 0, 128),
+    'pink': (255, 255, 192, 203),
+    'cyan': (255, 0, 255, 255),
+    'magenta': (255, 255, 0, 255),
+    'gray': (255, 128, 128, 128),
+    'grey': (255, 128, 128, 128),
+    'brown': (255, 165, 42, 42),
+    'lime': (255, 0, 255, 0),
+    'navy': (255, 0, 0, 128),
+    'teal': (255, 0, 128, 128),
+
+    # A
+    'aliceblue': (255, 240, 248, 255),
+    'antiquewhite': (255, 250, 235, 215),
+    'aqua': (255, 0, 255, 255),
+    'aquamarine': (255, 127, 255, 212),
+    'azure': (255, 240, 255, 255),
+
+    # B
+    'beige': (255, 245, 245, 220),
+    'bisque': (255, 255, 228, 196),
+    'blanchedalmond': (255, 255, 235, 205),
+    'blueviolet': (255, 138, 43, 226),
+    'burlywood': (255, 222, 184, 135),
+
+    # C
+    'cadetblue': (255, 95, 158, 160),
+    'chartreuse': (255, 127, 255, 0),
+    'chocolate': (255, 210, 105, 30),
+    'coral': (255, 255, 127, 80),
+    'cornflowerblue': (255, 100, 149, 237),
+    'cornsilk': (255, 255, 248, 220),
+    'crimson': (255, 220, 20, 60),
+
+    # D
+    'darkblue': (255, 0, 0, 139),
+    'darkcyan': (255, 0, 139, 139),
+    'darkgoldenrod': (255, 184, 134, 11),
+    'darkgray': (255, 169, 169, 169),
+    'darkgreen': (255, 0, 100, 0),
+    'darkgrey': (255, 169, 169, 169),
+    'darkkhaki': (255, 189, 183, 107),
+    'darkmagenta': (255, 139, 0, 139),
+    'darkolivegreen': (255, 85, 107, 47),
+    'darkorange': (255, 255, 140, 0),
+    'darkorchid': (255, 153, 50, 204),
+    'darkred': (255, 139, 0, 0),
+    'darksalmon': (255, 233, 150, 122),
+    'darkseagreen': (255, 143, 188, 143),
+    'darkslateblue': (255, 72, 61, 139),
+    'darkslategray': (255, 47, 79, 79),
+    'darkslategrey': (255, 47, 79, 79),
+    'darkturquoise': (255, 0, 206, 209),
+    'darkviolet': (255, 148, 0, 211),
+    'deeppink': (255, 255, 20, 147),
+    'deepskyblue': (255, 0, 191, 255),
+    'dimgray': (255, 105, 105, 105),
+    'dimgrey': (255, 105, 105, 105),
+    'dodgerblue': (255, 30, 144, 255),
+
+    # F
+    'firebrick': (255, 178, 34, 34),
+    'floralwhite': (255, 255, 250, 240),
+    'forestgreen': (255, 34, 139, 34),
+    'fuchsia': (255, 255, 0, 255),
+
+    # G
+    'gainsboro': (255, 220, 220, 220),
+    'ghostwhite': (255, 248, 248, 255),
+    'gold': (255, 255, 215, 0),
+    'goldenrod': (255, 218, 165, 32),
+    'greenyellow': (255, 173, 255, 47),
+
+    # H
+    'honeydew': (255, 240, 255, 240),
+    'hotpink': (255, 255, 105, 180),
+
+    # I
+    'indianred': (255, 205, 92, 92),
+    'indigo': (255, 75, 0, 130),
+    'ivory': (255, 255, 255, 240),
+
+    # K
+    'khaki': (255, 240, 230, 140),
+
+    # L
+    'lavender': (255, 230, 230, 250),
+    'lavenderblush': (255, 255, 240, 245),
+    'lawngreen': (255, 124, 252, 0),
+    'lemonchiffon': (255, 255, 250, 205),
+    'lightblue': (255, 173, 216, 230),
+    'lightcoral': (255, 240, 128, 128),
+    'lightcyan': (255, 224, 255, 255),
+    'lightgoldenrodyellow': (255, 250, 250, 210),
+    'lightgray': (255, 211, 211, 211),
+    'lightgreen': (255, 144, 238, 144),
+    'lightgrey': (255, 211, 211, 211),
+    'lightpink': (255, 255, 182, 193),
+    'lightsalmon': (255, 255, 160, 122),
+    'lightseagreen': (255, 32, 178, 170),
+    'lightskyblue': (255, 135, 206, 250),
+    'lightslategray': (255, 119, 136, 153),
+    'lightslategrey': (255, 119, 136, 153),
+    'lightsteelblue': (255, 176, 196, 222),
+    'lightyellow': (255, 255, 255, 224),
+    'limegreen': (255, 50, 205, 50),
+    'linen': (255, 250, 240, 230),
+
+    # M
+    'maroon': (255, 128, 0, 0),
+    'mediumaquamarine': (255, 102, 205, 170),
+    'mediumblue': (255, 0, 0, 205),
+    'mediumorchid': (255, 186, 85, 211),
+    'mediumpurple': (255, 147, 112, 219),
+    'mediumseagreen': (255, 60, 179, 113),
+    'mediumslateblue': (255, 123, 104, 238),
+    'mediumspringgreen': (255, 0, 250, 154),
+    'mediumturquoise': (255, 72, 209, 204),
+    'mediumvioletred': (255, 199, 21, 133),
+    'midnightblue': (255, 25, 25, 112),
+    'mintcream': (255, 245, 255, 250),
+    'mistyrose': (255, 255, 228, 225),
+    'moccasin': (255, 255, 228, 181),
+
+    # N
+    'navajowhite': (255, 255, 222, 173),
+
+    # O
+    'oldlace': (255, 253, 245, 230),
+    'olive': (255, 128, 128, 0),
+    'olivedrab': (255, 107, 142, 35),
+    'orangered': (255, 255, 69, 0),
+    'orchid': (255, 218, 112, 214),
+
+    # P
+    'palegoldenrod': (255, 238, 232, 170),
+    'palegreen': (255, 152, 251, 152),
+    'paleturquoise': (255, 175, 238, 238),
+    'palevioletred': (255, 219, 112, 147),
+    'papayawhip': (255, 255, 239, 213),
+    'peachpuff': (255, 255, 218, 185),
+    'peru': (255, 205, 133, 63),
+    'plum': (255, 221, 160, 221),
+    'powderblue': (255, 176, 224, 230),
+
+    # R
+    'rebeccapurple': (255, 102, 51, 153),
+    'rosybrown': (255, 188, 143, 143),
+    'royalblue': (255, 65, 105, 225),
+
+    # S
+    'saddlebrown': (255, 139, 69, 19),
+    'salmon': (255, 250, 128, 114),
+    'sandybrown': (255, 244, 164, 96),
+    'seagreen': (255, 46, 139, 87),
+    'seashell': (255, 255, 245, 238),
+    'sienna': (255, 160, 82, 45),
+    'silver': (255, 192, 192, 192),
+    'skyblue': (255, 135, 206, 235),
+    'slateblue': (255, 106, 90, 205),
+    'slategray': (255, 112, 128, 144),
+    'slategrey': (255, 112, 128, 144),
+    'snow': (255, 255, 250, 250),
+    'springgreen': (255, 0, 255, 127),
+    'steelblue': (255, 70, 130, 180),
+
+    # T
+    'tan': (255, 210, 180, 140),
+    'thistle': (255, 216, 191, 216),
+    'tomato': (255, 255, 99, 71),
+    'turquoise': (255, 64, 224, 208),
+
+    # V
+    'violet': (255, 238, 130, 238),
+
+    # W
+    'wheat': (255, 245, 222, 179),
+    'whitesmoke': (255, 245, 245, 245),
+
+    # Y
+    'yellowgreen': (255, 154, 205, 50),
+
+    'none': None,
+}
+
+def parse_svg_color(color_str):
+    """Parse an SVG/CSS color string to (a, r, g, b) tuple, or None for 'none'/'transparent'."""
+    if not color_str or color_str == 'none' or color_str == 'transparent':
+        return None
+    s = color_str.strip().lower()
+    if s in CSS_COLORS:
+        return CSS_COLORS[s]
+    if s.startswith('#'):
+        h = s[1:]
+        if len(h) == 3:
+            h = h[0]*2 + h[1]*2 + h[2]*2
+        if len(h) == 6:
+            try:
+                return (255, int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+            except Exception:
+                pass
+    return None
+
+def parse_svg(svg_str):
+    """Parse SVG XML and compile layout structure with per-path colors."""
+    root = ET.fromstring(svg_str)
+    
+    viewbox_str = root.get('viewBox')
+    if viewbox_str:
+        parts = viewbox_str.split()
+        if len(parts) == 4:
+            viewbox = [float(p) for p in parts]
+        else:
+            viewbox = [0.0, 0.0, 100.0, 50.0]
+    else:
+        viewbox = [0.0, 0.0, 100.0, 50.0]
+        
+    defs = find_all_defs_paths(root)
+    draw_ops = []  # list of (path_id, matrix, fill_color_str_or_None)
+    
+    def traverse(element, current_matrix, inherited_fill):
+        tag = clean_tag(element.tag)
+        attrs = clean_attrib(element.attrib)
+        
+        m = current_matrix
+        if 'transform' in attrs:
+            m = parse_transform(attrs['transform'], m)
+        
+        # Resolve fill: explicit attr overrides inherited
+        fill = attrs.get('fill', inherited_fill)
+        
+        if tag == 'use':
+            href = attrs.get('href')
+            if not href:
+                href = attrs.get('xlink:href')
+            if href and href.startswith('#'):
+                path_id = href[1:]
+                x = float(attrs.get('x', 0.0))
+                y = float(attrs.get('y', 0.0))
+                if x != 0.0 or y != 0.0:
+                    m = multiply_matrix(m, (1.0, 0.0, 0.0, 1.0, x, y))
+                draw_ops.append((path_id, m, fill))
+        elif tag == 'rect':
+            x = float(attrs.get('x', 0.0))
+            y = float(attrs.get('y', 0.0))
+            w = float(attrs.get('width', 0.0))
+            h = float(attrs.get('height', 0.0))
+            path_id = f"rect_{len(defs)}"
+            defs[path_id] = f"M {x} {y} L {x+w} {y} L {x+w} {y+h} L {x} {y+h} Z"
+            draw_ops.append((path_id, m, fill))
+        else:
+            for child in element:
+                traverse(child, m, fill)
+                
+    traverse(root, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), None)
+    return {
+        'viewbox': viewbox,
+        'defs': defs,
+        'ops': draw_ops
+    }
+
+def extract_argb(color):
+    """Extract A, R, G, B components from a 32-bit color int safely in Python."""
+    c = int(color)
+    a = (c >> 24) & 0xFF
+    r = (c >> 16) & 0xFF
+    g = (c >> 8) & 0xFF
+    b = c & 0xFF
+    return a, r, g, b
+
+def render_svg_to_bitmap(svg_layout, fg_color=None, bg_color=None):
+    """Render the parsed SVG paths onto a bitmap with per-path color support."""
+    try:
+        viewbox = svg_layout['viewbox']
+        min_x, min_y, vb_w, vb_h = viewbox
+
+        density = AndroidUtilities.density
+        scale = float(density) * 12.0
+
+        width = max(4, int(vb_w * scale))
+        height = max(4, int(vb_h * scale))
+
+        log(f"[latex] render_svg_to_bitmap: viewbox={viewbox} scale={scale} bmp={width}x{height}")
+
+        BitmapClass = find_class("android.graphics.Bitmap")
+        BitmapConfig = find_class("android.graphics.Bitmap$Config")
+        CanvasClass = find_class("android.graphics.Canvas")
+        PaintClass = find_class("android.graphics.Paint")
+        PaintStyleClass = find_class("android.graphics.Paint$Style")
+
+        argb_8888 = BitmapConfig.ARGB_8888
+        bmp = BitmapClass.createBitmap(width, height, argb_8888)
+        canvas = CanvasClass(bmp)
+
+        if bg_color is not None:
+            paint_bg = PaintClass()
+            a, r, g, b = extract_argb(bg_color)
+            paint_bg.setARGB(a, r, g, b)
+            paint_bg.setStyle(PaintStyleClass.FILL)
+            canvas.drawRect(0.0, 0.0, float(width), float(height), paint_bg)
+
+        # Default fg color
+        if fg_color is not None:
+            default_argb = extract_argb(fg_color)
+        else:
+            default_argb = (255, 0, 0, 0)
+
+        canvas.save()
+        canvas.scale(scale, scale)
+        canvas.translate(-min_x, -min_y)
+
+        draw_items = svg_layout.get('draw_items')  # list of (path_obj, mat, fill_str)
+        if draw_items:
+            for path_obj, mat, fill_str in draw_items:
+                paint = PaintClass()
+                paint.setAntiAlias(True)
+                paint.setStyle(PaintStyleClass.FILL)
+                
+                if fill_str:
+                    parsed = parse_svg_color(fill_str)
+                    if parsed is None:
+                        # 'none' — skip this path (transparent)
+                        continue
+                    a, r, g, b = parsed
+                    paint.setARGB(a, r, g, b)
+                else:
+                    a, r, g, b = default_argb
+                    paint.setARGB(a, r, g, b)
+                
+                # Apply matrix transform and draw
+                AndroidMatrix = find_class("android.graphics.Matrix")
+                from java import jarray, jfloat
+                ma, mb, mc, md, me, mf = mat
+                m = AndroidMatrix()
+                m.setValues(jarray(jfloat)([float(ma), float(mc), float(me), float(mb), float(md), float(mf), 0.0, 0.0, 1.0]))
+                canvas.save()
+                canvas.concat(m)
+                canvas.drawPath(path_obj, paint)
+                canvas.restore()
+        else:
+            # Fallback: old full_path mode
+            full_path = svg_layout.get('full_path')
+            if full_path:
+                paint = PaintClass()
+                a, r, g, b = default_argb
+                paint.setARGB(a, r, g, b)
+                paint.setAntiAlias(True)
+                paint.setStyle(PaintStyleClass.FILL)
+                canvas.drawPath(full_path, paint)
+
+        canvas.restore()
+        return bmp
+    except Exception as e:
+        log(f"[latex] render_svg_to_bitmap FAILED: {e}")
+        return None
+
+# Must be defined at module level so dynamic_proxy super().__init__() works correctly
+TextWatcherInterface = find_class("android.text.TextWatcher")
+
+class EditorTextWatcher(dynamic_proxy(TextWatcherInterface)):
+    """TextWatcher that triggers LaTeX preview as user types, with a debounce."""
+    def __init__(self, plugin, preview, preview_scroll):
+        super().__init__()
+        self.plugin = plugin
+        self.preview = preview
+        self.preview_scroll = preview_scroll
+        self.timer = None
+
+    def beforeTextChanged(self, s, start, count, after):
+        pass
+
+    def onTextChanged(self, s, start, before, count):
+        pass
+
+    def afterTextChanged(self, s):
+        text = str(s)
+        
+        if self.timer:
+            self.timer.cancel()
+            
+        if not text.strip():
+            self.preview.setImageBitmap(None)
+            return
+        
+        def trigger():
+            def on_loaded(svg_layout):
+                def do_ui():
+                    Theme = find_class("org.telegram.ui.ActionBar.Theme")
+                    fg = Theme.getColor(Theme.key_dialogTextBlack)
+                    bmp = render_svg_to_bitmap(svg_layout, bg_color=None, fg_color=fg)
+                    if bmp:
+                        self.preview.setImageBitmap(bmp)
+                        
+                        # Calculate exact pixel dimensions to avoid ImageView caching large widths
+                        # and to fix empty scrollable spaces.
+                        h_px = self.preview_scroll.getHeight()
+                        if h_px <= 0:
+                            AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
+                            h_px = AndroidUtilities.dp(104) # 120dp minus 8dp top/bottom padding
+                        else:
+                            h_px -= (self.preview_scroll.getPaddingTop() + self.preview_scroll.getPaddingBottom())
+                            
+                        if h_px > 0 and bmp.getHeight() > 0:
+                            aspect = bmp.getWidth() / float(bmp.getHeight())
+                            w_px = int(h_px * aspect)
+                            
+                            FrameLayout = find_class("android.widget.FrameLayout")
+                            Gravity = find_class("android.view.Gravity")
+                            params = FrameLayout.LayoutParams(w_px, h_px)
+                            params.gravity = Gravity.START | Gravity.CENTER_VERTICAL
+                            self.preview.setLayoutParams(params)
+                
+                run_on_ui_thread(do_ui)
+                
+            self.plugin.fetch_latex_image(text, on_loaded)
+            
+        from threading import Timer
+        self.timer = Timer(0.5, trigger)
+        self.timer.start()
+
+class LatexPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.image_cache = {}
+        self.downloading = set()
+        self.processed_messages = {}
+        
+        self.help_categories = {
+            "Math": [
+                r"\cdot", r"\times", r"\div", r"\pm", r"\mp",
+                r"\frac{a}{b}", r"\sqrt{x}", r"\sqrt[n]{x}",
+                r"x^2", r"a_i", r"\infty",
+                r"\neq", r"\le", r"\ge", r"\equiv", r"\approx",
+                r"\simeq", r"\propto", r"\sim", r"\doteq", r"\triangleq",
+                r"\gg", r"\ll", r"\circ",
+                r"\lfloor x \rfloor", r"\lceil x \rceil",
+                r"\max", r"\min", r"\sup", r"\inf",
+                r"\gcd", r"\deg", r"\dim", r"\ker", r"\det",
+                r"\bmod",
+            ],
+
+            "Calculus": [
+                r"\frac{d}{dx}", r"\frac{d^n}{dx^n}", r"\frac{\partial}{\partial x}",
+                r"\frac{\partial^2}{\partial x^2}", r"\partial", r"\nabla", r"\Delta",
+                r"\int", r"\iint", r"\iiint", r"\oint", r"\oiint",
+                r"\sum_{i=1}^{n}", r"\prod_{i=1}^{n}", r"\coprod_{i=1}^n",
+                r"\lim_{x \to \infty}", r"\varlimsup", r"\varliminf",
+                r"\bigg|_{a}^{b}",
+            ],
+
+            "Functions": [
+                r"\sin(x)", r"\cos(x)", r"\tan(x)", r"\cot(x)", r"\sec(x)", r"\csc(x)",
+                r"\arcsin(x)", r"\arccos(x)", r"\arctan(x)",
+                r"\sinh(x)", r"\cosh(x)", r"\tanh(x)",
+                r"\exp(x)", r"\ln(x)", r"\log_a(b)",
+                r"\Gamma(x)", r"\zeta(s)",
+                r"\Re(z)", r"\Im(z)",
+            ],
+
+            "Greek": [
+                r"\alpha", r"\beta", r"\gamma", r"\delta",
+                r"\epsilon", r"\varepsilon", r"\zeta", r"\eta",
+                r"\theta", r"\vartheta", r"\kappa", r"\lambda",
+                r"\mu", r"\nu", r"\xi", r"\pi",
+                r"\rho", r"\sigma", r"\tau", r"\upsilon",
+                r"\phi", r"\varphi", r"\chi", r"\psi", r"\omega",
+                r"\Gamma", r"\Delta", r"\Theta", r"\Lambda", r"\Xi",
+                r"\Pi", r"\Sigma", r"\Phi", r"\Psi", r"\Omega",
+            ],
+
+            "Sets & Logic": [
+                r"\in", r"\notin", r"\subset", r"\subseteq", r"\supset", r"\supseteq",
+                r"\cup", r"\cap", r"\setminus", r"\complement",
+                r"\emptyset", r"\varnothing",
+                r"\forall", r"\exists",
+                r"\implies", r"\iff", r"\wedge", r"\vee", r"\neg",
+                r"\top", r"\bot", r"\vdash", r"\models",
+                r"\mathbb{R}", r"\mathbb{N}", r"\mathbb{Z}",
+                r"\mathbb{Q}", r"\mathbb{C}", r"\mathbb{P}", r"\mathbb{H}",
+                r"\aleph", r"\aleph_0", r"\beth",
+            ],
+
+            "Linear Algebra": [
+                r"\mathbf{A}^{-1}", r"\mathbf{A}^T", r"\mathbf{A}^*",
+                r"\det(\mathbf{A})", r"\text{tr}(\mathbf{A})",
+                r"\text{rank}(\mathbf{A})", r"\ker(\mathbf{A})", r"\text{Im}(\mathbf{A})",
+                r"\|\mathbf{v}\|", r"\mathbf{u} \cdot \mathbf{v}", r"\mathbf{u} \times \mathbf{v}",
+                r"\otimes", r"\oplus",
+                r"\lambda_1, \dots, \lambda_n",
+                r"\begin{vmatrix} a & b \\ c & d \end{vmatrix}",
+                r"\begin{Vmatrix} a & b \\ c & d \end{Vmatrix}",
+            ],
+
+            "Probability & Statistics": [
+                r"P(A)", r"P(A \mid B)", r"P(A \cap B)", r"P(A \cup B)",
+                r"\mathbb{E}[X]", r"\text{Var}(X)", r"\text{Cov}(X,Y)",
+                r"\mu", r"\sigma^2", r"\bar{x}", r"\hat{\theta}",
+                r"X \sim \mathcal{N}(\mu, \sigma^2)",
+                r"X \sim \text{Bin}(n,p)", r"X \sim \text{Pois}(\lambda)",
+                r"\Phi(x)", r"\binom{n}{k}", r"n!",
+            ],
+
+            "Number Theory": [
+                r"\gcd(a,b)", r"\text{lcm}(a,b)",
+                r"a \equiv b \pmod{n}",
+                r"\lfloor x \rfloor", r"\lceil x \rceil", r"\{x\}",
+                r"p \mid n", r"p \nmid n",
+                r"\phi(n)", r"\mu(n)", r"\tau(n)", r"\sigma(n)",
+                r"\zeta(s)", r"\mathbb{P}",
+                r"\left(\frac{a}{p}\right)",
+            ],
+
+            "Complex Analysis": [
+                r"z = a + bi", r"|z|", r"\arg(z)", r"\bar{z}",
+                r"\text{Re}(z)", r"\text{Im}(z)",
+                r"e^{i\theta}", r"e^{i\pi} + 1 = 0",
+                r"\oint_C f(z)\,dz", r"\text{Res}(f, z_0)",
+                r"\mathbb{C}", r"\mathfrak{Re}", r"\mathfrak{Im}",
+            ],
+
+            "Arrows": [
+                r"\rightarrow", r"\leftarrow", r"\leftrightarrow",
+                r"\Rightarrow", r"\Leftarrow", r"\Leftrightarrow",
+                r"\longrightarrow", r"\xrightarrow{f}", r"\xleftarrow{f}",
+                r"\mapsto", r"\hookrightarrow", r"\hookleftarrow",
+                r"\twoheadrightarrow", r"\rightharpoonup", r"\leftharpoondown",
+                r"\rightleftharpoons",
+                r"\uparrow", r"\downarrow",
+                r"\nearrow", r"\searrow",
+                r"\circlearrowleft",
+            ],
+
+            "Vectors & Accents": [
+                r"\vec{v}", r"\hat{i}", r"\bar{x}", r"\dot{x}", r"\ddot{x}",
+                r"\tilde{x}", r"\widehat{AB}", r"\widetilde{AB}",
+                r"\overline{AB}", r"\underline{x}",
+                r"\overrightarrow{AB}", r"\overleftarrow{AB}",
+                r"\mathbf{A}", r"\langle x, y \rangle", r"|x|",
+            ],
+
+            "Brackets": [
+                r"\left( x \right)", r"\left[ x \right]",
+                r"\left\{ x \right\}", r"\left| x \right|",
+                r"\left\| x \right\|",
+                r"\left\langle x \right\rangle",
+                r"\langle \psi | \phi \rangle",
+                r"\lfloor x \rfloor", r"\lceil x \rceil",
+                r"\ulcorner x \urcorner",
+            ],
+
+            "Quantum Mechanics": [
+                r"\hat{p} = -i\hbar\nabla",
+                r"[\hat{x}, \hat{p}] = i\hbar",
+                r"\hat{a}", r"\hat{a}^\dagger",
+                r"\langle \hat{A} \rangle",
+                r"\hbar",
+                r"\sigma_x \sigma_p \geq \frac{\hbar}{2}",
+            ],
+
+            "Physics": [
+                r"\vec{F} = m\vec{a}", r"\Delta E = mc^2",
+                r"\nabla^2", r"\hbar", r"\hslash",
+                r"\mathring{A}", r"90^{\circ}",
+                r"\Delta H^\circ", r"\Delta G^\circ", r"\Delta S^\circ",
+            ],
+
+            "Geometry": [
+                r"\angle", r"\triangle", r"\perp", r"\parallel",
+                r"\cong", r"\sim", r"90^{\circ}",
+            ],
+
+            "Relations": [
+                r"\prec", r"\succ", r"\preceq", r"\succeq",
+                r"\lesssim", r"\gtrsim", r"\lessgtr", r"\gtrless",
+                r"\asymp", r"\between",
+                r"\not\sim", r"\not\equiv", r"\not\subset",
+            ],
+
+            "Operators": [
+                r"\oplus", r"\otimes", r"\odot", r"\ominus", r"\oslash",
+                r"\boxplus", r"\boxtimes", r"\boxdot",
+                r"\star", r"\ast", r"\bullet",
+                r"\dagger", r"\ddagger",
+                r"\ltimes", r"\rtimes", r"\wr",
+            ],
+
+            "Big Operators": [
+                r"\sum_{i=1}^n", r"\prod_{i=1}^n", r"\coprod_{i=1}^n",
+                r"\bigcup_{i=1}^n", r"\bigcap_{i=1}^n",
+                r"\bigoplus_{i=1}^n", r"\bigotimes_{i=1}^n",
+                r"\bigsqcup_{i=1}^n", r"\biguplus_{i=1}^n",
+                r"\bigvee_{i=1}^n", r"\bigwedge_{i=1}^n",
+            ],
+
+            "Structures": [
+                r"\frac{a}{b}", r"\binom{n}{k}",
+                r"\begin{matrix} a & b \\ c & d \end{matrix}",
+                r"\begin{pmatrix} a & b \\ c & d \end{pmatrix}",
+                r"\begin{bmatrix} a & b \\ c & d \end{bmatrix}",
+                r"\begin{vmatrix} a & b \\ c & d \end{vmatrix}",
+                r"\begin{Bmatrix} a & b \\ c & d \end{Bmatrix}",
+                r"\begin{cases} a \\ b \end{cases}",
+                r"\begin{align} a &= b \\ c &= d \end{align}",
+                r"\begin{gather} a \\ b \end{gather}",
+                r"\stackrel{?}{=}", r"\overset{!}{=}",
+                r"\underset{x \to 0}{\lim}",
+                r"\substack{a \\ b}",
+            ],
+
+            "Decorations": [
+                r"\boxed{x}",
+                r"\overbrace{a+b+c}^{n}", r"\underbrace{a+b}_{n}",
+                r"\cancel{x}", r"\bcancel{x}", r"\xcancel{x}", r"\cancelto{0}{x}",
+                r"\phantom{x}", r"\hphantom{x}", r"\vphantom{x}",
+                r"\smash{x}",
+                r"\color{red}{x}", r"\textcolor{red}{x}",
+            ],
+
+            "Fonts": [
+                r"\text{text}", r"\mathrm{e}", r"\mathit{x}",
+                r"\mathbf{A}", r"\boldsymbol{\alpha}",
+                r"\mathcal{L}", r"\mathcal{O}(n)", r"\mathscr{F}",
+                r"\mathfrak{g}", r"\mathfrak{Re}",
+                r"\mathsf{A}", r"\mathtt{A}",
+                r"\mathbb{R}", r"\mathbb{1}",
+            ],
+
+            "Formatting": [
+                r"\,", r"\:", r"\;", r"\quad", r"\qquad", r"\!", r"\dots",
+                r"\vdots", r"\ddots",
+                r"\displaystyle", r"\textstyle", r"\scriptstyle", r"\scriptscriptstyle",
+            ],
+
+            "Chemistry": [
+                r"\text{H}_2\text{O}", r"\text{CO}_2",
+                r"\text{H}_2\text{SO}_4", r"\text{NaCl}",
+                r"\rightleftharpoons",
+                r"\Delta H^\circ", r"\Delta G^\circ", r"\Delta S^\circ",
+                r"K_{eq}", r"K_a", r"K_b",
+                r"\text{pH} = -\log[\text{H}^+]",
+                r"^{12}_{\;6}\text{C}",
+                r"\alpha", r"\beta^-", r"\gamma",
+            ],
+        }
+
+    def hook_all_methods_safe(self, cls, method_name, hook_class):
+        """Safe alternative to base_plugin.hook_all_methods that works on older Android versions without Stream.toList()"""
+        try:
+            for m in cls.getClass().getDeclaredMethods():
+                if m.getName() == method_name:
+                    self.hook_method(m, hook_class(self))
+        except Exception as e:
+            log(f"Failed to hook {method_name}: {e}")
+
+    def on_plugin_unload(self):
+        log(f"[{__name__}] Unloaded successfully")
+        if hasattr(self, "_watchers"):
+            for eview, watcher in self._watchers.values():
+                try:
+                    eview.removeTextChangedListener(watcher)
+                except Exception:
+                    pass
+            self._watchers.clear()
+        self._watchers = {}
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False)
+
+    def on_plugin_load(self):
+        log(f"[{__name__}] Loaded successfully")
+        self._watchers = {}
+        from concurrent.futures import ThreadPoolExecutor
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        
+        # Setup local SVG cache directory
+        try:
+            self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "latex_svg_cache")
+            if not os.path.exists(self.cache_dir):
+                os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception as e:
+            self.cache_dir = None
+            log(f"Failed to create cache dir: {e}")
+
+        # 1. Hook ChatActivityEnterView to intercept `.ltx` during typing
+        ChatActivityEnterView = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+        if ChatActivityEnterView:
+            self.hook_all_constructors(ChatActivityEnterView.getClass(), ConstructorHook(self))
+            MessageObject = find_class("org.telegram.messenger.MessageObject")
+            ReplyQuote = find_class("org.telegram.ui.ChatActivity$ReplyQuote")
+            try:
+                method = ChatActivityEnterView.getClass().getDeclaredMethod("setReplyingMessageObject", MessageObject, ReplyQuote, MessageObject)
+                method.setAccessible(True)
+                self.hook_method(method, ReplyHook(self))
+            except Exception as e:
+                log(f"Failed to hook setReplyingMessageObject: {e}")
+
+        # 2. Hook ChatMessageCell to render LaTeX over messages
+        ChatMessageCellClass = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        try:
+            methods = ChatMessageCellClass.getClass().getDeclaredMethods()
+            found_method = None
+            for m in methods:
+                name = str(m.getName())
+                params = [str(p.getName()) for p in m.getParameterTypes()]
+                if "setMessage" in name or "setContent" in name:
+                    log(f"[latex] found method: {name}({', '.join(params)})")
+                if name == "setMessageContent":
+                    found_method = m
+            if found_method:
+                found_method.setAccessible(True)
+                self.hook_method(found_method, RenderHook(self))
+                log("[latex] hooked setMessageContent via reflection")
+            else:
+                log("[latex] setMessageContent not found, trying hook_all_methods_safe")
+                self.hook_all_methods_safe(ChatMessageCellClass, "setMessageContent", RenderHook)
+        except Exception as e:
+            log(f"Failed to hook setMessageContent: {e}")
+        
+        # 3. Attach to currently open chat immediately
+        try:
+            fragment = get_last_fragment()
+            if fragment and "ChatActivity" in str(fragment.getClass().getName()):
+                eview = None
+                try:
+                    eview = fragment.getChatActivityEnterView()
+                except Exception:
+                    try:
+                        eview_field = fragment.getClass().getDeclaredField("chatActivityEnterView")
+                        eview_field.setAccessible(True)
+                        eview = eview_field.get(fragment)
+                    except Exception:
+                        pass
+                if eview:
+                    self.attach_watcher(eview)
+        except Exception as e:
+            log(f"Failed to attach existing eview: {e}")
+        
+    def attach_watcher(self, eview):
+        if not eview:
+            return
+        if not hasattr(self, "_watchers"):
+            self._watchers = {}
+        
+        try:
+            e_id = eview.hashCode()
+            if e_id in self._watchers:
+                return
+            
+            watcher_cls = self._create_watcher_class()
+            watcher = watcher_cls(eview)
+            eview.addTextChangedListener(watcher)
+            self._watchers[e_id] = (eview, watcher)
+        except Exception as e:
+            log(f"Failed to attach watcher: {e}")
+
+    def _create_watcher_class(self):
+        plugin = self
+        from java import jclass
+        class LtxTextWatcher(dynamic_proxy(jclass("android.text.TextWatcher"))):
+            def __init__(self, eview):
+                super().__init__()
+                self.eview = eview
+                self._skip = False
+            def beforeTextChanged(self, s, start, count, after): pass
+            def afterTextChanged(self, s): pass
+            def onTextChanged(self, s, start, before, count):
+                if self._skip:
+                    self._skip = False
+                    return
+                text = str(s) if s else ""
+                if not text:
+                    return
+                
+                # Check for .ltx trigger
+                if ".ltx" in text:
+                    new_text = text.replace(".ltx", "")
+                    self._skip = True
+                    run_on_ui_thread(lambda: self.eview.setFieldText(new_text))
+                    run_on_ui_thread(lambda: plugin.show_latex_editor(self.eview))
+        return LtxTextWatcher
+        log(f"[{__name__}] Unloaded successfully")
+
+    def fetch_latex_image(self, formula: str, callback):
+        if formula in self.image_cache:
+            callback(self.image_cache[formula])
+            return
+
+        if formula in self.downloading:
+            return
+
+        self.downloading.add(formula)
+
+        def download():
+            log(f"[latex] download started for: {formula[:30]!r}")
+            try:
+                svg_data = None
+                cache_file = None
+                
+                if getattr(self, 'cache_dir', None):
+                    formula_hash = hashlib.md5(formula.encode('utf-8')).hexdigest()
+                    cache_file = os.path.join(self.cache_dir, f"{formula_hash}.svg")
+                    if os.path.exists(cache_file):
+                        try:
+                            with open(cache_file, 'r', encoding='utf-8') as f:
+                                svg_data = f.read()
+                            log("[latex] loaded from disk cache")
+                        except Exception:
+                            pass
+                            
+                if not svg_data:
+                    # Pre-process formula: normalize \textcolor to \color for consistent SVG output
+                    formula_enc = formula.replace(r'\textcolor', r'\color')
+                    encoded = urllib.parse.quote(formula_enc, safe='~()*!.\'\\')
+                    url = f"https://latex.codecogs.com/svg.image?{encoded}"
+                    log(f"[latex] fetching URL: {url[:80]}")
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req) as response:
+                        svg_data = response.read().decode('utf-8')
+                    log(f"[latex] downloaded {len(svg_data)} bytes")
+                        
+                    if cache_file:
+                        try:
+                            with open(cache_file, 'w', encoding='utf-8') as f:
+                                f.write(svg_data)
+                        except Exception:
+                            pass
+                
+                # Parse SVG
+                svg_layout = parse_svg(svg_data)
+                log(f"[latex] SVG parsed ok, viewbox={svg_layout.get('viewbox')}")
+                
+                PathClass = find_class("android.graphics.Path")
+
+                # Pre-compile SVG paths into Android Path objects
+                compiled_paths = {}
+                for path_id, d_str in svg_layout['defs'].items():
+                    path_obj = PathClass()
+                    parse_svg_path(d_str, path_obj)
+                    compiled_paths[path_id] = path_obj
+                    
+                # Build list of (path_obj, matrix, fill_color_str) for color-aware rendering
+                draw_items = []
+                for path_id, mat_tuple, fill_str in svg_layout['ops']:
+                    path_obj = compiled_paths.get(path_id)
+                    if path_obj:
+                        draw_items.append((path_obj, mat_tuple, fill_str))
+                        
+                svg_layout['draw_items'] = draw_items
+                
+                # Clean up temporary parsing data to free memory
+                svg_layout.pop('defs', None)
+                svg_layout.pop('ops', None)
+                
+                self.image_cache[formula] = svg_layout
+                log("[latex] calling callback via run_on_ui_thread")
+                run_on_ui_thread(lambda: callback(svg_layout))
+            except Exception as e:
+                log(f"[latex] download FAILED: {e}")
+            finally:
+                if formula in self.downloading:
+                    self.downloading.remove(formula)
+
+        self.executor.submit(download)
+
+    def show_latex_editor(self, target_eview=None):
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+
+        act = fragment.getParentActivity()
+        if not act:
+            return
+
+        # Capture dialog_id safely before opening dialog
+        try:
+            dialog_id = fragment.getDialogId()
+        except Exception:
+            try:
+                dialog_id = fragment.dialogId
+            except Exception:
+                log("Cannot get dialog_id, aborting editor")
+                return
+
+        builder = AlertDialogBuilder(act)
+        builder.set_title("LaTeX Editor")
+
+        layout = LinearLayout(act)
+        layout.setOrientation(LinearLayout.VERTICAL)
+        layout.setPadding(
+            AndroidUtilities.dp(16), AndroidUtilities.dp(8),
+            AndroidUtilities.dp(16), AndroidUtilities.dp(16)
+        )
+
+        preview_height_dp = [60]  # mutable container so closures can update it
+
+        edit_text = EditText(act)
+        edit_text.setHint("Formula (e.g. E=mc^2)")
+        edit_text.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        edit_text.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+
+        # --- INLINE HELP SECTION ---
+        help_section = LinearLayout(act)
+        help_section.setOrientation(LinearLayout.VERTICAL)
+        # Give it a small fixed height (~120dp) so it's about 3 lines
+        layout.addView(help_section, LayoutHelper.createLinear(-1, 120))
+        
+        HorizontalScrollView = find_class("android.widget.HorizontalScrollView")
+        FrameLayout = find_class("android.widget.FrameLayout")
+
+        # Categories Header (Tabs)
+        tabs_scroll = HorizontalScrollView(act)
+        tabs_scroll.setHorizontalScrollBarEnabled(False)
+        tabs_container = LinearLayout(act)
+        tabs_container.setOrientation(LinearLayout.HORIZONTAL)
+        
+        tabs_params = FrameLayout.LayoutParams(-2, -1)
+        tabs_params.gravity = Gravity.CENTER_VERTICAL
+        tabs_scroll.addView(tabs_container, tabs_params)
+        
+        help_section.addView(tabs_scroll, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 8))
+        
+        # Items Body (Scrollable horizontally)
+        items_scroll = HorizontalScrollView(act)
+        items_scroll.setHorizontalScrollBarEnabled(False)
+        items_container = LinearLayout(act)
+        items_container.setOrientation(LinearLayout.HORIZONTAL)
+        
+        items_params = FrameLayout.LayoutParams(-2, -1)
+        items_params.gravity = Gravity.CENTER_VERTICAL
+        items_scroll.addView(items_container, items_params)
+        
+        help_section.addView(items_scroll, LayoutHelper.createLinear(-1, -1))
+        
+        # Function to build item card
+        def make_click_listener(f):
+            def _on_click(_=None):
+                start = edit_text.getSelectionStart()
+                end = edit_text.getSelectionEnd()
+                if start < 0:
+                    start = 0
+                if end < 0:
+                    end = 0
+                if start > end:
+                    start, end = end, start
+                
+                editable = edit_text.getText()
+                if editable:
+                    editable.replace(start, end, f)
+                else:
+                    edit_text.setText(f)
+                    edit_text.setSelection(len(f))
+            return OnClickListener(_on_click)
+
+        def populate_category(cat_name):
+            items_container.removeAllViews()
+            for formula in self.help_categories.get(cat_name, []):
+                # Card
+                card = LinearLayout(act)
+                card.setOrientation(LinearLayout.VERTICAL)
+                card.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(4), AndroidUtilities.dp(16), AndroidUtilities.dp(4))
+                card.setGravity(Gravity.CENTER_HORIZONTAL)
+                card.setOnClickListener(make_click_listener(formula))
+                
+                # Text Hint
+                tv = TextView(act)
+                tv.setText(formula)
+                tv.setTextColor(Theme.getColor(Theme.key_dialogTextHint))
+                tv.setTextSize(12.0)
+                tv.setGravity(Gravity.CENTER_HORIZONTAL)
+                card.addView(tv, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 6))
+                
+                # Image
+                img = ImageView(act)
+                img.setScaleType(ImageView.ScaleType.FIT_CENTER)
+                img.setAdjustViewBounds(True)
+                
+                # Placeholder params
+                img_params = LinearLayout.LayoutParams(-2, AndroidUtilities.dp(24))
+                img_params.gravity = Gravity.CENTER_HORIZONTAL
+                card.addView(img, img_params)
+                
+                # Load asynchronously
+                def make_on_loaded(image_view):
+                    def on_loaded(svg_layout):
+                        Theme = find_class("org.telegram.ui.ActionBar.Theme")
+                        fg = Theme.getColor(Theme.key_dialogTextBlack)
+                        bmp = render_svg_to_bitmap(svg_layout, bg_color=None, fg_color=fg)
+                        if bmp:
+                            vb_h = svg_layout['viewbox'][3]
+                            vb_w = svg_layout['viewbox'][2]
+                            density = AndroidUtilities.density
+                            scale = density * 1.15
+                            
+                            w_px = max(1, int(vb_w * scale))
+                            h_px = max(1, int(vb_h * scale))
+                            
+                            image_view.setImageBitmap(bmp)
+                            params = image_view.getLayoutParams()
+                            params.width = w_px
+                            params.height = h_px
+                            image_view.setLayoutParams(params)
+                    return on_loaded
+                    
+                self.fetch_latex_image(formula, make_on_loaded(img))
+                
+                items_container.addView(card, LayoutHelper.createLinear(-2, -1, Gravity.CENTER_VERTICAL))
+                
+        # Build category tabs
+        if self.help_categories:
+            first_cat = list(self.help_categories.keys())[0]
+            
+            from android.graphics.drawable import GradientDrawable
+            
+            tab_views = []
+            
+            def update_tabs(selected_cat):
+                for c_name, tab_tv in tab_views:
+                    bg = GradientDrawable()
+                    bg.setShape(GradientDrawable.RECTANGLE)
+                    bg.setCornerRadius(float(AndroidUtilities.dp(8)))
+                    if c_name == selected_cat:
+                        bg.setColor(Theme.getColor(Theme.key_featuredStickers_addButton))
+                        tab_tv.setTextColor(Color.WHITE)
+                    else:
+                        # Subtle background for inactive volumetric buttons
+                        try:
+                            is_dark = Theme.isCurrentThemeDark()
+                        except Exception:
+                            is_dark = True
+                        if is_dark:
+                            bg.setColor(Color.argb(40, 255, 255, 255))
+                        else:
+                            bg.setColor(Color.argb(20, 0, 0, 0))
+                        tab_tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+                    tab_tv.setBackground(bg)
+            
+            for cat in self.help_categories.keys():
+                tab = TextView(act)
+                tab.setText(cat)
+                tab.setTextSize(14.0)
+                tab.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(6), AndroidUtilities.dp(14), AndroidUtilities.dp(6))
+                
+                # Bold typeface for tabs
+                try:
+                    tab.setTypeface(AndroidUtilities.getTypeface(AndroidUtilities.TYPEFACE_ROBOTO_MEDIUM))
+                except Exception:
+                    pass
+                
+                def make_tab_listener(c_name):
+                    def _on_tab_click(_=None):
+                        populate_category(c_name)
+                        update_tabs(c_name)
+                    return OnClickListener(_on_tab_click)
+                    
+                tab.setOnClickListener(make_tab_listener(cat))
+                
+                tab_params = LinearLayout.LayoutParams(-2, -2)
+                tab_params.rightMargin = AndroidUtilities.dp(8)
+                tabs_container.addView(tab, tab_params)
+                tab_views.append((cat, tab))
+                
+            # We defer populate_category to after builder.show() to prevent lag
+            update_tabs(first_cat)
+
+        # --- LIVE PREVIEW SECTION ---
+        scroll_container = HorizontalScrollView(act)
+        scroll_container.setPadding(
+            AndroidUtilities.dp(8), AndroidUtilities.dp(8),
+            AndroidUtilities.dp(8), AndroidUtilities.dp(8)
+        )
+
+        preview_image = ImageView(act)
+        preview_image.setAdjustViewBounds(True)
+        preview_image.setScaleType(ImageView.ScaleType.FIT_CENTER)
+        
+        img_params = FrameLayout.LayoutParams(-2, -1)
+        img_params.gravity = Gravity.START | Gravity.CENTER_VERTICAL
+        scroll_container.addView(preview_image, img_params)
+
+        preview_lp = LayoutHelper.createLinear(-1, preview_height_dp[0])
+        # --- RESIZE BAR above preview ---
+        resize_row = LinearLayout(act)
+        resize_row.setOrientation(LinearLayout.HORIZONTAL)
+        resize_row.setGravity(Gravity.CENTER_VERTICAL)
+
+        preview_label = TextView(act)
+        preview_label.setText("Preview")
+        preview_label.setTextSize(12.0)
+        preview_label.setTextColor(Theme.getColor(Theme.key_dialogTextHint))
+        resize_row.addView(preview_label, LayoutHelper.createLinear(0, -2, 1.0, Gravity.CENTER_VERTICAL))
+
+        def make_resize_btn(label):
+            from android.graphics.drawable import GradientDrawable as GD
+            btn = TextView(act)
+            btn.setText(label)
+            btn.setTextSize(18.0)
+            btn.setTextColor(Theme.getColor(Theme.key_dialogTextBlue))
+            btn.setGravity(Gravity.CENTER)
+            btn.setPadding(
+                AndroidUtilities.dp(12), AndroidUtilities.dp(2),
+                AndroidUtilities.dp(12), AndroidUtilities.dp(2)
+            )
+            try:
+                bg = GD()
+                bg.setShape(GD.RECTANGLE)
+                bg.setCornerRadius(float(AndroidUtilities.dp(8)))
+                try:
+                    is_dark = Theme.isCurrentThemeDark()
+                except Exception:
+                    is_dark = True
+                bg.setColor(Color.argb(50, 255, 255, 255) if is_dark else Color.argb(20, 0, 0, 0))
+                btn.setBackground(bg)
+            except Exception:
+                pass
+            return btn
+
+        btn_minus = make_resize_btn("−")
+        btn_plus  = make_resize_btn("+")
+
+        p_m = LinearLayout.LayoutParams(-2, -2)
+        p_m.rightMargin = AndroidUtilities.dp(6)
+        resize_row.addView(btn_minus, p_m)
+        resize_row.addView(btn_plus, LinearLayout.LayoutParams(-2, -2))
+
+        layout.addView(resize_row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 4))
+
+        layout.addView(scroll_container, preview_lp)
+
+        def resize_preview(delta):
+            new_h = max(30, min(300, preview_height_dp[0] + delta))
+            preview_height_dp[0] = new_h
+            h_px = AndroidUtilities.dp(new_h)
+            lp = scroll_container.getLayoutParams()
+            lp.height = h_px
+            scroll_container.setLayoutParams(lp)
+
+            # Also rescale the ImageView to match new container height
+            try:
+                bmp = preview_image.getDrawable()
+                if bmp:
+                    inner_h = max(1, h_px - AndroidUtilities.dp(16))
+                    bw = bmp.getIntrinsicWidth()
+                    bh = bmp.getIntrinsicHeight()
+                    if bh > 0 and bw > 0:
+                        aspect = bw / float(bh)
+                        inner_w = int(inner_h * aspect)
+                        img_lp = FrameLayout.LayoutParams(inner_w, inner_h)
+                        img_lp.gravity = Gravity.START | Gravity.CENTER_VERTICAL
+                        preview_image.setLayoutParams(img_lp)
+            except Exception as e:
+                log(f"resize_preview image update: {e}")
+
+        btn_minus.setOnClickListener(OnClickListener(lambda _: resize_preview(-20)))
+        btn_plus.setOnClickListener(OnClickListener(lambda _: resize_preview(20)))
+        
+        # Add EditText below preview
+        layout.addView(edit_text, LayoutHelper.createLinear(-1, -2, 0, 16, 0, 0))
+
+        # Attach live-preview watcher
+        edit_text.addTextChangedListener(EditorTextWatcher(self, preview_image, scroll_container))
+
+        def on_insert(bld, which):
+            formula = str(edit_text.getText()).strip()
+            if formula:
+                wrapped = f"$${formula}$$"
+                if target_eview:
+                    try:
+                        current_cs = target_eview.getFieldText()
+                        current = str(current_cs) if current_cs else ""
+                        spacer = " " if current and not current.endswith(" ") else ""
+                        target_eview.setFieldText(current + spacer + wrapped + " ")
+                    except Exception as e:
+                        log(f"Failed to insert inline: {e}")
+                        from client_utils import send_message
+                        send_message({
+                            "peer": dialog_id,
+                            "message": wrapped
+                        })
+                else:
+                    from client_utils import send_message
+                    send_message({
+                        "peer": dialog_id,
+                        "message": wrapped
+                    })
+            bld.dismiss()
+
+        builder.set_view(layout)
+        builder.set_positive_button("Insert", on_insert)
+        builder.set_negative_button("Cancel", lambda b, w: b.dismiss())
+        builder.show()
+        
+        # Populate after the dialog is shown so it doesn't freeze the keyboard
+        if self.help_categories:
+            first_cat = list(self.help_categories.keys())[0]
+            run_on_ui_thread(lambda: populate_category(first_cat))
+
+class ConstructorHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+    def after_hooked_method(self, param):
+        self.plugin.attach_watcher(param.thisObject)
+
+class ReplyHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+    def after_hooked_method(self, param):
+        self.plugin.attach_watcher(param.thisObject)
+
+class RenderHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        cell = param.thisObject
+        msg_obj = param.args[0]
+        if not msg_obj:
+            return
+
+        try:
+            text = str(msg_obj.messageText) if msg_obj.messageText else ""
+        except Exception as ex:
+            log(f"[latex] failed to get messageText: {ex}")
+            return
+
+        msg_id = msg_obj.getId()
+        
+        # Prevent infinite loops but allow re-processing if the CharSequence object itself changed
+        # (which happens when scrolling away and back, as Telegram strips custom spans)
+        try:
+            current_hash = msg_obj.messageText.hashCode()
+        except Exception:
+            current_hash = hash(text)
+
+        if self.plugin.processed_messages.get(msg_id) == current_hash:
+            return
+
+        formulas = list(re.finditer(r'\$\$(.*?)\$\$', text, re.DOTALL))
+        if not formulas:
+            return
+
+        log(f"[latex] found {len(formulas)} formula(s) in message {msg_id}")
+        self.plugin.processed_messages[msg_id] = current_hash
+
+        Theme = find_class("org.telegram.ui.ActionBar.Theme")
+        try:
+            is_out = msg_obj.isOutOwner()
+        except Exception:
+            is_out = True
+            
+        try:
+            color = Theme.getColor(Theme.key_chat_messageTextOut) if is_out else Theme.getColor(Theme.key_chat_messageTextIn)
+        except Exception:
+            try:
+                # Fallback to dialog text color if chat keys are unavailable
+                color = Theme.getColor(Theme.key_dialogTextBlack)
+            except Exception:
+                from android.graphics import Color
+                color = Color.BLACK
+
+        results = {}
+        expected_count = len(formulas)
+        completed = [0]
+
+        def check_all_done():
+            log(f"[latex] check_all_done: {completed[0]}/{expected_count}")
+            if completed[0] < expected_count:
+                return
+
+            try:
+                SpannableString = find_class("android.text.SpannableString")
+                ImageSpan = find_class("android.text.style.ImageSpan")
+                BitmapDrawable = find_class("android.graphics.drawable.BitmapDrawable")
+                ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
+                context = ApplicationLoader.applicationContext
+
+                # Use original CharSequence to preserve links/bold etc.
+                span_str = SpannableString(msg_obj.messageText)
+                density = AndroidUtilities.density
+
+                for idx, match in enumerate(formulas):
+                    bmp = results.get(idx)
+                    if bmp:
+                        drawable = BitmapDrawable(context.getResources(), bmp)
+                        svg_layout = results[f"layout_{idx}"]
+                        vb_w = svg_layout['viewbox'][2]
+                        vb_h = svg_layout['viewbox'][3]
+                        scale = density * 2.0
+                        vw = max(1, int(vb_w * scale))
+                        vh = max(1, int(vb_h * scale))
+                        drawable.setBounds(0, 0, vw, vh)
+                        # 2 is ALIGN_CENTER (API 29+), centers vertically relative to text
+                        span = ImageSpan(drawable, 2)
+                        span_str.setSpan(span, match.start(), match.end(), 33)
+                        log(f"[latex] span set at [{match.start()}:{match.end()}] size={vw}x{vh}")
+
+                log("[latex] calling applyNewText")
+                msg_obj.applyNewText(span_str)
+                msg_obj.forceUpdate = True
+                
+                # Update hash code to match the newly applied SpannableString
+                self.plugin.processed_messages[msg_id] = span_str.hashCode()
+
+                def redraw():
+                    try:
+                        # Re-invoke the hooked setMessageContent method to rebuild the layout
+                        args = list(param.args)
+                        param.method.invoke(cell, *args)
+                        cell.invalidate()
+                        log("[latex] cell redraw done via param.method.invoke")
+                    except Exception as ex:
+                        log(f"[latex] redraw failed: {ex}")
+                        try:
+                            # Fallback if unpacking fails
+                            param.method.invoke(cell, param.args)
+                            cell.invalidate()
+                            log("[latex] cell redraw done via fallback invoke")
+                        except Exception as ex2:
+                            log(f"[latex] fallback redraw failed: {ex2}")
+                run_on_ui_thread(redraw)
+            except Exception as e:
+                log(f"[latex] check_all_done FAILED: {e}")
+
+        try:
+            for idx, match in enumerate(formulas):
+                formula = match.group(1).strip()
+
+                def make_callback(i):
+                    def on_loaded(svg_layout):
+                        log(f"[latex] on_loaded called for formula #{i}")
+                        bmp = render_svg_to_bitmap(svg_layout, fg_color=color, bg_color=None)
+                        log(f"[latex] bitmap rendered: {bmp}")
+                        results[i] = bmp
+                        results[f"layout_{i}"] = svg_layout
+                        completed[0] += 1
+                        check_all_done()
+                    return on_loaded
+
+                log(f"[latex] calling fetch_latex_image for #{idx}")
+                self.plugin.fetch_latex_image(formula, make_callback(idx))
+        except Exception as e:
+            log(f"[latex] error in formula loop: {e}")
