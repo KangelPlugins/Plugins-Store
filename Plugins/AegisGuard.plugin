@@ -1,0 +1,841 @@
+__id__          = "AegisGuard"
+__name__        = "Aegis"
+__description__ = "Слежка, тихие сообщения, автокик сессий, генератор паролей"
+__author__      = "~GRED~(@GREDpl)"
+__version__     = "2.0.0"
+__icon__        = "exteraPlugins/0"
+__min_version__ = "11.12.0"
+
+import time
+import threading
+import json
+import re
+import string
+import secrets
+from typing import Any
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook, MenuItemData, MenuItemType
+from client_utils import get_user_config, send_text, get_messages_controller, get_last_fragment
+from android_utils import run_on_ui_thread
+from ui.settings import Header, Switch, Divider, Input, Text
+from ui.bulletin import BulletinHelper
+
+
+class SilentModePlugin(BasePlugin):
+
+    MENU_ITEM_ID = "guardmod_user"
+
+    def on_plugin_load(self):
+        self._notified_ids   = set()
+        self._msg_cache      = {}
+        self._users          = self._load_users()
+        self._pending_kick   = {}
+        self._known_sessions = set()
+        self._kick_timer     = None
+        self._last_silent_msg = None
+
+        self.add_on_send_message_hook()
+        self.add_hook("TL_updateNewMessage")
+        self.add_hook("TL_updateNewChannelMessage")
+        self.add_hook("TL_updates")
+        self.add_hook("TL_updatesCombined")
+        self.add_hook("TL_updateShortMessage")
+        self.add_hook("TL_updateShortChatMessage")
+        self.add_hook("TL_updateUserStatus")
+        self.add_hook("TL_updateUserName")
+        self.add_hook("TL_updateUserPhoto")
+        self.add_hook("TL_updateReadHistoryOutbox")
+        self.add_hook("TL_updateReadChannelOutbox")
+        self.add_hook("TL_updateNewAuthorization")
+
+        self._hook_send_menu()
+        self._start_kick_watcher()
+        self._refresh_menu(0)
+        threading.Thread(target=self._scan_reset_auth_class, daemon=True).start()
+
+
+    def on_plugin_unload(self):
+        if self._kick_timer:
+            try: self._kick_timer.cancel()
+            except Exception: pass
+
+    def _load_users(self) -> dict:
+        try:
+            return json.loads(self.get_setting("users_v2", "{}"))
+        except Exception:
+            return {}
+
+    def _save_users(self):
+        self.set_setting("users_v2", json.dumps(self._users))
+
+    def _get_user_cfg(self, user_id: int) -> dict:
+        return self._users.get(str(user_id), {})
+
+    def _user_setting(self, user_id: int, key: str, default=False):
+        return self._get_user_cfg(user_id).get(key, default)
+
+    def _refresh_menu(self, user_id: int = 0):
+        try: self.remove_menu_item(self.MENU_ITEM_ID)
+        except Exception: pass
+        tracked = str(user_id) in self._users if user_id else False
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="👁 Aegis ✅" if tracked else "👁 Aegis",
+            on_click=self._on_menu_click,
+            item_id=self.MENU_ITEM_ID,
+        ))
+
+    def _on_menu_click(self, context):
+        try:
+            fragment = get_last_fragment()
+            if not fragment or not hasattr(fragment, "getDialogId"):
+                BulletinHelper.show_error("Открой личный чат с пользователем")
+                return
+            did = int(fragment.getDialogId())
+            if did <= 0:
+                BulletinHelper.show_error("Работает только с личными чатами")
+                return
+            sdid = str(did)
+            if sdid in self._users:
+                self._users[sdid]["enabled"] = not self._users[sdid].get("enabled", True)
+                self._save_users()
+                en = self._users[sdid]["enabled"]
+                BulletinHelper.show_info(f"{'✅ Слежка включена' if en else '⏸ Слежка приостановлена'}")
+            else:
+                mc   = get_messages_controller()
+                user = mc.getUser(did)
+                name = self._user_name(user) if user else str(did)
+                fn = str(getattr(user, "first_name", "") or "") if user else ""
+                ln = str(getattr(user, "last_name",  "") or "") if user else ""
+                un = str(getattr(user, "username",   "") or "") if user else ""
+                self._users[sdid] = {
+                    "enabled":       True,
+                    "name":          name,
+                    "first_name":    fn,
+                    "last_name":     ln,
+                    "username":      un,
+                    "track_online":  True,
+                    "track_changes": True,
+                    "track_edits":   False,
+                    "track_reads":   False,
+                    "notify_to_chat":  True,
+                    "notify_to_notif": False,
+                    "notify_target":   "",
+                }
+                self._save_users()
+                BulletinHelper.show_info(f"✅ Добавлен: {name}")
+            self._refresh_menu(did)
+            self.set_setting("_r", sdid, reload_settings=True)
+        except Exception as e:
+            self.log(f"[Aegis] menu: {e}")
+
+    def _my_uid(self):
+        try: return get_user_config().getClientUserId()
+        except Exception: return 0
+
+    def _notify_user(self, user_id: int, text: str):
+        uid_str = str(user_id)
+        cfg = self._get_user_cfg(user_id)
+        self.log(f"[Aegis] _notify_user: uid={uid_str} cfg={cfg}")
+        if not cfg.get("enabled", True):
+            self.log("[Aegis] notify: disabled"); return
+        to_chat  = bool(self.get_setting(f"u_{uid_str}_to_chat",  cfg.get("notify_to_chat",  True)))
+        to_notif = bool(self.get_setting(f"u_{uid_str}_to_notif", cfg.get("notify_to_notif", False)))
+        target   = str(self.get_setting(f"u_{uid_str}_target",    cfg.get("notify_target",   ""))).strip()
+        self.log(f"[Aegis] notify: to_chat={to_chat} to_notif={to_notif} target='{target}'")
+        if to_chat:
+            if target:
+                try:
+                    parts    = target.split(":")
+                    peer_id  = int(parts[0])
+                    topic_id = int(parts[1]) if len(parts) > 1 else 0
+					
+                    if peer_id > 0 and peer_id < 1000000000000:
+                        peer_id = int(f"-100{peer_id}")
+                    self.log(f"[Aegis] sending to peer={peer_id} topic={topic_id}")
+                    self._send_to_target(peer_id, topic_id, text)
+                except Exception as e:
+                    self.log(f"[Aegis] target error: {e}")
+                    send_text(self._my_uid(), text)
+            else:
+                self.log("[Aegis] sending to Saved Messages")
+                send_text(self._my_uid(), text)
+        if to_notif:
+            lines = text.split("\n")
+            self._show_notification(lines[0][:60], lines[1] if len(lines) > 1 else "")
+
+    def _send_to_target(self, peer_id: int, topic_id: int, text: str):
+        try:
+            send_text(peer_id, text)
+        except Exception as e:
+            self.log(f"[Aegis] send err: {e}")
+
+    def _notify_global(self, text: str):
+        send_text(self._my_uid(), text)
+
+    def _send_to_target(self, peer_id: int, topic_id: int, text: str):
+        try:
+            send_text(peer_id, text)
+        except Exception as e:
+            self.log(f"[Aegis] send err: {e}")
+
+    def _notify_global(self, text: str):
+        send_text(self._my_uid(), text)
+
+    def _send_to_target(self, peer_id: int, topic_id: int, text: str):
+        try:
+            send_text(peer_id, text)
+        except Exception as e:
+            self.log(f"[Aegis] send err: {e}")
+
+    def _notify_global(self, text: str):
+        send_text(self._my_uid(), text)
+
+    def _send_topic_via_hook(self, peer_id: int, topic_id: int, text: str):
+        self._pending_topic_send = (peer_id, topic_id, text)
+        send_text(peer_id, text, replyToMsg=topic_id)
+		
+    def _handle_user_status(self, update):
+        try:
+            user_id = int(getattr(update, "user_id", 0))
+            if not user_id or str(user_id) not in self._users:
+                return
+            cfg = self._get_user_cfg(user_id)
+            if not bool(self.get_setting(f"u_{str(user_id)}_online", cfg.get("track_online", True))):
+                return
+            status = getattr(update, "status", None)
+            if not status:
+                return
+            status_name = type(status).__name__
+            mc   = get_messages_controller()
+            user = mc.getUser(user_id)
+            name = cfg.get("name") or self._user_name(user)
+            if "Online" in status_name:
+                prev_ts = cfg.get("last_online", 0)
+                now_ts  = int(time.time())
+                if now_ts - prev_ts > 60:
+                    cfg["last_online"] = now_ts
+                    self._users[str(user_id)] = cfg
+                    self._save_users()
+                    self._notify_user(user_id, f"🟢 {name} онлайн")
+            elif "Offline" in status_name:
+                was_online = int(getattr(status, "was_online", 0)) or int(time.time())
+                cfg["last_online"] = was_online
+                self._users[str(user_id)] = cfg
+                self._save_users()
+                dt = time.strftime("%H:%M", time.localtime(was_online))
+                self._notify_user(user_id, f"⚫ {name}\n был в {dt}")
+        except Exception as e:
+            self.log(f"[Aegis] status: {e}")
+
+    def _handle_user_name(self, update):
+        try:
+            user_id = int(getattr(update, "user_id", 0))
+            if not user_id or str(user_id) not in self._users:
+                return
+            cfg = self._get_user_cfg(user_id)
+            if not bool(self.get_setting(f"u_{str(user_id)}_changes", cfg.get("track_changes", True))):
+                return
+            mc   = get_messages_controller()
+            user = mc.getUser(user_id)
+            name = cfg.get("name") or self._user_name(user)
+            changes = []
+            new_fn = str(getattr(update, "first_name", "") or "")
+            new_ln = str(getattr(update, "last_name",  "") or "")
+            new_un = str(getattr(update, "username",   "") or "")
+
+            if "first_name" not in cfg and user:
+                cfg["first_name"] = str(getattr(user, "first_name", "") or "")
+                cfg["last_name"]  = str(getattr(user, "last_name",  "") or "")
+                cfg["username"]   = str(getattr(user, "username",   "") or "")
+            if new_fn and new_fn != cfg.get("first_name", ""):
+                changes.append(f"{cfg.get('first_name','?')} > {new_fn}")
+                cfg["first_name"] = new_fn
+            if new_ln != cfg.get("last_name", ""):
+                old_ln = cfg.get('last_name', '')
+                if old_ln or new_ln:
+                    changes.append(f"{old_ln or '—'} > {new_ln or '—'}")
+                cfg["last_name"] = new_ln
+            if new_un != cfg.get("username", ""):
+                old_un = cfg.get('username', '')
+                changes.append(f"@{old_un or '—'} > @{new_un or '—'}")
+                cfg["username"] = new_un
+            if changes:
+                self._users[str(user_id)] = cfg
+                self._save_users()
+                self._notify_user(user_id, f"📝 {name}\n" + "\n".join(changes))
+        except Exception as e:
+            self.log(f"[Aegis] username: {e}")
+
+    def _handle_user_photo(self, update):
+        try:
+            user_id = int(getattr(update, "user_id", 0))
+            if not user_id or str(user_id) not in self._users:
+                return
+            cfg = self._get_user_cfg(user_id)
+            if not bool(self.get_setting(f"u_{str(user_id)}_changes", cfg.get("track_changes", True))):
+                return
+            photo = getattr(update, "photo", None)
+            if not photo:
+                return
+            photo_id = str(getattr(photo, "photo_id", "") or "")
+            if photo_id and photo_id != cfg.get("photo_id", ""):
+                cfg["photo_id"] = photo_id
+                self._users[str(user_id)] = cfg
+                self._save_users()
+                mc   = get_messages_controller()
+                user = mc.getUser(user_id)
+                name = cfg.get("name") or self._user_name(user)
+                self._notify_user(user_id, f"🖼 {name}\nсменил аватарку")
+        except Exception as e:
+            self.log(f"[Aegis] photo: {e}")
+
+    def _handle_edit(self, msg):
+        try:
+            from_id  = getattr(msg, "from_id", None)
+            user_id  = int(getattr(from_id, "user_id", 0)) if from_id else 0
+            if not user_id or str(user_id) not in self._users:
+                return
+            cfg = self._get_user_cfg(user_id)
+            if not bool(self.get_setting(f"u_{str(user_id)}_edits", cfg.get("track_edits", False))):
+                return
+            mc       = get_messages_controller()
+            user     = mc.getUser(user_id)
+            name     = cfg.get("name") or self._user_name(user)
+            new_text = str(getattr(msg, "message", "") or "")[:100]
+            mid      = int(getattr(msg, "id", 0))
+            old_text = self._msg_cache.get(mid, "")
+            if old_text and old_text != new_text:
+                self._notify_user(user_id, f"📝 {name} изменил:\n{old_text}\n  ↓\n{new_text}")
+            else:
+                self._notify_user(user_id, f"📝 {name} изменил сообщение:\n{new_text}")
+            if mid:
+                self._msg_cache[mid] = new_text
+        except Exception as e:
+            self.log(f"[Aegis] edit: {e}")
+
+    def _handle_read_outbox(self, update):
+        try:
+            peer = getattr(update, "peer", None)
+            if not peer or "User" not in type(peer).__name__:
+                return
+            user_id = int(getattr(peer, "user_id", 0))
+            if not user_id or str(user_id) not in self._users:
+                return
+            cfg = self._get_user_cfg(user_id)
+            if not bool(self.get_setting(f"u_{str(user_id)}_reads", cfg.get("track_reads", False))):
+                return
+            max_id = int(getattr(update, "max_id", 0))
+            if max_id <= cfg.get("last_read_outbox", 0):
+                return
+            cfg["last_read_outbox"] = max_id
+            self._users[str(user_id)] = cfg
+            self._save_users()
+            mc   = get_messages_controller()
+            user = mc.getUser(user_id)
+            name = cfg.get("name") or self._user_name(user)
+            ts   = time.strftime("%H:%M", time.localtime())
+            self._notify_user(user_id, f"👁 {name}\n📖 прочитал в {ts}")
+        except Exception as e:
+            self.log(f"[Aegis] read: {e}")
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        try:
+            if update_name == "TL_updateUserStatus":
+                self._handle_user_status(update); return HookResult()
+            if update_name == "TL_updateUserName":
+                self._handle_user_name(update); return HookResult()
+            if update_name == "TL_updateUserPhoto":
+                self._handle_user_photo(update); return HookResult()
+            if update_name in ("TL_updateReadHistoryOutbox", "TL_updateReadChannelOutbox"):
+                self._handle_read_outbox(update); return HookResult()
+            if update_name in ("TL_updateNewAuthorization", "updateNewAuthorization"):
+                self.log("[Aegis] NewAuthorization update received")
+                try:
+                    h = None
+                    for fname in ("authorization_id", "hash", "auth_key_id"):
+                        try:
+                            hf = update.getClass().getDeclaredField(fname)
+                            hf.setAccessible(True)
+                            h = str(hf.get(update)); break
+                        except Exception: pass
+                    if not h:
+                        h = str(int(getattr(update, "authorization_id",
+                                   getattr(update, "hash", 0)) or 0))
+                    if h and h != "0" and h not in self._known_sessions:
+                        self._known_sessions.add(h)
+                        self._on_new_session(h)
+                except Exception as e:
+                    self.log(f"[Aegis] new_auth: {e}")
+                return HookResult()
+            if update_name == "TL_updateShortMessage":
+                mid = int(getattr(update, "id", 0))
+                txt = str(getattr(update, "message", "") or "")
+                if mid and txt:
+                    self._msg_cache[mid] = txt
+            if update_name in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
+                msg = getattr(update, "message", None)
+                if msg:
+                    mid  = int(getattr(msg, "id", 0))
+                    text = str(getattr(msg, "message", "") or "")
+                    if mid and text:
+                        self._msg_cache[mid] = text
+                        if len(self._msg_cache) > 500:
+                            oldest = list(self._msg_cache.keys())[:100]
+                            for k in oldest: del self._msg_cache[k]
+                if msg is not None:
+                    uid = self._my_uid()
+                    peer = getattr(msg, "peer_id", None)
+                    peer_uid = int(getattr(peer, "user_id", 0)) if peer else 0
+                    text = str(getattr(msg, "message", "") or "")
+                    if self._pending_kick and uid and peer_uid == uid:
+                        self._check_codeword(text)
+                if not self.get_setting("notify_silent", False):
+                    return HookResult()
+                msg = getattr(update, "message", None)
+                if msg and not getattr(msg, "out", False) and self._is_silent_msg(msg):
+                    self._last_silent_msg = msg
+                    run_on_ui_thread(self._notify_silent_ui)
+        except Exception as e:
+            self.log(f"[Aegis] update: {e}")
+        return HookResult()
+
+    def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
+        try:
+            if container_name in ("TL_updateShortMessage", "TL_updateShortChatMessage"):
+                if not getattr(updates, "out", False) and getattr(updates, "silent", False):
+                    if self.get_setting("notify_silent", False):
+                        run_on_ui_thread(self._notify_silent_short)
+                return HookResult()
+            if not hasattr(updates, "updates"):
+                return HookResult()
+            upd_list = updates.updates
+            for i in range(upd_list.size()):
+                upd = upd_list.get(i)
+                try:
+                    upd_name = type(upd).__name__
+                    self.log(f"[Aegis]   upd: {upd_name}")
+                    if "NewAuthorization" in upd_name:
+                        try:
+                            hf = upd.getClass().getDeclaredField("hash")
+                            hf.setAccessible(True)
+                            h = str(hf.get(upd))
+                            if h and h != "0" and h not in self._known_sessions:
+                                self._known_sessions.add(h)
+                                self._on_new_session(h)
+                        except Exception: pass
+                    if self._pending_kick:
+                        if "NewMessage" in upd_name or "NewChannelMessage" in upd_name:
+                            msg = getattr(upd, "message", None)
+                            if msg:
+                                uid2 = self._my_uid()
+                                peer2 = getattr(msg, "peer_id", None)
+                                peer_uid2 = int(getattr(peer2, "user_id", 0)) if peer2 else 0
+                                if uid2 and peer_uid2 == uid2:
+                                    self._check_codeword(str(getattr(msg, "message", "") or ""))
+                    if self.get_setting("notify_silent", False):
+                        if "NewMessage" in upd_name or "NewChannelMessage" in upd_name:
+                            msg = getattr(upd, "message", None)
+                            if msg:
+                                mid  = int(getattr(msg, "id", 0))
+                                txt  = str(getattr(msg, "message", "") or "")
+                                if mid and txt:
+                                    self._msg_cache[mid] = txt
+                            if msg and not getattr(msg, "out", False) and self._is_silent_msg(msg):
+                                self._last_silent_msg = msg
+                                run_on_ui_thread(self._notify_silent_ui)
+                    if "EditMessage" in upd_name or "EditChannelMessage" in upd_name:
+                        msg = getattr(upd, "message", None)
+                        if msg and not getattr(msg, "out", False):
+                            self._handle_edit(msg)
+                except Exception: pass
+        except Exception as e:
+            self.log(f"[Aegis] updates: {e}")
+        return HookResult()
+
+    def _hook_send_menu(self):
+        try:
+            from hook_utils import find_class
+            from java import dynamic_proxy
+            from java.lang import Runnable
+            plugin = self
+
+            class RunnableImpl(dynamic_proxy(Runnable)):
+                def __init__(self, func):
+                    super().__init__(); self.func = func
+                def run(self):
+                    try: self.func()
+                    except Exception: pass
+
+            class SendMenuHook(MethodHook):
+                def before_hooked_method(self, param):
+                    try:
+                        item_options = param.args[0]
+                        if not item_options: return
+                        silent_on = plugin.get_setting("all_silent", False)
+                        label = "🔇 Без звука ✅" if silent_on else "🔇 Без звука"
+                        def toggle_silent():
+                            new_val = not plugin.get_setting("all_silent", False)
+                            plugin.set_setting("all_silent", new_val)
+                            BulletinHelper.show_info("🔇 Тихий режим включён" if new_val else "🔔 Выключен")
+                        try:
+                            from org.telegram.messenger import R
+                            icon = getattr(R.drawable, "msg_mute", 0)
+                            item_options.add(icon, label, RunnableImpl(toggle_silent))
+                        except Exception:
+                            item_options.add(0, label, RunnableImpl(toggle_silent))
+                    except Exception: pass
+
+            JClass = find_class("java.lang.Class")
+            if not JClass: return
+            preview_cls = JClass.forName("org.telegram.ui.MessageSendPreview")
+            options_cls = JClass.forName("org.telegram.ui.Components.ItemOptions")
+            if not preview_cls or not options_cls: return
+            method = preview_cls.getDeclaredMethod("setItemOptions", options_cls)
+            method.setAccessible(True)
+            self.hook_method(method, SendMenuHook())
+        except Exception as e:
+            self.log(f"[Aegis] send menu: {e}")
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            text = str(getattr(params, "message", "") or "")
+            if text.strip().startswith("!cpass"):
+                self._handle_cpass(text.strip())
+            if not self.get_setting("all_silent", False):
+                return HookResult()
+            cls = params.getClass()
+            while cls:
+                try:
+                    f = cls.getDeclaredField("notify")
+                    f.setAccessible(True); f.set(params, False)
+                    return HookResult(strategy=HookStrategy.MODIFY, params=params)
+                except Exception:
+                    try: cls = cls.getSuperclass()
+                    except Exception: break
+        except Exception: pass
+        return HookResult()
+
+    def _handle_cpass(self, text: str):
+        try:
+            parts = text.split()
+            length = 16
+            use_lower = use_upper = use_digits = use_sym = True
+            for p in parts[1:]:
+                if p.isdigit(): length = max(4, min(128, int(p)))
+                else:
+                    p = p.lower()
+                    use_lower=("l" in p); use_upper=("u" in p)
+                    use_digits=("d" in p); use_sym=("s" in p)
+            alphabet = ""
+            if use_lower:  alphabet += string.ascii_lowercase
+            if use_upper:  alphabet += string.ascii_uppercase
+            if use_digits: alphabet += string.digits
+            if use_sym:    alphabet += "!@#$%^&*()-_=+[]{}|;:,.<>?"
+            if not alphabet: alphabet = string.ascii_letters + string.digits
+            pwd = "".join(secrets.choice(alphabet) for _ in range(length))
+            flags = [x for x,y in [("a-z",use_lower),("A-Z",use_upper),("0-9",use_digits),("!@#",use_sym)] if y]
+            uid = self._my_uid()
+            if uid:
+                send_text(uid, f"🔑 Пароль ({length} симв, {', '.join(flags)}):\n`{pwd}`")
+        except Exception: pass
+
+    def _is_silent_msg(self, msg) -> bool:
+        try:
+            if getattr(msg, "out", False): return False
+            peer = getattr(msg, "peer_id", None)
+            if peer is None: return False
+            peer_type = type(peer).__name__
+            if "User" not in peer_type: return False
+            silent = getattr(msg, "silent", False)
+            if not silent:
+                flags = int(getattr(msg, "flags", 0))
+                silent = bool(flags & 0x2000)
+            self.log(f"[Aegis] silent check: silent={silent} peer={peer_type}")
+            return bool(silent)
+        except Exception as e:
+            self.log(f"[Aegis] silent err: {e}")
+        return False
+
+    def _notify_silent_ui(self):
+        try:
+            if self._last_silent_msg:
+                self._notify_silent(self._last_silent_msg)
+        except Exception: pass
+
+    def _notify_silent_short(self):
+        try:
+            self._show_notification("🔕 Тихое сообщение", "")
+        except Exception: pass
+
+    def _notify_silent(self, msg):
+        try:
+            msg_id = getattr(msg, "id", 0)
+            if msg_id and msg_id in self._notified_ids: return
+            if msg_id:
+                self._notified_ids.add(msg_id)
+                if len(self._notified_ids) > 200: self._notified_ids.clear()
+            self._show_notification("🔕 Тихое сообщение", "")
+        except Exception: pass
+
+    def _start_kick_watcher(self):
+        self._schedule_kick_check()
+        threading.Thread(target=self._load_known_sessions, daemon=True).start()
+
+    def _load_known_sessions(self):
+        time.sleep(5)
+        try:
+            from hook_utils import find_class
+            req_cls  = find_class("org.telegram.tgnet.TLRPC$TL_account_getAuthorizations")
+            conn_cls = find_class("org.telegram.tgnet.ConnectionsManager")
+            if not req_cls or not conn_cls: return
+            req = req_cls(); cm = conn_cls.getInstance(0)
+            result = {"done": False}
+            class CB:
+                def run(self_, resp, err):
+                    try:
+                        if resp:
+                            af = resp.getClass().getDeclaredField("authorizations")
+                            af.setAccessible(True); auths = af.get(resp)
+                            hashes = set()
+                            for i in range(auths.size()):
+                                try:
+                                    hf = auths.get(i).getClass().getDeclaredField("hash")
+                                    hf.setAccessible(True)
+                                    hashes.add(str(hf.get(auths.get(i))))
+                                except Exception: pass
+                            self._known_sessions = hashes
+                    except Exception: pass
+                    result["done"] = True
+            cm.sendRequest(req, CB())
+            for _ in range(30):
+                if result["done"]: break
+                time.sleep(0.5)
+        except Exception as e:
+            self.log(f"[Aegis] sessions: {e}")
+
+    def _schedule_kick_check(self):
+        if self.get_setting("autokick", False):
+            now = int(time.time())
+            expired = [h for h,exp in self._pending_kick.items() if now > exp]
+            if self._pending_kick:
+                self.log(f"[Aegis] kick check: pending={len(self._pending_kick)} expired={len(expired)}")
+            for h in expired:
+                self._pending_kick.pop(h, None)
+                self._do_kick_session(h)
+        self._kick_timer = threading.Timer(15, self._schedule_kick_check)
+        self._kick_timer.daemon = True
+        self._kick_timer.start()
+
+    def _on_new_session(self, session_hash: str):
+        ak = self.get_setting("autokick", False)
+        self.log(f"[Aegis] _on_new_session: hash={session_hash} autokick={ak}")
+        if not ak:
+            self.log("[Aegis] autokick OFF — пропускаю")
+            return
+        timeout = int(self.get_setting("kick_timeout", "60"))
+        self._pending_kick[session_hash] = int(time.time()) + timeout
+        self.log(f"[Aegis] kick scheduled in {timeout}s for {session_hash}")
+        tmpl = str(self.get_setting("kick_notify_text", "")).strip()
+        if tmpl:
+            uid = self._my_uid()
+            if uid: send_text(uid, tmpl.replace("{timeout}", str(timeout)))
+
+    def _check_codeword(self, text: str):
+        if not self.get_setting("autokick", False): return
+        if not self._pending_kick: return
+        codeword = str(self.get_setting("kick_codeword", "")).strip()
+        if not codeword: return
+        if text.strip() == codeword:
+            self._pending_kick.clear()
+            uid = self._my_uid()
+            if uid: send_text(uid, "✅ Кодовое слово принято.")
+
+    def _do_kick_session(self, session_hash: str):
+        uid = self._my_uid()
+        self.log(f"[Aegis] _do_kick_session: {session_hash}")
+        plugin = self
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            cl  = ApplicationLoader.applicationContext.getClassLoader()
+            from client_utils import send_request, RequestCallback
+
+            def cb(resp, err):
+                if err:
+                    et = getattr(err, "text", str(err))
+                    ec = getattr(err, "code", "?")
+                    plugin.log(f"[Aegis] reset RESULT: ERROR code={ec} text={et}")
+                    if uid:
+                        send_text(uid, f"⚠️ Сессия не завершена: {et}")
+                else:
+                    plugin.log("[Aegis] reset RESULT: OK")
+                    if uid:
+                        send_text(uid, "🔒 Новая сессия завершена!")
+
+            single_paths = [
+                "org.telegram.tgnet.tl.TL_account$resetAuthorization",
+                "org.telegram.tgnet.tl.TL_account$TL_account_resetAuthorization",
+            ]
+            for cp in single_paths:
+                try:
+                    cls = cl.loadClass(cp)
+                    ctor = cls.getDeclaredConstructors()[0]; ctor.setAccessible(True)
+                    req = ctor.newInstance(None)
+                    hf = cls.getDeclaredField("hash"); hf.setAccessible(True)
+                    from java import jlong
+                    hf.set(req, jlong(int(session_hash)))
+                    send_request(req, RequestCallback(cb))
+                    self.log(f"[Aegis] single reset sent via {cp}")
+                    return
+                except Exception as e1:
+                    plugin.log(f"[Aegis] {cp} failed: {str(e1)[:60]}")
+
+            cls = cl.loadClass("org.telegram.tgnet.TLRPC$TL_auth_resetAuthorizations")
+            ctor = cls.getDeclaredConstructors()[0]; ctor.setAccessible(True)
+            req = ctor.newInstance(None)
+            send_request(req, RequestCallback(cb))
+            self.log("[Aegis] resetAuthorizations (all) sent")
+        except Exception as e:
+            self.log(f"[Aegis] kick err: {e}")
+
+    def _scan_reset_auth_class(self):
+        time.sleep(3)
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            cl = ApplicationLoader.applicationContext.getClassLoader()
+            inner = cl.loadClass("org.telegram.tgnet.TLRPC").getDeclaredClasses()
+            for i in range(len(inner)):
+                try:
+                    ic = inner[i]
+                    fields = [f.getName() for f in ic.getDeclaredFields()]
+                    if "hash" not in fields: continue
+                    cf = ic.getDeclaredField("constructor")
+                    cf.setAccessible(True)
+                    if int(str(cf.get(None))) & 0xFFFFFFFF == 0xdf77f3bc:
+                        self._reset_auth_cls = ic; return
+                except Exception: pass
+        except Exception: pass
+
+    def _show_notification(self, title: str, text: str):
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            from android.app import NotificationManager, NotificationChannel
+            from android.content import Context
+            from androidx.core.app import NotificationCompat
+            ctx = ApplicationLoader.applicationContext
+            nm  = ctx.getSystemService(Context.NOTIFICATION_SERVICE)
+            cid = "guard_notify_v1"
+            try:
+                from android.app import NotificationChannel
+                ch = NotificationChannel(cid, "Aegis", NotificationManager.IMPORTANCE_HIGH)
+                ch.enableVibration(True)
+                ch.setShowBadge(True)
+                nm.createNotificationChannel(ch)
+            except Exception: pass
+            b = NotificationCompat.Builder(ctx, cid)
+            b.setContentTitle(title or "Aegis")
+            b.setContentText(text or "")
+            b.setAutoCancel(True)
+            b.setPriority(1)
+            b.setDefaults(-1)
+            try:
+                from org.telegram.messenger import R
+                icon = 0
+                for name in ("ic_notification", "ic_launcher_round", "ic_launcher"):
+                    try:
+                        icon = getattr(R.drawable, name, 0)
+                        if icon: break
+                    except Exception: pass
+                if not icon:
+                    icon = 17301651
+                b.setSmallIcon(icon)
+            except Exception:
+                b.setSmallIcon(17301651)
+            nm.notify(88882, b.build())
+            self.log(f"[Aegis] notification shown: {title}")
+        except Exception as e:
+            self.log(f"[Aegis] notification error: {e}")
+
+    def _user_name(self, user) -> str:
+        try:
+            fn = str(getattr(user, "first_name", "") or "")
+            ln = str(getattr(user, "last_name",  "") or "")
+            un = str(getattr(user, "username",   "") or "")
+            full = " ".join(filter(None, [fn, ln]))
+            return f"{full} (@{un})" if un else full or str(getattr(user, "id", "?"))
+        except Exception: return "?"
+
+    def _make_toggle_user(self, uid_str: str):
+        def toggle(v=None):
+            if uid_str in self._users:
+                self._users[uid_str]["enabled"] = not self._users[uid_str].get("enabled", True)
+                self._save_users()
+                self.set_setting("_r", uid_str, reload_settings=True)
+        return toggle
+
+    def _make_remove_user(self, uid_str: str):
+        def remove(v=None):
+            self._users.pop(uid_str, None)
+            self._save_users()
+            self.set_setting("_r", uid_str, reload_settings=True)
+        return remove
+
+    def _make_switcher(self, uid_str: str, key: str):
+        def save(val):
+            if uid_str in self._users:
+                self._users[uid_str][key] = bool(val)
+                self._save_users()
+        return save
+
+    def create_settings(self):
+        s = [
+            Header(text="📤 Исходящие"),
+            Switch(key="all_silent", text="Все сообщения без звука", default=False),
+            Divider(),
+            Header(text="📥 Тихие входящие"),
+            Switch(key="notify_silent", text="Уведомлять о тихих входящих", default=False),
+            Divider(),
+            Header(text="👁 Отслеживаемые пользователи"),
+            Text(text="Как добавить", subtext="Открой личный чат → ⋮ → 👁 Aegis"),
+        ]
+
+        if not self._users:
+            s.append(Text(text="Нет отслеживаемых пользователей",
+                         subtext="Открой чат → ⋮ → Aegis"))
+        else:
+            for uid_str, cfg in self._users.items():
+                enabled = cfg.get("enabled", True)
+                name    = cfg.get("name", uid_str)
+                s += [
+                    Divider(),
+                    Text(
+                        text=f"{'✅' if enabled else '⏸'} {name}",
+                        subtext="Нажми чтобы включить/выключить",
+                        on_click=self._make_toggle_user(uid_str),
+                    ),
+                    Switch(key=f"u_{uid_str}_online",   text="🟢 Онлайн/оффлайн",      default=cfg.get("track_online", True)),
+                    Switch(key=f"u_{uid_str}_changes",  text="✏️ Профиль",              default=cfg.get("track_changes", True)),
+                    Switch(key=f"u_{uid_str}_edits",    text="📝 Правки сообщений",    default=cfg.get("track_edits", False)),
+                    Switch(key=f"u_{uid_str}_reads",    text="👁 Прочитанные",         default=cfg.get("track_reads", False)),
+                    Switch(key=f"u_{uid_str}_to_chat",  text="💬 В чат",               default=cfg.get("notify_to_chat", True)),
+                    Switch(key=f"u_{uid_str}_to_notif", text="🔔 Уведомлением",        default=cfg.get("notify_to_notif", False)),
+                    Input(key=f"u_{uid_str}_target",    text="Куда отправлять",
+                          subtext="ID чата (пусто = Избранное). \nПрим: -2017846540 \nВсе группы указываются с -",
+                          default=cfg.get("notify_target", "")),
+                    Text(text="🗑 Удалить", on_click=self._make_remove_user(uid_str)),
+                ]
+
+        s += [
+            Divider(),
+            Header(text="🔒 Автокик сессий"),
+            Switch(key="autokick", text="Включить автокик", default=False),
+            Input(key="kick_codeword", text="Кодовое слово", default=""),
+            Input(key="kick_timeout", text="Таймаут (сек)", default="60"),
+            Input(key="kick_notify_text", text="Текст уведомления",
+                  subtext="Переменная {timeout}",
+                  default="🔐 Новая сессия! Напиши кодовое слово в течение {timeout} сек"),
+            Divider(),
+            Header(text="🔑 Генератор паролей"),
+            Text(text="!cpass [длина] [luds]", subtext="Отправь в любом чате — пароль придёт в Избранное"),
+        ]
+        return s
