@@ -30,6 +30,8 @@ import math
 import requests
 import traceback
 import ast
+import io
+import tokenize
 from typing import Any, Dict, Optional, Tuple, List
 
 from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
@@ -37,6 +39,10 @@ from client_utils import (
     get_file_loader, run_on_queue, send_message, get_last_fragment,
     get_messages_controller, get_user_config
 )
+try:
+    from client_utils import EXTERNAL_NETWORK_QUEUE
+except Exception:
+    EXTERNAL_NETWORK_QUEUE = "externalNetworkQueue"
 from markdown_utils import parse_markdown
 from ui.settings import Header, Input, Divider, Switch, Selector, Text, EditText
 from ui.bulletin import BulletinHelper
@@ -45,6 +51,7 @@ from android_utils import run_on_ui_thread, log, OnClickListener
 from hook_utils import find_class
 
 from java import dynamic_proxy, jclass
+from java.lang import Integer
 from java.util import Locale
 from android.view import View
 from org.telegram.tgnet import TLRPC
@@ -52,9 +59,9 @@ from org.telegram.messenger import MessageObject, FileLoader, AndroidUtilities, 
 
 __id__ = "plugin_security"
 __name__ = "Plugin Security"
-__description__ = "Checks extera plugin code locally and with Google Gemini / OpenAI-compatible AI.\nNow with install menu integration!"
+__description__ = "Checks extera plugin code locally and with Google Gemini / OpenAI-compatible AI\n"
 __author__ = "@mihailkotovski & @mishabotov"
-__version__ = "6.5 [fixes + visual]"
+__version__ = "7.0 [fixes + visual]"
 __min_version__ = "11.12.1"
 __icon__ = "DateRegBot_by_MoiStikiBot/8"
 
@@ -150,6 +157,9 @@ DISCORD_WEBHOOK_REGEX = re.compile(
 DATA_PATH_REGEX = re.compile(r"/data/(?:user/0|data)/[^\s\"']+", re.IGNORECASE)
 FIXED_ID_ASSIGNMENT_REGEX = re.compile(r"(?:target_user_id|your_chat_id)\s*=\s*\d{5,}", re.IGNORECASE)
 HARD_CODED_ID_REGEX = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*=\s*-?\d{5,}\b")
+GENERIC_SECRET_REGEX = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{20,}|[A-Za-z0-9_-]{40,})\b"
+)
 
 PREMIUM_EMOJI_MAP = {
     "❌": "[❌](5210952531676504517)",
@@ -188,7 +198,20 @@ def with_alpha(color: int, alpha: int) -> int:
 def mask_sensitive_text(text: str) -> str:
     redacted = BOT_TOKEN_REGEX.sub("<bot_token>", text)
     redacted = DISCORD_WEBHOOK_REGEX.sub("<discord_webhook>", redacted)
+    redacted = GENERIC_SECRET_REGEX.sub("<secret>", redacted)
     return redacted
+
+def strip_python_comments(code: str) -> str:
+    try:
+        tokens = []
+        reader = io.StringIO(code).readline
+        for token in tokenize.generate_tokens(reader):
+            if token.type == tokenize.COMMENT:
+                continue
+            tokens.append(token)
+        return tokenize.untokenize(tokens)
+    except Exception:
+        return code
 
 DEFAULT_PROMPT_MARKDOWN = (
     "Ты — ведущий аналитик по кибербезопасности, специализирующийся именно на аудите плагинов для фреймворка exteraGram. Твоя задача — провести строгий технический аудит кода плагина '{plugin_name}' (v{plugin_version}), опираясь на знание его API, и вынести точный вердикт по 5-уровневой шкале риска. Обрати внимание: код может быть предварительно обработан для анонимизации (переименованы переменные и строки), анализируй только логику.\n\n"
@@ -434,6 +457,23 @@ def build_reply_to_top(topic_id, peer_id):
         return None
 
 class CodeMasker(ast.NodeTransformer):
+    PRESERVED_IDENTIFIERS = {
+        "self", "cls", "super",
+        "BasePlugin", "HookResult", "HookStrategy", "MenuItemData", "MenuItemType", "MethodHook",
+        "TLRPC", "MessageObject", "FileLoader", "AndroidUtilities", "ChatObject",
+        "requests", "os", "re", "time", "json", "math", "traceback", "ast",
+        "base64", "zlib", "marshal", "pickle", "subprocess", "ctypes", "threading",
+        "jclass", "dynamic_proxy", "find_class", "run_on_queue", "run_on_ui_thread",
+        "send_message", "send_request", "get_file_loader", "get_messages_controller",
+        "get_user_config", "get_last_fragment", "BulletinHelper", "AlertDialogBuilder",
+        "View", "Locale",
+    }
+    PRESERVED_FUNCTION_NAMES = {
+        "on_plugin_load", "on_plugin_unload", "create_settings", "on_app_event",
+        "pre_request_hook", "post_request_hook", "on_update_hook", "on_updates_hook",
+        "on_send_message_hook", "__init__",
+    }
+
     def __init__(self, rename_vars=True, rename_strings=True):
         self.rename_vars = rename_vars
         self.rename_strings = rename_strings
@@ -450,36 +490,62 @@ class CodeMasker(ast.NodeTransformer):
 
     def _get_new_str_val(self, old_str):
         if old_str not in self.str_map:
-            self.str_map[old_str] = f"string_literal_{self.str_counter}"
+            self.str_map[old_str] = f"<opaque_string_{self.str_counter}_len_{len(old_str)}>"
             self.str_counter += 1
         return self.str_map[old_str]
 
+    def _should_preserve_name(self, name: str) -> bool:
+        if not name:
+            return True
+        if name.startswith("__") and name.endswith("__"):
+            return True
+        if name in self.PRESERVED_IDENTIFIERS or name in self.PRESERVED_FUNCTION_NAMES:
+            return True
+        if name.isupper():
+            return True
+        return False
+
+    def _safe_string_value(self, value: str) -> str:
+        redacted = mask_sensitive_text(value)
+        if redacted != value:
+            return redacted
+
+        compact = value.strip()
+        if len(compact) >= 160 and re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact):
+            return self._get_new_str_val(value)
+        if len(value) >= 500:
+            return self._get_new_str_val(value)
+        return value
+
     def visit_Name(self, node):
-        if self.rename_vars and isinstance(node.ctx, (ast.Store, ast.Load, ast.Del)):
-            if not (node.id.startswith('__') and node.id.endswith('__')):
+        if self.rename_vars and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if not self._should_preserve_name(node.id):
                 node.id = self._get_new_var_name(node.id)
+        elif self.rename_vars and isinstance(node.ctx, ast.Load):
+            if node.id in self.var_map:
+                node.id = self.var_map[node.id]
         return node
 
     def visit_FunctionDef(self, node):
-        if self.rename_vars:
-            node.name = self._get_new_var_name(node.name)
+        self.generic_visit(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
         self.generic_visit(node)
         return node
 
     def visit_ClassDef(self, node):
-        if self.rename_vars:
-            node.name = self._get_new_var_name(node.name)
         self.generic_visit(node)
         return node
 
     def visit_arg(self, node):
-        if self.rename_vars:
+        if self.rename_vars and not self._should_preserve_name(node.arg):
             node.arg = self._get_new_var_name(node.arg)
         return node
 
     def visit_Constant(self, node):
         if self.rename_strings and isinstance(node.value, str):
-            node.value = self._get_new_str_val(node.value)
+            node.value = self._safe_string_value(node.value)
         return node
 
 class AlertHelper:
@@ -512,34 +578,29 @@ class TextCatalog:
         "ru": {
             "SETTINGS_HEADER": "Настройки Gemini Security",
             "API_KEY_INPUT": "API Key",
-            "API_KEY_SUBTEXT": "Получите ключ в Google AI Studio.",
-            "GET_API_KEY_BUTTON": "Ссылка для получения ключа",
+            "API_KEY_SUBTEXT": "Ключ из Google AI Studio.",
+            "GET_API_KEY_BUTTON": "Получить ключ",
             "MODEL_SELECTOR": "Модель",
             "PROMPT_INPUT_MD": "Промпт (Markdown)",
             "PROMPT_INPUT_PLAIN": "Промпт (Цитата)",
             "PROMPT_SECTION": "Промпт",
             "ENABLE_SWITCH": "Включить сканер",
-            "USAGE_INFO_TITLE": "FAQ",
+            "USAGE_INFO_TITLE": "Как юзать",
             "USAGE_INFO_TEXT": (
-                "Этот плагин помогает проверить код других плагинов на наличие подозрительных или вредоносных действий с помощью нейросети Google Gemini.\n\n"
-                "Шаг 1: Настройка\n"
-                "1. Получите ваш API-ключ в Google AI Studio.\n"
-                "2. Вставьте ключ в соответствующее поле в настройках плагина.\n\n"
-                "Шаг 2: Использование\n"
-                "1. Найдите сообщение с файлом плагина, который вы хотите проверить (файл должен иметь расширение .plugin или .py).\n"
-                f"2. Ответьте на это сообщение командой: {DEFAULT_COMMAND}\n\n"
-                "Плагин отправит код на анализ и пришлет вам отчет о безопасности в этот же чат."
+                "Проверяет код плагинов через нейросеть.\n\n"
+                "1. Берешь API-ключ в Google AI Studio, кидаешь в настройки.\n"
+                f"2. Делаешь реплай на файл (.plugin/.py) командой {{DEFAULT_COMMAND}}."
             ),
-            "API_KEY_MISSING": "❌ API ключ не найден. Укажите его в настройках плагина.",
-            "NO_REPLY": "❌ Пожалуйста, ответьте на сообщение с файлом плагина.",
-            "NOT_A_PLUGIN": "❌ Файл в отвеченном сообщении не является плагином (.plugin или .py).",
-            "ANALYZING_MESSAGE": "🛡️ Проверяю плагин на безопасность...",
-            "LOCAL_ANALYZING_MESSAGE": "🛡️ Запускаю локальную проверку...",
+            "API_KEY_MISSING": "❌ Нет API ключа. Добавь в настройки.",
+            "NO_REPLY": "❌ Реплайни на файл плагина.",
+            "NOT_A_PLUGIN": "❌ Это не плагин (.plugin или .py).",
+            "ANALYZING_MESSAGE": "🛡️ Проверяю...",
+            "LOCAL_ANALYZING_MESSAGE": "🛡️ Локальная проверка...",
             "API_ERROR": "⚠️ Ошибка API: {error}",
-            "FILE_DOWNLOAD_ERROR": "❌ Не удалось загрузить файл плагина.",
-            "FILE_READ_ERROR": "❌ Не удалось прочитать файл плагина.",
-            "UNEXPECTED_ERROR": "❗ Произошла неожиданная ошибка: {error}",
-            "PLUGIN_DISABLED": "❌ Плагин отключен в настройках.",
+            "FILE_DOWNLOAD_ERROR": "❌ Не удалось скачать файл.",
+            "FILE_READ_ERROR": "❌ Не удалось прочитать файл.",
+            "UNEXPECTED_ERROR": "❗ Ошибка: {error}",
+            "PLUGIN_DISABLED": "❌ Плагин выключен в настройках.",
             "SUCCESS_HEADER_MD": "🛡️ Отчет по безопасности: {plugin_name} v{plugin_version}\n\n",
             "SUCCESS_HEADER_PLAIN": "🛡️ Отчет по безопасности: {plugin_name} v{plugin_version}\n\n",
             "ALERT_CLOSE_BUTTON": "Закрыть",
@@ -553,36 +614,35 @@ class TextCatalog:
             "COPIED_TO_CLIPBOARD": "Скопировано в буфер: {label}",
             "CRYPTO_LABEL": "Крипто",
             "USE_BLOCKQUOTE_TITLE": "Использовать цитату",
-            "USE_BLOCKQUOTE_SUBTEXT": "Отображать отчет в виде сворачиваемой цитаты для компактности.",
+            "USE_BLOCKQUOTE_SUBTEXT": "Сворачиваемая цитата для отчета (так компактнее).",
             "USE_PREMIUM_EMOJI_TITLE": "Премиум эмодзи",
-            "USE_PREMIUM_EMOJI_SUBTEXT": "Заменять обычные эмодзи на анимированные премиум эмодзи в отчётах.",
+            "USE_PREMIUM_EMOJI_SUBTEXT": "Анимированные эмодзи в отчетах.",
             "APPEARANCE_HEADER": "Внешний вид",
             "ADVANCED_HEADER": "Расширенные настройки",
             "GENERATION_HEADER": "Параметры генерации",
             "TEMPERATURE_INPUT": "Температура",
-            "TEMPERATURE_SUBTEXT": "0.0-2.0. Контролирует случайность. Более низкие значения делают ответ более предсказуемым.",
+            "TEMPERATURE_SUBTEXT": "0.0-2.0. Чем ниже, тем предсказуемее ответ.",
             "MAX_TOKENS_INPUT": "Максимум токенов",
-            "MAX_TOKENS_SUBTEXT": "Максимальная длина ответа в токенах.",
+            "MAX_TOKENS_SUBTEXT": "Лимит длины ответа.",
             "RENAME_VARS_TITLE": "Переменные",
-            "RENAME_VARS_SUBTEXT": "Заменяет имена переменных и функций на общие (var_0, func_1).",
+            "RENAME_VARS_SUBTEXT": "Прячет имена переменных (var_0, func_1).",
             "RENAME_STRINGS_TITLE": "Строки",
-            "RENAME_STRINGS_SUBTEXT": "Заменяет содержимое строковых литералов на метки (string_0).",
+            "RENAME_STRINGS_SUBTEXT": "Прячет содержимое строк (string_0).",
             "DONATE_HEADER": "Поддержать разработку",
             "DONATE_CRYPTO": "Крипто кошелек",
-            "DONATE_INFO": "Другая информация и реквизиты",
-            "ZWYLIB_NOT_FOUND": "Для автообновления требуется плагин ZwyLib, но он не установлен.",
+            "DONATE_INFO": "Другие реквизиты",
             "PROVIDER_SELECTOR": "Провайдер API",
             "OPENAI_SECTION": "OpenAI-совместимый API",
             "OPENAI_API_KEY_INPUT": "API Key",
             "OPENAI_BASE_URL_INPUT": "URL сервера",
-            "OPENAI_BASE_URL_SUBTEXT": "Базовый URL API (например, https://api.openai.com)",
+            "OPENAI_BASE_URL_SUBTEXT": "Например: https://api.openai.com",
             "OPENAI_MODEL_INPUT": "Модель",
-            "OPENAI_MODEL_SUBTEXT": "Название модели (например, gpt-5, claude-4-5-sonnet)",
+            "OPENAI_MODEL_SUBTEXT": "Например: gpt-4o",
             "OPENAI_HEADER_NAME_INPUT": "Заголовок API-ключа",
-            "OPENAI_HEADER_NAME_SUBTEXT": "Название HTTP-заголовка для ключа (обычно Authorization)",
+            "OPENAI_HEADER_NAME_SUBTEXT": "Обычно Authorization",
             "OPENAI_HEADER_PREFIX_INPUT": "Префикс заголовка",
-            "OPENAI_HEADER_PREFIX_SUBTEXT": "Префикс перед ключом (обычно Bearer)",
-            "OPENAI_API_KEY_MISSING": "❌ API ключ OpenAI не найден. Укажите его в настройках.",
+            "OPENAI_HEADER_PREFIX_SUBTEXT": "Обычно Bearer",
+            "OPENAI_API_KEY_MISSING": "❌ Нет API ключа OpenAI.",
             "GEMINI_SECTION": "Google Gemini"
         },
         "en": {
@@ -646,7 +706,6 @@ class TextCatalog:
             "DONATE_HEADER": "Support Development",
             "DONATE_CRYPTO": "CRYPTO Wallet",
             "DONATE_INFO": "Other info and requisites",
-            "ZWYLIB_NOT_FOUND": "The ZwyLib plugin is required for auto-updates but is not installed.",
             "PROVIDER_SELECTOR": "API Provider",
             "OPENAI_SECTION": "OpenAI-compatible API",
             "OPENAI_API_KEY_INPUT": "API Key",
@@ -976,33 +1035,121 @@ class PluginSecurityPlugin(BasePlugin):
                 return found_view, parent
         return None, None
 
+    def _get_theme_provider(self, source: Any = None) -> Any:
+        for target in [source, get_last_fragment()]:
+            if not target:
+                continue
+            for attr in ["getResourceProvider", "resourcesProvider"]:
+                try:
+                    value = getattr(target, attr)
+                    provider = value() if callable(value) else value
+                    if provider is not None:
+                        return provider
+                except Exception:
+                    pass
+        return None
+
+    def _java_color(self, color: int):
+        return Integer(as_java_color(color))
+
+    def _theme_color(self, theme_class: Any, key: Any, fallback: int, resources_provider: Any = None) -> int:
+        try:
+            if resources_provider is not None:
+                return as_java_color(theme_class.getColor(key, resources_provider))
+        except Exception:
+            pass
+        try:
+            return as_java_color(theme_class.getColor(key))
+        except Exception:
+            return as_java_color(fallback)
+
+    def _call_int_method(self, target: Any, method_name: str, value: int) -> bool:
+        if target is None:
+            return False
+        try:
+            method = target.getClass().getMethod(method_name, Integer.TYPE)
+            method.invoke(target, self._java_color(value))
+            return True
+        except Exception:
+            return False
+
+    def _set_text_color(self, view: Any, color: int):
+        if not self._call_int_method(view, "setTextColor", color):
+            try:
+                view.setTextColor(as_java_color(color))
+            except Exception:
+                pass
+
+    def _set_background_color(self, view: Any, color: int):
+        if not self._call_int_method(view, "setBackgroundColor", color):
+            try:
+                view.setBackgroundColor(as_java_color(color))
+            except Exception:
+                pass
+
+    def _set_color_filter(self, view: Any, color: int):
+        if not self._call_int_method(view, "setColorFilter", color):
+            try:
+                view.setColorFilter(as_java_color(color))
+            except Exception:
+                pass
+
+    def _set_drawable_color(self, drawable: Any, color: int):
+        if self._call_int_method(drawable, "setColor", color):
+            return
+        try:
+            ColorStateList = jclass("android.content.res.ColorStateList")
+            drawable.setColor(ColorStateList.valueOf(self._java_color(color)))
+        except Exception:
+            pass
+
+    def _set_drawable_stroke(self, drawable: Any, width: int, color: int):
+        try:
+            method = drawable.getClass().getMethod("setStroke", Integer.TYPE, Integer.TYPE)
+            method.invoke(drawable, Integer(int(width)), self._java_color(color))
+        except Exception:
+            pass
+
+    def _fix_sheet_navigation_bar(self, sheet: Any, color: int):
+        if not self._call_int_method(sheet, "fixNavigationBar", color):
+            try:
+                sheet.fixNavigationBar(as_java_color(color))
+            except Exception:
+                pass
+
     def _make_button_bg(
         self,
         theme_class: Any,
         android_utilities_class: Any,
         fallback_color: int,
         fallback_pressed: int,
+        resources_provider: Any = None,
     ):
-        try:
-            button_color = theme_class.getColor(theme_class.key_featuredStickers_addButton)
-            try:
-                button_pressed = theme_class.getColor(theme_class.key_featuredStickers_addButtonPressed)
-            except Exception:
-                button_pressed = theme_class.getColor(theme_class.key_listSelector)
-        except Exception:
-            button_color = as_java_color(fallback_color)
-            button_pressed = as_java_color(fallback_pressed)
+        button_color = self._theme_color(
+            theme_class,
+            theme_class.key_featuredStickers_addButton,
+            fallback_color,
+            resources_provider,
+        )
+        button_pressed = self._theme_color(
+            theme_class,
+            getattr(theme_class, "key_featuredStickers_addButtonPressed", theme_class.key_listSelector),
+            fallback_pressed,
+            resources_provider,
+        )
         return theme_class.createSimpleSelectorRoundRectDrawable(
             android_utilities_class.dp(8),
             button_color,
             button_pressed,
         )
 
-    def _get_primary_button_text_color(self, theme_class: Any, fallback_color: int = 0xFFFFFFFF):
-        try:
-            return theme_class.getColor(theme_class.key_featuredStickers_buttonText)
-        except Exception:
-            return as_java_color(fallback_color)
+    def _get_primary_button_text_color(self, theme_class: Any, fallback_color: int = 0xFFFFFFFF, resources_provider: Any = None):
+        return self._theme_color(
+            theme_class,
+            theme_class.key_featuredStickers_buttonText,
+            fallback_color,
+            resources_provider,
+        )
 
     def _get_install_sheet_class(self):
         try:
@@ -1322,6 +1469,47 @@ class PluginSecurityPlugin(BasePlugin):
 
         return "deletedialog(" in lower_code
 
+    def _has_sensitive_external_post(self, code: str) -> bool:
+        sensitive_markers = (
+            "phone", "access_hash", "dialogs", "alldialogs", "contacts",
+            "currentuser", "getcurrentuser", "getclientphone", "username",
+            "first_name", "last_name", "auth_key", "session", "user_id",
+        )
+        lower_code = code.lower()
+        if "post(" not in lower_code:
+            return False
+
+        tree = self._parse_ast_tree(code)
+        if tree is None:
+            return (
+                any(marker in lower_code for marker in ["requests.post(", ".session.post("])
+                and any(marker in lower_code for marker in sensitive_markers)
+            )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "post":
+                continue
+
+            try:
+                func_text = ast.unparse(node.func).lower()
+                call_text = ast.unparse(node).lower()
+            except Exception:
+                continue
+
+            looks_network_post = (
+                "requests" in func_text
+                or "session" in func_text
+                or "http" in call_text
+                or "url" in call_text
+                or "webhook" in call_text
+            )
+            if looks_network_post and any(marker in call_text for marker in sensitive_markers):
+                return True
+
+        return False
+
     def _scan_local(self, plugin_code: str) -> Dict[str, Any]:
         plugin_name, plugin_version = self._parse_plugin_meta(plugin_code)
         code_lines = plugin_code.splitlines()
@@ -1441,6 +1629,82 @@ class PluginSecurityPlugin(BasePlugin):
             ("action_image_capture" in lower_code and "startactivity(" in lower_code)
             or ("wallpapermanager" in lower_code and "setbitmap(" in lower_code)
         )
+        has_destructive_message_api = any(
+            marker in lower_code
+            for marker in [
+                "tl_messages_deletehistory",
+                "tl_messages_deletemessages",
+                "tl_channels_deletemessages",
+            ]
+        )
+        has_account_destruction_api = any(
+            marker in lower_code
+            for marker in [
+                "tl_account_deleteaccount",
+                "tl_auth_resetauthorizations",
+            ]
+        )
+        has_contact_or_dialog_read = any(
+            marker in lower_code
+            for marker in [
+                "tl_contacts_getcontacts",
+                "tl_contacts_resolveusername",
+                "contactscontroller",
+                "get_contacts_controller",
+                "getcontacts(",
+                "contacts_dict",
+                "contactsbyphone",
+                "tl_messages_getdialogs",
+                "tl_messages_gethistory",
+                "getdialogs(",
+                "getdialogsfolderid",
+                "dialogsdict",
+                "dialogs_dict",
+                "alldialogs",
+                "get_messages_controller().dialogs",
+                "messagescontroller.getinstance",
+            ]
+        )
+        has_clipboard_read = any(
+            marker in lower_code
+            for marker in [
+                "getclipboardstring(",
+                "clipboardmanager",
+                "getprimaryclip(",
+                "getprimaryclipdescription(",
+                "getsystemservice(context.clipboard_service",
+                "getsystemservice(\"clipboard\"",
+                "getsystemservice('clipboard'",
+            ]
+        )
+        has_dynamic_code_loading = any(
+            marker in lower_code
+            for marker in [
+                "dexclassloader",
+                "pathclassloader",
+                "inmemorydexclassloader",
+                "runtime.getruntime().exec",
+                "getruntime().exec(",
+                "java.lang.runtime",
+            ]
+        )
+        has_obfuscation_payload = any(
+            marker in lower_code
+            for marker in [
+                "base64.b64decode",
+                "base64.urlsafe_b64decode",
+                "b64decode(",
+                "zlib.decompress",
+                "marshal.loads",
+                "pickle.loads",
+                "pickle.load(",
+                "codecs.decode(",
+            ]
+        ) or (
+            any(marker in lower_code for marker in ["base64", "zlib", "marshal", "pickle"])
+            and any(marker in lower_code for marker in ["eval(", "exec(", "compile("])
+        )
+        has_sensitive_external_post = self._has_sensitive_external_post(plugin_code)
         recursive_functions = self._find_recursive_defs(plugin_code)
         recursive_function_markers = [name for name in recursive_functions[:2]]
         has_crash_command = any(
@@ -1580,6 +1844,39 @@ class PluginSecurityPlugin(BasePlugin):
                 ],
             )
 
+        if has_account_destruction_api:
+            add_issue(
+                "account_destruction_api",
+                "danger",
+                "Удаление аккаунта или сброс авторизаций" if is_ru else "Account deletion or authorization reset",
+                (
+                    "Код использует TL API для удаления аккаунта или сброса всех авторизаций, что может привести к потере доступа и сессий."
+                    if is_ru else
+                    "The code uses TL API calls for account deletion or resetting all authorizations, which can revoke sessions or destroy access."
+                ),
+                [
+                    "TL_account_deleteAccount",
+                    "TL_auth_resetAuthorizations",
+                ],
+            )
+
+        if has_destructive_message_api:
+            add_issue(
+                "destructive_message_api",
+                "danger",
+                "Удаление истории или сообщений через TL API" if is_ru else "Message or history deletion through TL API",
+                (
+                    "Найдены прямые TL-запросы удаления истории или сообщений. Такой код может скрытно очищать переписки или удалять чужие сообщения при наличии прав."
+                    if is_ru else
+                    "Direct TL requests for deleting history or messages were found. This can silently wipe chats or delete messages when permissions allow it."
+                ),
+                [
+                    "TL_messages_deleteHistory",
+                    "TL_messages_deleteMessages",
+                    "TL_channels_deleteMessages",
+                ],
+            )
+
         if has_mass_dialog_deletion:
             add_issue(
                 "mass_dialog_deletion",
@@ -1637,6 +1934,66 @@ class PluginSecurityPlugin(BasePlugin):
                 ],
             )
 
+        if has_sensitive_external_post:
+            add_issue(
+                "sensitive_external_post",
+                "danger",
+                "Отправка чувствительных данных через внешний POST" if is_ru else "Sensitive data sent through an external POST",
+                (
+                    "Код формирует сетевой POST, в котором рядом с запросом встречаются телефон, `access_hash`, контакты, диалоги или данные текущего пользователя."
+                    if is_ru else
+                    "The code builds a network POST containing phone, `access_hash`, contacts, dialogs or current-user data."
+                ),
+                [
+                    "requests.post(",
+                    ".session.post(",
+                    "phone",
+                    "access_hash",
+                    "dialogs",
+                    "contacts",
+                    "currentUser",
+                ],
+            )
+
+        if has_contact_or_dialog_read:
+            add_issue(
+                "contacts_or_dialogs_read",
+                "high_risk",
+                "Чтение контактов или списка диалогов" if is_ru else "Contacts or dialogs enumeration",
+                (
+                    "Плагин обращается к контактам, истории, списку диалогов или контроллерам Telegram, которые раскрывают социальный граф и приватную активность."
+                    if is_ru else
+                    "The plugin accesses contacts, history, dialogs or Telegram controllers that expose social graph and private activity."
+                ),
+                [
+                    "TL_contacts_getContacts",
+                    "ContactsController",
+                    "get_contacts_controller",
+                    "TL_messages_getDialogs",
+                    "TL_messages_getHistory",
+                    "dialogs_dict",
+                    "allDialogs",
+                ],
+            )
+
+        if has_clipboard_read:
+            add_issue(
+                "clipboard_read",
+                "high_risk",
+                "Чтение буфера обмена" if is_ru else "Clipboard read access",
+                (
+                    "Код читает системный буфер обмена. Там часто оказываются коды, ссылки, адреса кошельков, пароли или личные сообщения."
+                    if is_ru else
+                    "The code reads the system clipboard, which often contains codes, links, wallet addresses, passwords or private messages."
+                ),
+                [
+                    "AndroidUtilities.getClipboardString(",
+                    "ClipboardManager",
+                    "getPrimaryClip(",
+                    "getSystemService(\"clipboard\"",
+                ],
+            )
+
         if has_device_coercion_overlay:
             add_issue(
                 "device_coercion_overlay",
@@ -1657,6 +2014,25 @@ class PluginSecurityPlugin(BasePlugin):
                 ],
             )
 
+        if has_dynamic_code_loading:
+            add_issue(
+                "dynamic_code_loading",
+                "danger",
+                "Динамическая загрузка или выполнение кода" if is_ru else "Dynamic code loading or execution",
+                (
+                    "Найдены `DexClassLoader`/`PathClassLoader` или Java `Runtime.exec`, что позволяет подгружать внешний dex-код или запускать команды вне обычного plugin API."
+                    if is_ru else
+                    "`DexClassLoader`/`PathClassLoader` or Java `Runtime.exec` was found, allowing external dex loading or command execution outside the normal plugin API."
+                ),
+                [
+                    "DexClassLoader",
+                    "PathClassLoader",
+                    "InMemoryDexClassLoader",
+                    "Runtime.getRuntime().exec",
+                    "getRuntime().exec(",
+                ],
+            )
+
         if has_camera_or_wallpaper_abuse:
             add_issue(
                 "camera_or_wallpaper_abuse",
@@ -1672,6 +2048,28 @@ class PluginSecurityPlugin(BasePlugin):
                     "WallpaperManager",
                     "setBitmap(",
                     "startActivity(",
+                ],
+            )
+
+        if has_obfuscation_payload:
+            add_issue(
+                "obfuscated_payload",
+                "high_risk",
+                "Обфускация или скрытая полезная нагрузка" if is_ru else "Obfuscation or hidden payload",
+                (
+                    "Код использует base64/zlib/marshal/pickle или похожие декодеры. Это часто скрывает исполняемую логику, особенно рядом с `eval`, `exec` или `compile`."
+                    if is_ru else
+                    "The code uses base64/zlib/marshal/pickle or similar decoders. This often hides executable logic, especially near `eval`, `exec` or `compile`."
+                ),
+                [
+                    "base64.b64decode",
+                    "zlib.decompress",
+                    "marshal.loads",
+                    "pickle.loads",
+                    "pickle.load(",
+                    "codecs.decode(",
+                    "exec(",
+                    "eval(",
                 ],
             )
 
@@ -2181,6 +2579,12 @@ class PluginSecurityPlugin(BasePlugin):
             AccelerateDecelerateInterpolator = find_class("android.view.animation.AccelerateDecelerateInterpolator")
             OvershootInterpolator = find_class("android.view.animation.OvershootInterpolator")
             AccelerateInterpolator = find_class("android.view.animation.AccelerateInterpolator")
+            resources_provider = self._get_theme_provider(fragment)
+            dialog_bg_color = self._theme_color(ThemeClass, ThemeClass.key_dialogBackground, 0xFF101318, resources_provider)
+            dialog_text_color = self._theme_color(ThemeClass, ThemeClass.key_dialogTextBlack, 0xFFFFFFFF, resources_provider)
+            dialog_muted_color = self._theme_color(ThemeClass, ThemeClass.key_dialogTextGray2, 0xFF8F96A3, resources_provider)
+            selector_color = self._theme_color(ThemeClass, ThemeClass.key_listSelector, 0x1F000000, resources_provider)
+            link_color = self._theme_color(ThemeClass, ThemeClass.key_windowBackgroundWhiteBlueText, 0xFF3390EC, resources_provider)
             from android.os import Handler, Looper
             from java.lang import Runnable as JRunnable
 
@@ -2249,7 +2653,7 @@ class PluginSecurityPlugin(BasePlugin):
                 chip_frame = FrameLayout(context)
                 chip_bg = GradientDrawable()
                 chip_bg.setCornerRadius(AndroidUtilitiesClass.dp(14))
-                chip_bg.setColor(as_java_color(bg_color))
+                self._set_drawable_color(chip_bg, bg_color)
                 chip_frame.setBackground(chip_bg)
 
                 chip_layout = LinearLayoutClass(context)
@@ -2265,7 +2669,7 @@ class PluginSecurityPlugin(BasePlugin):
                 if icon_res:
                     chip_icon = ImageView(context)
                     chip_icon.setImageResource(icon_res)
-                    chip_icon.setColorFilter(as_java_color(text_color))
+                    self._set_color_filter(chip_icon, text_color)
                     chip_layout.addView(
                         chip_icon,
                         LayoutHelper.createLinear(14, 14, Gravity.CENTER_VERTICAL, 0, 0, 6, 0),
@@ -2275,7 +2679,7 @@ class PluginSecurityPlugin(BasePlugin):
                 chip_text.setText(text)
                 chip_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
                 chip_text.setTypeface(AndroidUtilitiesClass.bold())
-                chip_text.setTextColor(as_java_color(text_color))
+                self._set_text_color(chip_text, text_color)
                 chip_layout.addView(chip_text, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL))
                 chip_frame.addView(chip_layout, LayoutHelper.createFrame(-2, -2, Gravity.CENTER))
                 return chip_frame
@@ -2311,10 +2715,7 @@ class PluginSecurityPlugin(BasePlugin):
                 button_frame = FrameLayout(context)
                 button_bg = GradientDrawable()
                 button_bg.setCornerRadius(AndroidUtilitiesClass.dp(10))
-                try:
-                    button_bg.setColor(ThemeClass.getColor(ThemeClass.key_listSelector))
-                except Exception:
-                    button_bg.setColor(as_java_color(0xFFEDEDED))
+                self._set_drawable_color(button_bg, selector_color)
                 button_frame.setBackground(button_bg)
 
                 label = TextView(context)
@@ -2322,10 +2723,7 @@ class PluginSecurityPlugin(BasePlugin):
                 label.setGravity(Gravity.CENTER)
                 label.setTypeface(AndroidUtilitiesClass.bold())
                 label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
-                try:
-                    label.setTextColor(ThemeClass.getColor(ThemeClass.key_windowBackgroundWhiteBlueText))
-                except Exception:
-                    label.setTextColor(as_java_color(0xFF3390EC))
+                self._set_text_color(label, link_color)
 
                 button_frame.addView(label, LayoutHelper.createFrame(-1, -1))
                 button_frame.setOnClickListener(OnClickListener(on_click))
@@ -2338,7 +2736,7 @@ class PluginSecurityPlugin(BasePlugin):
                 card_frame = FrameLayout(context)
                 card_bg = GradientDrawable()
                 card_bg.setCornerRadius(AndroidUtilitiesClass.dp(14))
-                card_bg.setColor(as_java_color(with_alpha(color, 0x12)))
+                self._set_drawable_color(card_bg, with_alpha(color, 0x12))
                 card_frame.setBackground(card_bg)
 
                 card_layout = LinearLayoutClass(context)
@@ -2354,7 +2752,7 @@ class PluginSecurityPlugin(BasePlugin):
                 title_view.setText(clean_ui_text(title))
                 title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
                 title_view.setTypeface(AndroidUtilitiesClass.bold())
-                title_view.setTextColor(as_java_color(color))
+                self._set_text_color(title_view, color)
                 try:
                     title_view.setLineSpacing(AndroidUtilitiesClass.dp(2), 1.05)
                 except Exception:
@@ -2364,10 +2762,7 @@ class PluginSecurityPlugin(BasePlugin):
                 desc_view = TextView(context)
                 desc_view.setText(clean_ui_text(description))
                 desc_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
-                try:
-                    desc_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextGray2))
-                except Exception:
-                    desc_view.setTextColor(as_java_color(0xFF8F96A3))
+                self._set_text_color(desc_view, dialog_muted_color)
                 try:
                     desc_view.setLineSpacing(AndroidUtilitiesClass.dp(3), 1.1)
                 except Exception:
@@ -2381,14 +2776,8 @@ class PluginSecurityPlugin(BasePlugin):
                 card_frame = FrameLayout(context)
                 card_bg = GradientDrawable()
                 card_bg.setCornerRadius(AndroidUtilitiesClass.dp(14))
-                card_bg.setColor(as_java_color(with_alpha(accent_color, 0x10)))
-                try:
-                    card_bg.setStroke(
-                        AndroidUtilitiesClass.dp(1),
-                        as_java_color(with_alpha(accent_color, 0x1E)),
-                    )
-                except Exception:
-                    pass
+                self._set_drawable_color(card_bg, with_alpha(accent_color, 0x10))
+                self._set_drawable_stroke(card_bg, AndroidUtilitiesClass.dp(1), with_alpha(accent_color, 0x1E))
                 card_frame.setBackground(card_bg)
                 glow_view = None
 
@@ -2404,7 +2793,7 @@ class PluginSecurityPlugin(BasePlugin):
                 accent_line = View(context)
                 accent_bg = GradientDrawable()
                 accent_bg.setCornerRadius(AndroidUtilitiesClass.dp(2))
-                accent_bg.setColor(as_java_color(with_alpha(accent_color, 0xD0)))
+                self._set_drawable_color(accent_bg, with_alpha(accent_color, 0xD0))
                 accent_line.setBackground(accent_bg)
                 try:
                     accent_line.setAlpha(0.0)
@@ -2419,7 +2808,7 @@ class PluginSecurityPlugin(BasePlugin):
                 title_view.setText("")
                 title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
                 title_view.setTypeface(AndroidUtilitiesClass.bold())
-                title_view.setTextColor(as_java_color(accent_color))
+                self._set_text_color(title_view, accent_color)
                 try:
                     title_view.setLineSpacing(AndroidUtilitiesClass.dp(2), 1.05)
                 except Exception:
@@ -2429,11 +2818,8 @@ class PluginSecurityPlugin(BasePlugin):
                 desc_view = TextView(context)
                 desc_view.setText("")
                 desc_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
-                try:
-                    desc_color = int(ThemeClass.getColor(ThemeClass.key_dialogTextGray2))
-                except Exception:
-                    desc_color = 0xFF8F96A3
-                desc_view.setTextColor(as_java_color(desc_color))
+                desc_color = dialog_muted_color
+                self._set_text_color(desc_view, desc_color)
                 try:
                     desc_view.setLineSpacing(AndroidUtilitiesClass.dp(3), 1.1)
                 except Exception:
@@ -3005,10 +3391,7 @@ class PluginSecurityPlugin(BasePlugin):
                         pass
 
             sheet = BottomSheet(context, False)
-            try:
-                sheet.fixNavigationBar(ThemeClass.getColor(ThemeClass.key_dialogBackground))
-            except Exception:
-                pass
+            self._fix_sheet_navigation_bar(sheet, dialog_bg_color)
 
             root = LinearLayoutClass(context)
             root.setOrientation(LinearLayoutClass.VERTICAL)
@@ -3018,10 +3401,7 @@ class PluginSecurityPlugin(BasePlugin):
                 AndroidUtilitiesClass.dp(18),
                 AndroidUtilitiesClass.dp(16),
             )
-            try:
-                root.setBackgroundColor(ThemeClass.getColor(ThemeClass.key_dialogBackground))
-            except Exception:
-                pass
+            self._set_background_color(root, dialog_bg_color)
 
             top_icon_res = resolve_drawable(
                 "menu_feature_reliable",
@@ -3036,14 +3416,14 @@ class PluginSecurityPlugin(BasePlugin):
             icon_holder = FrameLayout(context)
             icon_bg = GradientDrawable()
             icon_bg.setShape(GradientDrawable.OVAL)
-            icon_bg.setColor(as_java_color(with_alpha(verdict["color"], 0x18)))
+            self._set_drawable_color(icon_bg, with_alpha(verdict["color"], 0x18))
 
             icon_view = ImageView(context)
             if top_icon_res:
                 icon_view.setImageResource(top_icon_res)
             else:
                 icon_view.setImageResource(RClass.drawable.menu_privacy_policy)
-            icon_view.setColorFilter(as_java_color(verdict["color"]))
+            self._set_color_filter(icon_view, verdict["color"])
             icon_view.setBackground(icon_bg)
             icon_view.setPadding(
                 AndroidUtilitiesClass.dp(14),
@@ -3059,10 +3439,7 @@ class PluginSecurityPlugin(BasePlugin):
             title_view.setGravity(Gravity.CENTER)
             title_view.setTypeface(AndroidUtilitiesClass.bold())
             title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
-            try:
-                title_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-            except Exception:
-                pass
+            self._set_text_color(title_view, dialog_text_color)
             root.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 8))
 
             subtitle_view = TextView(context)
@@ -3076,10 +3453,7 @@ class PluginSecurityPlugin(BasePlugin):
             )
             subtitle_view.setGravity(Gravity.CENTER)
             subtitle_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
-            try:
-                subtitle_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextGray2))
-            except Exception:
-                pass
+            self._set_text_color(subtitle_view, dialog_muted_color)
             root.addView(subtitle_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 12))
 
             verdict_chip = create_chip(
@@ -3148,7 +3522,7 @@ class PluginSecurityPlugin(BasePlugin):
 
             verdict_chip.setOnClickListener(OnClickListener(on_verdict_chip_click))
 
-            ai_button = ButtonWithCounterView(context, True, None)
+            ai_button = ButtonWithCounterView(context, True, resources_provider)
             ai_button.setText(texts.get("LOCAL_SCAN_AI_BUTTON"), False)
             ai_button.setBackground(
                 self._make_button_bg(
@@ -3156,6 +3530,7 @@ class PluginSecurityPlugin(BasePlugin):
                     AndroidUtilitiesClass,
                     0xFF3390EC,
                     0xFF2D7FCF,
+                    resources_provider,
                 )
             )
             ai_button.setOnClickListener(
@@ -3168,10 +3543,7 @@ class PluginSecurityPlugin(BasePlugin):
             summary_view.setText(local_result["summary"])
             summary_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
             summary_view.setGravity(Gravity.LEFT)
-            try:
-                summary_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-            except Exception:
-                pass
+            self._set_text_color(summary_view, dialog_text_color)
             try:
                 summary_view.setLineSpacing(AndroidUtilitiesClass.dp(4), 1.12)
             except Exception:
@@ -3338,7 +3710,7 @@ class PluginSecurityPlugin(BasePlugin):
                         return
 
                     context = sheet.getContext()
-                    resources_provider = plugin._call_zero_arg_deep(sheet, "getResourceProvider")
+                    resources_provider = plugin._get_theme_provider(sheet)
 
                     analyze_btn = ButtonWithCounterView(context, True, resources_provider)
                     analyze_btn.setText(texts.get("LOCAL_SCAN_BUTTON"), False)
@@ -3348,6 +3720,7 @@ class PluginSecurityPlugin(BasePlugin):
                             AndroidUtilitiesClass,
                             0xFF63B4F4,
                             0xFF4A9FE0,
+                            resources_provider,
                         )
                     )
 
@@ -3483,7 +3856,7 @@ class PluginSecurityPlugin(BasePlugin):
                     self._show_error("UNEXPECTED_ERROR", error=str(e))
                     self._reset_ai_button(analyze_btn, analysis_error_text)
 
-            run_on_queue(analyze_task)
+            run_on_queue(analyze_task, EXTERNAL_NETWORK_QUEUE)
 
         except Exception as e:
             log(f"[Gemini] Ошибка _analyze_file_ai: {traceback.format_exc()}")
@@ -3608,14 +3981,14 @@ class PluginSecurityPlugin(BasePlugin):
             TypedValue = jclass("android.util.TypedValue")
             Gravity = jclass("android.view.Gravity")
             GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+            resources_provider = self._get_theme_provider(fragment)
+            dialog_bg_color = self._theme_color(ThemeClass, ThemeClass.key_dialogBackground, 0xFF101318, resources_provider)
+            dialog_text_color = self._theme_color(ThemeClass, ThemeClass.key_dialogTextBlack, 0xFFFFFFFF, resources_provider)
 
             sheet_ref = {"sheet": None}
 
             root = FrameLayout(context)
-            try:
-                root.setBackgroundColor(ThemeClass.getColor(ThemeClass.key_dialogBackground))
-            except Exception:
-                root.setBackgroundColor(as_java_color(0xFFFFFFFF))
+            self._set_background_color(root, dialog_bg_color)
 
             content = LinearLayoutClass(context)
             content.setOrientation(LinearLayoutClass.VERTICAL)
@@ -3645,10 +4018,7 @@ class PluginSecurityPlugin(BasePlugin):
             body_text_view.setText(report_data["report_text"])
             body_text_view.setTextIsSelectable(True)
             body_text_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
-            try:
-                body_text_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-            except Exception:
-                body_text_view.setTextColor(as_java_color(0xFF111111))
+            self._set_text_color(body_text_view, dialog_text_color)
             try:
                 body_text_view.setLineSpacing(AndroidUtilities.dp(4), 1.14)
             except Exception:
@@ -3693,10 +4063,7 @@ class PluginSecurityPlugin(BasePlugin):
                 sheet.setCanDismissWithTouchOutside(True)
             except Exception:
                 pass
-            try:
-                sheet.fixNavigationBar(ThemeClass.getColor(ThemeClass.key_dialogBackground))
-            except Exception:
-                pass
+            self._fix_sheet_navigation_bar(sheet, dialog_bg_color)
 
             self._current_report_sheet = sheet
             sheet_ref["sheet"] = sheet
@@ -3756,6 +4123,11 @@ class PluginSecurityPlugin(BasePlugin):
             GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
             RClass = jclass("org.telegram.messenger.R")
             AndroidUtilitiesClass = jclass("org.telegram.messenger.AndroidUtilities")
+            resources_provider = self._get_theme_provider(fragment)
+            dialog_bg_color = self._theme_color(ThemeClass, ThemeClass.key_dialogBackground, 0xFF101318, resources_provider)
+            dialog_text_color = self._theme_color(ThemeClass, ThemeClass.key_dialogTextBlack, 0xFFFFFFFF, resources_provider)
+            surface_color = self._theme_color(ThemeClass, ThemeClass.key_windowBackgroundWhite, 0xFF1B1F26, resources_provider)
+            selector_color = self._theme_color(ThemeClass, ThemeClass.key_listSelector, 0x1F000000, resources_provider)
 
             def resolve_drawable(*names: str) -> int:
                 drawable_class = None
@@ -3800,7 +4172,7 @@ class PluginSecurityPlugin(BasePlugin):
                 chip_frame = FrameLayout(context)
                 chip_bg = GradientDrawable()
                 chip_bg.setCornerRadius(AndroidUtilitiesClass.dp(14))
-                chip_bg.setColor(as_java_color(bg_color))
+                self._set_drawable_color(chip_bg, bg_color)
                 chip_frame.setBackground(chip_bg)
 
                 chip_layout = LinearLayoutClass(context)
@@ -3816,7 +4188,7 @@ class PluginSecurityPlugin(BasePlugin):
                 if icon_res:
                     chip_icon = ImageView(context)
                     chip_icon.setImageResource(icon_res)
-                    chip_icon.setColorFilter(as_java_color(text_color))
+                    self._set_color_filter(chip_icon, text_color)
                     chip_layout.addView(
                         chip_icon,
                         LayoutHelper.createLinear(14, 14, Gravity.CENTER_VERTICAL, 0, 0, 6, 0),
@@ -3826,7 +4198,7 @@ class PluginSecurityPlugin(BasePlugin):
                 chip_text.setText(text)
                 chip_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
                 chip_text.setTypeface(AndroidUtilitiesClass.bold())
-                chip_text.setTextColor(as_java_color(text_color))
+                self._set_text_color(chip_text, text_color)
                 chip_layout.addView(chip_text, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL))
                 chip_frame.addView(chip_layout, LayoutHelper.createFrame(-2, -2, Gravity.CENTER))
                 return chip_frame
@@ -3835,11 +4207,8 @@ class PluginSecurityPlugin(BasePlugin):
                 card_frame = FrameLayout(context)
                 card_bg = GradientDrawable()
                 card_bg.setCornerRadius(AndroidUtilitiesClass.dp(16))
-                card_bg.setColor(as_java_color(with_alpha(accent_color, 0x10)))
-                try:
-                    card_bg.setStroke(AndroidUtilitiesClass.dp(1), as_java_color(with_alpha(accent_color, 0x18)))
-                except Exception:
-                    pass
+                self._set_drawable_color(card_bg, with_alpha(accent_color, 0x10))
+                self._set_drawable_stroke(card_bg, AndroidUtilitiesClass.dp(1), with_alpha(accent_color, 0x18))
                 card_frame.setBackground(card_bg)
 
                 card_layout = LinearLayoutClass(context)
@@ -3855,16 +4224,13 @@ class PluginSecurityPlugin(BasePlugin):
                 header_view.setText(title)
                 header_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
                 header_view.setTypeface(AndroidUtilitiesClass.bold())
-                header_view.setTextColor(as_java_color(accent_color))
+                self._set_text_color(header_view, accent_color)
                 card_layout.addView(header_view, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 8))
 
                 body_view = TextView(context)
                 body_view.setText(description)
                 body_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
-                try:
-                    body_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-                except Exception:
-                    body_view.setTextColor(as_java_color(0xFF111111))
+                self._set_text_color(body_view, dialog_text_color)
                 try:
                     body_view.setLineSpacing(AndroidUtilitiesClass.dp(3), 1.1)
                 except Exception:
@@ -3878,10 +4244,7 @@ class PluginSecurityPlugin(BasePlugin):
                 button_frame = FrameLayout(context)
                 button_bg = GradientDrawable()
                 button_bg.setCornerRadius(AndroidUtilitiesClass.dp(18))
-                try:
-                    button_bg.setColor(ThemeClass.getColor(ThemeClass.key_listSelector))
-                except Exception:
-                    button_bg.setColor(as_java_color(0xFFF1F1F1))
+                self._set_drawable_color(button_bg, selector_color)
                 button_frame.setBackground(button_bg)
                 button_frame.setClickable(True)
                 button_frame.setFocusable(True)
@@ -3899,10 +4262,7 @@ class PluginSecurityPlugin(BasePlugin):
                 if icon_res:
                     button_icon = ImageView(context)
                     button_icon.setImageResource(icon_res)
-                    try:
-                        button_icon.setColorFilter(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-                    except Exception:
-                        button_icon.setColorFilter(as_java_color(0xFF111111))
+                    self._set_color_filter(button_icon, dialog_text_color)
                     button_layout.addView(
                         button_icon,
                         LayoutHelper.createLinear(16, 16, Gravity.CENTER_VERTICAL, 0, 0, 6, 0),
@@ -3912,10 +4272,7 @@ class PluginSecurityPlugin(BasePlugin):
                 button_text.setText(text)
                 button_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
                 button_text.setTypeface(AndroidUtilitiesClass.bold())
-                try:
-                    button_text.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-                except Exception:
-                    button_text.setTextColor(as_java_color(0xFF111111))
+                self._set_text_color(button_text, dialog_text_color)
                 button_layout.addView(button_text, LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL))
 
                 button_frame.addView(button_layout, LayoutHelper.createFrame(-2, -2, Gravity.CENTER))
@@ -3930,6 +4287,7 @@ class PluginSecurityPlugin(BasePlugin):
                         AndroidUtilitiesClass,
                         0xFF3390EC,
                         0xFF2D7FCF,
+                        resources_provider,
                     )
                 )
                 button_frame.setClickable(True)
@@ -3940,7 +4298,7 @@ class PluginSecurityPlugin(BasePlugin):
                 button_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
                 button_text.setTypeface(AndroidUtilitiesClass.bold())
                 button_text.setGravity(Gravity.CENTER)
-                button_text.setTextColor(self._get_primary_button_text_color(ThemeClass))
+                self._set_text_color(button_text, self._get_primary_button_text_color(ThemeClass, 0xFFFFFFFF, resources_provider))
                 button_frame.addView(button_text, LayoutHelper.createFrame(-1, -1))
                 button_frame.setOnClickListener(OnClickListener(on_click))
                 return button_frame
@@ -3949,10 +4307,7 @@ class PluginSecurityPlugin(BasePlugin):
                 self._dismiss_report_sheet()
 
             sheet = BottomSheet(context, False)
-            try:
-                sheet.fixNavigationBar(ThemeClass.getColor(ThemeClass.key_dialogBackground))
-            except Exception:
-                pass
+            self._fix_sheet_navigation_bar(sheet, dialog_bg_color)
 
             root = LinearLayoutClass(context)
             root.setOrientation(LinearLayoutClass.VERTICAL)
@@ -3962,10 +4317,7 @@ class PluginSecurityPlugin(BasePlugin):
                 AndroidUtilitiesClass.dp(18),
                 AndroidUtilitiesClass.dp(16),
             )
-            try:
-                root.setBackgroundColor(ThemeClass.getColor(ThemeClass.key_dialogBackground))
-            except Exception:
-                pass
+            self._set_background_color(root, dialog_bg_color)
 
             top_icon_res = resolve_drawable("menu_feature_reliable", "menu_privacy_policy")
             verdict_icon_res = resolve_drawable(
@@ -3978,14 +4330,14 @@ class PluginSecurityPlugin(BasePlugin):
             icon_holder = FrameLayout(context)
             icon_bg = GradientDrawable()
             icon_bg.setShape(GradientDrawable.OVAL)
-            icon_bg.setColor(as_java_color(with_alpha(verdict["color"], 0x18)))
+            self._set_drawable_color(icon_bg, with_alpha(verdict["color"], 0x18))
 
             icon_view = ImageView(context)
             if top_icon_res:
                 icon_view.setImageResource(top_icon_res)
             else:
                 icon_view.setImageResource(RClass.drawable.menu_privacy_policy)
-            icon_view.setColorFilter(as_java_color(verdict["color"]))
+            self._set_color_filter(icon_view, verdict["color"])
             icon_view.setBackground(icon_bg)
             icon_view.setPadding(
                 AndroidUtilitiesClass.dp(14),
@@ -4001,10 +4353,7 @@ class PluginSecurityPlugin(BasePlugin):
             title_view.setGravity(Gravity.CENTER)
             title_view.setTypeface(AndroidUtilitiesClass.bold())
             title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
-            try:
-                title_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-            except Exception:
-                title_view.setTextColor(as_java_color(0xFF111111))
+            self._set_text_color(title_view, dialog_text_color)
             root.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 8))
 
             tags_row = LinearLayoutClass(context)
@@ -4034,17 +4383,8 @@ class PluginSecurityPlugin(BasePlugin):
             body_frame = FrameLayout(context)
             body_bg = GradientDrawable()
             body_bg.setCornerRadius(AndroidUtilitiesClass.dp(16))
-            try:
-                body_bg.setColor(ThemeClass.getColor(ThemeClass.key_windowBackgroundWhite))
-            except Exception:
-                body_bg.setColor(as_java_color(0xFFF8F9FB))
-            try:
-                body_bg.setStroke(
-                    AndroidUtilitiesClass.dp(1),
-                    as_java_color(with_alpha(verdict["color"], 0x14)),
-                )
-            except Exception:
-                pass
+            self._set_drawable_color(body_bg, surface_color)
+            self._set_drawable_stroke(body_bg, AndroidUtilitiesClass.dp(1), with_alpha(verdict["color"], 0x14))
             body_frame.setBackground(body_bg)
             body_frame.setClickable(True)
             body_frame.setFocusable(True)
@@ -4075,10 +4415,7 @@ class PluginSecurityPlugin(BasePlugin):
                 AndroidUtilitiesClass.dp(16),
                 AndroidUtilitiesClass.dp(10),
             )
-            try:
-                body_text_view.setTextColor(ThemeClass.getColor(ThemeClass.key_dialogTextBlack))
-            except Exception:
-                body_text_view.setTextColor(as_java_color(0xFF111111))
+            self._set_text_color(body_text_view, dialog_text_color)
             try:
                 body_text_view.setLineSpacing(AndroidUtilitiesClass.dp(4), 1.12)
             except Exception:
@@ -4262,6 +4599,18 @@ class PluginSecurityPlugin(BasePlugin):
         except (ValueError, TypeError):
             return fallback
 
+    def _validate_model_index(self, value: Any, default: int = 0) -> int:
+        try:
+            index = int(value)
+        except (ValueError, TypeError):
+            index = default
+
+        if 0 <= index < len(GEMINI_MODEL_API_NAMES):
+            return index
+        if 0 <= default < len(GEMINI_MODEL_API_NAMES):
+            return default
+        return 0
+
     def _get_api_key(self, provider_type: int) -> str:
         if provider_type == API_PROVIDER_OPENAI_COMPATIBLE:
             return self.get_setting("openai_api_key", "").strip()
@@ -4271,7 +4620,7 @@ class PluginSecurityPlugin(BasePlugin):
         return any(str(file_name).endswith(ext) for ext in [".plugin", ".py"])
 
     def _read_file_text(self, file_path: str) -> str:
-        with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as file:
+        with tokenize.open(file_path) as file:
             return file.read()
 
     def _load_plugin_source(self, file_path: str) -> Tuple[str, str, str]:
@@ -4317,9 +4666,7 @@ class PluginSecurityPlugin(BasePlugin):
                 header_prefix,
             )
 
-        model_idx = self._get_int_setting("model_selection", "0", 0)
-        if model_idx < 0 or model_idx >= len(GEMINI_MODEL_API_NAMES):
-            model_idx = 0
+        model_idx = self._validate_model_index(self.get_setting("model_selection", "0"))
         model_name = GEMINI_MODEL_API_NAMES[model_idx]
         return self.gemini_client.analyze(api_key, model_name, prompt, temperature, max_tokens)
 
@@ -4543,11 +4890,7 @@ class PluginSecurityPlugin(BasePlugin):
         return False
     
     def _mask_code(self, code: str) -> str:
-        lines = []
-        for line in code.split('\n'):
-            stripped_line = line.split('#', 1)[0]
-            lines.append(stripped_line)
-        clean_code = '\n'.join(lines)
+        clean_code = strip_python_comments(code)
 
         rename_vars = self.get_setting("rename_variables", True)
         rename_strings = self.get_setting("rename_strings", True)
@@ -4661,5 +5004,5 @@ class PluginSecurityPlugin(BasePlugin):
             return HookResult(strategy=HookStrategy.CANCEL)
 
         BulletinHelper.show_info(texts.get("ANALYZING_MESSAGE"))
-        run_on_queue(lambda: self._analyze_reply_task(params, document))
+        run_on_queue(lambda: self._analyze_reply_task(params, document), EXTERNAL_NETWORK_QUEUE)
         return HookResult(strategy=HookStrategy.CANCEL)
