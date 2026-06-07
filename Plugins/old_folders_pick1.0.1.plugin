@@ -1,0 +1,750 @@
+import json
+import os
+import shutil
+import threading
+import traceback
+import weakref
+from typing import Optional
+
+from java import jclass
+from java.chaquopy import dynamic_proxy
+from java.lang import Class as JClass
+from java.nio import ByteBuffer
+from dalvik.system import InMemoryDexClassLoader
+from org.telegram.messenger import ApplicationLoader, NotificationCenter
+
+from android.os import Looper
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+
+__id__ = "old_folders_pick"
+__name__ = "Old Folders Pick"
+__icon__ = "RnDev/5"
+__description__ = "Делает панель папок чатов как в старых версиях Telegram"
+__version__ = "1.0.1"
+__author__ = "@YouRooni"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+DEX_CLASS_NAME = "ofp.Plugin"
+DEX_CACHE_DIR = "old_folders_pick_cache"
+DEX_FILE_NAME = "ofp_plugin.dex"
+DEBUG = False
+
+
+class DexDownloadDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin_ref = weakref.ref(plugin)
+
+    def didReceivedNotification(self, notification_id, account, *args):
+        plugin = self._plugin_ref()
+        if plugin is not None:
+            plugin._on_download_notification(notification_id, account, *args)
+
+
+class DexOpenHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin_ref = weakref.ref(plugin)
+
+    def before_hooked_method(self, param):
+        plugin = self._plugin_ref()
+        if plugin is None:
+            return
+
+        try:
+            method_name = param.method.getName()
+            plugin.log(f"[OFP Loader] Hook called: {method_name}")
+            if not param.args:
+                plugin.log("[OFP Loader] Hook called with no args")
+                return
+
+            if len(param.args) == 6:
+                file_name = str(param.args[1]) if param.args[1] else ""
+                plugin.log(f"[OFP Loader] Clicked file (6-args): {file_name}")
+                is_ofp = file_name.lower().startswith("ofp-") and file_name.lower().endswith(".dex")
+                if not is_ofp:
+                    return
+
+                plugin.log(f"[OFP Loader] Intercepting click for DEX file: {file_name}")
+                param.setResult(True)
+                run_on_ui_thread(lambda: plugin.show_security_warning())
+                return
+            else:
+                message = param.args[0]
+                file_name = plugin._get_message_file_name(message)
+                plugin.log(f"[OFP Loader] Clicked file: {file_name}")
+
+                if not plugin._is_any_dex_message(message):
+                    return
+
+                plugin.log(f"[OFP Loader] Intercepting click for DEX file: {file_name}")
+                if "openForView" in method_name:
+                    param.setResult(True)
+                else:
+                    param.setResult(None)
+
+                if not plugin._is_safe_message(message):
+                    run_on_ui_thread(lambda: plugin.show_security_warning())
+                    return
+
+                path = plugin._resolve_message_file_path(message)
+                if path and os.path.exists(path):
+                    plugin.log(f"[OFP Loader] File local at {path}. Installing...")
+                    run_on_ui_thread(lambda: plugin.install_dex_from_path(path, announce=True))
+                else:
+                    plugin.log("[OFP Loader] File not downloaded. Triggering download...")
+                    run_on_ui_thread(lambda: plugin.download_dex_from_message(message))
+        except Exception as e:
+            plugin.log(f"[OFP Loader] open hook error: {e}")
+
+
+class Plugin(BasePlugin):
+    def log(self, message: str) -> None:
+        if not DEBUG:
+            return
+        super().log(message)
+        try:
+            log_path = os.path.join(
+                ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath(),
+                "ofp_loader.log"
+            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(message + "\n")
+        except Exception:
+            pass
+
+    def on_plugin_load(self) -> None:
+        try:
+            log_path = os.path.join(
+                ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath(),
+                "ofp_loader.log"
+            )
+            if os.path.exists(log_path):
+                os.remove(log_path)
+        except Exception:
+            pass
+
+        self.log(f"[OFP Loader] Plugin load initiated. Version: {__version__}")
+
+        cache_dir = os.path.join(
+            ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath(),
+            DEX_CACHE_DIR,
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        self.dex_path = os.path.join(cache_dir, DEX_FILE_NAME)
+        self.dex_class = None
+        self.dex_loader = None
+        self._hooks = []
+        self._download_delegate = DexDownloadDelegate(self)
+        self._observer_account = None
+        self._pending_file_name = None
+        self._pending_install_after_download = False
+
+        self._hook_android_utilities()
+        self.load_dex(announce=False)
+
+    def on_plugin_unload(self) -> None:
+        self._reset_pending_download_state()
+        self._detach_download_observer()
+        self.unload_dex()
+
+        for hook in self._hooks:
+            try:
+                hook.unhook()
+            except Exception:
+                pass
+        self._hooks.clear()
+        self._download_delegate = None
+        self.log("[OFP Loader] Unloaded")
+
+    def _hook_android_utilities(self):
+        android_utilities = None
+        
+        try:
+            class_loader = ApplicationLoader.applicationContext.getClassLoader()
+            from java.lang import Class as JClass
+            android_utilities = JClass.forName("org.telegram.messenger.AndroidUtilities", True, class_loader)
+            self.log("[OFP Loader] Resolved AndroidUtilities via JClass.forName (with classloader)")
+        except Exception as e:
+            self.log(f"[OFP Loader] JClass.forName (with classloader) failed: {e}")
+
+        if android_utilities is None:
+            try:
+                from java.lang import Class as JClass
+                android_utilities = JClass.forName("org.telegram.messenger.AndroidUtilities")
+                self.log("[OFP Loader] Resolved AndroidUtilities via JClass.forName (default)")
+            except Exception as e:
+                self.log(f"[OFP Loader] JClass.forName (default) failed: {e}")
+
+        if android_utilities is None:
+            self.log("[OFP Loader] CRITICAL: Could not resolve org.telegram.messenger.AndroidUtilities class!")
+            return
+
+        try:
+            hook_count = 0
+            for method in android_utilities.getDeclaredMethods():
+                method_name = method.getName()
+                if method_name == "openDocument" and len(method.getParameterTypes()) == 3:
+                    if "MessageObject" in method.getParameterTypes()[0].getName():
+                        method.setAccessible(True)
+                        ref = self.hook_method(method, DexOpenHook(self))
+                        if ref:
+                            self._hooks.append(ref)
+                            hook_count += 1
+                elif method_name == "openForView" and len(method.getParameterTypes()) == 4:
+                    if "MessageObject" in method.getParameterTypes()[0].getName():
+                        method.setAccessible(True)
+                        ref = self.hook_method(method, DexOpenHook(self))
+                        if ref:
+                            self._hooks.append(ref)
+                            hook_count += 1
+                elif method_name == "openForView" and len(method.getParameterTypes()) == 6:
+                    if "File" in method.getParameterTypes()[0].getName():
+                        method.setAccessible(True)
+                        ref = self.hook_method(method, DexOpenHook(self))
+                        if ref:
+                            self._hooks.append(ref)
+                            hook_count += 1
+
+            self.log(f"[OFP Loader] AndroidUtilities hooks installed. Count: {hook_count}")
+            
+            if hook_count == 0:
+                self.log("[OFP Loader] WARNING: hook_count is 0! Listing open* methods in AndroidUtilities:")
+                for method in android_utilities.getDeclaredMethods():
+                    name = method.getName()
+                    if name.startswith("open"):
+                        params = ", ".join([p.getName() for p in method.getParameterTypes()])
+                        self.log(f"  Method found: {name}({params})")
+
+        except Exception as e:
+            self.log(f"[OFP Loader] failed to hook/analyze AndroidUtilities: {e}")
+
+    def load_dex(self, announce: bool = False) -> bool:
+        try:
+            if self.dex_class is not None:
+                self.unload_dex()
+
+            if not os.path.exists(self.dex_path):
+                self.log("[OFP Loader] Dex file not found, waiting for installation")
+                return False
+
+            with open(self.dex_path, "rb") as f:
+                self.dex_bytes_cache = f.read()
+
+            self.dex_buffer = ByteBuffer.wrap(self.dex_bytes_cache)
+            parent_cl = ApplicationLoader.applicationContext.getClassLoader()
+            self.dex_loader = InMemoryDexClassLoader(self.dex_buffer, parent_cl)
+            self.dex_class = self.dex_loader.loadClass(DEX_CLASS_NAME)
+            
+            start_method = self.dex_class.getMethod("start")
+            start_method.invoke(None)
+            
+            self.apply_settings()
+            self.log("[OFP Loader] Loaded DEX successfully (statically)")
+            if announce:
+                BulletinHelper.show_success("Ядро загружено", get_last_fragment())
+            return True
+        except Exception as e:
+            self.log(f"[OFP Loader] Load DEX error: {e}\n{traceback.format_exc()}")
+            try:
+                if os.path.exists(self.dex_path):
+                    os.remove(self.dex_path)
+                    self.log("[OFP Loader] Deleted broken/incompatible DEX from cache")
+            except Exception:
+                pass
+            if announce:
+                BulletinHelper.show_error(f"Ошибка загрузки DEX: {e}", get_last_fragment())
+            return False
+
+    def unload_dex(self):
+        try:
+            if self.dex_class is not None:
+                stop_method = self.dex_class.getMethod("stop")
+                stop_method.invoke(None)
+        except Exception as e:
+            self.log(f"[OFP Loader] stop error: {e}")
+        finally:
+            self.dex_class = None
+            self.dex_loader = None
+            self.dex_buffer = None
+            self.dex_bytes_cache = None
+
+    def install_dex_from_path(self, path: str, announce: bool = True):
+        try:
+            shutil.copy(path, self.dex_path)
+            self.log(f"[OFP Loader] Copied dex to {self.dex_path}")
+            
+            success = self.load_dex(announce=announce)
+            if success:
+                if path != self.dex_path:
+                    try:
+                        os.remove(path)
+                        self.log(f"[OFP Loader] Deleted source dex file: {path}")
+                    except Exception as e_del:
+                        self.log(f"[OFP Loader] Failed to delete source dex file: {e_del}")
+                if announce:
+                    BulletinHelper.show_success("Плагин успешно установлен/обновлен!", get_last_fragment())
+            else:
+                if announce:
+                    BulletinHelper.show_error("Ошибка инициализации ядра DEX", get_last_fragment())
+        except Exception as e:
+            self.log(f"[OFP Loader] Install error: {e}")
+            BulletinHelper.show_error(f"Ошибка установки: {e}", get_last_fragment())
+
+    def download_dex_from_message(self, message):
+        try:
+            document = message.getDocument()
+            if document is None:
+                BulletinHelper.show_error("DEX-файл не найден в сообщении", get_last_fragment())
+                return
+
+            file_name = self._get_message_file_name(message)
+            if not file_name:
+                BulletinHelper.show_error("Не удалось определить имя DEX-файла", get_last_fragment())
+                return
+
+            account = int(message.currentAccount)
+            self._attach_download_observer(account)
+            self._pending_file_name = file_name
+            self._pending_install_after_download = True
+
+            from org.telegram.messenger import FileLoader
+            FileLoader.getInstance(account).loadFile(document, message, FileLoader.PRIORITY_HIGH, 1)
+
+            BulletinHelper.show_info(f"Скачиваю {file_name}…", get_last_fragment())
+        except Exception as e:
+            self._reset_pending_download_state()
+            self._detach_download_observer()
+            self.log(f"[OFP Loader] download start error: {e}")
+            BulletinHelper.show_error(f"Не удалось начать скачивание DEX: {e}", get_last_fragment())
+
+    def _attach_download_observer(self, account: int):
+        def attach():
+            if self._observer_account == account:
+                return
+
+            self._detach_download_observer_locked()
+            notification_center = NotificationCenter.getInstance(account)
+            notification_center.addObserver(self._download_delegate, NotificationCenter.fileLoaded)
+            notification_center.addObserver(self._download_delegate, NotificationCenter.fileLoadFailed)
+            self._observer_account = account
+
+        self._run_on_ui_thread_sync(attach)
+
+    def _detach_download_observer(self):
+        self._run_on_ui_thread_sync(self._detach_download_observer_locked)
+
+    def _detach_download_observer_locked(self):
+        if self._observer_account is None:
+            return
+
+        try:
+            notification_center = NotificationCenter.getInstance(self._observer_account)
+            notification_center.removeObserver(self._download_delegate, NotificationCenter.fileLoaded)
+            notification_center.removeObserver(self._download_delegate, NotificationCenter.fileLoadFailed)
+        except Exception:
+            pass
+        finally:
+            self._observer_account = None
+
+    def _matches_pending_file(self, location) -> bool:
+        if not self._pending_file_name or location is None:
+            return False
+        return str(location).lower() == self._pending_file_name.lower()
+
+    def _on_download_notification(self, notification_id, account, *args):
+        try:
+            if self._observer_account is None or int(account) != int(self._observer_account):
+                return
+
+            if notification_id == NotificationCenter.fileLoaded:
+                location = args[0] if len(args) > 0 else None
+                final_file = args[1] if len(args) > 1 else None
+                if not self._matches_pending_file(location):
+                    return
+
+                path = None
+                if final_file is not None and hasattr(final_file, "getAbsolutePath"):
+                    path = str(final_file.getAbsolutePath())
+
+                install_after_download = self._pending_install_after_download
+                self._reset_pending_download_state()
+                self._detach_download_observer()
+
+                if path and os.path.exists(path) and install_after_download:
+                    run_on_ui_thread(lambda: self.install_dex_from_path(path, announce=True))
+                else:
+                    run_on_ui_thread(
+                        lambda: BulletinHelper.show_error(
+                            "DEX скачан, но локальный файл не найден",
+                            get_last_fragment(),
+                        )
+                    )
+
+            elif notification_id == NotificationCenter.fileLoadFailed:
+                location = args[0] if len(args) > 0 else None
+                if not self._matches_pending_file(location):
+                    return
+
+                failed_name = self._pending_file_name or "DEX-файл"
+                self._reset_pending_download_state()
+                self._detach_download_observer()
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_error(
+                        f"Не удалось скачать {failed_name}",
+                        get_last_fragment(),
+                    )
+                )
+        except Exception as e:
+            self.log(f"[OFP Loader] download notification error: {e}")
+
+    def _run_on_ui_thread_sync(self, fn, timeout_ms: int = 3000):
+        try:
+            if Looper.getMainLooper().isCurrentThread():
+                fn()
+                return
+        except Exception:
+            pass
+
+        finished = threading.Event()
+        error_holder = {}
+
+        def wrapped():
+            try:
+                fn()
+            except Exception as error:
+                error_holder["error"] = error
+            finally:
+                finished.set()
+
+        run_on_ui_thread(wrapped)
+        finished.wait(timeout_ms / 1000.0)
+
+        error = error_holder.get("error")
+        if error is not None:
+            raise error
+
+    def _reset_pending_download_state(self):
+        self._pending_file_name = None
+        self._pending_install_after_download = False
+
+    def _is_any_dex_message(self, message) -> bool:
+        file_name = self._get_message_file_name(message)
+        if not file_name:
+            self.log("[OFP Loader] _is_any_dex_message: empty filename")
+            return False
+        normalized = file_name.lower()
+        res = normalized.startswith("ofp-") and normalized.endswith(".dex")
+        self.log(f"[OFP Loader] _is_any_dex_message check for '{file_name}': {res}")
+        return res
+
+    def _is_safe_message(self, message) -> bool:
+        if message is None:
+            return False
+        TARGET_CHANNEL_ID = -1002813564336
+        allowed_ids = {TARGET_CHANNEL_ID}
+        if str(TARGET_CHANNEL_ID).startswith("-100"):
+            try:
+                raw_id = int(str(TARGET_CHANNEL_ID)[4:])
+                allowed_ids.add(-raw_id)
+            except Exception:
+                pass
+
+        try:
+            dialog_id = int(message.getDialogId())
+            if dialog_id in allowed_ids:
+                return True
+        except Exception:
+            pass
+        try:
+            message_owner = message.messageOwner
+            if message_owner is not None and message_owner.fwd_from is not None:
+                fwd_from = message_owner.fwd_from
+                if fwd_from.saved_from_peer is not None:
+                    from_id = self._get_peer_dialog_id(fwd_from.saved_from_peer)
+                    if from_id in allowed_ids:
+                        return True
+                if fwd_from.from_id is not None:
+                    from_id = self._get_peer_dialog_id(fwd_from.from_id)
+                    if from_id in allowed_ids:
+                        return True
+        except Exception as e:
+            self.log(f"[OFP Loader] _is_safe_message error: {e}")
+        return False
+
+    def _get_peer_dialog_id(self, peer) -> int:
+        if peer is None:
+            return 0
+        try:
+            from org.telegram.messenger import DialogObject
+            return int(DialogObject.getPeerDialogId(peer))
+        except Exception:
+            pass
+        try:
+            channel_id = getattr(peer, "channel_id", 0)
+            if channel_id != 0:
+                return -1000000000000 - int(channel_id)
+            user_id = getattr(peer, "user_id", 0)
+            if user_id != 0:
+                return int(user_id)
+            chat_id = getattr(peer, "chat_id", 0)
+            if chat_id != 0:
+                return -int(chat_id)
+        except Exception:
+            pass
+        return 0
+
+    def show_security_warning(self):
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            from ui.bulletin import BulletinHelper
+            from java import jclass
+            
+            def open_channel():
+                try:
+                    context = ApplicationLoader.applicationContext
+                    intent = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=RnPlugins"))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(intent)
+                except Exception:
+                    try:
+                        intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/RnPlugins"))
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(intent)
+                    except Exception:
+                        pass
+
+            err_text = "Этот файл получен из неофициального источника. Для безопасности, найдите официальную версию."
+            button_text = "Перейти"
+            icon_id = jclass("org.telegram.messenger.R").raw.error
+            
+            BulletinHelper.show_with_button(
+                err_text,
+                icon_id,
+                button_text,
+                open_channel,
+                get_last_fragment(),
+                BulletinHelper.DURATION_PROLONG
+            )
+        except Exception as e:
+            self.log(f"[OFP Loader] show_security_warning error: {e}")
+
+    def _get_message_file_name(self, message) -> str:
+        if message is None:
+            return ""
+        try:
+            name = message.getDocumentName()
+            if name:
+                self.log(f"[OFP Loader] getDocumentName returned: {name}")
+                return str(name)
+        except Exception as e:
+            self.log(f"[OFP Loader] getDocumentName error: {e}")
+        try:
+            doc = message.getDocument()
+            if doc is not None:
+                for attr in ("file_name_fixed", "file_name"):
+                    val = getattr(doc, attr, None)
+                    if val:
+                        self.log(f"[OFP Loader] getDocument attribute {attr} returned: {val}")
+                        return str(val)
+        except Exception as e:
+            self.log(f"[OFP Loader] getDocument error: {e}")
+        return ""
+
+    def _resolve_message_file_path(self, message) -> Optional[str]:
+        if message is None:
+            return None
+
+        try:
+            attach_path = getattr(message.messageOwner, "attachPath", None)
+            if attach_path:
+                attach_path = str(attach_path)
+                if attach_path and os.path.exists(attach_path):
+                    return attach_path
+        except Exception:
+            pass
+
+        try:
+            from org.telegram.messenger import FileLoader
+            file_obj = FileLoader.getInstance(message.currentAccount).getPathToMessage(message.messageOwner)
+            if file_obj is not None:
+                path = str(file_obj.getAbsolutePath())
+                if os.path.exists(path):
+                    return path
+        except Exception as e:
+            self.log(f"[OFP Loader] path resolve error: {e}")
+
+        return None
+
+    def apply_settings(self):
+        try:
+            size_preset = int(self.get_setting("size_preset", 1))
+            folder_rounding = int(self.get_setting("folder_rounding", 4))
+            if self.dex_class is not None:
+                for method in self.dex_class.getMethods():
+                    if method.getName() == "updateSettings" and len(method.getParameterTypes()) == 2:
+                        method.invoke(None, size_preset, folder_rounding)
+                        self.log(f"[OFP Loader] Settings applied dynamically: size={size_preset}, rounding={folder_rounding}")
+                        return
+                self.log("[OFP Loader] Method updateSettings not found in DEX class")
+        except Exception as e:
+            self.log(f"[OFP Loader] Apply settings error: {e}\n{traceback.format_exc()}")
+
+    def _clear_dex_cache(self, _view=None):
+        self._reset_pending_download_state()
+        self._detach_download_observer()
+        self.unload_dex()
+        try:
+            if os.path.exists(self.dex_path):
+                os.remove(self.dex_path)
+        except Exception as e:
+            self.log(f"[OFP Loader] failed to clear cache: {e}")
+        BulletinHelper.show_success("Кеш DEX очищен", get_last_fragment())
+
+    def _show_log(self, view=None):
+        try:
+            log_path = os.path.join(
+                ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath(),
+                "ofp_loader.log"
+            )
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    log_text = "".join(lines[-35:])
+            else:
+                log_text = "Лог пуст или файл не найден."
+        except Exception as e:
+            log_text = f"Не удалось прочитать лог: {e}"
+
+        try:
+            from ui.alert import AlertDialogBuilder
+            context = None
+            if view is not None:
+                try:
+                    context = view.getContext()
+                except Exception:
+                    pass
+            if context is None:
+                try:
+                    context = get_last_fragment().getParentActivity()
+                except Exception:
+                    pass
+            
+            builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            builder.set_title("Лог загрузчика OFP")
+            builder.set_message(log_text)
+            builder.set_positive_button("ОК", None)
+            builder.show()
+        except Exception as err:
+            self.log(f"[OFP Loader] Dialog display error: {err}")
+            try:
+                BulletinHelper.show_error(f"Ошибка диалога: {err}", get_last_fragment())
+            except Exception:
+                pass
+
+    def _copy_log(self, view=None):
+        try:
+            log_path = os.path.join(
+                ApplicationLoader.applicationContext.getFilesDir().getAbsolutePath(),
+                "ofp_loader.log"
+            )
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8") as f:
+                    log_text = f.read()
+            else:
+                log_text = "Лог пуст или файл не найден."
+        except Exception as e:
+            log_text = f"Не удалось прочитать лог: {e}"
+
+        try:
+            from android.content import Context, ClipData
+            context = ApplicationLoader.applicationContext
+            clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+            clip = ClipData.newPlainText("OFP Loader Log", log_text)
+            clipboard.setPrimaryClip(clip)
+            BulletinHelper.show_success("Лог скопирован в буфер обмена", get_last_fragment())
+        except Exception as err:
+            self.log(f"[OFP Loader] Copy log error: {err}")
+            try:
+                BulletinHelper.show_error(f"Ошибка копирования: {err}", get_last_fragment())
+            except Exception:
+                pass
+
+    def _open_etg_settings(self, view=None):
+        try:
+            from org.telegram.messenger.browser import Browser
+            from client_utils import get_last_fragment
+            activity = get_last_fragment().getParentActivity()
+            if activity:
+                run_on_ui_thread(lambda: Browser.openUrl(activity, "https://t.me/exteraSettings?s=tabTitleStyle"))
+        except Exception as e:
+            self.log(f"[OFP Loader] Error opening ETG settings: {e}")
+
+    def create_settings(self):
+        from ui.settings import Header, Selector, Divider, Text
+        status_text = "Ядро загружено" if self.dex_class is not None else "Ядро не загружено / Ожидает ofp-*.dex"
+        
+        settings = [
+            Text(
+                text="Статус ядра",
+                subtext=status_text,
+                icon="files_storage"
+            ),
+            Header(text="Внешний вид папок"),
+            Selector(
+                key="size_preset",
+                text="Размер",
+                default=2,
+                items=["Маленький", "По умолчанию", "Средний (По умолчанию)", "Большой"],
+                icon="ic_gofullscreen",
+                on_change=lambda val: self.apply_settings()
+            ),
+            Selector(
+                key="folder_rounding",
+                text="Скругление",
+                default=6,
+                items=["0 (Квадрат)", "2", "4", "6", "8", "10", "12 (По умолчанию)", "14 (Круглая)"],
+                icon="msg_autodelete_badge2",
+                on_change=lambda val: self.apply_settings()
+            ),
+            Text(
+                text="Настройки exteraGram",
+                subtext="Папки чатов в настройках exteraGram.",
+                icon="msg_colors",
+                on_click=self._open_etg_settings
+            ),
+            Divider(text="Иногда для применения изменений может потребоваться перезапуск.")
+        ]
+
+        if DEBUG:
+            settings.extend([
+                Text(
+                    text="Посмотреть лог загрузчика",
+                    subtext="Показывает последние записи отладочного лога.",
+                    icon="msg_info",
+                    on_click=self._show_log
+                ),
+                Text(
+                    text="Скопировать лог загрузчика",
+                    subtext="Копирует весь отладочный лог в буфер обмена.",
+                    icon="copy",
+                    on_click=self._copy_log
+                )
+            ])
+
+        settings.append(
+            Text(
+                text="Очистить кеш DEX",
+                subtext="Удаляет сохраненный файл ядра.",
+                icon="msg_delete",
+                accent=True,
+                on_click=self._clear_dex_cache
+            )
+        )
+        return settings
