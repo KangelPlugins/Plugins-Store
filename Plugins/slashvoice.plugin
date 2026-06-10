@@ -1,0 +1,602 @@
+# -*- coding: utf-8 -*-
+#
+# SlashVoice — голосовые "быстрые ответы" в ЛЮБЫХ чатах/группах/каналах.
+#
+# ГЛАВНОЕ: умеет брать голосовые прямо из твоих Telegram Business быстрых ответов.
+#
+# Как пользоваться:
+#   1) Один раз (и после добавления новых ответов) напиши в любом чате: .qsync
+#      Плагин подтянет твои Business быстрые ответы (/да, /нет, /янемогу ...).
+#   2) В любом чате напиши /да и отправь -> уйдёт голосовое из быстрого ответа "да".
+#      - если перед этим ответить (свайп) на чьё-то сообщение, голосовое уйдёт ЦИТАТОЙ.
+#   3) Напиши просто / -> появится список для выбора.
+#   4) Команды: .qsync (обновить из Business), .qlist (показать список)
+#
+# Бонус: можно сохранить любое голосовое и вручную — зажать его -> "Сохранить как быстрый ответ".
+#
+# По документации SDK: https://plugins.exteragram.app/docs
+
+import json
+import base64
+import traceback
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from ui.settings import Header, Input, Text
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+from android_utils import run_on_ui_thread, log
+from client_utils import (
+    send_message, send_audio, send_request, run_on_queue,
+    get_last_fragment, get_file_loader,
+)
+
+from org.telegram.tgnet import TLRPC, SerializedData
+from android.widget import EditText
+
+__id__ = "slashvoice"
+__name__ = "SlashVoice — быстрые голосовые"
+__description__ = ("Голосовые быстрые ответы в любых чатах/группах/каналах. "
+                   "Подтягивает голосовые из твоих Telegram Business быстрых ответов: "
+                   "напиши .qsync, потом в любом чате пиши /имя (например /да). "
+                   "Если отвечаешь на сообщение — голосовое уйдёт цитатой. "
+                   "Просто / открывает список.")
+__author__ = "@you"
+__version__ = "1.3.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.4.0"
+__sdk_version__ = ">=1.4.3.0"
+
+MANUAL_KEY = "replies_json"   # сохранённые вручную (зажать голосовое)
+NATIVE_KEY = "native_json"    # подтянутые из Business быстрых ответов
+DEFAULT_PREFIX = "/"
+
+
+# ---------- хелперы ----------
+
+def _argb(v):
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
+def toast(kind, text):
+    try:
+        if kind == "ok" and hasattr(BulletinHelper, "show_success"):
+            BulletinHelper.show_success(text); return
+        if kind == "err" and hasattr(BulletinHelper, "show_error"):
+            BulletinHelper.show_error(text); return
+    except Exception:
+        pass
+    try:
+        BulletinHelper.show_info(text)
+    except Exception:
+        log("SlashVoice toast: " + str(text))
+
+
+def serialize_document(doc):
+    """TLRPC.Document -> base64 (сохраняем форму ИМЕННО голосового: waveform + voice)."""
+    try:
+        size = doc.getObjectSize()
+        data = SerializedData(size)
+        doc.serializeToStream(data)
+        raw = data.toByteArray()
+        try:
+            data.cleanup()
+        except Exception:
+            pass
+        return base64.b64encode(bytes(raw)).decode("ascii")
+    except Exception:
+        log("SlashVoice serialize_document failed\n" + traceback.format_exc())
+        return None
+
+
+def deserialize_document(b64):
+    try:
+        raw = base64.b64decode(b64)
+        data = SerializedData(bytes(raw))
+        constructor = data.readInt32(False)
+        doc = TLRPC.Document.TLdeserialize(data, constructor, False)
+        try:
+            data.cleanup()
+        except Exception:
+            pass
+        return doc
+    except Exception:
+        log("SlashVoice deserialize_document failed\n" + traceback.format_exc())
+        return None
+
+
+def extract_voice(msg):
+    """Из MessageObject -> (document, path, is_voice)."""
+    doc = None
+    path = None
+    is_voice = False
+    try:
+        try:
+            is_voice = bool(msg.isVoice())
+        except Exception:
+            is_voice = False
+        try:
+            doc = msg.getDocument()
+        except Exception:
+            doc = None
+        try:
+            f = get_file_loader().getPathToMessage(msg.messageOwner)
+            if f is not None and f.exists():
+                path = f.getAbsolutePath()
+        except Exception:
+            path = None
+    except Exception:
+        log("SlashVoice extract_voice failed\n" + traceback.format_exc())
+    return doc, path, is_voice
+
+
+def java_iter(obj):
+    """Превращаем Java List / массив / Iterable в python-список — максимально устойчиво."""
+    items = []
+    if obj is None:
+        return items
+    try:
+        n = obj.size()  # java.util.List
+        for i in range(n):
+            items.append(obj.get(i))
+        return items
+    except Exception:
+        pass
+    try:
+        for x in obj:  # Iterable / массив
+            items.append(x)
+        return items
+    except Exception:
+        pass
+    try:
+        n = len(obj)
+        for i in range(n):
+            items.append(obj[i])
+    except Exception:
+        pass
+    return items
+
+
+# ---------- плагин ----------
+
+class SlashVoicePlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._pending_pass = None  # текст, который можно пропустить один раз (после "Да")
+        self.add_on_send_message_hook()
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="🎙 Сохранить как быстрый ответ",
+                on_click=self._on_save_click,
+                icon="input_mic",
+                priority=5,
+            ))
+        except Exception:
+            log("SlashVoice: add MESSAGE_CONTEXT_MENU failed\n" + traceback.format_exc())
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                text="Мои быстрые голосовые",
+                on_click=self._on_manage_click,
+                icon="msg_saved",
+            ))
+        except Exception:
+            log("SlashVoice: add DRAWER_MENU failed\n" + traceback.format_exc())
+        # подтягиваем Business быстрые ответы при старте
+        try:
+            self.sync_quick_replies(notify=False)
+        except Exception:
+            log("SlashVoice: initial sync failed\n" + traceback.format_exc())
+        self.log("SlashVoice loaded")
+
+    # ----- настройки -----
+
+    def create_settings(self):
+        rows = [
+            Header(text="SlashVoice"),
+            Input(key="prefix", text="Префикс команды", default=DEFAULT_PREFIX,
+                  subtext="С него начинается команда. По умолчанию /", icon="msg_edit"),
+            Text(text="Подтянуть Business ответы",
+                 subtext="Напиши в любом чате: .qsync — плагин загрузит твои быстрые ответы (/да, /нет ...)",
+                 icon="msg_download"),
+            Text(text="Как отправить",
+                 subtext="Напиши /имя. Можно часть имени: /нем покажет список (/немогу, /немог...). Просто / — весь список. Свайп-ответ перед командой → уйдёт цитатой.",
+                 icon="msg_info"),
+            Text(text="Если изменил быстрые ответы",
+                 subtext="Снова напиши .qsync, чтобы обновить список.",
+                 icon="msg_reset"),
+        ]
+        names_native = sorted(self._get_native().keys())
+        names_manual = sorted(self._get_manual().keys())
+        if names_native:
+            rows.append(Header(text="Из Business быстрых ответов"))
+            for n in names_native:
+                rows.append(Text(text=self._prefix() + n, icon="input_mic"))
+        if names_manual:
+            rows.append(Header(text="Сохранённые вручную"))
+            for n in names_manual:
+                rows.append(Text(text=self._prefix() + n, icon="input_mic"))
+        return rows
+
+    # ----- хранилища -----
+
+    def _read_json(self, key):
+        raw = self.get_setting(key, "{}")
+        try:
+            d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _get_manual(self):
+        return self._read_json(MANUAL_KEY)
+
+    def _get_native(self):
+        return self._read_json(NATIVE_KEY)
+
+    def _save_manual(self, d):
+        try:
+            self.set_setting(MANUAL_KEY, json.dumps(d, ensure_ascii=False))
+        except Exception:
+            log("SlashVoice: save manual failed\n" + traceback.format_exc())
+
+    def _prefix(self):
+        p = self.get_setting("prefix", DEFAULT_PREFIX)
+        return p if isinstance(p, str) and p else DEFAULT_PREFIX
+
+    def _resolve(self, name):
+        """Ищем голосовое по имени: сначала Business, потом ручные."""
+        nat = self._get_native()
+        if name in nat:
+            return nat[name]
+        man = self._get_manual()
+        if name in man:
+            return man[name]
+        return None
+
+    def _all_names(self):
+        return sorted(set(self._get_native().keys()) | set(self._get_manual().keys()))
+
+    # ----- ПОДТЯГИВАНИЕ Business быстрых ответов -----
+
+    def sync_quick_replies(self, notify=False):
+        def worker():
+            try:
+                req = TLRPC.TL_messages_getQuickReplies()
+                try:
+                    req.hash = 0
+                except Exception:
+                    pass
+
+                def on_resp(response, error):
+                    try:
+                        if error is not None:
+                            if notify:
+                                toast("err", "Ошибка: " + str(getattr(error, "text", error)))
+                            return
+                        quick = getattr(response, "quick_replies", None)
+                        msgs = getattr(response, "messages", None)
+                        if quick is None or msgs is None:
+                            if notify:
+                                toast("err", "Быстрые ответы не загрузились (пусто?)")
+                            return
+
+                        # shortcut_id -> имя
+                        quick_list = java_iter(quick)
+                        msgs_list = java_iter(msgs)
+
+                        id_to_name = {}
+                        for qr in quick_list:
+                            try:
+                                sid = getattr(qr, "shortcut_id", None)
+                                name = getattr(qr, "shortcut", None)
+                                if sid is not None and name:
+                                    id_to_name[int(sid)] = str(name)
+                            except Exception:
+                                continue
+
+                        # сообщения -> имя -> голосовое (document)
+                        native = {}
+                        for m in msgs_list:
+                            try:
+                                sid = getattr(m, "quick_reply_shortcut_id", None)
+                                if not sid:
+                                    continue
+                                name = id_to_name.get(int(sid))
+                                if not name:
+                                    continue
+                                media = getattr(m, "media", None)
+                                doc = getattr(media, "document", None) if media is not None else None
+                                if doc is None:
+                                    continue
+                                b64 = serialize_document(doc)
+                                if b64:
+                                    native[name] = {"doc": b64}
+                            except Exception:
+                                continue
+
+                        self.set_setting(NATIVE_KEY, json.dumps(native, ensure_ascii=False))
+                        if notify:
+                            if native:
+                                toast("ok", "Загружено голосовых: " + str(len(native)))
+                            else:
+                                toast("err", ("Ответов: %d, сообщений: %d, голосовых: 0"
+                                              % (len(quick_list), len(msgs_list))))
+                    except Exception as e:
+                        log("SlashVoice sync parse error\n" + traceback.format_exc())
+                        if notify:
+                            toast("err", "Ошибка обработки: " + str(e)[:140])
+
+                send_request(req, on_resp)
+            except Exception as e:
+                log("SlashVoice sync error\n" + traceback.format_exc())
+                if notify:
+                    toast("err", "Запрос не ушёл: " + str(e)[:140])
+
+        run_on_queue(worker)
+
+    # ----- сохранение голосового вручную -----
+
+    def _on_save_click(self, context):
+        msg = context.get("message")
+        if msg is None:
+            toast("err", "Нет сообщения")
+            return
+        doc, path, is_voice = extract_voice(msg)
+        if doc is None and not path:
+            toast("err", "Не удалось получить файл. Сначала прослушай/прогрузи голосовое.")
+            return
+        self._prompt_name(doc, path)
+
+    def _prompt_name(self, doc, path):
+        def show():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            activity = frag.getParentActivity()
+            if not activity:
+                return
+
+            edit = EditText(activity)
+            try:
+                edit.setHint("имя, напр. да")
+                edit.setSingleLine(True)
+                edit.setTextColor(_argb(0xFFFFFFFF))
+                edit.setHintTextColor(_argb(0xFF7F7F7F))
+                edit.setPadding(48, 24, 48, 24)
+            except Exception:
+                pass
+
+            b = AlertDialogBuilder(activity)
+            b.set_title("Новый быстрый ответ")
+            b.set_message("Введи короткое имя. Потом пиши «" + self._prefix() + "имя» в любом чате.")
+            b.set_view(edit)
+
+            def on_ok(bld, which):
+                try:
+                    name = edit.getText().toString().strip()
+                except Exception:
+                    name = ""
+                name = name.lstrip(self._prefix()).strip()
+                if not name:
+                    toast("err", "Пустое имя")
+                    bld.dismiss()
+                    return
+                doc_b64 = serialize_document(doc) if doc is not None else None
+                store = self._get_manual()
+                store[name] = {"doc": doc_b64, "path": path}
+                self._save_manual(store)
+                bld.dismiss()
+                toast("ok", "Сохранено: " + self._prefix() + name)
+
+            b.set_positive_button("Сохранить", on_ok)
+            b.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(show)
+
+    # ----- список / управление -----
+
+    def _on_manage_click(self, context):
+        def show():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            activity = frag.getParentActivity()
+            if not activity:
+                return
+            names = self._all_names()
+            if not names:
+                b = AlertDialogBuilder(activity)
+                b.set_title("Быстрые голосовые")
+                b.set_message("Пусто.\nНапиши .qsync, чтобы подтянуть Business быстрые ответы,\nили зажми голосовое -> «Сохранить как быстрый ответ».")
+                b.set_positive_button("Ок", lambda bld, w: bld.dismiss())
+                b.show()
+                return
+            items = [self._prefix() + n for n in names]
+            b = AlertDialogBuilder(activity)
+            b.set_title("Твои быстрые голосовые")
+            b.set_items(items, lambda bld, w: bld.dismiss())
+            b.set_negative_button("Закрыть", lambda bld, w: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(show)
+
+    # ----- выбор из списка -----
+
+    def _choose_and_send(self, peer, reply):
+        self._choose_from(peer, reply, self._all_names())
+
+    def _choose_from(self, peer, reply, names):
+        names = list(names)
+
+        def show():
+            frag = get_last_fragment()
+            if not frag:
+                return
+            activity = frag.getParentActivity()
+            if not activity:
+                return
+            if not names:
+                toast("err", "Пусто. Напиши .qsync для загрузки Business ответов.")
+                return
+            items = [self._prefix() + n for n in names]
+            b = AlertDialogBuilder(activity)
+            b.set_title("Выбери голосовое")
+
+            def on_pick(bld, which):
+                bld.dismiss()
+                entry = self._resolve(names[which])
+                if entry:
+                    self._send_voice(peer, entry, reply)
+
+            b.set_items(items, on_pick)
+            b.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(show)
+
+    # ----- подтверждение отправки текстом -----
+
+    def _confirm_send_text(self, peer, text, reply):
+        def show():
+            frag = get_last_fragment()
+            activity = frag.getParentActivity() if frag else None
+            if not activity:
+                # не смогли показать диалог — отправим как есть, чтобы не терять сообщение
+                self._send_text_raw(peer, text, reply)
+                return
+            b = AlertDialogBuilder(activity)
+            b.set_title("Нет такого ответа")
+            b.set_message("Голосового «" + text + "» нет.\nВсё равно отправить «" + text + "» текстом?")
+            b.set_positive_button("Да", lambda bld, w: (bld.dismiss(), self._send_text_raw(peer, text, reply)))
+            b.set_negative_button("Нет", lambda bld, w: bld.dismiss())
+            b.show()
+
+        run_on_ui_thread(show)
+
+    def _send_text_raw(self, peer, text, reply):
+        def do():
+            try:
+                # помечаем текст как разрешённый, чтобы хук пропустил его один раз
+                self._pending_pass = text.strip()
+                p = {"peer": peer, "message": text}
+                if reply is not None:
+                    p["replyToMsg"] = reply
+                send_message(p)
+            except Exception:
+                self._pending_pass = None
+                log("SlashVoice send text error\n" + traceback.format_exc())
+
+        run_on_ui_thread(do)
+
+    # ----- отправка голосового -----
+
+    def _send_voice(self, peer, entry, reply):
+        doc = None
+        b64 = entry.get("doc")
+        if b64:
+            doc = deserialize_document(b64)
+        path = entry.get("path")
+
+        def do_send():
+            try:
+                if doc is not None:
+                    p = {"peer": peer, "document": doc}
+                    if reply is not None:
+                        p["replyToMsg"] = reply
+                    send_message(p)
+                    return
+                if path:
+                    p = {"peer": peer, "path": path}
+                    if reply is not None:
+                        p["replyToMsg"] = reply
+                    send_message(p)
+                    return
+                toast("err", "Файл недоступен. Попробуй .qsync заново.")
+            except Exception:
+                log("SlashVoice send error\n" + traceback.format_exc())
+                try:
+                    if path:
+                        send_audio(peer, path)
+                except Exception:
+                    log("SlashVoice fallback send_audio failed\n" + traceback.format_exc())
+
+        run_on_ui_thread(do_send)
+
+    # ----- перехват исходящих -----
+
+    def on_send_message_hook(self, account, params):
+        try:
+            text = getattr(params, "message", None)
+            if not isinstance(text, str):
+                return HookResult()
+            t = text.strip()
+            prefix = self._prefix()
+
+            # пропускаем один раз текст, подтверждённый кнопкой "Да"
+            pend = getattr(self, "_pending_pass", None)
+            if pend is not None and t == pend:
+                self._pending_pass = None
+                return HookResult()
+
+            if t == ".qsync":
+                self.sync_quick_replies(notify=True)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if t == ".qlist":
+                self._on_manage_click({})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if t.startswith(".qdel"):
+                name = t[len(".qdel"):].strip().lstrip(prefix).strip()
+                store = self._get_manual()
+                if name in store:
+                    del store[name]
+                    self._save_manual(store)
+                    toast("ok", "Удалено (вручную): " + prefix + name)
+                else:
+                    toast("err", "Нет такого среди ручных: " + name)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            if not prefix or not t.startswith(prefix):
+                return HookResult()
+
+            peer = getattr(params, "peer", None)
+            reply = getattr(params, "replyToMsg", None)
+            if peer is None:
+                return HookResult()
+
+            # просто "/" -> список выбора
+            if t == prefix:
+                self._choose_and_send(peer, reply)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            name = t[len(prefix):].strip()
+
+            # точное совпадение -> сразу отправляем
+            entry = self._resolve(name)
+            if entry is not None:
+                self._send_voice(peer, entry, reply)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            # нет точного — подбираем похожие (сначала по началу имени)
+            low = name.lower()
+            all_names = self._all_names()
+            matches = [n for n in all_names if n.lower().startswith(low)]
+            if not matches:
+                matches = [n for n in all_names if low in n.lower()]
+
+            if len(matches) == 1:
+                self._send_voice(peer, self._resolve(matches[0]), reply)
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if len(matches) >= 2:
+                self._choose_from(peer, reply, matches)
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            # совсем ничего не нашли — спросим перед отправкой текстом
+            self._confirm_send_text(peer, t, reply)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        except Exception:
+            log("SlashVoice on_send_message_hook error\n" + traceback.format_exc())
+            return HookResult()
