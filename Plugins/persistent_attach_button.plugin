@@ -1,97 +1,317 @@
 __id__ = "persistent_attach_button"
 __name__ = "Persistent Attach Button"
 __description__ = "Keeps the attach button (paperclip) visible when typing text in chat"
-__author__ = "DarkLuny"
-__version__ = "1.0.0"
+__author__ = "@DarkLuny"
+__version__ = "2.4.1"
 __icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
 
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, get_private_field
-from android_utils import run_on_ui_thread
+from android_utils import run_on_ui_thread, log
 from ui.bulletin import BulletinHelper
 
+VISIBLE = 0  # android.view.View.VISIBLE
 
-class KeepVisibleHook(MethodHook):
-    """Keeps attach button visible"""
-    
-    def __init__(self):
-        self.fields = ['attachButton', 'attachLayout']
-    
-    def before_hooked_method(self, param):
-        """Force visible before method"""
-        self._force_visible(param.thisObject)
-    
-    def after_hooked_method(self, param):
-        """Force visible after method"""
-        enter_view = param.thisObject
-        self._force_visible(enter_view)
-        
-        # Single delayed check for edge cases
-        if enter_view:
-            run_on_ui_thread(lambda: self._force_visible(enter_view), 50)
-    
-    def _force_visible(self, enter_view):
-        """Force buttons visible"""
-        if not enter_view:
+# How far to push the paperclip to the left of the send button (in dp).
+FLOAT_OFFSET_DP = 48
+
+# Small extra gap (dp) between the end of the text and the floated paperclip.
+EXTRA_GAP_DP = 2
+
+# FALLBACK right padding (dp) used only if the live measurement fails. The
+# normal path measures the reserve from the paperclip's real position so the
+# wrap point is correct on every screen size / resolution.
+TEXT_RESERVE_DP = 42
+
+# Safety: never let the visible text area get narrower than this (dp).
+MIN_TEXT_WIDTH_DP = 120
+
+# Only rewrite the text-field padding when it changes by more than this (px),
+# to avoid relayout churn (and lag) while the paperclip animates into place.
+PAD_TOLERANCE_PX = 2
+
+# Per-instance natural right padding of the text field, keyed by view hashCode.
+_base_pad = {}
+
+# --- Performance caches ----------------------------------------------------
+# Cache dp->px conversions so we never call find_class()/AndroidUtilities.dp()
+# on every animation frame.
+_dp_cache = {}
+_android_utils = None
+
+
+def _dp(value):
+    """Convert dp to px via AndroidUtilities, cached, with a rough fallback."""
+    cached = _dp_cache.get(value)
+    if cached is not None:
+        return cached
+    global _android_utils
+    px = None
+    try:
+        if _android_utils is None:
+            _android_utils = find_class("org.telegram.messenger.AndroidUtilities")
+        if _android_utils is not None:
+            px = int(_android_utils.dp(float(value)))
+    except Exception:
+        px = None
+    if px is None:
+        px = int(value * 2.75)
+    _dp_cache[value] = px
+    return px
+
+
+def _is_typing(enter_view):
+    """True if the text field has text (i.e. the send button is shown)."""
+    try:
+        edit = get_private_field(enter_view, "messageEditText")
+        if edit is not None:
+            text = edit.getText()
+            return text is not None and len(str(text).strip()) > 0
+    except Exception:
+        pass
+    return False
+
+
+def _x_rel(view, ancestor):
+    """Sum getX() up the parent chain to get `view`'s left edge relative to
+    `ancestor`. getX() includes translationX, so a floated view reports its
+    floated position. Bounded so a broken chain can never hang. Returns None
+    if `ancestor` is not reached."""
+    try:
+        x = 0.0
+        node = view
+        guard = 0
+        while node is not None and guard < 80:
+            try:
+                if node.equals(ancestor):
+                    return x
+            except Exception:
+                pass
+            x += node.getX()
+            node = node.getParent()
+            guard += 1
+    except Exception:
+        pass
+    return None
+
+
+def _measure_reserve(enter_view, edit):
+    """Reserve = (right edge of the text field) - (left edge of the floated
+    paperclip) + a small gap, all relative to the enter view. This makes the
+    wrap point follow the paperclip's real on-screen position on any device."""
+    try:
+        clip = get_private_field(enter_view, "attachButton")
+        if clip is None:
+            clip = get_private_field(enter_view, "attachLayout")
+        if clip is None:
+            return None
+        edit_x = _x_rel(edit, enter_view)
+        clip_left = _x_rel(clip, enter_view)
+        if edit_x is None or clip_left is None:
+            return None
+        edit_right = edit_x + edit.getWidth()
+        reserve = int(edit_right - clip_left + _dp(EXTRA_GAP_DP))
+        if reserve <= 0:
+            return None
+        return reserve
+    except Exception:
+        return None
+
+
+def _cancel_animator(enter_view, field_name):
+    """Cancel a stored AnimatorSet / ViewPropertyAnimator if present."""
+    try:
+        anim = get_private_field(enter_view, field_name)
+        if anim is None:
             return
-        
         try:
-            for field_name in self.fields:
-                try:
-                    button = get_private_field(enter_view, field_name)
-                    if button:
-                        button.setVisibility(0)
-                        button.setAlpha(1.0)
-                        button.setScaleX(1.0)
-                        button.setScaleY(1.0)
-                except:
-                    pass
-        except:
+            if hasattr(anim, "isRunning") and not anim.isRunning():
+                return
+        except Exception:
             pass
+        anim.cancel()
+    except Exception:
+        pass
+
+
+def _reset_view(view, translation_x=None):
+    """Pin the view to full size/opacity. Returns early (does nothing) when the
+    view is already in the desired state, so 'quiet' frames cost almost nothing
+    and we don't churn allocations / invalidate layout every frame."""
+    if view is None:
+        return
+    try:
+        target_tx = None if translation_x is None else float(translation_x)
+        # Fast path: already pinned -> skip all work (this is what kills the lag).
+        if (view.getVisibility() == VISIBLE
+                and view.getAlpha() == 1.0
+                and view.getScaleX() == 1.0
+                and view.getScaleY() == 1.0
+                and (target_tx is None or view.getTranslationX() == target_tx)):
+            return
+
+        try:
+            view.animate().cancel()
+        except Exception:
+            pass
+        try:
+            view.clearAnimation()
+        except Exception:
+            pass
+
+        if view.getVisibility() != VISIBLE:
+            view.setVisibility(VISIBLE)
+        if view.getAlpha() != 1.0:
+            view.setAlpha(1.0)
+        if view.getScaleX() != 1.0:
+            view.setScaleX(1.0)
+        if view.getScaleY() != 1.0:
+            view.setScaleY(1.0)
+        if target_tx is not None and view.getTranslationX() != target_tx:
+            view.setTranslationX(target_tx)
+    except Exception:
+        pass
+
+
+def _clip_text_field(enter_view, typing):
+    """Reserve room on the right of the text field while typing so the text never
+    slides under the floating paperclip. The reserve is MEASURED from the
+    paperclip's real position (correct on any resolution), with a hard safety
+    clamp and a constant fallback."""
+    try:
+        edit = get_private_field(enter_view, "messageEditText")
+        if edit is None:
+            return
+        key = enter_view.hashCode()
+        pl = edit.getPaddingLeft()
+        pt = edit.getPaddingTop()
+        pb = edit.getPaddingBottom()
+
+        if not typing:
+            # Remember (once) and restore the app's natural right padding.
+            base = _base_pad.get(key)
+            if base is None:
+                base = edit.getPaddingRight()
+                _base_pad[key] = base
+            if edit.getPaddingRight() != base:
+                edit.setPadding(pl, pt, base, pb)
+            return
+
+        # Typing: measure reserve from the floated paperclip; fall back to const.
+        reserve = _measure_reserve(enter_view, edit)
+        if reserve is None:
+            reserve = _dp(TEXT_RESERVE_DP)
+
+        # Safety clamp so the editable area can never collapse.
+        width = edit.getWidth()
+        if width > 0:
+            max_pad = width - pl - _dp(MIN_TEXT_WIDTH_DP)
+            if max_pad < 0:
+                max_pad = 0
+            if reserve > max_pad:
+                reserve = max_pad
+        if reserve < 0:
+            reserve = 0
+
+        # Only rewrite padding on a meaningful change -> no relayout churn / lag.
+        if abs(edit.getPaddingRight() - reserve) > PAD_TOLERANCE_PX:
+            edit.setPadding(pl, pt, reserve, pb)
+    except Exception:
+        pass
+
+
+def _force_visible(enter_view):
+    """Pin the attach button to a fully visible, full-size state with no animation."""
+    if not enter_view:
+        return
+    try:
+        # Cancel ONLY the animators that fade/shrink the paperclip itself.
+        # IMPORTANT: deliberately DO NOT cancel "runningAnimation" -- that is the
+        # send <-> voice toggle AnimatorSet. Cancelling it (as 2.4.0 did) froze
+        # the send button so it never morphed into the voice-message button.
+        _cancel_animator(enter_view, "runningAnimation2")
+        # Stop the dedicated paperclip animator that shrinks/fades the icon.
+        _cancel_animator(enter_view, "attachButtonAnimator")
+
+        attach_layout = get_private_field(enter_view, "attachLayout")
+        if attach_layout is None:
+            return
+
+        typing = _is_typing(enter_view)
+
+        # Float left of the send button while typing, otherwise keep in place.
+        offset = -_dp(FLOAT_OFFSET_DP) if typing else 0
+        _reset_view(attach_layout, translation_x=offset)
+
+        # Inner buttons are scaled/animated separately - pin them at full size too.
+        for inner in ("attachButton", "botButton"):
+            try:
+                _reset_view(get_private_field(enter_view, inner), translation_x=0)
+            except Exception:
+                pass
+
+        # Keep typed text from sliding under the floating paperclip.
+        _clip_text_field(enter_view, typing)
+    except Exception:
+        pass
+
+
+class FrameHook(MethodHook):
+    """Runs on every frame of the attach-layout animation -> no flicker."""
+
+    def after_hooked_method(self, param):
+        _force_visible(param.thisObject)
+
+
+class StateHook(MethodHook):
+    """Runs when the state changes (text added/removed). Re-asserts immediately and
+    across the animation window so nothing fades, shrinks, or overlaps."""
+
+    def after_hooked_method(self, param):
+        enter_view = param.thisObject
+        _force_visible(enter_view)
+        if enter_view:
+            for delay in (16, 80, 200):
+                run_on_ui_thread(lambda ev=enter_view: _force_visible(ev), delay)
 
 
 class PersistentAttachButtonPlugin(BasePlugin):
-    
+
     def on_plugin_load(self):
         try:
-            ChatActivityEnterViewClass = find_class("org.telegram.ui.Components.ChatActivityEnterView")
-            
-            if not ChatActivityEnterViewClass:
+            cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            if not cls:
                 BulletinHelper.show_error("ChatActivityEnterView not found!")
                 return
-            
-            # Hook only essential methods
-            methods = [
-                'checkSendButton',
-                'updateFieldHint',
-                'onTextChanged',
-                'beforeTextChanged',
-                'afterTextChanged'
-            ]
-            
-            hook = KeepVisibleHook()
-            total = 0
-            
-            for method in methods:
-                try:
-                    unhook_list = self.hook_all_methods(
-                        ChatActivityEnterViewClass,
-                        method,
-                        hook,
-                        priority=100
-                    )
-                    if unhook_list:
-                        total += len(unhook_list)
-                except:
-                    pass
-            
-            if total > 0:
-                BulletinHelper.show_success(f"Persistent Attach Button loaded ({total} hooks)")
+
+            self._hooks = []
+
+            # 1) Per-frame flicker/size fix.
+            frame = self.hook_all_methods(
+                cls, "updateAttachLayoutParams", FrameHook(), priority=100
+            )
+            if frame:
+                self._hooks.extend(frame)
+
+            # 2) State-change fix (cancel the hide animation, keep button visible).
+            state = self.hook_all_methods(
+                cls, "checkSendButton", StateHook(), priority=100
+            )
+            if state:
+                self._hooks.extend(state)
+
+            if self._hooks:
+                BulletinHelper.show_success(
+                    f"Persistent Attach Button loaded ({len(self._hooks)} hooks)"
+                )
             else:
-                BulletinHelper.show_error("Failed to load plugin")
-                
+                BulletinHelper.show_error("Methods not found - check app version")
         except Exception as e:
             BulletinHelper.show_error(f"Error: {str(e)[:50]}")
-    
+
     def on_plugin_unload(self):
+        _base_pad.clear()
+        _dp_cache.clear()
         BulletinHelper.show_info("Persistent Attach Button unloaded")
