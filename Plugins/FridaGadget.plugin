@@ -1,0 +1,2385 @@
+__id__ = "FridaGadget"
+__name__ = "Frida Gadget"
+__description__ = "Плагин-библиотека, позволяющий другим плагинам исполнять Frida скрипты внутри Exteragram-a."
+__author__ = "@Altyplugins"
+__version__ = "0.2.0"
+__icon__ = "fridalogo/1"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.1.1"
+
+import json
+import lzma
+import os
+import re
+import shutil
+import socket
+import sys
+import time
+import traceback
+import threading
+import types
+import hashlib
+import base64
+import urllib.error
+import urllib.request
+
+from base_plugin import BasePlugin
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text
+
+try:
+    from java import jclass
+except Exception:
+    jclass = None
+
+try:
+    from android_utils import run_on_ui_thread
+except Exception:
+    def run_on_ui_thread(callback, delay=0):
+        try:
+            callback()
+        except Exception:
+            pass
+
+try:
+    from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+except Exception:
+    AndroidUtilities = None
+    from org.telegram.messenger import ApplicationLoader
+
+
+MODULE_DIR_NAME = "fridagadget_modules"
+DEFAULT_LIB_NAME = "libfrida-gadget.so"
+DEFAULT_SCRIPT_NAME = "gadget.js"
+GADGET_VERSION_FILE = "libfrida-gadget.version"
+DEFAULT_PORT = 27042
+FRIDA_VERSION = "17.9.10"
+GADGET_DOWNLOAD_URL = "https://github.com/frida/frida/releases/download/%s/frida-gadget-%s-android-arm64.so.xz" % (FRIDA_VERSION, FRIDA_VERSION)
+GADGET_FALLBACK_URL = "https://cdn.jsdelivr.net/gh/Altuskhins/internal@main/frida-gadget-17.9.10-android-arm64.so.xz"
+GADGET_DOWNLOAD_URLS = [
+    GADGET_DOWNLOAD_URL,
+    GADGET_FALLBACK_URL,
+]
+DOWNLOAD_TIMEOUT_SEC = 60.0
+MIN_GADGET_SIZE = 1024 * 1024
+PRELUDE_DOWNLOAD_URL = (
+    "https://github.com/Altuskhins/internal/raw/refs/heads/main/java_bridge_prelude.js"
+)
+PRELUDE_FALLBACK_URL = (
+    "https://cdn.jsdelivr.net/gh/Altuskhins/internal@main/java_bridge_prelude.js"
+)
+PRELUDE_DOWNLOAD_URLS = [
+    PRELUDE_DOWNLOAD_URL,
+    PRELUDE_FALLBACK_URL,
+]
+PRELUDE_EXPECTED_SHA256 = (
+    "b0104faa264af96ee174a7b5c6cfe1c2578ee11c27b6c2c2145aa4e3222f80f6"
+)
+PRELUDE_MIN_SIZE = 100 * 1024
+MAX_SCRIPT_BYTES = 2 * 1024 * 1024
+API_MODULE_NAME = "frida_gadget_api"
+LEGACY_LOG_FILE_NAME = "frida-rpc-log.jsonl"
+MAX_LOG_ENTRIES = 500
+DEFAULT_PUSH_SERVER_PORT = 42792
+PUSH_SERVER_MAX_BYTES = MAX_SCRIPT_BYTES + 128 * 1024
+REGISTRY_WATCH_INTERVAL_SEC = 1.5
+DOUBLE_CLICK_WINDOW_SEC = 0.9
+JAVA_BRIDGE_IMPORT_RE = re.compile(
+    r"^\s*import\s+Java\s+from\s+([\"'])frida-java-bridge\1\s*;?\s*(?://.*)?$"
+)
+JAVA_BRIDGE_DIRECTIVE_RE = re.compile(
+    r"^\s*//\s*@frida-gadget\s+use\s+java\s*$",
+    re.IGNORECASE,
+)
+INTERACTION_ITEMS = [
+    "Listen",
+    "Script",
+]
+
+RUNTIME_ITEMS = [
+    "default",
+    "qjs",
+    "v8",
+]
+
+TEARDOWN_ITEMS = [
+    "minimal",
+    "full",
+]
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _clean_text(value):
+    return str(value or "").strip()
+
+
+def _safe_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "enabled"):
+        return True
+    if text in ("0", "false", "no", "off", "disabled", ""):
+        return False
+    return bool(default)
+
+
+def _short_error(exc):
+    text = str(exc or "").strip()
+    if not text:
+        text = exc.__class__.__name__ if exc is not None else "unknown error"
+    return text[:180]
+
+
+def _download_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        reason = str(getattr(exc, "reason", "") or getattr(exc, "msg", "") or "").strip()
+        text = "HTTP %s" % getattr(exc, "code", "?")
+        if reason:
+            text += " %s" % reason
+        return text
+    if isinstance(exc, urllib.error.URLError):
+        reason = str(getattr(exc, "reason", "") or exc).strip()
+        return reason or exc.__class__.__name__
+    return _short_error(exc)
+
+
+def _api_module():
+    module = sys.modules.get(API_MODULE_NAME)
+    if module is None:
+        module = types.ModuleType(API_MODULE_NAME)
+        module.__dict__["_registry"] = {}
+        module.__dict__["_plugin"] = None
+        sys.modules[API_MODULE_NAME] = module
+    if not hasattr(module, "_registry") or module._registry is None:
+        module._registry = {}
+    return module
+
+
+def _normalize_plugin_id(plugin_id):
+    text = _clean_text(plugin_id)
+    if not text:
+        raise ValueError("plugin_id is required")
+    return text[:96]
+
+
+def _normalize_script_name(name):
+    text = _clean_text(name)
+    return (text or "script")[:96]
+
+
+class FridaGadgetPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._modules_dir = MODULE_DIR_NAME
+        self._loaded = False
+        self._last_status = "Idle"
+        self._last_error = ""
+        self._last_config_path = ""
+        self._loaded_interaction = ""
+        self._last_config_interaction = ""
+        self._api_module = None
+        self._quiet = False
+        self._api_logs = []
+        self._api_log_next = 0
+        self._api_log_lock = threading.RLock()
+        self._registry_lock = threading.RLock()
+        self._registry_watch_thread = None
+        self._registry_watch_running = False
+        self._log_server_socket = None
+        self._log_server_thread = None
+        self._log_server_running = False
+        self._log_server_port = 0
+        self._push_server_socket = None
+        self._push_server_thread = None
+        self._push_server_running = False
+        self._push_server_port = 0
+        self._last_script_click_id = ""
+        self._last_script_click_at = 0.0
+        self._last_bundle_hash = ""
+        self._last_bundle_entry_ids = ()
+
+    def on_plugin_load(self):
+        self._init_paths()
+        self._ensure_module_dir()
+        self._install_api()
+        self._cleanup_legacy_log_file()
+        self._ensure_push_server_state()
+        self._start_registry_watch()
+        self._sync_registry_owner_state(reload_bundle=False)
+        self._refresh_loaded_from_process()
+        self._last_status = "Ready"
+        self._fg_log(
+            "loaded modules_dir=%s native_loaded=%s interaction=%s"
+            % (
+                self._modules_dir,
+                self._loaded,
+                self._loaded_interaction or "-",
+            )
+        )
+        if self._registered_entries():
+            self._execute_api_bundle()
+
+    def on_plugin_unload(self):
+        self._fg_log("plugin unloaded")
+        self._last_status = "Unloaded plugin"
+        self._stop_registry_watch()
+        self._stop_push_server()
+        try:
+            module = _api_module()
+            if getattr(module, "_plugin", None) is self:
+                module._plugin = None
+        except Exception:
+            pass
+        self._stop_log_server()
+
+    def _init_paths(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            base = ctx.getFilesDir().getAbsolutePath()
+            self._modules_dir = os.path.join(base, MODULE_DIR_NAME)
+        except Exception:
+            self._modules_dir = MODULE_DIR_NAME
+
+    def _ensure_module_dir(self):
+        try:
+            os.makedirs(self._modules_dir, exist_ok=True)
+        except Exception as exc:
+            self._last_error = _short_error(exc)
+
+    def _default_lib_path(self):
+        return os.path.join(self._modules_dir, DEFAULT_LIB_NAME)
+
+    def _default_script_path(self):
+        return os.path.join(self._modules_dir, DEFAULT_SCRIPT_NAME)
+
+    def _gadget_version_path(self):
+        return os.path.join(self._modules_dir, GADGET_VERSION_FILE)
+
+    def _frida_log_path(self):
+        return os.path.join(self._modules_dir, LEGACY_LOG_FILE_NAME)
+
+    def _java_bridge_prelude_path(self):
+        return os.path.join(self._modules_dir, "java_bridge_prelude.js")
+
+    def _read_java_bridge_prelude(self):
+        path = self._java_bridge_prelude_path()
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                    return handle.read()
+        except Exception as exc:
+            self._fg_log("java bridge prelude read failed", exc)
+        return ""
+
+    def _get_setting_value(self, key, default=None):
+        try:
+            return self.get_setting(str(key or ""), default)
+        except Exception:
+            return default
+
+    def _set_setting_value(self, key, value, reload_settings=False):
+        try:
+            self.set_setting(str(key or ""), value, reload_settings=bool(reload_settings))
+            return True
+        except Exception:
+            pass
+        try:
+            self.set_setting(str(key or ""), value)
+            return True
+        except Exception:
+            return False
+
+    def _push_server_enabled(self):
+        return _safe_bool(self._get_setting_value("dev_server_enabled", True), True)
+
+    def _ensure_push_server_state(self):
+        if self._push_server_enabled():
+            return self._start_push_server()
+        self._stop_push_server()
+        return 0
+
+    def _on_dev_server_changed(self, value):
+        enabled = bool(value)
+        self._set_setting_value("dev_server_enabled", enabled, reload_settings=True)
+        if enabled:
+            port = self._ensure_push_server_state()
+            self._last_status = "Dev server enabled"
+            self._last_error = ""
+            self._show_success("Dev сервер включён: %s" % int(port or self._push_server_bind_port()))
+        else:
+            self._ensure_push_server_state()
+            self._last_status = "Dev server disabled"
+            self._last_error = ""
+            self._show_info("Dev сервер выключен")
+
+    def _fg_log(self, message, exc=None):
+        try:
+            text = "[FridaGadget] %s" % str(message or "")
+            if exc is not None:
+                text += ": %s" % _short_error(exc)
+            self.log(text)
+            if exc is not None:
+                self.log(traceback.format_exc())
+        except Exception:
+            try:
+                print("[FridaGadget] %s" % str(message or ""))
+                if exc is not None:
+                    traceback.print_exc()
+            except Exception:
+                pass
+
+    def _bulletin(self, kind, text):
+        if self._quiet:
+            self._fg_log("bulletin suppressed kind=%s text=%s" % (kind, text))
+            return
+
+        def show():
+            try:
+                if kind == "success":
+                    BulletinHelper.show_success(str(text or ""))
+                elif kind == "error":
+                    BulletinHelper.show_error(str(text or ""))
+                else:
+                    BulletinHelper.show_info(str(text or ""))
+            except Exception as exc:
+                self._fg_log("bulletin failed", exc)
+
+        run_on_ui_thread(show)
+
+    def _show_success(self, text):
+        self._bulletin("success", text)
+
+    def _show_error(self, text):
+        self._bulletin("error", text)
+
+    def _show_info(self, text):
+        self._bulletin("info", text)
+
+    def _is_ui_thread(self):
+        try:
+            if AndroidUtilities is not None:
+                return bool(AndroidUtilities.isOnUIThread())
+        except Exception:
+            pass
+        try:
+            Looper = jclass("android.os.Looper") if jclass is not None else None
+            if Looper is not None:
+                return Looper.myLooper() == Looper.getMainLooper()
+        except Exception:
+            pass
+        return False
+
+    def _run_on_ui_thread_sync(self, callback, timeout=10.0):
+        if self._is_ui_thread():
+            return callback()
+
+        done = threading.Event()
+        result = {}
+
+        def wrapper():
+            try:
+                result["value"] = callback()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                try:
+                    done.set()
+                except Exception:
+                    pass
+
+        run_on_ui_thread(wrapper)
+        if not done.wait(float(timeout or 10.0)):
+            raise RuntimeError("UI thread callback timed out")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def _system_load(self, lib_path):
+        def load():
+            System = jclass("java.lang.System")
+            System.load(str(lib_path))
+            return True
+
+        return self._run_on_ui_thread_sync(load, timeout=15.0)
+
+    def _install_api(self):
+        module = _api_module()
+        module._plugin = self
+        self._api_module = module
+
+        def register_script(plugin_id, script, name=None, replace=True, autoload=True):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_register_script(plugin_id, script, name=name, replace=replace, autoload=autoload)
+
+        def register_script_file(plugin_id, path, name=None, replace=True, autoload=True):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_register_script_file(plugin_id, path, name=name, replace=replace, autoload=autoload)
+
+        def unregister_plugin(plugin_id):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_unregister_plugin(plugin_id)
+
+        def set_plugin_active(plugin_id, active=True, reason="", autoload=True):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_set_plugin_active(plugin_id, active=active, reason=reason, autoload=autoload)
+
+        def activate_plugin(plugin_id, reason="plugin_load", autoload=True):
+            return set_plugin_active(plugin_id, True, reason=reason, autoload=autoload)
+
+        def deactivate_plugin(plugin_id, reason="plugin_unload", autoload=True):
+            return set_plugin_active(plugin_id, False, reason=reason, autoload=autoload)
+
+        def set_script_enabled(entry_id=None, plugin_id=None, name=None, index=None, enabled=True, autoload=True, reason="manual"):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_set_script_state(
+                entry_id=entry_id,
+                plugin_id=plugin_id,
+                name=name,
+                index=index,
+                enabled=enabled,
+                reason=reason,
+                autoload=autoload,
+            )
+
+        def set_script_active(entry_id=None, plugin_id=None, name=None, index=None, active=True, autoload=True, reason="manual"):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_set_script_state(
+                entry_id=entry_id,
+                plugin_id=plugin_id,
+                name=name,
+                index=index,
+                active=active,
+                reason=reason,
+                autoload=autoload,
+            )
+
+        def activate_script(entry_id=None, plugin_id=None, name=None, index=None, autoload=True, reason="manual"):
+            return set_script_active(
+                entry_id=entry_id,
+                plugin_id=plugin_id,
+                name=name,
+                index=index,
+                active=True,
+                autoload=autoload,
+                reason=reason,
+            )
+
+        def deactivate_script(entry_id=None, plugin_id=None, name=None, index=None, autoload=True, reason="manual"):
+            return set_script_active(
+                entry_id=entry_id,
+                plugin_id=plugin_id,
+                name=name,
+                index=index,
+                active=False,
+                autoload=autoload,
+                reason=reason,
+            )
+
+        def execute():
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._execute_api_bundle()
+
+        def read_logs(plugin_id=None, after=0, limit=200):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_read_logs(plugin_id=plugin_id, after=after, limit=limit)
+
+        def clear_logs():
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("Frida Gadget plugin is not loaded")
+            return plugin._api_clear_logs()
+
+        def registered_plugins():
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                return []
+            return plugin._api_registered_plugins()
+
+        def list_scripts(include_source=False):
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                return []
+            return plugin._api_script_entries(include_source=include_source)
+
+        def status():
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                return {"loaded": False, "error": "Frida Gadget plugin is not loaded"}
+            return plugin._api_status()
+
+        module.register_script = register_script
+        module.register_script_file = register_script_file
+        module.unregister_plugin = unregister_plugin
+        module.unregister_scripts = unregister_plugin
+        module.set_plugin_active = set_plugin_active
+        module.activate_plugin = activate_plugin
+        module.deactivate_plugin = deactivate_plugin
+        module.set_script_enabled = set_script_enabled
+        module.set_script_active = set_script_active
+        module.activate_script = activate_script
+        module.deactivate_script = deactivate_script
+        module.enable_script = activate_script
+        module.disable_script = deactivate_script
+        module.execute = execute
+        module.read_logs = read_logs
+        module.clear_logs = clear_logs
+        module.registered_plugins = registered_plugins
+        module.list_scripts = list_scripts
+        module.scripts = list_scripts
+        module.status = status
+        module.API_VERSION = 2
+        self._fg_log("api installed module=%s registered=%s" % (API_MODULE_NAME, len(self._registered_entries())))
+
+    def _push_server_bind_port(self):
+        port = _safe_int(self._get_setting_value("push_port", DEFAULT_PUSH_SERVER_PORT), DEFAULT_PUSH_SERVER_PORT)
+        if port <= 0 or port > 65535:
+            return DEFAULT_PUSH_SERVER_PORT
+        return int(port)
+
+    def _start_push_server(self):
+        if not self._push_server_enabled():
+            self._stop_push_server()
+            return 0
+        if self._push_server_running and self._push_server_socket is not None and self._push_server_port:
+            return self._push_server_port
+        self._stop_push_server()
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        port = self._push_server_bind_port()
+        try:
+            server.bind(("127.0.0.1", port))
+        except Exception as exc:
+            self._fg_log("push server fixed port failed, picking random", exc)
+            server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        server.settimeout(1.0)
+        self._push_server_socket = server
+        self._push_server_port = int(server.getsockname()[1])
+        self._push_server_running = True
+        thread = threading.Thread(target=self._push_server_loop, args=(server,), name="FridaGadgetPushServer")
+        thread.daemon = True
+        self._push_server_thread = thread
+        thread.start()
+        self._fg_log("push server listening on 127.0.0.1:%s" % self._push_server_port)
+        return self._push_server_port
+
+    def _stop_push_server(self):
+        self._push_server_running = False
+        sock = self._push_server_socket
+        self._push_server_socket = None
+        self._push_server_port = 0
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _push_server_loop(self, server):
+        while self._push_server_running and server is self._push_server_socket:
+            try:
+                client, _addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as exc:
+                self._fg_log("push server accept failed", exc)
+                continue
+            thread = threading.Thread(target=self._handle_push_client, args=(client,), name="FridaGadgetPushClient")
+            thread.daemon = True
+            thread.start()
+
+    def _handle_push_client(self, client):
+        try:
+            client.settimeout(4.0)
+            chunks = []
+            total = 0
+            while total < PUSH_SERVER_MAX_BYTES:
+                try:
+                    chunk = client.recv(16384)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if b"\n" in chunk:
+                    break
+            if not chunks:
+                return
+            raw = b"".join(chunks)
+            if len(raw) > PUSH_SERVER_MAX_BYTES:
+                raise ValueError("request is too large")
+            text = raw.decode("utf-8", "replace").strip()
+            if not text:
+                return
+            request = json.loads(text)
+            response = self._handle_push_request(request)
+        except Exception as exc:
+            response = {"ok": False, "error": _short_error(exc)}
+        try:
+            client.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    def _handle_push_request(self, request):
+        if not isinstance(request, dict):
+            raise ValueError("JSON object expected")
+        action = str(request.get("action") or request.get("cmd") or "").strip().lower()
+        if action in ("", "ping"):
+            return {"ok": True, "pong": True, "push_port": int(self._push_server_port or 0)}
+        if action == "status":
+            status = self._api_status()
+            status["ok"] = True
+            status["push_port"] = int(self._push_server_port or 0)
+            status["scripts"] = self._api_script_entries()
+            return status
+        if action in ("scripts", "list_scripts", "list"):
+            return {"ok": True, "scripts": self._api_script_entries()}
+        if action in ("logs", "read_logs"):
+            return self._api_read_logs(
+                plugin_id=request.get("plugin_id"),
+                after=request.get("after", 0),
+                limit=request.get("limit", 200),
+            )
+        if action == "clear_logs":
+            return self._api_clear_logs()
+        if action in ("execute", "run"):
+            return self._execute_api_bundle()
+        if action in ("unregister_plugin", "unregister"):
+            return self._api_unregister_plugin(request.get("plugin_id"))
+        if action in ("set_plugin_active", "activate_plugin", "deactivate_plugin"):
+            active = action != "deactivate_plugin"
+            if "active" in request:
+                active = _safe_bool(request.get("active"), active)
+            return self._api_set_plugin_active(
+                request.get("plugin_id"),
+                active=active,
+                reason=request.get("reason") or "adb",
+                autoload=_safe_bool(request.get("autoload"), True),
+            )
+        if action in ("set_script_active", "activate_script", "deactivate_script", "toggle_script"):
+            if action == "toggle_script":
+                entry = self._find_registry_entry(
+                    entry_id=request.get("entry_id") or request.get("id"),
+                    plugin_id=request.get("plugin_id"),
+                    name=request.get("name"),
+                    index=request.get("index"),
+                )
+                if entry is None:
+                    raise ValueError("script entry not found")
+                active = not bool(entry.get("active", True))
+            else:
+                active = action != "deactivate_script"
+                if "active" in request:
+                    active = _safe_bool(request.get("active"), active)
+            return self._api_set_script_state(
+                entry_id=request.get("entry_id") or request.get("id"),
+                plugin_id=request.get("plugin_id"),
+                name=request.get("name"),
+                index=request.get("index"),
+                active=active,
+                reason=request.get("reason") or "adb",
+                autoload=_safe_bool(request.get("autoload"), True),
+            )
+        if action in ("set_script_enabled", "enable_script_persistent", "disable_script_persistent"):
+            enabled = action != "disable_script_persistent"
+            if "enabled" in request:
+                enabled = _safe_bool(request.get("enabled"), enabled)
+            return self._api_set_script_state(
+                entry_id=request.get("entry_id") or request.get("id"),
+                plugin_id=request.get("plugin_id"),
+                name=request.get("name"),
+                index=request.get("index"),
+                enabled=enabled,
+                reason=request.get("reason") or "adb",
+                autoload=_safe_bool(request.get("autoload"), True),
+            )
+        if action in ("register_script", "push_script", "push"):
+            script = request.get("script")
+            if script is None and request.get("script_b64"):
+                script = base64.b64decode(str(request.get("script_b64"))).decode("utf-8", "replace")
+            if script is None and request.get("path"):
+                return self._api_register_script_file(
+                    request.get("plugin_id") or "adb",
+                    request.get("path"),
+                    name=request.get("name"),
+                    replace=_safe_bool(request.get("replace"), True),
+                    autoload=_safe_bool(request.get("autoload"), True),
+                )
+            return self._api_register_script(
+                request.get("plugin_id") or "adb",
+                script,
+                name=request.get("name") or "adb-script.js",
+                replace=_safe_bool(request.get("replace"), True),
+                autoload=_safe_bool(request.get("autoload"), True),
+            )
+        raise ValueError("unknown action: %s" % (action or "<missing>"))
+
+    def _ensure_log_server(self):
+        if self._log_server_running and self._log_server_socket is not None and self._log_server_port:
+            return self._log_server_port
+        self._stop_log_server()
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        server.settimeout(1.0)
+        self._log_server_socket = server
+        self._log_server_port = int(server.getsockname()[1])
+        self._log_server_running = True
+        thread = threading.Thread(target=self._log_server_loop, args=(server,), name="FridaGadgetLogServer")
+        thread.daemon = True
+        self._log_server_thread = thread
+        thread.start()
+        self._fg_log("api log server listening on 127.0.0.1:%s" % self._log_server_port)
+        return self._log_server_port
+
+    def _stop_log_server(self):
+        self._log_server_running = False
+        sock = self._log_server_socket
+        self._log_server_socket = None
+        self._log_server_port = 0
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _log_server_loop(self, server):
+        while self._log_server_running and server is self._log_server_socket:
+            try:
+                client, _addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as exc:
+                self._fg_log("api log accept failed", exc)
+                continue
+            try:
+                self._read_log_client(client)
+            except Exception as exc:
+                self._fg_log("api log client failed", exc)
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def _read_log_client(self, client):
+        client.settimeout(2.0)
+        chunks = []
+        total = 0
+        while total < 64 * 1024:
+            try:
+                chunk = client.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if b"\n" in chunk:
+                break
+        if not chunks:
+            return
+        text = b"".join(chunks).decode("utf-8", "replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                item = {"source": "Frida", "level": "raw", "message": line}
+            self._append_api_log(item)
+
+    def _append_api_log(self, item):
+        if not isinstance(item, dict):
+            item = {"message": str(item)}
+        with self._api_log_lock:
+            self._api_log_next += 1
+            entry = {
+                "line": self._api_log_next,
+                "ts": _safe_int(item.get("ts", int(time.time() * 1000)), int(time.time() * 1000)),
+                "source": str(item.get("source") or "Frida")[:96],
+                "level": str(item.get("level") or "log")[:24],
+                "message": str(item.get("message") or "")[:4096],
+            }
+            self._api_logs.append(entry)
+            if len(self._api_logs) > MAX_LOG_ENTRIES:
+                del self._api_logs[:len(self._api_logs) - MAX_LOG_ENTRIES]
+        return entry
+
+    def _api_log_cursor(self):
+        with self._api_log_lock:
+            return int(self._api_log_next)
+
+    def _api_registry(self):
+        module = self._api_module or _api_module()
+        if not hasattr(module, "_registry") or module._registry is None:
+            module._registry = {}
+        return module._registry
+
+    def _new_entry_id(self, plugin_id, name):
+        seed = "%s:%s:%s:%s" % (plugin_id, name, time.time(), len(self._all_registry_entries_safe()))
+        digest = hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()[:10]
+        prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(plugin_id or "plugin"))[:48]
+        return "%s:%s" % (prefix or "plugin", digest)
+
+    def _all_registry_entries_safe(self):
+        try:
+            result = []
+            registry = self._api_registry()
+            for pid in registry:
+                result.extend(registry.get(pid) or [])
+            return result
+        except Exception:
+            return []
+
+    def _plugins_controller_instance(self):
+        if jclass is None:
+            return None
+        try:
+            return jclass("com.exteragram.messenger.plugins.PluginsController").getInstance()
+        except Exception:
+            return None
+
+    def _plugin_record(self, plugin_id):
+        pid = str(plugin_id or "")
+        if not pid:
+            return (False, None)
+        inst = self._plugins_controller_instance()
+        if inst is None:
+            return (False, None)
+        try:
+            plugins = getattr(inst, "plugins", None)
+            if plugins is None:
+                return (False, None)
+            try:
+                return (True, plugins.get(pid))
+            except Exception:
+                try:
+                    if bool(plugins.containsKey(pid)):
+                        return (True, plugins.get(pid))
+                except Exception:
+                    pass
+                return (True, None)
+        except Exception:
+            return (False, None)
+
+    def _plugin_owner_exists(self, plugin_id):
+        pid = str(plugin_id or "")
+        if not pid or pid == __id__ or pid in ("adb", "adb_push", "desktop", "local_server"):
+            return False
+        known, record = self._plugin_record(pid)
+        return bool(known and record is not None)
+
+    def _plugin_owner_is_enabled(self, plugin_id):
+        known, record = self._plugin_record(plugin_id)
+        if not known:
+            return True
+        if record is None:
+            return False
+        for attr in ("isEnabled", "enabled"):
+            try:
+                value = getattr(record, attr)
+                if callable(value):
+                    return bool(value())
+                return bool(value)
+            except Exception:
+                pass
+        return True
+
+    def _normalize_registry_entry(self, item, plugin_id, index=0):
+        if not isinstance(item, dict):
+            item = {"plugin_id": plugin_id, "name": "script", "script": str(item or "")}
+        pid = _normalize_plugin_id(item.get("plugin_id") or plugin_id)
+        item["plugin_id"] = pid
+        item["name"] = _normalize_script_name(item.get("name") or ("script-%s" % (int(index) + 1)))
+        if not item.get("id"):
+            item["id"] = self._new_entry_id(pid, item["name"])
+        if "enabled" not in item:
+            item["enabled"] = True
+        if "active" not in item:
+            item["active"] = True
+        if "inactive_reason" not in item:
+            item["inactive_reason"] = ""
+        if "owner_auto_disable" not in item:
+            item["owner_auto_disable"] = self._plugin_owner_exists(pid)
+        if "updated_at" not in item:
+            item["updated_at"] = time.time()
+        script = str(item.get("script") or "")
+        if "needs_java" not in item:
+            processed_script, needs_java = self._preprocess_registered_script(script)
+            item["script"] = processed_script
+            item["needs_java"] = needs_java
+        elif not item.get("needs_java") and self._script_requests_java(script):
+            processed_script, needs_java = self._preprocess_registered_script(script)
+            item["script"] = processed_script
+            item["needs_java"] = needs_java
+        elif (
+            str(item.get("plugin_id") or "") == "frida_smoke_test"
+            and item.get("needs_java")
+            and not self._script_requests_java(script)
+        ):
+            item["needs_java"] = False
+        return item
+
+    def _script_requests_java(self, script):
+        text = str(script or "")
+        for line in text.splitlines():
+            if JAVA_BRIDGE_IMPORT_RE.match(line) or JAVA_BRIDGE_DIRECTIVE_RE.match(line):
+                return True
+        return False
+
+    def _preprocess_registered_script(self, script):
+        text = str(script or "")
+        needs_java = False
+        processed = []
+        for line in text.splitlines(True):
+            check_line = line.rstrip("\r\n")
+            if JAVA_BRIDGE_IMPORT_RE.match(check_line):
+                needs_java = True
+                continue
+            if JAVA_BRIDGE_DIRECTIVE_RE.match(check_line):
+                needs_java = True
+            processed.append(line)
+        if not needs_java:
+            needs_java = self._script_requests_java(text)
+        return "".join(processed), bool(needs_java)
+
+    def _all_registry_entries(self):
+        entries = []
+        try:
+            registry = self._api_registry()
+            with self._registry_lock:
+                for plugin_id in sorted(list(registry.keys())):
+                    normalized = []
+                    for index, item in enumerate(registry.get(plugin_id) or []):
+                        entry = self._normalize_registry_entry(item, plugin_id, index=index)
+                        normalized.append(entry)
+                        entries.append(entry)
+                    registry[plugin_id] = normalized
+        except Exception as exc:
+            self._fg_log("registry read failed", exc)
+        return entries
+
+    def _registered_entries(self):
+        return [
+            item
+            for item in self._all_registry_entries()
+            if bool(item.get("enabled", True)) and bool(item.get("active", True))
+        ]
+
+    def _api_registered_plugins(self):
+        result = []
+        counts = {}
+        active_counts = {}
+        enabled_counts = {}
+        java_counts = {}
+        reasons = {}
+        for item in self._all_registry_entries():
+            pid = str(item.get("plugin_id") or "")
+            counts[pid] = counts.get(pid, 0) + 1
+            if item.get("enabled", True):
+                enabled_counts[pid] = enabled_counts.get(pid, 0) + 1
+            if item.get("enabled", True) and item.get("active", True):
+                active_counts[pid] = active_counts.get(pid, 0) + 1
+            if item.get("needs_java") and item.get("enabled", True) and item.get("active", True):
+                java_counts[pid] = java_counts.get(pid, 0) + 1
+            reason = str(item.get("inactive_reason") or "")
+            if reason:
+                reasons[pid] = reason
+        for pid in sorted(counts.keys()):
+            result.append(
+                {
+                    "plugin_id": pid,
+                    "scripts": counts[pid],
+                    "enabled_scripts": enabled_counts.get(pid, 0),
+                    "active_scripts": active_counts.get(pid, 0),
+                    "active": bool(active_counts.get(pid, 0)),
+                    "inactive_reason": reasons.get(pid, ""),
+                    "needs_java": bool(java_counts.get(pid)),
+                }
+            )
+        return result
+
+    def _api_script_entries(self, include_source=False):
+        result = []
+        for item in self._all_registry_entries():
+            script = str(item.get("script") or "")
+            entry = {
+                "id": str(item.get("id") or ""),
+                "plugin_id": str(item.get("plugin_id") or ""),
+                "name": str(item.get("name") or "script"),
+                "enabled": bool(item.get("enabled", True)),
+                "active": bool(item.get("active", True)),
+                "inactive_reason": str(item.get("inactive_reason") or ""),
+                "needs_java": bool(item.get("needs_java")),
+                "owner_auto_disable": bool(item.get("owner_auto_disable")),
+                "updated_at": float(item.get("updated_at") or 0),
+                "bytes": len(script.encode("utf-8", "ignore")),
+            }
+            if include_source:
+                entry["script"] = script
+            result.append(entry)
+        return result
+
+    def _find_registry_entry(self, entry_id=None, plugin_id=None, name=None, index=None):
+        entry_id = _clean_text(entry_id)
+        pid = _clean_text(plugin_id)
+        wanted_name = _clean_text(name)
+        wanted_index = None
+        if index is not None:
+            wanted_index = _safe_int(index, -1)
+        per_plugin_index = {}
+        for item in self._all_registry_entries():
+            item_pid = str(item.get("plugin_id") or "")
+            per_plugin_index[item_pid] = per_plugin_index.get(item_pid, -1) + 1
+            if entry_id and str(item.get("id") or "") == entry_id:
+                return item
+            if pid and item_pid != pid:
+                continue
+            if wanted_name and str(item.get("name") or "") != wanted_name:
+                continue
+            if wanted_index is not None and per_plugin_index[item_pid] != wanted_index:
+                continue
+            if pid or wanted_name or wanted_index is not None:
+                return item
+        return None
+
+    def _reload_loaded_script_bundle(self):
+        self._refresh_loaded_from_process()
+        if self._loaded and self._loaded_interaction == "script":
+            try:
+                self._write_config(force_interaction=1)
+                os.utime(self._script_path(), None)
+                return {"ok": True, "loaded": True, "reloaded": True}
+            except Exception as exc:
+                self._fg_log("bundle reload failed", exc)
+                return {"ok": False, "error": _short_error(exc)}
+        return {"ok": True, "loaded": bool(self._loaded), "reloaded": False}
+
+    def _apply_registry_update(self, autoload=True, allow_load=False):
+        active_entries = self._registered_entries()
+        if autoload and active_entries and (allow_load or self._loaded):
+            return self._execute_api_bundle()
+        self._write_registered_bundle(entries=active_entries)
+        if autoload:
+            return self._reload_loaded_script_bundle()
+        return {"ok": True, "loaded": bool(self._loaded), "scripts": len(active_entries)}
+
+    def _api_set_plugin_active(self, plugin_id, active=True, reason="", autoload=True):
+        pid = _normalize_plugin_id(plugin_id)
+        changed = 0
+        with self._registry_lock:
+            registry = self._api_registry()
+            items = registry.get(pid) or []
+            for index, item in enumerate(items):
+                entry = self._normalize_registry_entry(item, pid, index=index)
+                entry["active"] = bool(active)
+                entry["inactive_reason"] = "" if active else str(reason or "inactive")[:120]
+                entry["updated_at"] = time.time()
+                changed += 1
+        result = self._apply_registry_update(autoload=autoload, allow_load=bool(active))
+        result.update({"ok": bool(result.get("ok", True)), "plugin_id": pid, "changed": changed, "active": bool(active)})
+        try:
+            self._set_setting_value("__reload__", time.time(), reload_settings=True)
+        except Exception:
+            pass
+        self._fg_log("api plugin active plugin=%s active=%s changed=%s reason=%s" % (pid, bool(active), changed, reason or ""))
+        return result
+
+    def _api_set_script_state(
+        self,
+        entry_id=None,
+        plugin_id=None,
+        name=None,
+        index=None,
+        enabled=None,
+        active=None,
+        reason="manual",
+        autoload=True,
+    ):
+        with self._registry_lock:
+            entry = self._find_registry_entry(entry_id=entry_id, plugin_id=plugin_id, name=name, index=index)
+            if entry is None:
+                raise ValueError("script entry not found")
+            if enabled is not None:
+                entry["enabled"] = bool(enabled)
+            if active is not None:
+                entry["active"] = bool(active)
+            if (enabled is False) or (active is False):
+                entry["inactive_reason"] = str(reason or "manual")[:120]
+            elif bool(entry.get("enabled", True)) and bool(entry.get("active", True)):
+                entry["inactive_reason"] = ""
+            entry["updated_at"] = time.time()
+            public = self._script_entry_public(entry)
+        allow_load = bool(public.get("enabled")) and bool(public.get("active"))
+        result = self._apply_registry_update(autoload=autoload, allow_load=allow_load)
+        result.update({"ok": bool(result.get("ok", True)), "script": public})
+        try:
+            self._set_setting_value("__reload__", time.time(), reload_settings=True)
+        except Exception:
+            pass
+        return result
+
+    def _script_entry_public(self, item):
+        script = str(item.get("script") or "")
+        return {
+            "id": str(item.get("id") or ""),
+            "plugin_id": str(item.get("plugin_id") or ""),
+            "name": str(item.get("name") or "script"),
+            "enabled": bool(item.get("enabled", True)),
+            "active": bool(item.get("active", True)),
+            "inactive_reason": str(item.get("inactive_reason") or ""),
+            "needs_java": bool(item.get("needs_java")),
+            "bytes": len(script.encode("utf-8", "ignore")),
+        }
+
+    def _start_registry_watch(self):
+        if self._registry_watch_running:
+            return
+        self._registry_watch_running = True
+        thread = threading.Thread(target=self._registry_watch_loop, name="FridaGadgetRegistryWatch")
+        thread.daemon = True
+        self._registry_watch_thread = thread
+        thread.start()
+
+    def _stop_registry_watch(self):
+        self._registry_watch_running = False
+
+    def _registry_watch_loop(self):
+        while self._registry_watch_running:
+            try:
+                self._sync_registry_owner_state(reload_bundle=True)
+            except Exception as exc:
+                self._fg_log("registry watch failed", exc)
+            try:
+                time.sleep(REGISTRY_WATCH_INTERVAL_SEC)
+            except Exception:
+                pass
+
+    def _sync_registry_owner_state(self, reload_bundle=True):
+        changed = False
+        with self._registry_lock:
+            for item in self._all_registry_entries():
+                if not item.get("owner_auto_disable"):
+                    continue
+                pid = str(item.get("plugin_id") or "")
+                owner_enabled = self._plugin_owner_is_enabled(pid)
+                if not owner_enabled and item.get("active", True):
+                    item["active"] = False
+                    item["inactive_reason"] = "owner_unloaded"
+                    item["updated_at"] = time.time()
+                    changed = True
+                elif owner_enabled and not item.get("active", True) and item.get("inactive_reason") == "owner_unloaded":
+                    item["active"] = True
+                    item["inactive_reason"] = ""
+                    item["updated_at"] = time.time()
+                    changed = True
+        if changed:
+            self._fg_log("registry owner state changed")
+            if reload_bundle:
+                self._apply_registry_update(autoload=True, allow_load=False)
+            try:
+                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+            except Exception:
+                pass
+
+    def _api_register_script(self, plugin_id, script, name=None, replace=True, autoload=True):
+        pid = _normalize_plugin_id(plugin_id)
+        original_script = str(script or "")
+        if not original_script.strip():
+            raise ValueError("script is empty")
+        script_text, needs_java = self._preprocess_registered_script(original_script)
+        if len(script_text.encode("utf-8")) > MAX_SCRIPT_BYTES:
+            raise ValueError("script is too large")
+        entry = {
+            "plugin_id": pid,
+            "name": _normalize_script_name(name),
+            "script": script_text,
+            "needs_java": bool(needs_java),
+            "enabled": True,
+            "active": True,
+            "inactive_reason": "",
+            "owner_auto_disable": self._plugin_owner_exists(pid),
+            "updated_at": time.time(),
+        }
+        entry["id"] = self._new_entry_id(pid, entry["name"])
+        registry = self._api_registry()
+        with self._registry_lock:
+            if replace or pid not in registry:
+                registry[pid] = [entry]
+            else:
+                registry[pid].append(entry)
+        self._fg_log(
+            "api script registered plugin=%s name=%s id=%s bytes=%s needs_java=%s owner_auto_disable=%s"
+            % (pid, entry["name"], entry["id"], len(script_text.encode("utf-8")), bool(needs_java), bool(entry["owner_auto_disable"]))
+        )
+        if autoload:
+            self._execute_api_bundle()
+        else:
+            self._write_registered_bundle()
+        try:
+            self._set_setting_value("__reload__", time.time(), reload_settings=True)
+        except Exception:
+            pass
+        return {"ok": True, "plugin_id": pid, "scripts": len(registry.get(pid) or []), "entry": self._script_entry_public(entry)}
+
+    def _api_register_script_file(self, plugin_id, path, name=None, replace=True, autoload=True):
+        source = _clean_text(path)
+        if not source:
+            raise ValueError("path is required")
+        with open(source, "r", encoding="utf-8") as handle:
+            content = handle.read(MAX_SCRIPT_BYTES + 1)
+        return self._api_register_script(plugin_id, content, name=name or os.path.basename(source), replace=replace, autoload=autoload)
+
+    def _api_unregister_plugin(self, plugin_id):
+        pid = _normalize_plugin_id(plugin_id)
+        registry = self._api_registry()
+        with self._registry_lock:
+            removed = len(registry.get(pid) or [])
+            if pid in registry:
+                del registry[pid]
+        self._fg_log("api scripts unregistered plugin=%s removed=%s" % (pid, removed))
+        self._apply_registry_update(autoload=True, allow_load=False)
+        try:
+            self._set_setting_value("__reload__", time.time(), reload_settings=True)
+        except Exception:
+            pass
+        return {"ok": True, "plugin_id": pid, "removed": removed}
+
+    def _api_status(self):
+        self._refresh_loaded_from_process()
+        return {
+            "loaded": bool(self._loaded),
+            "interaction": self._loaded_interaction or "",
+            "registered": self._api_registered_plugins(),
+            "scripts": self._api_script_entries(),
+            "script_path": self._script_path(),
+            "log_transport": "api-memory",
+            "log_port": self._log_server_port,
+            "push_port": self._push_server_port,
+            "version": FRIDA_VERSION,
+            "last_status": self._last_status,
+            "last_error": self._last_error,
+        }
+
+    def _api_clear_logs(self):
+        with self._api_log_lock:
+            self._api_logs = []
+            self._api_log_next = 0
+        self._cleanup_legacy_log_file()
+        return {"ok": True, "transport": "api-memory"}
+
+    def _api_read_logs(self, plugin_id=None, after=0, limit=200):
+        source_filter = _clean_text(plugin_id)
+        start = max(0, _safe_int(after, 0))
+        max_items = max(1, min(_safe_int(limit, 200), 1000))
+        with self._api_log_lock:
+            current_next = int(self._api_log_next)
+            snapshot = list(self._api_logs)
+        entries = []
+        for item in snapshot:
+            if int(item.get("line") or 0) <= start:
+                continue
+            if source_filter and str(item.get("source") or "") != source_filter:
+                continue
+            entries.append(dict(item))
+            if len(entries) >= max_items:
+                break
+        return {"next": current_next, "entries": entries, "transport": "api-memory"}
+
+    def _current_pid(self):
+        try:
+            if jclass is not None:
+                Process = jclass("android.os.Process")
+                return int(Process.myPid())
+        except Exception:
+            pass
+        try:
+            return int(os.getpid())
+        except Exception:
+            return 0
+
+    def _native_gadget_mapped(self):
+        try:
+            with open("/proc/self/maps", "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "frida-gadget" in line.lower():
+                        return True
+        except Exception as exc:
+            self._fg_log("cannot read process maps", exc)
+        return False
+
+    def _remember_loaded_state(self, interaction):
+        pid = self._current_pid()
+        interaction_text = str(interaction or "")
+        self._set_setting_value("_loaded_pid", str(pid), reload_settings=False)
+        self._set_setting_value("_loaded_interaction", interaction_text, reload_settings=False)
+        self._fg_log("remember native load pid=%s interaction=%s" % (pid, interaction_text or "-"))
+
+    def _refresh_loaded_from_process(self):
+        pid = str(self._current_pid())
+        stored_pid = str(self._get_setting_value("_loaded_pid", "") or "")
+        stored_interaction = str(self._get_setting_value("_loaded_interaction", "") or "")
+        if stored_pid and stored_pid == pid:
+            self._loaded = True
+            self._loaded_interaction = stored_interaction or "unknown"
+            return True
+        if self._native_gadget_mapped():
+            self._loaded = True
+            self._loaded_interaction = stored_interaction or "unknown"
+            self._fg_log("native gadget is already mapped in pid=%s interaction=%s" % (pid, self._loaded_interaction))
+            return True
+        self._loaded = False
+        self._loaded_interaction = ""
+        return False
+
+    def _restart_required_for_script(self):
+        self._write_config(force_interaction=1)
+        self._last_status = "Restart needed"
+        self._last_error = "Gadget already loaded in %s mode" % (self._loaded_interaction or "unknown")
+        self._fg_log(self._last_error)
+        self._show_error("Перезапусти Telegram и нажми ещё раз")
+
+    def _selector_index(self, key, items, default=0):
+        idx = _safe_int(self._get_setting_value(key, default), default)
+        if idx < 0 or idx >= len(items):
+            return int(default)
+        return idx
+
+    def _lib_path(self):
+        custom = _clean_text(self._get_setting_value("lib_path", self._default_lib_path()))
+        return custom or self._default_lib_path()
+
+    def _script_path(self):
+        custom = _clean_text(self._get_setting_value("script_path", self._default_script_path()))
+        return custom or self._default_script_path()
+
+    def _config_path_for_lib(self, lib_path):
+        path = str(lib_path or "")
+        base, ext = os.path.splitext(path)
+        if ext:
+            return base + ".config"
+        return path + ".config"
+
+    def _config_paths_for_lib(self, lib_path):
+        primary = self._config_path_for_lib(lib_path)
+        paths = [primary]
+        path = str(lib_path or "")
+        base, ext = os.path.splitext(path)
+        appended_path = path + ".config"
+        if appended_path not in paths:
+            paths.append(appended_path)
+        if ext == ".so":
+            android_path = base + ".config.so"
+            if android_path not in paths:
+                paths.append(android_path)
+        return paths
+
+    def _cleanup_legacy_log_file(self):
+        path = self._frida_log_path()
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as exc:
+            self._fg_log("legacy frida log cleanup failed", exc)
+
+    def _java_bridge_buffer_polyfill_lines(self):
+        return [
+            "(function () {",
+            "  if (typeof globalThis !== 'undefined' && typeof globalThis.Buffer !== 'undefined') return;",
+            "  function __fgUtf8Encode(str) {",
+            "    var s = unescape(encodeURIComponent(String(str)));",
+            "    var out = [];",
+            "    for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);",
+            "    return out;",
+            "  }",
+            "  function __fgUtf8Decode(bytes, start, end) {",
+            "    start = start || 0;",
+            "    end = end === undefined ? bytes.length : end;",
+            "    var s = '';",
+            "    for (var i = start; i < end; i++) s += String.fromCharCode(bytes[i] & 0xff);",
+            "    try { return decodeURIComponent(escape(s)); } catch (_) { return s; }",
+            "  }",
+            "  function FGBuffer(size) {",
+            "    var arr = new Uint8Array(size >>> 0);",
+            "    Object.setPrototypeOf(arr, FGBuffer.prototype);",
+            "    return arr;",
+            "  }",
+            "  FGBuffer.prototype = Object.create(Uint8Array.prototype);",
+            "  FGBuffer.prototype.constructor = FGBuffer;",
+            "  FGBuffer.from = function (value, encoding) {",
+            "    var i, src, out;",
+            "    if (typeof value === 'string') {",
+            "      src = __fgUtf8Encode(value);",
+            "      out = FGBuffer(src.length);",
+            "      for (i = 0; i < src.length; i++) out[i] = src[i];",
+            "      return out;",
+            "    }",
+            "    if (value instanceof ArrayBuffer) {",
+            "      src = new Uint8Array(value);",
+            "      out = FGBuffer(src.length);",
+            "      out.set(src);",
+            "      return out;",
+            "    }",
+            "    if (ArrayBuffer.isView(value)) {",
+            "      src = new Uint8Array(value.buffer, value.byteOffset || 0, value.byteLength);",
+            "      out = FGBuffer(src.length);",
+            "      out.set(src);",
+            "      return out;",
+            "    }",
+            "    if (value && typeof value.length === 'number') {",
+            "      out = FGBuffer(value.length);",
+            "      for (i = 0; i < value.length; i++) out[i] = value[i] & 0xff;",
+            "      return out;",
+            "    }",
+            "    return FGBuffer(0);",
+            "  };",
+            "  FGBuffer.alloc = function (size) { return FGBuffer(size >>> 0); };",
+            "  FGBuffer.concat = function (list, totalLength) {",
+            "    var i, offset = 0;",
+            "    if (totalLength === undefined) {",
+            "      totalLength = 0;",
+            "      for (i = 0; i < list.length; i++) totalLength += list[i].length;",
+            "    }",
+            "    var out = FGBuffer(totalLength);",
+            "    for (i = 0; i < list.length; i++) {",
+            "      out.set(list[i], offset);",
+            "      offset += list[i].length;",
+            "    }",
+            "    return out;",
+            "  };",
+            "  FGBuffer.prototype.write = function (str, offset, length, encoding) {",
+            "    offset = offset || 0;",
+            "    var bytes = __fgUtf8Encode(str);",
+            "    if (length === undefined || length === null) length = bytes.length;",
+            "    var n = Math.min(length, bytes.length, this.length - offset);",
+            "    for (var i = 0; i < n; i++) this[offset + i] = bytes[i];",
+            "    return n;",
+            "  };",
+            "  FGBuffer.prototype.writeUInt16LE = function (value, offset) {",
+            "    offset = offset || 0;",
+            "    value = value >>> 0;",
+            "    this[offset] = value & 0xff;",
+            "    this[offset + 1] = (value >>> 8) & 0xff;",
+            "    return offset + 2;",
+            "  };",
+            "  FGBuffer.prototype.writeUInt32LE = function (value, offset) {",
+            "    offset = offset || 0;",
+            "    value = value >>> 0;",
+            "    this[offset] = value & 0xff;",
+            "    this[offset + 1] = (value >>> 8) & 0xff;",
+            "    this[offset + 2] = (value >>> 16) & 0xff;",
+            "    this[offset + 3] = (value >>> 24) & 0xff;",
+            "    return offset + 4;",
+            "  };",
+            "  FGBuffer.prototype.copy = function (target, targetStart, sourceStart, sourceEnd) {",
+            "    targetStart = targetStart || 0;",
+            "    sourceStart = sourceStart || 0;",
+            "    sourceEnd = sourceEnd === undefined ? this.length : sourceEnd;",
+            "    var n = Math.max(0, Math.min(sourceEnd - sourceStart, target.length - targetStart));",
+            "    for (var i = 0; i < n; i++) target[targetStart + i] = this[sourceStart + i];",
+            "    return n;",
+            "  };",
+            "  FGBuffer.prototype.slice = function (start, end) {",
+            "    return FGBuffer.from(Uint8Array.prototype.slice.call(this, start, end));",
+            "  };",
+            "  FGBuffer.prototype.toString = function (encoding, start, end) {",
+            "    return __fgUtf8Decode(this, start || 0, end === undefined ? this.length : end);",
+            "  };",
+            "  globalThis.Buffer = FGBuffer;",
+            "})();",
+        ]
+
+    def _bundle_script_source(self, entries):
+        log_port = self._ensure_log_server()
+        needs_java_bridge = any(bool(item.get("needs_java")) for item in entries)
+        prelude_path = self._java_bridge_prelude_path()
+        prelude_text = self._read_java_bridge_prelude() if needs_java_bridge else ""
+        has_prelude = bool(prelude_text.strip())
+        prelude_path_js = json.dumps(prelude_path)
+
+        lines = [
+            "'use strict';",
+            "",
+        ]
+
+        if needs_java_bridge and has_prelude:
+            lines.extend(
+                [
+                    "try {",
+                ]
+                + self._java_bridge_buffer_polyfill_lines()
+                + [
+                    prelude_text.rstrip("\n"),
+                    "  ;globalThis.__fridaGadgetPreludeStatus = 'ok';",
+                    "  globalThis.__fridaGadgetPreludeSource = %s;" % prelude_path_js,
+                    "} catch (e) {",
+                    "  try { globalThis.__fridaGadgetPreludeError = String(e && e.stack ? e.stack : e); }",
+                    "  catch (_) { globalThis.__fridaGadgetPreludeError = 'unknown prelude error'; }",
+                    "}",
+                    "",
+                ]
+            )
+
+        lines.extend([
+            "var __fgLogPort = %s;" % int(log_port),
+            "var __fgEntries = [];",
+            "var __fgJavaNoticeShown = false;",
+            "var __fgNeedsJavaBridge = %s;" % ("true" if needs_java_bridge else "false"),
+            "var __fgPreludePresent = %s;" % ("true" if has_prelude else "false"),
+            "var __fgPreludePath = %s;" % prelude_path_js,
+            "",
+            "function __fgToString(value) {",
+            "  try {",
+            "    if (value === null) return 'null';",
+            "    if (value === undefined) return 'undefined';",
+            "    if (typeof value === 'string') return value;",
+            "    if (value && value.stack) return String(value.stack);",
+            "    return JSON.stringify(value);",
+            "  } catch (_) {",
+            "    try { return String(value); } catch (__) { return '<unprintable>'; }",
+            "  }",
+            "}",
+            "",
+            "function __fgUtf8Bytes(text) {",
+            "  var encoded = unescape(encodeURIComponent(String(text)));",
+            "  var bytes = [];",
+            "  for (var i = 0; i < encoded.length; i++) bytes.push(encoded.charCodeAt(i));",
+            "  return bytes;",
+            "}",
+            "",
+            "function __fgSendEntry(entry) {",
+            "  if (!__fgLogPort || typeof Socket === 'undefined') return;",
+            "  try {",
+            "    Socket.connect({ family: 'ipv4', host: '127.0.0.1', port: __fgLogPort })",
+            "      .then(function (connection) {",
+            "        return connection.output.writeAll(__fgUtf8Bytes(JSON.stringify(entry) + '\\n'))",
+            "          .then(function () { return connection.close(); });",
+            "      })",
+            "      .catch(function (_) {});",
+            "  } catch (_) {}",
+            "}",
+            "",
+            "function __fgLog(source, level, args) {",
+            "  var values = [];",
+            "  for (var i = 0; i < args.length; i++) values.push(__fgToString(args[i]));",
+            "  var message = values.join(' ');",
+            "  var entry = { ts: Date.now(), source: String(source || 'Frida'), level: String(level || 'log'), message: message };",
+            "  __fgSendEntry(entry);",
+            "  try {",
+            "    var fn = console[level] || console.log;",
+            "    fn.call(console, '[FridaGadget][' + entry.source + '] ' + message);",
+            "  } catch (_) {}",
+            "}",
+            "",
+            "function __fgMark(stage) {",
+            "  __fgLog('FridaGadget', 'mark', [String(stage || 'mark')]);",
+            "}",
+            "",
+            "function __fgJavaSnapshot() {",
+            "  var javaObj = __fgJavaObject();",
+            "  var info = { typeof_Java: typeof javaObj };",
+            "  try { info.Java_available = javaObj ? !!javaObj.available : false; } catch (_) { info.Java_available = false; }",
+            "  try { info.has_libart = !!Process.findModuleByName('libart.so'); } catch (_) {}",
+            "  return info;",
+            "}",
+            "",
+            "function __fgJavaObject() {",
+            "  try { if (typeof globalThis !== 'undefined' && globalThis.Java) return globalThis.Java; } catch (_) {}",
+            "  try { if (typeof globalThis !== 'undefined' && globalThis.__fridaJavaBridge) return globalThis.__fridaJavaBridge; } catch (_) {}",
+            "  try { if (typeof Java !== 'undefined') return Java; } catch (_) {}",
+            "  return undefined;",
+            "}",
+            "",
+            "function __fgDiagnose(stage) {",
+            "  var info = { stage: String(stage || 'diagnose') };",
+            "  try { info.script_runtime = (typeof Script !== 'undefined' && Script.runtime) ? Script.runtime : 'unknown'; } catch (_) {}",
+            "  try { info.frida_version = (typeof Frida !== 'undefined' && Frida.version) ? Frida.version : 'unknown'; } catch (_) {}",
+            "  try { info.platform = Process.platform; } catch (_) {}",
+            "  try { info.arch = Process.arch; } catch (_) {}",
+            "  try { info.pointer_size = Process.pointerSize; } catch (_) {}",
+            "  try { info.has_Interceptor = (typeof Interceptor !== 'undefined'); } catch (_) {}",
+            "  try { info.has_Process = (typeof Process !== 'undefined'); } catch (_) {}",
+            "  try { info.modules_count = Process.enumerateModules().length; } catch (_) {}",
+            "  var snap = __fgJavaSnapshot();",
+            "  for (var k in snap) info[k] = snap[k];",
+            "  __fgLog('FridaGadget', 'log', ['diagnose ' + JSON.stringify(info)]);",
+            "  return info;",
+            "}",
+            "",
+            "function __fgJavaUndefinedNotice() {",
+            "  if (!__fgNeedsJavaBridge) return;",
+            "  if (__fgJavaNoticeShown) return;",
+            "  __fgJavaNoticeShown = true;",
+            "  __fgLog('FridaGadget', 'warn', ['Java bridge requested, but Java is unavailable.']);",
+            "}",
+            "",
+            "function __fgLogPreludeState() {",
+            "  if (!__fgNeedsJavaBridge) return;",
+            "  try {",
+            "    if (typeof globalThis !== 'undefined' && globalThis.__fridaGadgetPreludeError) {",
+            "      __fgLog('FridaGadget', 'error', ['java_bridge_prelude failed', globalThis.__fridaGadgetPreludeError]);",
+            "      return;",
+            "    }",
+            "    if (!__fgPreludePresent) {",
+            "      __fgLog('FridaGadget', 'error', ['Script requested Java bridge, but java_bridge_prelude.js is missing at ' + __fgPreludePath]);",
+            "      return;",
+            "    }",
+            "    var javaObj = __fgJavaObject();",
+            "    if (javaObj) {",
+            "      var available = 'unknown';",
+            "      try { available = String(!!javaObj.available); } catch (_) {}",
+            "      __fgLog('FridaGadget', 'log', ['java_bridge_prelude ready', __fgPreludePath, 'Java.available=' + available]);",
+            "    } else {",
+            "      __fgLog('FridaGadget', 'warn', ['java_bridge_prelude was injected but Java is still unavailable', __fgPreludePath]);",
+            "    }",
+            "  } catch (_) {}",
+            "}",
+            "",
+            "function __fgMakeApi(source) {",
+            "  var initHandlers = [];",
+            "  var disposeHandlers = [];",
+            "  var api = {",
+            "    source: source,",
+            "    markerPath: '',",
+            "    logPath: '',",
+            "    parameters: {},",
+            "    log: function () { __fgLog(source, 'log', arguments); },",
+            "    warn: function () { __fgLog(source, 'warn', arguments); },",
+            "    error: function () { __fgLog(source, 'error', arguments); },",
+            "    mark: function (stage) { __fgMark(source + ':' + String(stage || 'mark')); },",
+            "    onInit: function (handler) { if (typeof handler === 'function') initHandlers.push(handler); },",
+            "    onDispose: function (handler) { if (typeof handler === 'function') disposeHandlers.push(handler); },",
+            "    diagnose: function (stage) { return __fgDiagnose(stage || (source + ':diagnose')); },",
+            "    javaState: function () { return __fgJavaSnapshot(); },",
+            "    javaNotice: function () { __fgJavaUndefinedNotice(); }",
+            "  };",
+            "  try {",
+            "    if (typeof globalThis !== 'undefined') {",
+            "      if (!globalThis.__fridaGadgetApis) globalThis.__fridaGadgetApis = {};",
+            "      globalThis.__fridaGadgetApis[source] = api;",
+            "      globalThis.__fridaGadgetApi = api;",
+            "    }",
+            "  } catch (_) {}",
+            "  __fgEntries.push({ source: source, api: api, initHandlers: initHandlers, disposeHandlers: disposeHandlers });",
+            "  return api;",
+            "}",
+            "",
+            "__fgDiagnose('bundle-prologue');",
+            "__fgLogPreludeState();",
+            "if (__fgNeedsJavaBridge && !__fgJavaObject()) { __fgJavaUndefinedNotice(); }",
+            "",
+        ])
+
+        for item in entries:
+            source = str(item.get("plugin_id") or "unknown")
+            name = str(item.get("name") or "script")
+            script = str(item.get("script") or "")
+            lines.extend(
+                [
+                    "(function () {",
+                    "  var fridaGadget = __fgMakeApi(%s);" % json.dumps(source),
+                    "  var console = {",
+                    "    log: function () { fridaGadget.log.apply(fridaGadget, arguments); },",
+                    "    warn: function () { fridaGadget.warn.apply(fridaGadget, arguments); },",
+                    "    error: function () { fridaGadget.error.apply(fridaGadget, arguments); }",
+                    "  };",
+                    "  try {",
+                    "    fridaGadget.log('load', %s);" % json.dumps(name),
+                    "    try { if (typeof globalThis !== 'undefined') globalThis.__fridaGadgetApi = fridaGadget; } catch (_) {}",
+                    "    var __script = %s;" % json.dumps(script),
+                    "    var __runner = new Function('fridaGadget', 'console', 'Java', __script);",
+                    "    __runner(fridaGadget, console, globalThis.Java || globalThis.__fridaJavaBridge);",
+                    "  } catch (e) {",
+                    "    fridaGadget.error(e && e.stack ? e.stack : e);",
+                    "  }",
+                    "})();",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "__fgMark('bundle-loaded');",
+                "__fgLog('FridaGadget', 'log', ['bundle-loaded', String(__fgEntries.length)]);",
+                "",
+                "rpc.exports = {",
+                "  init: function (stage, parameters) {",
+                "    var snap = __fgJavaSnapshot();",
+                "    __fgLog('FridaGadget', 'log', ['init', stage, 'java=' + JSON.stringify(snap), 'entries=' + __fgEntries.length]);",
+                "    if (__fgNeedsJavaBridge && !__fgJavaObject()) { __fgJavaUndefinedNotice(); }",
+                "    for (var i = 0; i < __fgEntries.length; i++) {",
+                "      var entry = __fgEntries[i];",
+                "      entry.api.parameters = parameters || {};",
+                "      for (var j = 0; j < entry.initHandlers.length; j++) {",
+                "        try { entry.initHandlers[j](stage, parameters || {}); }",
+                "        catch (e) { __fgLog(entry.source, 'error', [e && e.stack ? e.stack : e]); }",
+                "      }",
+                "    }",
+                "    __fgMark('init-' + String(stage));",
+                "    return true;",
+                "  },",
+                "  dispose: function () {",
+                "    __fgLog('FridaGadget', 'log', ['dispose']);",
+                "    for (var i = 0; i < __fgEntries.length; i++) {",
+                "      var entry = __fgEntries[i];",
+                "      for (var j = 0; j < entry.disposeHandlers.length; j++) {",
+                "        try { entry.disposeHandlers[j](); }",
+                "        catch (e) { __fgLog(entry.source, 'error', [e && e.stack ? e.stack : e]); }",
+                "      }",
+                "    }",
+                "    __fgMark('dispose');",
+                "  }",
+                "};",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _bundle_state(self, entries):
+        payload = []
+        entry_ids = []
+        for item in entries or []:
+            entry_ids.append(str(item.get("id") or ""))
+            payload.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "plugin_id": str(item.get("plugin_id") or ""),
+                    "name": str(item.get("name") or ""),
+                    "enabled": bool(item.get("enabled", True)),
+                    "active": bool(item.get("active", True)),
+                    "needs_java": bool(item.get("needs_java")),
+                    "script": str(item.get("script") or ""),
+                }
+            )
+        digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        return digest, tuple(entry_ids)
+
+    def _write_registered_bundle(self, entries=None, force=False):
+        self._init_paths()
+        self._ensure_module_dir()
+        if entries is None:
+            entries = self._registered_entries()
+        script_path = self._default_script_path()
+        try:
+            bundle_hash, entry_ids = self._bundle_state(entries)
+            if (
+                not force
+                and self._last_bundle_hash == bundle_hash
+                and self._last_bundle_entry_ids == entry_ids
+                and os.path.exists(script_path)
+            ):
+                self._fg_log("registered bundle unchanged scripts=%s path=%s" % (len(entries), script_path))
+                return script_path
+            os.makedirs(os.path.dirname(script_path), exist_ok=True)
+            self._cleanup_legacy_log_file()
+            with open(script_path, "w", encoding="utf-8") as handle:
+                handle.write(self._bundle_script_source(entries))
+            self._set_setting_value("script_path", script_path, reload_settings=False)
+            self._set_setting_value("interaction", 1, reload_settings=False)
+            self._last_bundle_hash = bundle_hash
+            self._last_bundle_entry_ids = entry_ids
+            self._fg_log("registered bundle written scripts=%s path=%s bytes=%s" % (len(entries), script_path, os.path.getsize(script_path)))
+            return script_path
+        except Exception as exc:
+            self._last_status = "Bundle error"
+            self._last_error = _short_error(exc)
+            self._fg_log("registered bundle write failed", exc)
+            return ""
+
+    def _lib_needs_download(self, lib_path):
+        try:
+            if not os.path.exists(lib_path):
+                return True
+            if os.path.getsize(lib_path) < MIN_GADGET_SIZE:
+                return True
+            marker = ""
+            version_path = self._gadget_version_path()
+            if os.path.exists(version_path):
+                with open(version_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    marker = handle.read().strip()
+            if marker != FRIDA_VERSION:
+                self._fg_log("gadget version mismatch marker=%s expected=%s" % (marker or "<missing>", FRIDA_VERSION))
+                return True
+        except Exception as exc:
+            self._fg_log("gadget version check failed", exc)
+            return True
+        return False
+
+    def _interaction_index(self):
+        return self._selector_index("interaction", INTERACTION_ITEMS, 0)
+
+    def _runtime_value(self):
+        idx = self._selector_index("runtime", RUNTIME_ITEMS, 0)
+        return RUNTIME_ITEMS[idx]
+
+    def _teardown_value(self):
+        idx = self._selector_index("teardown", TEARDOWN_ITEMS, 0)
+        return TEARDOWN_ITEMS[idx]
+
+    def _listen_address(self):
+        return _clean_text(self._get_setting_value("listen_address", "127.0.0.1")) or "127.0.0.1"
+
+    def _listen_port(self):
+        port = _safe_int(self._get_setting_value("listen_port", DEFAULT_PORT), DEFAULT_PORT)
+        if port <= 0 or port > 65535:
+            return DEFAULT_PORT
+        return port
+
+    def _token(self):
+        return _clean_text(self._get_setting_value("token", ""))
+
+    def _device_abis(self):
+        if jclass is None:
+            return "unknown"
+        try:
+            Build = jclass("android.os.Build")
+            abis = Build.SUPPORTED_ABIS
+            return ", ".join([str(abis[i]) for i in range(len(abis))])
+        except Exception:
+            return "unknown"
+
+    def _build_config(self, force_interaction=None):
+        if force_interaction is None:
+            interaction_idx = self._interaction_index()
+        else:
+            interaction_idx = _safe_int(force_interaction, self._interaction_index())
+
+        if interaction_idx == 1:
+            script_path = self._script_path()
+            if self._registered_entries() or not os.path.exists(script_path):
+                script_path = self._write_registered_bundle() or script_path
+            return {
+                "interaction": {
+                    "type": "script",
+                    "path": script_path,
+                    "parameters": {
+                        "modules_dir": self._modules_dir,
+                        "script_path": script_path,
+                        "log_transport": "api-memory",
+                        "log_port": self._log_server_port,
+                        "registered_plugins": self._api_registered_plugins(),
+                    },
+                    "on_change": "reload",
+                },
+                "teardown": self._teardown_value(),
+                "runtime": self._runtime_value(),
+            }
+
+        interaction = {
+            "type": "listen",
+            "address": self._listen_address(),
+            "port": self._listen_port(),
+            "on_port_conflict": "pick-next",
+            "on_load": "resume",
+        }
+        token = self._token()
+        if token:
+            interaction["token"] = token
+        return {
+            "interaction": interaction,
+            "teardown": self._teardown_value(),
+            "runtime": self._runtime_value(),
+        }
+
+    def _write_config(self, force_interaction=None):
+        self._init_paths()
+        self._ensure_module_dir()
+        lib_path = self._lib_path()
+        config_paths = self._config_paths_for_lib(lib_path)
+        config_path = config_paths[0]
+        config = self._build_config(force_interaction=force_interaction)
+        try:
+            safe_config = json.loads(json.dumps(config))
+            safe_interaction = safe_config.get("interaction") if isinstance(safe_config, dict) else None
+            if isinstance(safe_interaction, dict) and safe_interaction.get("token"):
+                safe_interaction["token"] = "***"
+            config_dump = json.dumps(safe_config, ensure_ascii=False)
+        except Exception:
+            config_dump = repr(config)
+        self._fg_log(
+            "write config lib=%s paths=%s interaction=%s script=%s script_exists=%s"
+            % (
+                lib_path,
+                ", ".join(config_paths),
+                str((config.get("interaction") or {}).get("type") or ""),
+                self._script_path(),
+                os.path.exists(self._script_path()),
+            )
+        )
+        self._fg_log("config json: %s" % config_dump)
+        try:
+            for path in config_paths:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(config, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+            self._last_config_path = config_path
+            self._last_status = "Config written"
+            self._last_error = ""
+            self._last_config_interaction = str((config.get("interaction") or {}).get("type") or "")
+            self._fg_log("config written to %s" % ", ".join(config_paths))
+            return config_path
+        except Exception as exc:
+            self._last_error = _short_error(exc)
+            self._last_status = "Config error"
+            self._fg_log("config write failed", exc)
+            self._show_error("Ошибка config")
+            return ""
+
+    def _download_gadget_sync(self):
+        self._init_paths()
+        self._ensure_module_dir()
+        target = self._default_lib_path()
+        tmp = target + ".download"
+        archive_tmp = target + ".download.xz"
+        errors = []
+
+        for source_url in GADGET_DOWNLOAD_URLS:
+            for path in (tmp, archive_tmp):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+
+            try:
+                request = urllib.request.Request(
+                    source_url,
+                    headers={
+                        "User-Agent": "FridaGadget/%s" % FRIDA_VERSION,
+                        "Accept": "application/octet-stream,*/*",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SEC) as response:
+                    final_url = str(getattr(response, "url", "") or response.geturl() or source_url)
+                    disposition = str(response.headers.get("Content-Disposition", "") or "")
+                    is_xz = (
+                        source_url.split("?", 1)[0].endswith(".xz")
+                        or final_url.split("?", 1)[0].endswith(".xz")
+                        or ".xz" in disposition
+                    )
+                    download_path = archive_tmp if is_xz else tmp
+                    with open(download_path, "wb") as handle:
+                        while True:
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                self._fg_log("downloaded gadget source=%s file=%s bytes=%s" % (source_url, download_path, os.path.getsize(download_path)))
+
+                if download_path == archive_tmp:
+                    if not os.path.exists(archive_tmp) or os.path.getsize(archive_tmp) < MIN_GADGET_SIZE:
+                        raise IOError("archive is too small: %s bytes" % (os.path.getsize(archive_tmp) if os.path.exists(archive_tmp) else 0))
+                    with lzma.open(archive_tmp, "rb") as src:
+                        with open(tmp, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+
+                if not os.path.exists(tmp) or os.path.getsize(tmp) < MIN_GADGET_SIZE:
+                    raise IOError("library is too small: %s bytes" % (os.path.getsize(tmp) if os.path.exists(tmp) else 0))
+                if os.path.exists(target):
+                    try:
+                        os.remove(target)
+                    except Exception:
+                        pass
+                os.replace(tmp, target)
+                try:
+                    os.chmod(target, 0o755)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(archive_tmp):
+                        os.remove(archive_tmp)
+                except Exception:
+                    pass
+                try:
+                    with open(self._gadget_version_path(), "w", encoding="utf-8") as handle:
+                        handle.write(FRIDA_VERSION + "\n")
+                except Exception as exc:
+                    self._fg_log("gadget version marker write failed", exc)
+                self._set_setting_value("lib_path", self._default_lib_path(), reload_settings=False)
+                self._last_status = "Library downloaded"
+                self._last_error = ""
+                self._fg_log("gadget ready path=%s bytes=%s source=%s" % (target, os.path.getsize(target), source_url))
+                return True
+            except Exception as exc:
+                error_text = "%s: %s" % (source_url, _download_error(exc))
+                errors.append(error_text)
+                self._fg_log("gadget download source failed %s" % error_text, exc)
+
+            for path in (tmp, archive_tmp):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+
+        self._last_status = "Download error"
+        self._last_error = " | ".join(errors)[-180:] if errors else "download failed"
+        self._fg_log("gadget download failed: %s" % self._last_error)
+        return False
+
+    def _sha256_of_file(self, path):
+        try:
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(256 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return digest.hexdigest().lower()
+        except Exception as exc:
+            self._fg_log("sha256 read failed", exc)
+            return ""
+
+    def _download_prelude_sync(self):
+        self._init_paths()
+        self._ensure_module_dir()
+        target = self._java_bridge_prelude_path()
+        tmp = target + ".download"
+        errors = []
+
+        for source_url in PRELUDE_DOWNLOAD_URLS:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+            try:
+                request = urllib.request.Request(
+                    source_url,
+                    headers={
+                        "User-Agent": "FridaGadget/%s" % FRIDA_VERSION,
+                        "Accept": "application/javascript,text/javascript,*/*",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SEC) as response:
+                    with open(tmp, "wb") as handle:
+                        while True:
+                            chunk = response.read(256 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+
+                size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+                if size < PRELUDE_MIN_SIZE:
+                    raise IOError("prelude is too small: %s bytes" % size)
+
+                actual_sha = self._sha256_of_file(tmp)
+                if PRELUDE_EXPECTED_SHA256 and actual_sha != PRELUDE_EXPECTED_SHA256:
+                    self._fg_log(
+                        "prelude sha mismatch source=%s expected=%s actual=%s"
+                        % (source_url, PRELUDE_EXPECTED_SHA256, actual_sha)
+                    )
+
+                if os.path.exists(target):
+                    try:
+                        os.remove(target)
+                    except Exception:
+                        pass
+                os.replace(tmp, target)
+                try:
+                    os.chmod(target, 0o644)
+                except Exception:
+                    pass
+
+                self._last_status = "Prelude downloaded"
+                self._last_error = ""
+                self._fg_log(
+                    "prelude ready path=%s bytes=%s sha256=%s source=%s"
+                    % (target, os.path.getsize(target), actual_sha, source_url)
+                )
+                return True
+            except Exception as exc:
+                error_text = "%s: %s" % (source_url, _download_error(exc))
+                errors.append(error_text)
+                self._fg_log("prelude download source failed %s" % error_text, exc)
+
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        self._last_status = "Prelude download error"
+        self._last_error = " | ".join(errors)[-180:] if errors else "download failed"
+        self._fg_log("prelude download failed: %s" % self._last_error)
+        return False
+
+    def _execute_api_bundle(self):
+        old_quiet = self._quiet
+        self._quiet = True
+        try:
+            self._init_paths()
+            self._ensure_module_dir()
+            entries = self._registered_entries()
+            script_path = self._write_registered_bundle(entries=entries)
+            if not script_path:
+                return {"ok": False, "error": self._last_error or "bundle write failed"}
+            log_cursor = self._api_log_cursor()
+            self._refresh_loaded_from_process()
+            self._fg_log(
+                "api execute scripts=%s loaded=%s interaction=%s log_cursor=%s"
+                % (len(entries), self._loaded, self._loaded_interaction or "-", log_cursor)
+            )
+            if not entries:
+                result = self._reload_loaded_script_bundle()
+                result.update({"ok": bool(result.get("ok", True)), "scripts": 0})
+                return result
+
+            if self._loaded:
+                if self._loaded_interaction != "script":
+                    self._restart_required_for_script()
+                    return {"ok": False, "restart_required": True, "interaction": self._loaded_interaction}
+                if self._write_config(force_interaction=1):
+                    try:
+                        os.utime(script_path, None)
+                    except Exception:
+                        pass
+                    self._last_status = "API scripts applied"
+                    self._last_error = ""
+                    self._schedule_api_log_check(log_cursor)
+                    return {"ok": True, "loaded": True, "scripts": len(entries), "reloaded": True}
+                return {"ok": False, "error": self._last_error or "config write failed"}
+
+            self._load_gadget(force_interaction=1)
+            if self._loaded:
+                self._last_status = "API scripts loaded"
+                self._schedule_api_log_check(log_cursor)
+                return {"ok": True, "loaded": True, "scripts": len(entries), "downloaded": True}
+            return {"ok": False, "loaded": False, "scripts": len(entries), "error": self._last_error}
+        finally:
+            self._quiet = old_quiet
+
+    def _load_gadget(self, force_interaction=None):
+        self._init_paths()
+        self._ensure_module_dir()
+        lib_path = self._lib_path()
+        self._refresh_loaded_from_process()
+
+        if self._loaded:
+            desired_interaction = _safe_int(force_interaction, self._interaction_index())
+            if desired_interaction == 1 and self._loaded_interaction != "script":
+                self._restart_required_for_script()
+                return
+            self._fg_log("load skipped, native gadget already loaded interaction=%s" % (self._loaded_interaction or "-"))
+            self._show_info("Gadget уже загружен")
+            return
+        if self._lib_needs_download(lib_path):
+            self._show_info("Скачиваю Gadget...")
+            if not self._download_gadget_sync():
+                self._show_error(".so не найден: %s" % (self._last_error or "download failed"))
+                return
+            lib_path = self._lib_path()
+
+        config_path = self._write_config(force_interaction=force_interaction)
+        if not config_path:
+            return
+
+        if jclass is None:
+            self._last_status = "Java bridge missing"
+            self._last_error = "java.jclass is unavailable"
+            self._fg_log(self._last_error)
+            self._show_error("Нет Java bridge")
+            return
+
+        try:
+            try:
+                os.chmod(lib_path, 0o755)
+            except Exception:
+                pass
+            self._fg_log("System.load start path=%s force_interaction=%s" % (lib_path, force_interaction))
+            self._system_load(lib_path)
+            self._loaded = True
+            self._loaded_interaction = self._last_config_interaction
+            self._remember_loaded_state(self._loaded_interaction)
+            self._last_status = "Loaded"
+            self._last_error = ""
+            self._fg_log("System.load ok interaction=%s" % (self._loaded_interaction or "-"))
+            self._show_success("Gadget загружен")
+        except Exception as exc:
+            self._loaded = False
+            self._loaded_interaction = ""
+            self._last_status = "Load error"
+            self._last_error = _short_error(exc)
+            self._fg_log("System.load failed", exc)
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+            self._show_error("Ошибка загрузки")
+
+    def _schedule_api_log_check(self, previous_line):
+        def check():
+            self._verify_api_log_signal(previous_line)
+
+        run_on_ui_thread(check, 5000)
+
+    def _verify_api_log_signal(self, previous_line):
+        current_line = self._api_log_cursor()
+        if current_line > int(previous_line or 0):
+            self._last_status = "API logs confirmed"
+            self._last_error = ""
+            self._fg_log("api log confirmed previous=%s current=%s" % (previous_line or 0, current_line))
+            return
+        self._last_status = "No API log signal"
+        self._last_error = "Frida API log buffer was not updated"
+        self._fg_log("api log missing previous=%s current=%s" % (previous_line or 0, current_line))
+
+    def _script_row_subtext(self, item):
+        enabled = bool(item.get("enabled", True))
+        active = bool(item.get("active", True))
+        if enabled and active:
+            state = "active"
+        elif not enabled:
+            state = "disabled"
+        else:
+            state = "inactive"
+        reason = str(item.get("inactive_reason") or "")
+        parts = [state]
+        if reason:
+            parts.append(reason)
+        parts.append("java" if item.get("needs_java") else "native")
+        try:
+            parts.append("%s b" % int(item.get("bytes") or 0))
+        except Exception:
+            pass
+        return " | ".join(parts)[:180]
+
+    def _set_script_active_from_settings(self, entry_id, active):
+        entry_id = str(entry_id or "")
+        if not entry_id:
+            self._show_error("Скрипт не найден")
+            return
+        result = self._api_set_script_state(
+            entry_id=entry_id,
+            enabled=True if bool(active) else None,
+            active=bool(active),
+            reason="ui",
+            autoload=True,
+        )
+        if result.get("ok"):
+            self._show_success("Скрипт загружен" if bool(active) else "Скрипт выгружен")
+        else:
+            self._show_error("Ошибка: %s" % (result.get("error") or "unknown"))
+
+    def _script_row_clicked(self, entry_id):
+        now = time.time()
+        entry_id = str(entry_id or "")
+        if entry_id and self._last_script_click_id == entry_id and (now - self._last_script_click_at) <= DOUBLE_CLICK_WINDOW_SEC:
+            self._last_script_click_id = ""
+            self._last_script_click_at = 0.0
+            entry = self._find_registry_entry(entry_id=entry_id)
+            if entry is None:
+                self._show_error("Скрипт не найден")
+                return
+            make_active = not bool(entry.get("active", True))
+            self._set_script_active_from_settings(entry_id, make_active)
+            return
+        self._last_script_click_id = entry_id
+        self._last_script_click_at = now
+        self._show_info("Ещё раз — load/unload")
+
+    def create_settings(self):
+        try:
+            return self._create_settings()
+        except Exception as exc:
+            self._last_status = "Settings error"
+            self._last_error = _short_error(exc)
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+            return [
+                Header(text="Frida Gadget"),
+                Text(text="Settings error", icon="msg_error"),
+                Text(text=self._last_error or "unknown error", icon="msg_info"),
+            ]
+
+    def _create_settings(self):
+        self._init_paths()
+        self._ensure_push_server_state()
+        rows = [Header(text="Frida Gadget")]
+        rows.append(
+            Switch(
+                key="dev_server_enabled",
+                text="Включить dev сервер",
+                default=bool(self._push_server_enabled()),
+                subtext="ADB push API для загрузки скриптов с ПК",
+                icon="msg_settings",
+                on_change=self._on_dev_server_changed,
+            )
+        )
+        if self._push_server_enabled():
+            port = int(self._push_server_port or self._push_server_bind_port())
+            server_subtext = "127.0.0.1:%s" % port
+        else:
+            server_subtext = "Выключен"
+        rows.append(
+            Text(
+                text="ADB push server",
+                subtext=server_subtext,
+                icon="msg_link",
+            )
+        )
+
+        rows.append(Header(text="Скрипты"))
+        scripts = self._api_script_entries()
+        if not scripts:
+            rows.append(Text(text="Нет скриптов", icon="msg_info"))
+            return rows
+
+        for item in scripts:
+            title = "%s / %s" % (
+                str(item.get("plugin_id") or "unknown"),
+                str(item.get("name") or "script"),
+            )
+            active = bool(item.get("enabled", True)) and bool(item.get("active", True))
+            action = "Unload" if active else "Load"
+            icon = "msg_delete" if active else "msg_retry"
+            rows.append(
+                Text(
+                    text=("%s: %s" % (action, title))[:96],
+                    subtext=self._script_row_subtext(item),
+                    icon=icon,
+                    on_click=lambda v, eid=item.get("id"), want_active=not active: self._set_script_active_from_settings(eid, want_active),
+                )
+            )
+        return rows
