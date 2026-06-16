@@ -1,8 +1,8 @@
 __id__ = "GreenPass"
 __name__ = "GreenPass"
-__description__ = "Крутой прокси плагин"
+__description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc"
 __author__ = "@Altyplugins / Codex"
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 __icon__ = "bratpass/0"
 __min_version__ = "12.1.1"
 
@@ -25,13 +25,15 @@ import gzip
 import hashlib
 import socket
 import struct
+import sys
+import types
 from html import unescape
 from base_plugin import BasePlugin, AppEvent, MethodHook, MenuItemData, MenuItemType
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
 from ui.settings import Header, Text, Divider, Selector, Switch, EditText
 from android_utils import run_on_ui_thread
-from client_utils import get_last_fragment
+from client_utils import get_last_fragment, send_document
 from hook_utils import find_class
 try:
     from java import jclass
@@ -112,11 +114,17 @@ TGWS_WS_POOL_SIZE = 4
 TGWS_WS_POOL_MAX_AGE_SEC = 30.0
 TGWS_SOCKET_BUFFER_SIZE = 256 * 1024
 TGWS_RESERVED_PORTS = {VLESS_LOCAL_PORT, OLCRTC_LOCAL_PORT, AWG_LOCAL_PORT}
+GREENPASS_PROXY_API_MODULE = "greenpass_proxy_api"
+GREENPASS_PLUGIN_PROXY_FRIDA_ID = "GreenPassPluginProxy"
+GREENPASS_PLUGIN_PROXY_NAME = "greenpass-java-url-proxy"
 OLCRTC_CARRIER_ITEMS = ("telemost", "jitsi", "wbstream")
 OLCRTC_TRANSPORT_ITEMS = ("datachannel", "vp8channel", "videochannel", "seichannel")
 OLCRTC_CARRIER_LABELS = ("Яндекс Телемост", "Jitsi Meet", "WB Stream") #валбериз звонки прокси чзх???
 OLCRTC_TRANSPORT_LABELS = ("Data-канал", "VP8-канал", "Видео-канал", "SEI-канал")
 AWG_FILE_PICKER_REQ = 13371
+GREENPASS_IMPORT_FILE_PICKER_REQ = 13372
+GREENPASS_EXPORT_FILE_NAME = "export.greenpass"
+GREENPASS_EXPORT_FORMAT = "greenpass_export_v1"
 VLESS_TEST_TARGETS = [
     ("149.154.167.51", 443),
     ("1.1.1.1", 443),
@@ -4883,11 +4891,15 @@ class _AwgActivityResultHook(MethodHook):
             req_code = int(param.args[0])
             res_code = int(param.args[1])
             data = param.args[2]
-            if req_code != int(AWG_FILE_PICKER_REQ) or res_code != -1 or data is None:
+            if res_code != -1 or data is None:
                 return
             uri = data.getData()
-            if uri is not None:
+            if uri is None:
+                return
+            if req_code == int(AWG_FILE_PICKER_REQ):
                 self._plugin._process_awg_file_uri(uri)
+            elif req_code == int(GREENPASS_IMPORT_FILE_PICKER_REQ):
+                self._plugin._process_greenpass_import_file_uri(uri)
         except:
             pass
 
@@ -5064,6 +5076,32 @@ class _BindVlessTextLinksHook(MethodHook):
         except:
             pass
 
+
+class _GreenPassOpenForViewHook(MethodHook):
+    def __init__(self, plugin):
+        self._plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self._plugin._active:
+                return
+            if not param.args:
+                return
+            message_object = param.args[0]
+            if message_object is None:
+                return
+            if self._plugin._handle_greenpass_file_open(message_object):
+                try:
+                    param.setResult(False)
+                except:
+                    try:
+                        param.result = False
+                    except:
+                        pass
+        except:
+            pass
+
+
 class SafeBypassPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -5089,6 +5127,12 @@ class SafeBypassPlugin(BasePlugin):
         self._browser_vless_hook_installed = False
         self._text_vless_hook_installed = False
         self._cell_vless_hook_installed = False
+        self._greenpass_file_hook_installed = False
+        self._plugin_proxy_python_patch_installed = False
+        self._plugin_proxy_originals = {}
+        self._plugin_proxy_frida_registered = False
+        self._plugin_proxy_frida_endpoint_key = ""
+        self._plugin_proxy_last_error = ""
 
         self._last_proxy_sponsor_hide = 0
         self._last_provider_name = ""
@@ -5349,6 +5393,394 @@ class SafeBypassPlugin(BasePlugin):
                 pass
         except Exception as e:
             print(f"Error saving config: {e}")
+
+    def _greenpass_settings_keys(self):
+        return (
+            "use_proxy",
+            "proxy_calls_via_proxy",
+            "dont_use_with_vpn",
+            "proxy_plugins_via_greenpass",
+            "proxy_provider_auto",
+            "proxy_provider",
+            "vless_provider",
+            "tgjiv_source_url",
+            "tgjiv_cookie_header",
+            "tgjiv_user_agent",
+            "olcrtc_carrier",
+            "olcrtc_transport",
+            "olcrtc_room_id",
+            "olcrtc_client_id",
+            "olcrtc_key_hex",
+            "hardcoded_proxies_text",
+        )
+
+    def _greenpass_export_settings(self):
+        settings = {}
+        for key in self._greenpass_settings_keys():
+            try:
+                settings[str(key)] = self.get_setting(str(key), None)
+            except:
+                pass
+        try:
+            settings["use_proxy"] = bool(self._desired_use_proxy)
+        except:
+            pass
+        return settings
+
+    def _greenpass_current_config_snapshot(self):
+        try:
+            self._save_config()
+        except:
+            pass
+        try:
+            if os.path.exists(self._config_file):
+                with open(self._config_file, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except:
+            pass
+        return {
+            "server": self._current_server,
+            "port": self._current_port,
+            "secret": self._current_secret,
+            "last_provider_name": self._last_provider_name,
+            "connection_mode": str(self._connection_mode or "proxy"),
+            "desired_use_proxy": bool(self._desired_use_proxy),
+            "proxy_suspended_by_vpn": bool(self._proxy_suspended_by_vpn),
+            "awg_data": {
+                "conf_name": str(self._awg_conf_name or ""),
+                "conf_content": str(self._awg_conf_content or ""),
+            },
+            "vless_data": self._vless_data,
+            "olcrtc_data": {
+                "profiles": self._sanitize_olcrtc_profiles(self._olcrtc_profiles),
+                "active_profile_id": str(self._olcrtc_active_profile_id or ""),
+            },
+            "plugin_proxy_state": self._proxy_state,
+            "hot_proxy_cache": self._sanitize_hot_proxy_cache(self._hot_proxy_cache),
+            "last_working_proxy": self._normalize_proxy_dict(self._last_working_proxy),
+        }
+
+    def _greenpass_export_payload(self):
+        return {
+            "format": GREENPASS_EXPORT_FORMAT,
+            "plugin_id": str(__id__),
+            "plugin_version": str(__version__),
+            "exported_at": int(time.time()),
+            "config": self._greenpass_current_config_snapshot(),
+            "settings": self._greenpass_export_settings(),
+        }
+
+    def _greenpass_export_bytes(self):
+        raw = json.dumps(self._greenpass_export_payload(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return gzip.compress(raw)
+
+    def _greenpass_export_file_path(self):
+        try:
+            base_dir = os.path.dirname(os.path.abspath(str(self._config_file or "")))
+        except:
+            base_dir = ""
+        if not base_dir:
+            try:
+                base_dir = os.path.abspath(str(self._vless_dir or ""))
+            except:
+                base_dir = ""
+        if base_dir:
+            try:
+                if not os.path.exists(base_dir):
+                    os.makedirs(base_dir)
+            except:
+                pass
+            return os.path.join(base_dir, GREENPASS_EXPORT_FILE_NAME)
+        return GREENPASS_EXPORT_FILE_NAME
+
+    def _export_settings_to_favorites(self):
+        def _worker():
+            try:
+                file_path = self._greenpass_export_file_path()
+                payload = self._greenpass_export_bytes()
+                with open(file_path, "wb") as f:
+                    f.write(payload)
+                account = UserConfig.selectedAccount
+                user_id = UserConfig.getInstance(account).getClientUserId()
+
+                def _send():
+                    try:
+                        send_document(user_id, file_path, caption=GREENPASS_EXPORT_FILE_NAME)
+                        BulletinHelper.show_success("Экспорт отправлен")
+                    except Exception as send_exc:
+                        BulletinHelper.show_error("Ошибка отправки: %s" % str(send_exc))
+
+                run_on_ui_thread(_send)
+            except Exception as exc:
+                err_text = str(exc)
+                run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка экспорта: %s" % err_text))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _current_activity(self):
+        activity = None
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                activity = fragment.getParentActivity()
+        except:
+            activity = None
+        if activity is None:
+            try:
+                AU = find_class("org.telegram.messenger.AndroidUtilities")
+                activity = AU.getActivity()
+            except:
+                activity = None
+        return activity
+
+    def _open_greenpass_import_file_picker(self):
+        try:
+            Intent = jclass("android.content.Intent") if jclass is not None else find_class("android.content.Intent")
+            intent = Intent(Intent.ACTION_GET_CONTENT)
+            intent.setType("*/*")
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            activity = self._current_activity()
+            if activity is not None:
+                activity.startActivityForResult(intent, int(GREENPASS_IMPORT_FILE_PICKER_REQ))
+            else:
+                BulletinHelper.show_error("Не удалось открыть файл")
+        except Exception as exc:
+            BulletinHelper.show_error("Ошибка выбора: %s" % str(exc))
+
+    def _read_greenpass_import_uri_bytes(self, uri):
+        activity = self._current_activity()
+        if activity is None:
+            raise Exception("activity is missing")
+        resolver = activity.getContentResolver()
+        stream = None
+        out = None
+        try:
+            ByteArrayOutputStream = jclass("java.io.ByteArrayOutputStream") if jclass is not None else find_class("java.io.ByteArrayOutputStream")
+            stream = resolver.openInputStream(uri)
+            if stream is None:
+                raise Exception("stream is missing")
+            out = ByteArrayOutputStream()
+            try:
+                from java import jarray, jbyte
+                buffer = jarray(jbyte)(8192)
+            except:
+                buffer = None
+            if buffer is None:
+                value = int(stream.read())
+                while value != -1:
+                    out.write(value)
+                    value = int(stream.read())
+            else:
+                read_count = int(stream.read(buffer))
+                while read_count != -1:
+                    if read_count > 0:
+                        out.write(buffer, 0, read_count)
+                    read_count = int(stream.read(buffer))
+            arr = out.toByteArray()
+            return bytes([(int(arr[i]) + 256) % 256 for i in range(len(arr))])
+        finally:
+            try:
+                if out is not None:
+                    out.close()
+            except:
+                pass
+            try:
+                if stream is not None:
+                    stream.close()
+            except:
+                pass
+
+    def _decode_greenpass_export_bytes(self, raw_bytes):
+        decoded = gzip.decompress(bytes(raw_bytes))
+        payload = json.loads(decoded.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise Exception("bad export")
+        if str(payload.get("format", "") or "") != GREENPASS_EXPORT_FORMAT:
+            raise Exception("bad format")
+        if not isinstance(payload.get("config", None), dict):
+            raise Exception("missing config")
+        settings = payload.get("settings", {})
+        if settings is not None and not isinstance(settings, dict):
+            raise Exception("bad settings")
+        return payload
+
+    def _process_greenpass_import_bytes(self, raw):
+        payload = self._decode_greenpass_export_bytes(raw)
+        self._apply_greenpass_import_payload(payload)
+
+    def _process_greenpass_import_file_path(self, file_path):
+        try:
+            with open(str(file_path), "rb") as f:
+                raw = f.read()
+            self._process_greenpass_import_bytes(raw)
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Импорт выполнен"))
+        except Exception as exc:
+            err_text = str(exc)
+            run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка импорта: %s" % err_text))
+
+    def _apply_greenpass_import_payload(self, payload):
+        config = payload.get("config", {})
+        settings = payload.get("settings", {}) or {}
+        if not isinstance(config, dict):
+            raise Exception("missing config")
+        self._atomic_write_json(self._config_file, config)
+        try:
+            self._atomic_write_json(self._config_file + ".bak", config)
+        except:
+            pass
+        self._load_config()
+        for key in self._greenpass_settings_keys():
+            if key in settings:
+                try:
+                    self._set_setting_value(key, settings.get(key), reload_settings=False)
+                except:
+                    pass
+        try:
+            desired = bool(settings.get("use_proxy", config.get("desired_use_proxy", False)))
+        except:
+            desired = bool(getattr(self, "_desired_use_proxy", False))
+        self._on_use_proxy_changed(desired)
+        try:
+            self._sync_plugin_proxy_bridge()
+        except:
+            pass
+        self._refresh_settings_without_reopen()
+
+    def _process_greenpass_import_file_uri(self, uri):
+        try:
+            raw = self._read_greenpass_import_uri_bytes(uri)
+            self._process_greenpass_import_bytes(raw)
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Импорт выполнен"))
+        except Exception as exc:
+            err_text = str(exc)
+            run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка импорта: %s" % err_text))
+
+    def _greenpass_document_name(self, message_object):
+        try:
+            name = message_object.getDocumentName()
+            if name:
+                return str(name)
+        except:
+            pass
+        try:
+            doc = message_object.getDocument()
+        except:
+            doc = None
+        try:
+            attrs = getattr(doc, "attributes", None)
+            if attrs is not None:
+                for attr in list(attrs or []):
+                    try:
+                        file_name = str(getattr(attr, "file_name", "") or "")
+                    except:
+                        file_name = ""
+                    if file_name:
+                        return file_name
+        except:
+            pass
+        return ""
+
+    def _is_greenpass_export_file_name(self, name):
+        try:
+            return str(name or "").strip().lower().endswith(".greenpass")
+        except:
+            return False
+
+    def _greenpass_message_file_path(self, message_object):
+        try:
+            ChatUtils = jclass("com.exteragram.messenger.utils.chats.ChatUtils") if jclass is not None else find_class("com.exteragram.messenger.utils.chats.ChatUtils")
+            path = ChatUtils.getInstance().getPathToMessage(message_object)
+            if path:
+                return str(path)
+        except:
+            pass
+        try:
+            owner = getattr(message_object, "messageOwner", None)
+            media = getattr(owner, "media", None) if owner is not None else None
+            doc = getattr(media, "document", None) if media is not None else None
+            local_path = str(getattr(doc, "localPath", "") or "")
+            if local_path:
+                return local_path
+        except:
+            pass
+        try:
+            doc = message_object.getDocument()
+            if doc is not None and hasattr(doc, "getPathName"):
+                path = doc.getPathName()
+                if path:
+                    return str(path)
+        except:
+            pass
+        try:
+            doc = message_object.getDocument()
+            if doc is not None and hasattr(doc, "getLocalPath"):
+                path = doc.getLocalPath()
+                if path:
+                    return str(path)
+        except:
+            pass
+        try:
+            FileLoader = jclass("org.telegram.messenger.FileLoader") if jclass is not None else find_class("org.telegram.messenger.FileLoader")
+            doc = message_object.getDocument()
+            if doc is not None:
+                path_obj = FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(doc, True)
+                if path_obj:
+                    return str(path_obj.getAbsolutePath() if hasattr(path_obj, "getAbsolutePath") else path_obj)
+        except:
+            pass
+        return ""
+
+    def _confirm_greenpass_file_import(self, file_path, display_name=""):
+        activity = self._current_activity()
+        if activity is None:
+            BulletinHelper.show_error("Не удалось открыть импорт")
+            return
+        try:
+            name = str(display_name or GREENPASS_EXPORT_FILE_NAME)
+        except:
+            name = GREENPASS_EXPORT_FILE_NAME
+        try:
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Импорт GreenPass")
+            builder.set_message("Импортировать настройки из %s?\nТекущие настройки будут заменены." % name)
+
+            def _on_yes(dlg, which):
+                try:
+                    dlg.dismiss()
+                except:
+                    pass
+                self._process_greenpass_import_file_path(file_path)
+
+            def _on_no(dlg, which):
+                try:
+                    dlg.dismiss()
+                except:
+                    pass
+
+            builder.set_positive_button("Импортировать", _on_yes)
+            builder.set_negative_button("Отмена", _on_no)
+            builder.show()
+        except Exception as exc:
+            BulletinHelper.show_error("Ошибка импорта: %s" % str(exc))
+
+    def _handle_greenpass_file_open(self, message_object):
+        name = self._greenpass_document_name(message_object)
+        if not self._is_greenpass_export_file_name(name):
+            return False
+        file_path = self._greenpass_message_file_path(message_object)
+        if not file_path:
+            BulletinHelper.show_info("Сначала скачайте файл")
+            return True
+        try:
+            if not os.path.exists(str(file_path)):
+                BulletinHelper.show_info("Сначала скачайте файл")
+                return True
+        except:
+            pass
+        run_on_ui_thread(lambda file_path=file_path, name=name: self._confirm_greenpass_file_import(file_path, name))
+        return True
 
     def _plugin_runtime_path(self):
         try:
@@ -6625,6 +7057,480 @@ class SafeBypassPlugin(BasePlugin):
         except:
             return "", 0
 
+    def _get_plugins_proxy_enabled(self):
+        try:
+            return bool(self.get_setting("proxy_plugins_via_greenpass", False))
+        except:
+            return False
+
+    def _on_plugins_proxy_changed(self, enabled):
+        val = bool(enabled)
+        try:
+            self.set_setting("proxy_plugins_via_greenpass", val, reload_settings=False)
+        except:
+            pass
+        self._sync_plugin_proxy_bridge()
+        self._refresh_settings_without_reopen()
+
+    def _plugin_proxy_endpoint(self):
+        if not bool(self._get_plugins_proxy_enabled()):
+            self._plugin_proxy_last_error = ""
+            return None
+        if not bool(self._is_plugin_proxy_enabled()):
+            self._plugin_proxy_last_error = "GreenPass proxy is off"
+            return None
+
+        mode = self._get_connection_mode()
+        if mode == TGWS_KIND:
+            self._plugin_proxy_last_error = "TGWS is Telegram-only"
+            return None
+
+        owner, local_port = self._local_socks_owner_snapshot()
+        local_sources = {
+            VLESS_KIND: (bool(self._vless_running), int(self._vless_port or 0)),
+            AWG_KIND: (bool(self._awg_running), int(self._awg_port or 0)),
+            OLCRTC_KIND: (bool(self._olcrtc_running), int(self._olcrtc_port or 0)),
+        }
+        if mode in local_sources:
+            running, port = local_sources.get(mode)
+            if owner == mode and int(local_port or 0) > 0:
+                port = int(local_port)
+            if running and port > 0:
+                self._plugin_proxy_last_error = ""
+                return {
+                    "host": VLESS_LOCAL_HOST,
+                    "port": int(port),
+                    "username": "",
+                    "password": "",
+                    "source": str(mode),
+                }
+            self._plugin_proxy_last_error = "SOCKS is not ready"
+            return None
+
+        try:
+            enabled = bool(SharedConfig.isProxyEnabled())
+        except:
+            try:
+                enabled = bool(MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled", False))
+            except:
+                enabled = False
+        if not enabled:
+            self._plugin_proxy_last_error = "Telegram proxy is off"
+            return None
+
+        try:
+            proxy = SharedConfig.currentProxy
+        except:
+            proxy = None
+        if proxy is None:
+            self._plugin_proxy_last_error = "No active proxy"
+            return None
+
+        try:
+            secret = str(getattr(proxy, "secret", "") or "")
+            if secret:
+                self._plugin_proxy_last_error = "MTProto is Telegram-only"
+                return None
+            host = str(getattr(proxy, "address", "") or "").strip()
+            port = int(getattr(proxy, "port", 0) or 0)
+            if not host or port <= 0:
+                self._plugin_proxy_last_error = "No SOCKS endpoint"
+                return None
+            self._plugin_proxy_last_error = ""
+            return {
+                "host": host,
+                "port": port,
+                "username": str(getattr(proxy, "username", "") or ""),
+                "password": str(getattr(proxy, "password", "") or ""),
+                "source": "proxy",
+            }
+        except:
+            self._plugin_proxy_last_error = "Bad SOCKS endpoint"
+            return None
+
+    def _plugin_proxy_endpoint_key(self, endpoint=None):
+        ep = endpoint if endpoint is not None else self._plugin_proxy_endpoint()
+        if not ep:
+            return ""
+        try:
+            return "%s:%s:%s:%s" % (
+                str(ep.get("source", "") or ""),
+                str(ep.get("host", "") or ""),
+                int(ep.get("port", 0) or 0),
+                "auth" if (ep.get("username") or ep.get("password")) else "noauth",
+            )
+        except:
+            return ""
+
+    def _plugin_proxy_url(self, endpoint=None):
+        ep = endpoint if endpoint is not None else self._plugin_proxy_endpoint()
+        if not ep:
+            return ""
+        try:
+            host = str(ep.get("host", "") or "")
+            port = int(ep.get("port", 0) or 0)
+            user = str(ep.get("username", "") or "")
+            password = str(ep.get("password", "") or "")
+            auth = ""
+            if user or password:
+                auth = "%s:%s@" % (
+                    urllib.parse.quote(user, safe=""),
+                    urllib.parse.quote(password, safe=""),
+                )
+            return "socks5h://%s%s:%s" % (auth, host, port)
+        except:
+            return ""
+
+    def _install_plugin_proxy_api(self):
+        module = sys.modules.get(GREENPASS_PROXY_API_MODULE)
+        if module is None:
+            module = types.ModuleType(GREENPASS_PROXY_API_MODULE)
+            sys.modules[GREENPASS_PROXY_API_MODULE] = module
+        module._plugin = self
+
+        def _current():
+            plugin = getattr(module, "_plugin", None)
+            if plugin is None:
+                raise RuntimeError("GreenPass plugin is not loaded")
+            return plugin
+
+        def endpoint():
+            ep = _current()._plugin_proxy_endpoint()
+            return dict(ep or {})
+
+        def is_available():
+            return bool(_current()._plugin_proxy_endpoint())
+
+        def requests_proxies():
+            url = _current()._plugin_proxy_url()
+            if not url:
+                return {}
+            return {"http": url, "https": url}
+
+        def status():
+            plugin = _current()
+            ep = plugin._plugin_proxy_endpoint()
+            return {
+                "enabled": bool(plugin._get_plugins_proxy_enabled()),
+                "available": bool(ep),
+                "endpoint": dict(ep or {}),
+                "proxy_url": plugin._plugin_proxy_url(ep),
+                "error": str(plugin._plugin_proxy_last_error or ""),
+            }
+
+        module.endpoint = endpoint
+        module.is_available = is_available
+        module.requests_proxies = requests_proxies
+        module.status = status
+        module.API_VERSION = 1
+        return module
+
+    def _plugin_proxy_should_bypass_host(self, host, endpoint=None):
+        try:
+            h = str(host or "").strip().strip("[]").lower()
+        except:
+            h = ""
+        if not h:
+            return True
+        if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return True
+        if h.startswith("127."):
+            return True
+        try:
+            ep_host = str((endpoint or {}).get("host", "") or "").strip().strip("[]").lower()
+            if ep_host and h == ep_host:
+                return True
+        except:
+            pass
+        return False
+
+    def _plugin_proxy_is_greenpass_call(self):
+        try:
+            target = os.path.abspath(str(self._plugin_file_path or "")).replace("\\", "/").lower()
+        except:
+            target = ""
+        try:
+            target_name = os.path.basename(target)
+        except:
+            target_name = ""
+        if not target and not target_name:
+            return False
+
+        ignored = {
+            "_plugin_proxy_is_greenpass_call",
+            "patched_socket_create_connection",
+            "patched_urllib3_create_connection",
+            "_plugin_proxy_socks_create_connection",
+            "_plugin_proxy_recv_exact",
+        }
+        try:
+            frame = sys._getframe(1)
+        except:
+            frame = None
+
+        depth = 0
+        while frame is not None and depth < 48:
+            try:
+                code = frame.f_code
+                name = str(code.co_name or "")
+                filename = os.path.abspath(str(code.co_filename or "")).replace("\\", "/").lower()
+                filename_name = os.path.basename(filename)
+                if name not in ignored and ((target and filename == target) or (target_name and filename_name == target_name)):
+                    return True
+            except:
+                pass
+            try:
+                frame = frame.f_back
+            except:
+                frame = None
+            depth += 1
+        return False
+
+    def _plugin_proxy_recv_exact(self, sock, size):
+        chunks = []
+        remain = int(size or 0)
+        while remain > 0:
+            chunk = sock.recv(remain)
+            if not chunk:
+                raise OSError("SOCKS proxy closed")
+            chunks.append(chunk)
+            remain -= len(chunk)
+        return b"".join(chunks)
+
+    def _plugin_proxy_socks_create_connection(self, endpoint, address, timeout=None, source_address=None):
+        host, port = address
+        proxy_host = str(endpoint.get("host", "") or "")
+        proxy_port = int(endpoint.get("port", 0) or 0)
+        if not proxy_host or proxy_port <= 0:
+            raise OSError("GreenPass SOCKS endpoint is unavailable")
+
+        original = self._plugin_proxy_originals.get("socket.create_connection") or socket.create_connection
+        sock = original((proxy_host, proxy_port), timeout, source_address)
+        try:
+            user = str(endpoint.get("username", "") or "")
+            password = str(endpoint.get("password", "") or "")
+            if user or password:
+                sock.sendall(b"\x05\x01\x02")
+                reply = self._plugin_proxy_recv_exact(sock, 2)
+                if reply != b"\x05\x02":
+                    raise OSError("SOCKS auth method rejected")
+                ub = user.encode("utf-8")[:255]
+                pb = password.encode("utf-8")[:255]
+                sock.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
+                auth = self._plugin_proxy_recv_exact(sock, 2)
+                if len(auth) != 2 or auth[1] != 0:
+                    raise OSError("SOCKS auth rejected")
+            else:
+                sock.sendall(b"\x05\x01\x00")
+                reply = self._plugin_proxy_recv_exact(sock, 2)
+                if reply != b"\x05\x00":
+                    raise OSError("SOCKS no-auth rejected")
+
+            try:
+                addr = socket.inet_pton(socket.AF_INET, str(host))
+                atyp = b"\x01"
+                host_part = addr
+            except:
+                try:
+                    addr = socket.inet_pton(socket.AF_INET6, str(host))
+                    atyp = b"\x04"
+                    host_part = addr
+                except:
+                    hb = str(host).encode("idna")[:255]
+                    atyp = b"\x03"
+                    host_part = bytes([len(hb)]) + hb
+
+            req = b"\x05\x01\x00" + atyp + host_part + struct.pack("!H", int(port) & 0xFFFF)
+            sock.sendall(req)
+            head = self._plugin_proxy_recv_exact(sock, 4)
+            if len(head) != 4 or head[1] != 0:
+                code = head[1] if len(head) > 1 else 0xFF
+                raise OSError("SOCKS connect failed: 0x%02x" % code)
+            atyp = head[3]
+            if atyp == 1:
+                self._plugin_proxy_recv_exact(sock, 4)
+            elif atyp == 3:
+                ln = self._plugin_proxy_recv_exact(sock, 1)[0]
+                self._plugin_proxy_recv_exact(sock, ln)
+            elif atyp == 4:
+                self._plugin_proxy_recv_exact(sock, 16)
+            else:
+                raise OSError("SOCKS reply has invalid address type")
+            self._plugin_proxy_recv_exact(sock, 2)
+            return sock
+        except:
+            try:
+                sock.close()
+            except:
+                pass
+            raise
+
+    def _install_python_http_proxy_patch(self):
+        if self._plugin_proxy_python_patch_installed:
+            return True
+        endpoint = self._plugin_proxy_endpoint()
+        if not endpoint:
+            return False
+
+        plugin = self
+        originals = self._plugin_proxy_originals
+        originals["socket.create_connection"] = socket.create_connection
+
+        def patched_socket_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *args, **kwargs):
+            ep = plugin._plugin_proxy_endpoint()
+            try:
+                host = address[0]
+            except:
+                host = ""
+            if ep and not plugin._plugin_proxy_is_greenpass_call() and not plugin._plugin_proxy_should_bypass_host(host, ep):
+                return plugin._plugin_proxy_socks_create_connection(ep, address, timeout, source_address)
+            return originals["socket.create_connection"](address, timeout, source_address, *args, **kwargs)
+
+        socket.create_connection = patched_socket_create_connection
+
+        try:
+            import urllib3.util.connection as urllib3_connection
+            originals["urllib3.util.connection.create_connection"] = urllib3_connection.create_connection
+
+            def patched_urllib3_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, socket_options=None):
+                ep = plugin._plugin_proxy_endpoint()
+                try:
+                    host = address[0]
+                except:
+                    host = ""
+                if ep and not plugin._plugin_proxy_is_greenpass_call() and not plugin._plugin_proxy_should_bypass_host(host, ep):
+                    conn = plugin._plugin_proxy_socks_create_connection(ep, address, timeout, source_address)
+                    try:
+                        for opt in list(socket_options or []):
+                            conn.setsockopt(*opt)
+                    except:
+                        pass
+                    return conn
+                return originals["urllib3.util.connection.create_connection"](address, timeout, source_address, socket_options)
+
+            urllib3_connection.create_connection = patched_urllib3_create_connection
+        except:
+            pass
+
+        self._plugin_proxy_python_patch_installed = True
+        return True
+
+    def _remove_python_http_proxy_patch(self):
+        if not self._plugin_proxy_python_patch_installed:
+            return
+        originals = self._plugin_proxy_originals
+        try:
+            original = originals.get("socket.create_connection")
+            if original is not None:
+                socket.create_connection = original
+        except:
+            pass
+        try:
+            original = originals.get("urllib3.util.connection.create_connection")
+            if original is not None:
+                import urllib3.util.connection as urllib3_connection
+                urllib3_connection.create_connection = original
+        except:
+            pass
+        self._plugin_proxy_python_patch_installed = False
+
+    def _frida_plugin_proxy_script(self, endpoint):
+        host = str(endpoint.get("host", "") or "")
+        port = int(endpoint.get("port", 0) or 0)
+        return """
+Java.perform(function () {
+  var HOST = %s;
+  var PORT = %s;
+  var URL = Java.use('java.net.URL');
+  var Proxy = Java.use('java.net.Proxy');
+  var ProxyType = Java.use('java.net.Proxy$Type');
+  var InetSocketAddress = Java.use('java.net.InetSocketAddress');
+  var System = Java.use('java.lang.System');
+  var proxy = Proxy.$new(ProxyType.valueOf('SOCKS'), InetSocketAddress.$new(HOST, PORT));
+
+  function bypass(host) {
+    host = String(host || '').toLowerCase();
+    return !host || host === 'localhost' || host === '127.0.0.1' || host === '::1' ||
+      host.indexOf('127.') === 0 || host === String(HOST).toLowerCase();
+  }
+
+  System.setProperty('socksProxyHost', HOST);
+  System.setProperty('socksProxyPort', String(PORT));
+
+  var openNoProxy = URL.openConnection.overload();
+  var openWithProxy = URL.openConnection.overload('java.net.Proxy');
+  openNoProxy.implementation = function () {
+    var host = '';
+    try { host = String(this.getHost() || ''); } catch (_) {}
+    if (bypass(host)) {
+      return openNoProxy.call(this);
+    }
+    return openWithProxy.call(this, proxy);
+  };
+
+  fridaGadget.log('GreenPass plugin proxy active', HOST + ':' + PORT);
+  fridaGadget.onDispose(function () {
+    try {
+      System.clearProperty('socksProxyHost');
+      System.clearProperty('socksProxyPort');
+    } catch (_) {}
+  });
+});
+""" % (json.dumps(host), int(port))
+
+    def _register_frida_plugin_proxy_hook(self, endpoint=None):
+        ep = endpoint if endpoint is not None else self._plugin_proxy_endpoint()
+        if not ep:
+            return False
+        key = self._plugin_proxy_endpoint_key(ep)
+        try:
+            import frida_gadget_api
+        except Exception:
+            self._plugin_proxy_frida_registered = False
+            return False
+        try:
+            if self._plugin_proxy_frida_registered and self._plugin_proxy_frida_endpoint_key == key:
+                if hasattr(frida_gadget_api, "set_plugin_active"):
+                    frida_gadget_api.set_plugin_active(GREENPASS_PLUGIN_PROXY_FRIDA_ID, True, reason="greenpass_proxy", autoload=True)
+                return True
+            result = frida_gadget_api.register_script(
+                GREENPASS_PLUGIN_PROXY_FRIDA_ID,
+                self._frida_plugin_proxy_script(ep),
+                name=GREENPASS_PLUGIN_PROXY_NAME,
+                replace=True,
+                autoload=True,
+            )
+            self._plugin_proxy_frida_registered = bool(result.get("ok", True))
+            self._plugin_proxy_frida_endpoint_key = key
+            return bool(self._plugin_proxy_frida_registered)
+        except Exception as exc:
+            self._plugin_proxy_frida_registered = False
+            self._plugin_proxy_last_error = str(exc)[:180]
+            return False
+
+    def _deactivate_frida_plugin_proxy_hook(self):
+        try:
+            import frida_gadget_api
+            if hasattr(frida_gadget_api, "set_plugin_active"):
+                frida_gadget_api.set_plugin_active(GREENPASS_PLUGIN_PROXY_FRIDA_ID, False, reason="greenpass_proxy_off", autoload=True)
+        except:
+            pass
+        self._plugin_proxy_frida_registered = False
+        self._plugin_proxy_frida_endpoint_key = ""
+
+    def _sync_plugin_proxy_bridge(self):
+        try:
+            self._install_plugin_proxy_api()
+        except:
+            pass
+        endpoint = self._plugin_proxy_endpoint()
+        if bool(endpoint):
+            self._install_python_http_proxy_patch()
+            self._register_frida_plugin_proxy_hook(endpoint)
+        else:
+            self._remove_python_http_proxy_patch()
+            self._deactivate_frida_plugin_proxy_hook()
+
     def _proxy_key(self, server, port, secret, username="", password=""):
         try:
             srv = str(server or "")
@@ -6995,19 +7901,26 @@ class SafeBypassPlugin(BasePlugin):
             except:
                 pass
             try:
-                inst = self._plugins_controller_instance()
-                pid = self._plugin_settings_id()
-                if inst is not None and pid:
-                    inst.loadPluginSettings(pid)
-            except:
-                pass
-
-            try:
                 frag = get_last_fragment()
             except:
                 frag = None
+
+            def _fallback_full_reload():
+                try:
+                    inst = self._plugins_controller_instance()
+                    pid = self._plugin_settings_id()
+                    if inst is not None and pid:
+                        inst.loadPluginSettings(pid)
+                        return
+                except:
+                    pass
+                try:
+                    self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                except:
+                    pass
+
             if frag is None:
-                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                _fallback_full_reload()
                 return
 
             try:
@@ -7017,7 +7930,7 @@ class SafeBypassPlugin(BasePlugin):
                 cls = None
                 frag_name = ""
             if frag_name != "com.exteragram.messenger.plugins.ui.PluginSettingsActivity" or cls is None:
-                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                _fallback_full_reload()
                 return
 
             try:
@@ -7028,7 +7941,7 @@ class SafeBypassPlugin(BasePlugin):
             except:
                 frag_pid = ""
             if frag_pid != str(self._plugin_settings_id() or ""):
-                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                _fallback_full_reload()
                 return
 
             try:
@@ -7059,7 +7972,7 @@ class SafeBypassPlugin(BasePlugin):
             except:
                 list_view = None
             if list_view is None:
-                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                _fallback_full_reload()
                 return
 
             try:
@@ -7067,7 +7980,7 @@ class SafeBypassPlugin(BasePlugin):
             except:
                 adapter = None
             if adapter is None:
-                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                _fallback_full_reload()
                 return
 
             try:
@@ -7084,7 +7997,7 @@ class SafeBypassPlugin(BasePlugin):
                         return
                     except:
                         pass
-                self._set_setting_value("__reload__", time.time(), reload_settings=True)
+                _fallback_full_reload()
 
         try:
             run_on_ui_thread(_run, int(delay_ms))
@@ -7469,6 +8382,10 @@ class SafeBypassPlugin(BasePlugin):
         except:
             _notify()
         _append_awg_debug("apply_local_socks_proxy done enable=%s port=%s" % (bool(enable), int(port or 0)))
+        try:
+            self._sync_plugin_proxy_bridge()
+        except:
+            pass
         return True
 
     def _vless_apply_tg_proxy(self, port, enable):
@@ -8895,7 +9812,7 @@ class SafeBypassPlugin(BasePlugin):
         self._ensure_awg_core_then(self._awg_connect)
         self._refresh_settings_without_reopen()
 
-    def _activate_vless_uri(self, uri, enable_plugin=True):
+    def _activate_vless_uri(self, uri, enable_plugin=True, reload_settings=True):
         node = self._add_vless_manual_node(uri)
         if not node:
             BulletinHelper.show_error("Неверная ссылка")
@@ -8933,7 +9850,8 @@ class SafeBypassPlugin(BasePlugin):
                 pass
 
         self._ensure_vless_core_then(self._vless_connect)
-        self._refresh_settings_without_reopen()
+        if bool(reload_settings):
+            self._refresh_settings_without_reopen()
 
     def _add_vless_subscription(self, url, activate_first=False):
         target = str(url or "").strip()
@@ -10340,6 +11258,7 @@ class SafeBypassPlugin(BasePlugin):
 
     def on_plugin_load(self):
         self._active = True
+        self._install_plugin_proxy_api()
 
         try:
             self.add_menu_item(
@@ -10376,9 +11295,11 @@ class SafeBypassPlugin(BasePlugin):
         self._install_browser_vless_hook()
         self._install_text_vless_hook()
         self._install_cell_vless_hook()
+        self._install_greenpass_file_open_hook()
         self._load_rat_guard_module()
         self._refresh_current_dialogs_proxy_button()
         self._start_thread()
+        self._sync_plugin_proxy_bridge()
 
         if (not self._proxy_suspended_by_vpn) and self._is_plugin_proxy_enabled() and self._is_vless_mode_selected():
             self._ensure_vless_core_then(self._vless_connect)
@@ -10502,6 +11423,24 @@ class SafeBypassPlugin(BasePlugin):
                 pass
 
         self._cell_vless_hook_installed = bool(installed)
+
+    def _install_greenpass_file_open_hook(self):
+        if self._greenpass_file_hook_installed:
+            return
+        try:
+            AU = find_class("org.telegram.messenger.AndroidUtilities")
+        except:
+            AU = None
+        if AU is None:
+            return
+        try:
+            self.hook_all_methods(AU, "openForView", _GreenPassOpenForViewHook(self))
+            self._greenpass_file_hook_installed = True
+        except Exception as e:
+            try:
+                Logger.e("Ошибка хука .greenpass", e)
+            except:
+                pass
 
     def _apply_vless_clickable_spans(self, target):
         if target is None:
@@ -11802,6 +12741,10 @@ class SafeBypassPlugin(BasePlugin):
                 self._proxy_suspended_by_vpn = True
                 self._save_config()
                 run_on_ui_thread(lambda: BulletinHelper.show_info("VPN активен — прокси приостановлен"))
+                try:
+                    self._sync_plugin_proxy_bridge()
+                except:
+                    pass
                 self._refresh_settings_without_reopen()
                 self._refresh_current_dialogs_proxy_button()
                 return
@@ -11853,6 +12796,10 @@ class SafeBypassPlugin(BasePlugin):
             except:
                 pass
 
+        try:
+            self._sync_plugin_proxy_bridge()
+        except:
+            pass
         self._refresh_settings_without_reopen()
         self._refresh_current_dialogs_proxy_button()
 
@@ -11906,6 +12853,14 @@ class SafeBypassPlugin(BasePlugin):
             pass
         try:
             self._release_all_proxy_transition_killswitches()
+        except:
+            pass
+        try:
+            self._remove_python_http_proxy_patch()
+        except:
+            pass
+        try:
+            self._deactivate_frida_plugin_proxy_hook()
         except:
             pass
         try:
@@ -11964,6 +12919,7 @@ class SafeBypassPlugin(BasePlugin):
             self._install_browser_vless_hook()
             self._install_text_vless_hook()
             self._install_cell_vless_hook()
+            self._install_greenpass_file_open_hook()
             self._refresh_current_dialogs_proxy_button()
 
             was_backgrounded = bool(getattr(self, "_tgws_backgrounded", False))
@@ -12902,6 +13858,10 @@ class SafeBypassPlugin(BasePlugin):
             try: NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged)
             except: pass
 
+            try:
+                self._sync_plugin_proxy_bridge()
+            except:
+                pass
             return True
             
         except Exception as e:
@@ -13403,9 +14363,67 @@ class SafeBypassPlugin(BasePlugin):
             ))
         return items
 
+    def _create_active_mode_subpage(self):
+        mode = self._get_connection_mode()
+        title = self._settings_mode_title(mode)
+        items = [Header(text=title)]
+        items.extend(self._safe_settings_items(title, self._build_active_mode_items))
+        items.append(Divider())
+        items.append(Text(
+            text="Сменить режим",
+            icon="msg_list",
+            on_click=lambda *a: self._open_mode_picker(),
+        ))
+        return items
+
+    def _create_greenpass_extra_subpage(self):
+        calls_pref = bool(self._get_calls_proxy_preference())
+        return [
+            Header(text="Дополнительно"),
+            Switch(
+                key="proxy_calls_via_proxy",
+                text="Проксировать звонки",
+                default=bool(calls_pref),
+                icon="msg_settings",
+                on_change=self._on_use_proxy_calls_changed,
+            ),
+            Switch(
+                key="proxy_plugins_via_greenpass",
+                text="Проксировать плагины",
+                default=bool(self._get_plugins_proxy_enabled()),
+                subtext="Направляет запросы плагинов через GreenPass",
+                icon="msg_link",
+                on_change=self._on_plugins_proxy_changed,
+            ),
+            Switch(
+                key="dont_use_with_vpn",
+                text="Не использовать с VPN",
+                default=bool(self.get_setting("dont_use_with_vpn", True)),
+                subtext="Отключать при VPN",
+                icon="msg_secret",
+                on_change=self._on_dont_use_with_vpn_changed,
+            ),
+            Divider(),
+            Text(
+                text="Настройки Telegram",
+                icon="msg_settings",
+                on_click=lambda *a: self._open_tg_proxy_settings(),
+            ),
+            Text(
+                text="Экспорт настроек",
+                icon="msg_link",
+                on_click=lambda *a: self._export_settings_to_favorites(),
+            ),
+            Text(
+                text="Импорт настроек",
+                icon="msg_folder",
+                on_click=lambda *a: self._open_greenpass_import_file_picker(),
+            ),
+        ]
+
     def create_settings(self):
         try:
-            settings = [Header(text="Основное")]
+            settings = [Header(text="GreenPass")]
             tg_proxy_enabled = bool(self._is_plugin_proxy_enabled())
             settings.append(Switch(
                 key="use_proxy",
@@ -13415,43 +14433,23 @@ class SafeBypassPlugin(BasePlugin):
                 on_change=self._on_use_proxy_changed,
             ))
 
-            calls_pref = bool(self._get_calls_proxy_preference())
-            settings.append(Switch(
-                key="proxy_calls_via_proxy",
-                text="Проксировать звонки",
-                default=bool(calls_pref),
-                subtext="Для звонков Telegram использует только SOCKS-прокси",
-                icon="msg_settings",
-                on_change=self._on_use_proxy_calls_changed,
-            ))
-            settings.append(Switch(
-                key="dont_use_with_vpn",
-                text="Не использовать с VPN",
-                default=bool(self.get_setting("dont_use_with_vpn", True)),
-                subtext="Вкл — прокси отключается при системном VPN",
-                icon="msg_secret",
-                on_change=self._on_dont_use_with_vpn_changed,
-            ))
-            settings.append(Text(
-                text="Настройки Telegram",
-                icon="msg_settings",
-                on_click=lambda *a: self._open_tg_proxy_settings(),
-            ))
-
             settings.append(Divider())
             settings.append(Header(text="Статус"))
             settings.extend(self._safe_settings_items("Статус", self._build_status_settings_items))
 
             active_mode = self._get_connection_mode()
             settings.append(Divider())
-            settings.append(Header(text=self._settings_mode_title(active_mode)))
-            settings.extend(self._safe_settings_items(self._settings_mode_title(active_mode), self._build_active_mode_items))
-
-            other_modes = self._safe_settings_items("Другие режимы", self._build_other_mode_switch_items)
-            if other_modes:
-                settings.append(Divider())
-                settings.append(Header(text="Другие режимы"))
-                settings.extend(other_modes)
+            settings.append(Text(
+                text="Настроить режим",
+                subtext=self._settings_mode_title(active_mode),
+                icon=self._settings_mode_icon(active_mode),
+                create_sub_fragment=self._create_active_mode_subpage,
+            ))
+            settings.append(Text(
+                text="Дополнительно",
+                icon="msg_settings",
+                create_sub_fragment=self._create_greenpass_extra_subpage,
+            ))
 
             return settings
         except Exception as e:
