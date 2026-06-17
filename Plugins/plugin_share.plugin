@@ -1,0 +1,356 @@
+import ast
+import os
+import time
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import (
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    run_on_queue,
+    send_document,
+)
+from file_utils import (
+    delete_file,
+    ensure_dir_exists,
+    get_cache_dir,
+    get_plugins_dir,
+    read_file,
+    write_file,
+)
+from typing import Any, Dict
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+
+from java import dynamic_proxy, jclass
+from android.os import Bundle
+
+__id__ = "plugin_share"
+__name__ = "Plugin Share"
+__description__ = "Share all installed plugins at once to any chat."
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "2.0"
+__icon__ = "MaxExteraPluginsStickers/12"
+
+
+def _parse_plugin_meta(file_path: str) -> Dict[str, str]:
+    meta = {}
+    try:
+        source = read_file(file_path)
+        if not source:
+            return meta
+        tree = ast.parse(source)
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in (
+                        "__name__",
+                        "__description__",
+                        "__version__",
+                        "__author__",
+                        "__id__",
+                    ):
+                        if isinstance(node.value, ast.Constant):
+                            meta[target.id] = str(node.value.value)
+    except Exception:
+        pass
+    return meta
+
+
+def _build_caption(meta: Dict[str, str], file_name: str,
+                   show_name=True, show_version=True,
+                   show_desc=True, show_author=True) -> str:
+    parts = []
+    name = meta.get("__name__", "")
+    version = meta.get("__version__", "")
+    description = meta.get("__description__", "")
+    author = meta.get("__author__", "")
+
+    if show_name and name:
+        line = f"📦 {name}"
+        if show_version and version:
+            line += f"  v{version}"
+        parts.append(line)
+    elif show_version and version:
+        parts.append(f"📦 v{version}")
+
+    if show_desc and description:
+        parts.append(f"📝 {description}")
+    if show_author and author:
+        parts.append(f"👤 {author}")
+
+    if not parts:
+        parts.append(f"📦 {file_name}")
+
+    return "\n".join(parts)
+
+
+def _build_topic_reply(peer_id, topic_id):
+    if not topic_id or topic_id <= 1:
+        return None
+    try:
+        from org.telegram.messenger import MessageObject, UserConfig
+        chat_id = int(-peer_id)
+        topic = get_messages_controller().getTopicsController().findTopic(chat_id, int(topic_id))
+        if topic is None or topic.topicStartMessage is None:
+            return None
+        obj = MessageObject(int(UserConfig.selectedAccount), topic.topicStartMessage, False, False)
+        if obj.messageOwner is None:
+            return None
+        _ = obj.getId()
+        obj.isTopicMainMessage = True
+        return obj
+    except Exception:
+        return None
+
+
+def _collect_plugin_files(plugins_dir: str):
+    plugin_files = []
+    py_files = []
+    try:
+        for entry in os.listdir(plugins_dir):
+            full = os.path.join(plugins_dir, entry)
+            if not os.path.isfile(full):
+                continue
+            if entry.startswith(".") or entry.startswith("_"):
+                continue
+            lower = entry.lower()
+            if lower.endswith(".plugin"):
+                plugin_files.append(full)
+            elif lower.endswith(".py"):
+                py_files.append(full)
+    except Exception:
+        pass
+    return plugin_files if plugin_files else py_files
+
+
+def _prepare_share_file(source_path: str, cache_dir: str):
+    lower = source_path.lower()
+    if lower.endswith(".plugin"):
+        return source_path, False
+
+    content = read_file(source_path)
+    if content is None:
+        return source_path, False
+
+    base_name = os.path.basename(source_path)
+    plugin_name = base_name.rsplit(".py", 1)[0] if base_name.lower().endswith(".py") else base_name
+    share_path = os.path.join(cache_dir, plugin_name + ".plugin")
+    write_file(share_path, content)
+    return share_path, True
+
+
+class PluginExportPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        pass
+
+    def on_plugin_unload(self):
+        pass
+
+    def create_settings(self) -> list:
+        return [
+            Header(text="Caption"),
+            Switch(
+                key="include_caption",
+                text="Add caption",
+                default=True,
+                subtext="Attach metadata as a caption.",
+                icon="msg_text",
+            ),
+            Switch(
+                key="show_name",
+                text="Plugin name",
+                default=True,
+                icon="msg_openprofile",
+            ),
+            Switch(
+                key="show_version",
+                text="Plugin version",
+                default=True,
+                icon="msg_info",
+            ),
+            Switch(
+                key="show_desc",
+                text="Plugin description",
+                default=True,
+                icon="msg_log",
+            ),
+            Switch(
+                key="show_author",
+                text="Plugin author",
+                default=True,
+                icon="msg_contacts",
+            ),
+            Divider(),
+            Header(text="Export"),
+            Text(
+                text="Export to Saved Messages",
+                icon="msg_saved",
+                on_click=lambda v: self._export_to_saved(),
+            ),
+            Text(
+                text="Export to Another Chat",
+                icon="msg_forward",
+                on_click=lambda v: self._open_chat_picker(),
+            ),
+        ]
+
+    def _open_chat_picker(self):
+        plugin_ref = self
+
+        def _do_open():
+            try:
+                fragment = get_last_fragment()
+                if not fragment:
+                    BulletinHelper.show_error("No active fragment.")
+                    return
+
+                DialogsActivity = jclass("org.telegram.ui.DialogsActivity")
+                DelegateInterface = jclass(
+                    "org.telegram.ui.DialogsActivity$DialogsActivityDelegate"
+                )
+
+                class ChatPickerDelegate(dynamic_proxy(DelegateInterface)):
+                    def __init__(self):
+                        super().__init__()
+
+                    def didSelectDialogs(self, frag, dids, message, param,
+                                         notify, scheduleDate, scheduleRepeatPeriod,
+                                         topicsFragment):
+                        try:
+                            if dids is None or dids.size() == 0:
+                                return False
+
+                            first = dids.get(0)
+                            if hasattr(first, "dialogId"):
+                                peer_id = int(first.dialogId)
+                                topic_id = int(first.topicId) if hasattr(first, "topicId") else 0
+                            else:
+                                peer_id = int(first)
+                                topic_id = 0
+
+                            reply_msg = _build_topic_reply(peer_id, topic_id)
+
+                            if topicsFragment is not None:
+                                try:
+                                    topicsFragment.removeSelfFromStack()
+                                except Exception:
+                                    pass
+                            try:
+                                frag.removeSelfFromStack()
+                            except Exception:
+                                pass
+
+                            plugin_ref._start_export(peer_id, reply_msg)
+                        except Exception:
+                            pass
+                        return True
+
+                    def canSelectStories(self):
+                        return False
+
+                    def didSelectStories(self, frag):
+                        return False
+
+                args = Bundle()
+                args.putBoolean("onlySelect", True)
+                args.putInt("dialogsType", 3)
+                args.putBoolean("canSelectTopics", True)
+                args.putString("selectAlertString", "Send plugins to %1$s?")
+                args.putString("selectAlertStringGroup", "Send plugins to %1$s?")
+
+                dialogs_fragment = DialogsActivity(args)
+                dialogs_fragment.setDelegate(ChatPickerDelegate())
+                fragment.presentFragment(dialogs_fragment)
+
+            except Exception as e:
+                BulletinHelper.show_error(f"Failed to open picker: {e}")
+
+        run_on_ui_thread(_do_open)
+
+    def _export_to_saved(self):
+        user_cfg = get_user_config()
+        current_user = user_cfg.getCurrentUser()
+        if not current_user:
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_error("Cannot determine current user.")
+            )
+            return
+        self._start_export(current_user.id, None)
+
+    def _start_export(self, peer_id, reply_msg):
+        run_on_queue(lambda: self._do_export(peer_id, reply_msg))
+
+    def _do_export(self, peer_id, reply_msg):
+        try:
+            plugins_dir = get_plugins_dir()
+            plugin_files = _collect_plugin_files(plugins_dir)
+
+            if not plugin_files:
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_error("No plugin files found.")
+                )
+                return
+
+            include_caption = self.get_setting("include_caption", True)
+            show_name = self.get_setting("show_name", True)
+            show_version = self.get_setting("show_version", True)
+            show_desc = self.get_setting("show_desc", True)
+            show_author = self.get_setting("show_author", True)
+
+            share_cache_dir = os.path.join(get_cache_dir(), "plugin_share")
+            ensure_dir_exists(share_cache_dir)
+            temp_paths = []
+
+            sent_count = 0
+            try:
+                for source_path in plugin_files:
+                    file_name = os.path.basename(source_path)
+                    send_path, is_temp = _prepare_share_file(source_path, share_cache_dir)
+                    if is_temp:
+                        temp_paths.append(send_path)
+
+                    caption = ""
+                    if include_caption:
+                        meta = _parse_plugin_meta(source_path)
+                        caption = _build_caption(
+                            meta, file_name,
+                            show_name, show_version,
+                            show_desc, show_author,
+                        )
+
+                    try:
+                        if reply_msg is not None:
+                            send_document(
+                                peer_id, send_path, caption=caption,
+                                replyToMsg=reply_msg, replyToTopMsg=reply_msg,
+                            )
+                        else:
+                            send_document(peer_id, send_path, caption=caption)
+                        sent_count += 1
+                        time.sleep(0.5)
+                    except Exception:
+                        try:
+                            send_document(peer_id, send_path, caption=caption)
+                            sent_count += 1
+                        except Exception:
+                            pass
+            finally:
+                for temp_path in temp_paths:
+                    try:
+                        delete_file(temp_path)
+                    except Exception:
+                        pass
+
+            total = sent_count
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(f"Sent {total} plugin(s) ✓")
+            )
+
+        except Exception as e:
+            err = str(e)
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_error(f"Export failed: {err}")
+            )
