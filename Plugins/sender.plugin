@@ -1,11 +1,27 @@
-from collections import deque
+import ast
+import os
+import sys
+import threading
+import time
+import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import List
+from typing import Dict, Any, Union, List
 
-from android_utils import log, run_on_ui_thread
-from base_plugin import BasePlugin, HookResult
-from client_utils import send_message, get_user_config, get_messages_controller, get_messages_storage
-from java import jint
+from android_utils import run_on_ui_thread, log
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook, hook_filters, HookFilter
+from client_utils import (
+    send_document,
+    edit_message,
+    send_message,
+    get_user_config,
+    get_messages_controller,
+    get_messages_storage
+)
+from file_utils import get_cache_dir, ensure_dir_exists, write_file
+from hook_utils import find_class
+from java.lang import Integer, Long, Boolean
 from java.util import ArrayList
 from markdown_utils import parse_markdown
 from org.telegram.messenger import MessageObject
@@ -13,37 +29,70 @@ from org.telegram.tgnet import TLRPC
 
 __id__ = "sender"
 __name__ = "Sender"
-__description__ = "Re-send messages from **another devices** with **plugins**.\n**Usage**: `.send [message]` | `.ping`\n**Note**: Enable **Keep-Alive Service** and **Background Connection** for better experience."
+__description__ = "Re-send messages from **another devices** with **plugins**.\n**Usage**: `.send [message]` | `.ping` | `.eval [code]`\n**Note**: Enable **Keep-Alive Service** and **Background Connection** for better experience."
 __author__ = "@immat0x1"
-__version__ = "1.0.2"
-__min_version__ = "11.12.1"
+__version__ = "1.0.4"
+__min_version__ = "12.2.10"
 __icon__ = "exteraPlugins/2"
 
 PING_EMOJI_PC = "5870748341150683538"
 PING_EMOJI_TIME = "5872756762347573066"
 DELETE_DELAY_MS = 150
 
+_executor = ThreadPoolExecutor(max_workers=1)
+
+
+### HELPERS ###
+
+def run_on_queue(func, *args, delay: int = 0, **kwargs):
+    def _wrapper():
+        try:
+            if delay > 0:
+                time.sleep(delay)
+            func(*args, **kwargs)
+        except:
+            traceback.print_exc()
+
+    _executor.submit(_wrapper)
+
+
+def write_temp_file(filename: str, content: Union[str, bytes], delete_after: int = 0):
+    tmp_dir = os.path.join(get_cache_dir(), "eval_temp_files")
+    ensure_dir_exists(tmp_dir)
+
+    f = os.path.join(tmp_dir, filename)
+
+    write_file(f, content)
+
+    if delete_after > 0:
+        def _del():
+            if os.path.exists(f):
+                os.remove(f)
+
+        run_on_queue(_del, delay=delete_after)
+
+    return f
+
+
 def _delete_messages(msg_ids: List[int], chat_id: int, topic_id: int = 0):
     if not msg_ids:
         return
     msgs_list = ArrayList()
     for msg_id in msg_ids:
-        msgs_list.add(jint(msg_id))
+        msgs_list.add(Integer(msg_id))
 
     messages_ctrl = get_messages_controller()
     if messages_ctrl:
         messages_ctrl.deleteMessages(msgs_list, None, None, chat_id, topic_id, False, 0)
 
 
-def _send_message(cmd_text: str, original_mo: MessageObject):
-    chat_id = original_mo.getDialogId()
-    topic_id = original_mo.getTopicId()
-
+def _send_message_generic(chat_id: int, cmd_text: str, reply_to_obj: MessageObject = None,
+                          reply_to_top_obj: MessageObject = None):
     try:
         parsed = parse_markdown(cmd_text)
         text = parsed.text
-        entities = [e.to_tlrpc_object() for e in parsed.entities]
-    except Exception as e:
+        entities = [e.to_tlrpc_object() for e in parsed.entities] if parsed.entities else []
+    except ValueError as e:
         log(f"Markdown error: {e}")
         text = cmd_text
         entities = []
@@ -51,22 +100,64 @@ def _send_message(cmd_text: str, original_mo: MessageObject):
     params = {
         "message": text,
         "peer": chat_id,
-        "entities": entities,
+        "entities": entities
     }
 
-    if topic_id:
-        params["topicId"] = topic_id
+    if reply_to_obj:
+        params["replyToMsg"] = reply_to_obj
 
-    reply_id = original_mo.getReplyMsgId()
-    if reply_id:
-        reply_msg = get_messages_storage().getMessage(chat_id, reply_id)
-        if reply_msg:
-            reply_mo = MessageObject(get_user_config().selectedAccount, reply_msg, False, False)
-            params["replyToMsg"] = reply_mo
-            params["replyToTopMsg"] = reply_mo
+    if reply_to_top_obj:
+        params["replyToTopMsg"] = reply_to_top_obj
 
     send_message(params)
-    run_on_ui_thread(lambda: _delete_messages([original_mo.getId()], chat_id, topic_id), DELETE_DELAY_MS)
+
+
+def process_command_logic(plugin, text: str, chat_id: int, topic_id: int, reply_mo: MessageObject,
+                          reply_top_mo: MessageObject,
+                          msg_id_to_delete: int = 0):
+    handled = False
+
+    if text == ".ping":
+        uptime = _get_uptime(plugin.start_time)
+        resp = (
+            f"[💻]({PING_EMOJI_PC}) *Sender is alive!*\n"
+            f"[⏲]({PING_EMOJI_TIME}) Uptime: `{uptime}`"
+        )
+        _send_message_generic(chat_id, resp, reply_to_obj=reply_mo, reply_to_top_obj=reply_top_mo)
+        handled = True
+
+    elif text.startswith(".send "):
+        content = text[6:]
+        if content:
+            _send_message_generic(chat_id, content, reply_to_obj=reply_mo, reply_to_top_obj=reply_top_mo)
+            handled = True
+
+    elif text.startswith(".eval") or text.startswith(".e"):
+        code = ""
+        is_eval = False
+
+        if text.startswith(".eval"):
+            code = text[5:]
+            is_eval = True
+        elif text.startswith(".e"):
+            code = text[2:]
+            is_eval = True
+
+        if is_eval:
+            code = code.lstrip()
+
+            if not code and reply_mo:
+                code = reply_mo.messageOwner.message
+
+            if code:
+                cmd_dict = {'peer': chat_id}
+                run_on_queue(plugin.evaluator.execute, cmd_dict, code, reply_mo, reply_top_mo)
+                handled = True
+
+    if handled and msg_id_to_delete > 0:
+        run_on_ui_thread(lambda: _delete_messages([msg_id_to_delete], chat_id, topic_id), DELETE_DELAY_MS)
+
+    return handled
 
 
 def _get_uptime(start_time: datetime) -> str:
@@ -86,64 +177,461 @@ def _get_uptime(start_time: datetime) -> str:
     return " ".join(parts)
 
 
-class Sender(BasePlugin):
+def format_markdown_code(code: str, language: str = "") -> str:
+    max_consecutive_backticks = 0
+    current_consecutive_backticks = 0
+    for char in code:
+        if char == '`':
+            current_consecutive_backticks += 1
+        else:
+            max_consecutive_backticks = max(max_consecutive_backticks, current_consecutive_backticks)
+            current_consecutive_backticks = 0
+    max_consecutive_backticks = max(max_consecutive_backticks, current_consecutive_backticks)
+
+    fence_len = max(3, max_consecutive_backticks + 1)
+    fence = '`' * fence_len
+    return f"{fence}{language}\n{code}\n{fence}"
+
+
+### EVALUATOR LOGIC ###
+
+class Evaluator:
+    last_locals: Dict[str, Any] = {}
+    input_event: threading.Event
+    lib: Any
+
+    def __init__(self, lib):
+        self.lib = lib
+        self.input_event = threading.Event()
+
+    def get_base_locals(self):
+        return {
+            "self": self.lib,
+            "executor": self,
+            "traceback": traceback,
+            "os": os,
+            "sys": sys,
+            "time": time
+        }
+
+    def eval_print_func(self, cmd_params, uuid):
+        msg_obj = None
+        ll = []
+        length = 0
+        last_end = None
+        thread = None
+        edited_text = False
+        result_text = ""
+        editing = False
+        last_text = None
+        finished = False
+
+        def text():
+            content = "".join(map(str, ll))
+            parts = []
+            if length < 4000 and len(ll) < 50 and content:
+                parts.append(content)
+            if result_text:
+                parts.append(result_text)
+            return "\n".join(parts)
+
+        def loop():
+            nonlocal editing, edited_text, length, ll, last_text, msg_obj, finished
+            while True:
+                try:
+                    if edited_text and not editing:
+                        editing = True
+
+                        if msg_obj:
+                            edited_text = False
+                            txt = text()
+                            if txt != last_text:
+                                edit_message(msg_obj, txt)
+                                last_text = txt
+
+                            if length > 4000 or len(ll) >= 50:
+                                path = write_temp_file(
+                                    f"output-{uuid}.txt", "".join(ll), delete_after=60
+                                )
+                                send_document(cmd_params['peer'], path, caption=txt, replyToMsg=msg_obj)
+
+                        editing = False
+
+                    if finished and not edited_text:
+                        break
+
+                    time.sleep(2)
+                except:
+                    traceback.print_exc()
+                    editing = False
+                    break
+
+        def _print(*values, sep=' ', end='\n'):
+            nonlocal last_end, thread, edited_text, length
+            if not thread:
+                thread = threading.Thread(target=loop)
+                thread.daemon = True
+                thread.start()
+
+            string = sep.join([str(i) for i in values]) + end
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")
+
+            if last_end != "\n" and isinstance(last_end, str):
+                ll.append(string)
+                length += len(string)
+            else:
+                ll.append(f"[{timestamp}] {string}")
+                length += len(ll[-1])
+
+            last_end = end
+            edited_text = True
+
+        def set_result(result: str):
+            nonlocal edited_text, result_text
+            result_text = result
+            edited_text = True
+
+        def set_msg_obj(obj):
+            nonlocal msg_obj
+            msg_obj = obj
+
+        def stop_loop():
+            nonlocal finished
+            finished = True
+
+        _print.get_params = lambda: (msg_obj, text(), length > 4000 or len(ll) >= 50)
+        _print.set_result = set_result
+        _print.set_msg_obj = set_msg_obj
+        _print.stop_loop = stop_loop
+
+        return _print
+
+    @staticmethod
+    def _eval(code: str, globs, kwargs):
+        locs = {}
+        global_args = "__eval_internal_globals__"
+        ret_name = "__eval_internal_ret__"
+        locals_dict_name = "__eval_internal_locals__"
+
+        globs = globs.copy()
+        kwargs[global_args] = {}
+        for glob in ["__name__", "__package__"]:
+            if glob in globs:
+                kwargs[global_args][glob] = globs[glob]
+
+        root = ast.parse(code, "exec")
+        code_nodes = root.body
+
+        if not code_nodes:
+            return None, {}
+
+        ok = False
+        while True:
+            if ret_name in globs.keys():
+                ret_name = "_" + ret_name
+                continue
+            for node in ast.walk(root):
+                if isinstance(node, ast.Name) and node.id == ret_name:
+                    ret_name = "_" + ret_name
+                    break
+                ok = True
+            if ok:
+                break
+
+        if not code_nodes:
+            return None, {}
+
+        if not any(isinstance(node, ast.Return) for node in code_nodes):
+            for i in range(len(code_nodes)):
+                if isinstance(code_nodes[i], ast.Expr):
+                    if i == len(code_nodes) - 1 or not isinstance(code_nodes[i].value, ast.Call):
+                        code_nodes[i] = ast.copy_location(
+                            ast.Expr(
+                                ast.Call(
+                                    func=ast.Attribute(
+                                        value=ast.Name(id=ret_name, ctx=ast.Load()),
+                                        attr="append",
+                                        ctx=ast.Load()
+                                    ),
+                                    args=[code_nodes[i].value],
+                                    keywords=[]
+                                )
+                            ), code_nodes[-1]
+                        )
+        else:
+            for node in code_nodes:
+                if isinstance(node, ast.Return):
+                    node.value = ast.List(elts=[node.value], ctx=ast.Load())
+
+        while locals_dict_name in globs.keys() or locals_dict_name == ret_name:
+            locals_dict_name = "_" + locals_dict_name
+
+        save_locals = ast.Assign(
+            targets=[ast.Name(id=locals_dict_name, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id="locals", ctx=ast.Load()),
+                args=[],
+                keywords=[]
+            )
+        )
+        ast.fix_missing_locations(save_locals)
+        code_nodes.append(save_locals)
+
+        return_tuple = ast.Tuple(
+            elts=[
+                ast.Name(id=ret_name, ctx=ast.Load()),
+                ast.Name(id=locals_dict_name, ctx=ast.Load())
+            ],
+            ctx=ast.Load()
+        )
+        code_nodes.append(
+            ast.copy_location(ast.Return(value=return_tuple), code_nodes[-1])
+        )
+
+        glob_copy = ast.Expr(
+            ast.Call(
+                func=ast.Attribute(
+                    value=ast.Call(
+                        func=ast.Name(id="globals", ctx=ast.Load()),
+                        args=[], keywords=[]
+                    ),
+                    attr="update",
+                    ctx=ast.Load()),
+                args=[],
+                keywords=[ast.keyword(arg=None, value=ast.Name(id=global_args, ctx=ast.Load()))]
+            )
+        )
+        ast.fix_missing_locations(glob_copy)
+        code_nodes.insert(0, glob_copy)
+
+        ret_decl = ast.Assign(targets=[ast.Name(id=ret_name, ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load()))
+        ast.fix_missing_locations(ret_decl)
+        code_nodes.insert(1, ret_decl)
+
+        locals_decl = ast.Assign(
+            targets=[ast.Name(id=locals_dict_name, ctx=ast.Store())],
+            value=ast.Dict(keys=[], values=[])
+        )
+        ast.fix_missing_locations(locals_decl)
+        code_nodes.insert(2, locals_decl)
+
+        args = []
+        for a in list(map(lambda x: ast.arg(x, None), kwargs.keys())):
+            ast.fix_missing_locations(a)
+            args += [a]
+        args = ast.arguments(args=[], vararg=None, kwonlyargs=args, kwarg=None, defaults=[],
+                             kw_defaults=[None for _ in range(len(args))])
+        args.posonlyargs = []
+        fun = ast.FunctionDef(name="tmp", args=args, body=code_nodes, decorator_list=[], returns=None)
+        ast.fix_missing_locations(fun)
+        mod = ast.parse("")
+        mod.body = [fun]
+        comp = compile(mod, "<string-sender-evaluator>", "exec")
+
+        exec(comp, {}, locs)
+
+        result, all_locals = locs["tmp"](**kwargs)
+
+        if isinstance(result, list):
+            clean_result = [x for x in result if x is not None]
+
+            if not clean_result:
+                result = None
+            elif len(clean_result) == 1:
+                result = clean_result[0]
+            else:
+                result = clean_result
+
+        return result, all_locals
+
+    def execute(self, cmd_params, code: str, reply_msg, reply_top_msg):
+        self.input_event.clear()
+
+        print_func = self.eval_print_func(cmd_params, uuid.uuid4().hex)
+
+        try:
+            local_vars = self.get_base_locals()
+            local_vars.update(self.last_locals)
+            local_vars.update({
+                "params": cmd_params,
+                "reply": reply_msg,
+                "reply_top": reply_top_msg,
+                "print": print_func,
+            })
+
+            result, result_locals = self._eval(code, globals(), local_vars)
+
+            self.last_locals = {
+                k: v for k, v in result_locals.items()
+                if k not in local_vars and not k.startswith("_")
+            }
+
+            sresult = str(result)
+
+            if len(sresult) > 3072:
+                file_path = write_temp_file(
+                    "eval-result.txt", sresult.encode("utf-8"), delete_after=60
+                )
+                run_on_ui_thread(lambda: send_document(
+                    cmd_params['peer'], file_path, replyToMsg=reply_msg, replyToTopMsg=reply_top_msg
+                ))
+            else:
+                msg_obj, text, long = print_func.get_params()
+                print_func.set_result(sresult)
+                final_output = (text + "\n" + sresult).strip() if not long else sresult
+
+                formatted_input = f"*Input:*\n{format_markdown_code(code, 'python')}"
+                formatted_output = f"*Output:*\n{format_markdown_code(final_output)}"
+                final_msg = f"{formatted_input}\n{formatted_output}"
+
+                run_on_ui_thread(lambda: _send_message_generic(
+                    cmd_params['peer'], final_msg, reply_to_obj=reply_msg, reply_to_top_obj=reply_top_msg
+                ))
+
+        except Exception:
+            error = traceback.format_exc()
+            if len(error) > 3072:
+                file_path = write_temp_file(
+                    "eval-error.txt", error.encode("utf-8"), delete_after=60
+                )
+                run_on_ui_thread(lambda: send_document(
+                    cmd_params['peer'], file_path, replyToMsg=reply_msg, replyToTopMsg=reply_top_msg
+                ))
+            else:
+                formatted_input = f"*Input:*\n{format_markdown_code(code, 'python')}"
+                formatted_error = f"*Error:*\n{format_markdown_code(error)}"
+                final_msg = f"{formatted_input}\n{formatted_error}"
+                run_on_ui_thread(lambda: _send_message_generic(
+                    cmd_params['peer'], final_msg, reply_to_obj=reply_msg, reply_to_top_obj=reply_top_msg
+                ))
+        finally:
+            print_func.stop_loop()
+
+
+### MAIN PLUGIN CLASS ###
+
+class MessagesStorageHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.processed_ids = set()
+
+    @hook_filters(HookFilter.ArgumentEqual(6, 0))
+    def before_hooked_method(self, param):
+        try:
+            messages_list = param.args[0]
+            if messages_list is None or messages_list.isEmpty():
+                return
+
+            account_id = get_user_config().selectedAccount
+
+            for msg in messages_list.toArray():
+                if not msg or not msg.out:
+                    continue
+
+                if msg.id in self.processed_ids:
+                    continue
+                self.processed_ids.add(msg.id)
+                if len(self.processed_ids) > 1000:
+                    self.processed_ids.clear()
+
+                text = msg.message
+                if not text or not isinstance(text, str):
+                    continue
+
+                if not text.startswith("."):
+                    continue
+
+                mo = MessageObject(account_id, msg, False, False)
+                dialog_id = mo.getDialogId()
+                topic_id = mo.getTopicId()
+
+                if dialog_id >= 0:
+                    topic_id = 0
+
+                reply_mo = None
+                reply_top_mo = None
+
+                if mo.isReply():
+                    reply_id = mo.getReplyMsgId()
+                    if reply_id > 0:
+                        raw_reply = get_messages_storage().getMessage(dialog_id, reply_id)
+                        if raw_reply:
+                            reply_mo = MessageObject(account_id, raw_reply, False, False)
+
+                if topic_id > 0:
+                    top_mo = TLRPC.TL_message()
+                    top_mo.id = topic_id
+                    top_mo.dialog_id = dialog_id
+                    reply_top_mo = MessageObject(account_id, top_mo, False, False)
+                    if reply_top_mo and not reply_mo:
+                        reply_mo = reply_top_mo
+
+                process_command_logic(
+                    self.plugin,
+                    text,
+                    dialog_id,
+                    topic_id,
+                    reply_mo,
+                    reply_top_mo,
+                    msg_id_to_delete=mo.getId()
+                )
+
+        except Exception as e:
+            self.plugin.log(f"Error in hook: {e}\n{traceback.format_exc()}")
+
+
+class SenderEval(BasePlugin):
     def __init__(self):
         super().__init__()
-        self.send_prefix = ".send "
-        self.ping_command = ".ping"
+        self.evaluator = Evaluator(self)
         self.start_time = None
-        self.processed_messages_cache = deque(maxlen=100)
 
     def on_plugin_load(self):
-        self.add_hook("updateNewMessage", match_substring=True)
-        self.add_hook("updateNewChannelMessage", match_substring=True)
+        self.add_on_send_message_hook(priority=Integer.MAX_VALUE)
         self.start_time = datetime.now()
 
-    def on_updates_hook(self, container_name: str, account: int, updates_container: any) -> HookResult:
-        updates = getattr(updates_container, 'updates', None)
-        if updates:
-            for update in updates.toArray():
-                self._handle_update(account, update)
-        return HookResult()
+        try:
+            storage_class = find_class("org.telegram.messenger.MessagesStorage")
 
-    def on_update_hook(self, update_name: str, account: int, update: any) -> HookResult:
-        self._handle_update(account, update)
-        return HookResult()
+            if storage_class:
+                put_messages_method = storage_class.getClass().getDeclaredMethod(
+                    "putMessages",
+                    ArrayList.getClass(),
+                    Boolean.TYPE,  # withTransaction
+                    Boolean.TYPE,  # useQueue
+                    Boolean.TYPE,  # doNotUpdateDialogDate
+                    Integer.TYPE,  # downloadMask
+                    Boolean.TYPE,  # ifNoLastMessage
+                    Integer.TYPE,  # mode
+                    Long.TYPE  # threadMessageId
+                )
 
-    def _handle_update(self, account: int, update: any):
-        if not isinstance(update, (TLRPC.TL_updateNewMessage, TLRPC.TL_updateNewChannelMessage)):
-            return
+                self.hook_method(put_messages_method, MessagesStorageHook(self))
+                self.log("Sender hooked MessagesStorage.putMessages successfully.")
+            else:
+                self.log("Could not find MessagesStorage class.")
 
-        msg = getattr(update, 'message', None)
-        if not msg:
-            return
-
-        mo = MessageObject(account, msg, False, False)
-
-        if mo.getSenderId() != get_user_config().getClientUserId():
-            return
-
-        unique_id = (mo.getDialogId(), mo.getId())
-        if unique_id in self.processed_messages_cache:
-            return
-
-        self.processed_messages_cache.append(unique_id)
-        self._process_message(mo)
-
-    def _process_message(self, mo: MessageObject):
-        text = mo.messageText
-        if not text:
-            return
-
-        if text.startswith(self.send_prefix):
-            cmd = text[len(self.send_prefix):]
-            if cmd:
-                _send_message(cmd, mo)
-
-        elif text == self.ping_command:
-            uptime = _get_uptime(self.start_time)
-            resp = (
-                f"[💻]({PING_EMOJI_PC}) *Sender is alive!*\n"
-                f"[⏲]({PING_EMOJI_TIME}) Uptime: `{uptime}`"
+        except Exception as e:
+            self.log(
+                f"Failed to activate hook during plugin load: {e}\n{traceback.format_exc()}"
             )
-            _send_message(resp, mo)
+
+    def on_send_message_hook(self, account: int, params) -> HookResult:
+        if not params or not params.message or not isinstance(params.message, str):
+            return HookResult()
+
+        text = params.message.strip()
+        if not text.startswith("."):
+            return HookResult()
+
+        reply_mo = getattr(params, "replyToMsg", None)
+        reply_top_mo = getattr(params, "replyToTopMsg", None)
+
+        chat_id = params.peer
+
+        was_handled = process_command_logic(self, text, chat_id, 0, reply_mo, reply_top_mo, msg_id_to_delete=0)
+
+        if was_handled:
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()
