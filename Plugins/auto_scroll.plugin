@@ -1,0 +1,672 @@
+__id__ = "auto_scroll"
+__name__ = "Auto Scroll"
+__description__ = "Автоматическая прокрутка сообщений в чатах.\n\nАктивация: (⋮) → Плагины → Auto Scroll в любом чате."
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__icon__ = "MaxExteraPluginsStickers/17"
+__version__ = "1.2"
+__min_version__ = "12.5.1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+from typing import Any, Dict, List
+
+from android.graphics import Color, PorterDuff, PorterDuffColorFilter, Typeface
+from android.util import TypedValue
+from android.view import Gravity, MotionEvent, View
+from android.widget import FrameLayout, ImageView, LinearLayout, TextView
+
+from android.os import Bundle
+
+from org.telegram.messenger import AndroidUtilities, ChatObject, MessagesController, R as R_tg
+from org.telegram.messenger.browser import Browser
+from org.telegram.ui import ChatActivity
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from android_utils import R, OnClickListener, run_on_ui_thread
+from hook_utils import get_private_field
+from client_utils import get_last_fragment
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Text
+
+from java import dynamic_proxy, jclass
+
+
+def _c(color):
+    if color > 0x7FFFFFFF:
+        color -= 0x100000000
+    return int(color)
+
+
+COLOR_BG = _c(0xCC1B1B1B)
+COLOR_STROKE = _c(0x33FFFFFF)
+COLOR_DIVIDER = _c(0x33FFFFFF)
+COLOR_BLUE = _c(0xFF64B5F6)
+COLOR_RED = _c(0xFFFF6B6B)
+
+DELAY_OPTIONS = [1, 2, 3, 5, 7, 10]
+SCROLL_INTERVAL = 16
+BOTTOM_PAUSE_TICKS = 30
+WATCHER_INTERVAL = 500
+
+
+class AutoScrollPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._overlay = None
+        self._overlay_parent = None
+        self._scrolling = False
+        self._speed = 3
+        self._direction = 1
+        self._runnable = None
+        self._chat_list_view = None
+        self._fragment = None
+        self._speed_label = None
+        self._btn_play = None
+        self._btn_up = None
+        self._btn_down = None
+        self._touch_held = False
+        self._touch_listener = None
+        self._end_reached_count = 0
+        self._active = False
+        self._panel = None
+        self._watcher = None
+        self._last_fragment_id = None
+
+        if self.get_setting("remember_speed", False):
+            saved = self.get_setting("last_speed", 3)
+            if isinstance(saved, int) and 1 <= saved <= 30:
+                self._speed = saved
+
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Auto Scroll",
+                on_click=self._on_menu_click,
+                icon="msg_autodelete",
+                item_id="auto_scroll_toggle",
+            )
+        )
+
+    def _open_url(self, url):
+        try:
+            frag = get_last_fragment()
+            if frag is not None:
+                activity = frag.getParentActivity()
+                if activity is not None:
+                    Browser.openUrl(activity, url)
+        except Exception:
+            pass
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Информация"),
+            Text(
+                text="Документация",
+                subtext="Как пользоваться плагином",
+                icon="msg_help",
+                on_click=lambda v: self._open_url("https://telegra.ph/Dokumentaciya-k-plaginu-Auto-Scroll-06-24"),
+            ),
+            Text(
+                text="Канал автора",
+                subtext="@MaxExteraPlugins",
+                icon="msg_channel",
+                on_click=lambda v: self._open_url("https://t.me/MaxExteraPlugins"),
+            ),
+        ]
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._stop_scroll()
+        self._stop_watcher()
+        self._remove_overlay()
+
+    def _on_menu_click(self, context: Dict[str, Any]):
+        fragment = context.get("fragment")
+        if not isinstance(fragment, ChatActivity):
+            return
+        if self._active:
+            self._active = False
+            self._stop_scroll()
+            self._stop_watcher()
+            self._remove_overlay()
+            return
+        self._active = True
+        self._fragment = fragment
+        self._last_fragment_id = id(fragment)
+        run_on_ui_thread(lambda: self._show_overlay(fragment, auto_start=True))
+
+    def _start_watcher(self):
+        self._stop_watcher()
+        if not self._active:
+            return
+
+        def check():
+            if not self._active:
+                return
+            try:
+                frag = get_last_fragment()
+                if isinstance(frag, ChatActivity):
+                    frag_id = id(frag)
+                    if frag_id != self._last_fragment_id:
+                        self._last_fragment_id = frag_id
+                        self._stop_scroll()
+                        self._detach_touch_listener()
+                        self._remove_overlay_view()
+                        run_on_ui_thread(lambda f=frag: self._show_overlay(f, auto_start=False))
+            except Exception:
+                pass
+            if self._active:
+                w = R(check)
+                self._watcher = w
+                AndroidUtilities.runOnUIThread(w, WATCHER_INTERVAL)
+
+        w = R(check)
+        self._watcher = w
+        AndroidUtilities.runOnUIThread(w, WATCHER_INTERVAL)
+
+    def _stop_watcher(self):
+        if self._watcher is not None:
+            try:
+                AndroidUtilities.cancelRunOnUIThread(self._watcher)
+            except Exception:
+                pass
+            self._watcher = None
+
+    def _get_nav_delay_ticks(self):
+        secs = self.get_setting("nav_delay", 3)
+        if not isinstance(secs, int) or secs < 1:
+            secs = 3
+        return int(secs * 1000 / SCROLL_INTERVAL)
+
+    def _show_overlay(self, fragment, auto_start=True):
+        try:
+            ctx = fragment.getParentActivity()
+            if ctx is None:
+                return
+
+            content_view = fragment.getFragmentView()
+            if content_view is None:
+                return
+
+            chat_list = None
+            try:
+                chat_list = fragment.getChatListView()
+            except Exception:
+                pass
+            if chat_list is None:
+                chat_list = get_private_field(fragment, "chatListView")
+            if chat_list is None:
+                return
+            self._chat_list_view = chat_list
+            self._fragment = fragment
+            self._last_fragment_id = id(fragment)
+            self._end_reached_count = 0
+            self._attach_touch_listener(chat_list)
+
+            container = FrameLayout(ctx)
+            container.setClickable(False)
+            container.setFocusable(False)
+
+            panel = LinearLayout(ctx)
+            panel.setOrientation(LinearLayout.HORIZONTAL)
+            panel.setGravity(Gravity.CENTER_VERTICAL)
+            panel.setPadding(
+                AndroidUtilities.dp(14),
+                AndroidUtilities.dp(8),
+                AndroidUtilities.dp(14),
+                AndroidUtilities.dp(8),
+            )
+
+            bg = jclass("android.graphics.drawable.GradientDrawable")()
+            bg.setShape(0)
+            bg.setCornerRadius(float(AndroidUtilities.dp(28)))
+            bg.setColor(COLOR_BG)
+            bg.setStroke(AndroidUtilities.dp(1), COLOR_STROKE)
+            panel.setBackground(bg)
+            panel.setElevation(float(AndroidUtilities.dp(6)))
+            self._panel = panel
+
+            btn_play = self._make_text_button(ctx, "▶", self._on_play_click)
+            self._btn_play = btn_play
+            panel.addView(btn_play, self._btn_lp())
+
+            divider1 = self._make_divider(ctx)
+            panel.addView(divider1)
+
+            btn_up = self._make_text_button(ctx, "▲", self._on_up_click)
+            self._btn_up = btn_up
+            panel.addView(btn_up, self._btn_lp())
+
+            btn_down = self._make_text_button(ctx, "▼", self._on_down_click)
+            self._btn_down = btn_down
+            panel.addView(btn_down, self._btn_lp())
+
+            self._highlight_direction()
+
+            divider2 = self._make_divider(ctx)
+            panel.addView(divider2)
+
+            btn_minus = self._make_text_button(ctx, "−", self._on_minus_click)
+            panel.addView(btn_minus, self._btn_lp())
+
+            speed_label = TextView(ctx)
+            speed_label.setText(str(self._speed))
+            speed_label.setTextColor(Color.WHITE)
+            speed_label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            speed_label.setTypeface(Typeface.DEFAULT_BOLD)
+            speed_label.setGravity(Gravity.CENTER)
+            speed_label.setMinWidth(AndroidUtilities.dp(24))
+            self._speed_label = speed_label
+            panel.addView(speed_label, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ))
+
+            btn_plus = self._make_text_button(ctx, "+", self._on_plus_click)
+            panel.addView(btn_plus, self._btn_lp())
+
+            divider3 = self._make_divider(ctx)
+            panel.addView(divider3)
+
+            btn_settings = self._make_text_button(ctx, "⚙", self._on_settings_click)
+            panel.addView(btn_settings, self._btn_lp())
+
+            divider4 = self._make_divider(ctx)
+            panel.addView(divider4)
+
+            btn_close = self._make_text_button(ctx, "✕", self._on_close_click)
+            btn_close.setTextColor(COLOR_RED)
+            panel.addView(btn_close, self._btn_lp())
+
+            fl_params = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+            )
+            fl_params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL
+            fl_params.topMargin = AndroidUtilities.dp(8)
+            container.addView(panel, fl_params)
+
+            overlay_params = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+
+            parent = content_view
+            if isinstance(parent, FrameLayout):
+                parent.addView(container, overlay_params)
+            else:
+                p = parent.getParent()
+                while p is not None:
+                    if isinstance(p, FrameLayout):
+                        parent = p
+                        break
+                    try:
+                        p = p.getParent()
+                    except Exception:
+                        break
+                if isinstance(parent, FrameLayout):
+                    parent.addView(container, overlay_params)
+                else:
+                    return
+
+            self._overlay = container
+            self._overlay_parent = parent
+
+            self._scrolling = auto_start
+            self._update_play_button()
+            if auto_start:
+                self._start_scroll()
+
+            self._start_watcher()
+        except Exception as e:
+            self.log(f"AutoScroll overlay error: {e}")
+
+    def _attach_touch_listener(self, chat_list):
+        plugin = self
+
+        class ScrollTouchListener(dynamic_proxy(View.OnTouchListener)):
+            def onTouch(self, v, event):
+                action = event.getActionMasked()
+                if action == MotionEvent.ACTION_DOWN:
+                    plugin._touch_held = True
+                    plugin._cancel_runnable()
+                elif action == MotionEvent.ACTION_UP or action == MotionEvent.ACTION_CANCEL:
+                    plugin._touch_held = False
+                    if plugin._scrolling:
+                        plugin._start_scroll()
+                return False
+
+        self._touch_listener = ScrollTouchListener()
+        chat_list.setOnTouchListener(self._touch_listener)
+
+    def _detach_touch_listener(self):
+        if self._chat_list_view is not None:
+            try:
+                self._chat_list_view.setOnTouchListener(None)
+            except Exception:
+                pass
+        self._touch_listener = None
+        self._touch_held = False
+
+    def _make_text_button(self, ctx, text, callback):
+        tv = TextView(ctx)
+        tv.setText(text)
+        tv.setTextColor(Color.WHITE)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 17)
+        tv.setTypeface(Typeface.DEFAULT_BOLD)
+        tv.setGravity(Gravity.CENTER)
+        tv.setMinWidth(AndroidUtilities.dp(32))
+        tv.setMinHeight(AndroidUtilities.dp(32))
+        tv.setOnClickListener(OnClickListener(lambda v: callback()))
+        return tv
+
+    def _make_divider(self, ctx):
+        d = View(ctx)
+        d.setBackgroundColor(COLOR_DIVIDER)
+        lp = LinearLayout.LayoutParams(AndroidUtilities.dp(1), AndroidUtilities.dp(20))
+        lp.leftMargin = AndroidUtilities.dp(4)
+        lp.rightMargin = AndroidUtilities.dp(4)
+        d.setLayoutParams(lp)
+        return d
+
+    def _btn_lp(self):
+        lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            AndroidUtilities.dp(32),
+        )
+        return lp
+
+    def _on_play_click(self):
+        self._scrolling = not self._scrolling
+        self._update_play_button()
+        if self._scrolling:
+            self._end_reached_count = 0
+            self._start_scroll()
+        else:
+            self._stop_scroll()
+
+    def _on_up_click(self):
+        self._direction = -1
+        self._highlight_direction()
+
+    def _on_down_click(self):
+        self._direction = 1
+        self._highlight_direction()
+
+    def _highlight_direction(self):
+        if self._btn_up is not None and self._btn_down is not None:
+            if self._direction == -1:
+                self._btn_up.setTextColor(COLOR_BLUE)
+                self._btn_down.setTextColor(Color.WHITE)
+            else:
+                self._btn_up.setTextColor(Color.WHITE)
+                self._btn_down.setTextColor(COLOR_BLUE)
+
+    def _on_settings_click(self):
+        run_on_ui_thread(lambda: self._show_settings_dialog())
+
+    def _show_settings_dialog(self):
+        fragment = self._fragment
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+
+        remember = self.get_setting("remember_speed", False)
+        auto_nav = self.get_setting("auto_navigate", False)
+        nav_delay = self.get_setting("nav_delay", 3)
+
+        items = [
+            ("☑" if remember else "☐") + "  Запоминать скорость",
+            ("☑" if auto_nav else "☐") + "  Авто-переход к следующему чату",
+            "Задержка перед переходом: " + str(nav_delay) + " сек",
+        ]
+
+        plugin = self
+
+        def on_click(bld, which):
+            if which == 0:
+                new_val = not remember
+                plugin.set_setting("remember_speed", new_val)
+                if new_val:
+                    plugin.set_setting("last_speed", plugin._speed)
+                bld.dismiss()
+                run_on_ui_thread(lambda: plugin._show_settings_dialog())
+            elif which == 1:
+                plugin.set_setting("auto_navigate", not auto_nav)
+                bld.dismiss()
+                run_on_ui_thread(lambda: plugin._show_settings_dialog())
+            elif which == 2:
+                bld.dismiss()
+                run_on_ui_thread(lambda: plugin._show_delay_picker(activity))
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Auto Scroll")
+        builder.set_items(items, on_click)
+        builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+        builder.show()
+
+    def _show_delay_picker(self, activity):
+        current = self.get_setting("nav_delay", 3)
+        items = [("● " if d == current else "○ ") + str(d) + " сек" for d in DELAY_OPTIONS]
+        plugin = self
+
+        def on_pick(bld, which):
+            plugin.set_setting("nav_delay", DELAY_OPTIONS[which])
+            bld.dismiss()
+            run_on_ui_thread(lambda: plugin._show_settings_dialog())
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Задержка перехода")
+        builder.set_items(items, on_pick)
+        builder.set_negative_button("Отмена", lambda b, w: (b.dismiss(), run_on_ui_thread(lambda: plugin._show_settings_dialog())))
+        builder.show()
+
+    def _save_speed(self):
+        if self.get_setting("remember_speed", False):
+            self.set_setting("last_speed", self._speed)
+
+    def _on_minus_click(self):
+        if self._speed > 1:
+            self._speed -= 1
+            self._update_speed_label()
+            self._save_speed()
+
+    def _on_plus_click(self):
+        if self._speed < 30:
+            self._speed += 1
+            self._update_speed_label()
+            self._save_speed()
+
+    def _update_speed_label(self):
+        if self._speed_label is not None:
+            run_on_ui_thread(lambda: self._speed_label.setText(str(self._speed)))
+
+    def _on_close_click(self):
+        self._active = False
+        self._stop_scroll()
+        self._stop_watcher()
+        self._remove_overlay()
+
+    def _update_play_button(self):
+        if self._btn_play is None:
+            return
+        if self._scrolling:
+            self._btn_play.setText("⏸")
+        else:
+            self._btn_play.setText("▶")
+
+    def _start_scroll(self):
+        self._cancel_runnable()
+        if not self._scrolling or self._touch_held:
+            return
+
+        def do_scroll():
+            if not self._scrolling or self._chat_list_view is None:
+                return
+            can_scroll = True
+            try:
+                can_scroll = self._chat_list_view.canScrollVertically(self._direction)
+            except Exception:
+                pass
+            if can_scroll:
+                self._end_reached_count = 0
+                try:
+                    pixels = self._speed * 3 * self._direction
+                    self._chat_list_view.smoothScrollBy(0, pixels, None)
+                except Exception:
+                    try:
+                        pixels = self._speed * 3 * self._direction
+                        self._chat_list_view.smoothScrollBy(0, pixels)
+                    except Exception:
+                        self._scrolling = False
+                        run_on_ui_thread(lambda: self._update_play_button())
+                        return
+            else:
+                self._end_reached_count += 1
+                auto_nav = self.get_setting("auto_navigate", False)
+                if auto_nav and self._end_reached_count > self._get_nav_delay_ticks():
+                    self._end_reached_count = 0
+                    run_on_ui_thread(lambda: self._navigate_to_next())
+                    return
+                if not auto_nav and self._end_reached_count > BOTTOM_PAUSE_TICKS:
+                    self._end_reached_count = 0
+                    self._scrolling = False
+                    run_on_ui_thread(lambda: self._update_play_button())
+                    return
+            if self._scrolling:
+                r = R(do_scroll)
+                self._runnable = r
+                AndroidUtilities.runOnUIThread(r, SCROLL_INTERVAL)
+
+        r = R(do_scroll)
+        self._runnable = r
+        AndroidUtilities.runOnUIThread(r, SCROLL_INTERVAL)
+
+    def _navigate_to_next(self):
+        fragment = self._fragment
+        if fragment is None:
+            return
+        try:
+            current_chat = get_private_field(fragment, "currentChat")
+            if current_chat is None:
+                self._scrolling = False
+                self._update_play_button()
+                return
+            is_channel = ChatObject.isChannel(current_chat)
+            is_forum = False
+            try:
+                is_forum = bool(current_chat.forum)
+            except Exception:
+                pass
+            if not is_channel and not is_forum:
+                self._end_reached_count = 0
+                self._scrolling = False
+                self._update_play_button()
+                return
+
+            current_dialog_id = get_private_field(fragment, "dialog_id")
+            account = fragment.getCurrentAccount()
+            controller = MessagesController.getInstance(account)
+            dialogs = controller.allDialogs
+
+            next_id = self._find_next_unread(dialogs, current_dialog_id, controller)
+            if next_id is None:
+                self._end_reached_count = 0
+                self._scrolling = False
+                self._update_play_button()
+                return
+
+            self._cancel_runnable()
+            self._detach_touch_listener()
+            self._remove_overlay_view()
+
+            args = Bundle()
+            if next_id < 0:
+                args.putLong("chat_id", -next_id)
+            else:
+                args.putLong("user_id", next_id)
+            new_frag = ChatActivity(args)
+            fragment.presentFragment(new_frag, True)
+
+            self._last_fragment_id = id(new_frag)
+
+            def reattach():
+                if not self._active:
+                    return
+                self._show_overlay(new_frag, auto_start=True)
+
+            run_on_ui_thread(reattach, 500)
+        except Exception as e:
+            self.log(f"AutoScroll navigate error: {e}")
+
+    def _find_next_unread(self, dialogs, current_dialog_id, controller):
+        found = False
+        for i in range(dialogs.size()):
+            d = dialogs.get(i)
+            if d.id == current_dialog_id:
+                found = True
+                continue
+            if found and d.unread_count > 0 and d.id < 0:
+                chat = controller.getChat(int(-d.id))
+                if chat is not None:
+                    is_ch = ChatObject.isChannel(chat)
+                    is_f = False
+                    try:
+                        is_f = bool(chat.forum)
+                    except Exception:
+                        pass
+                    if is_ch or is_f:
+                        return d.id
+        for i in range(dialogs.size()):
+            d = dialogs.get(i)
+            if d.id == current_dialog_id:
+                return None
+            if d.unread_count > 0 and d.id < 0:
+                chat = controller.getChat(int(-d.id))
+                if chat is not None:
+                    is_ch = ChatObject.isChannel(chat)
+                    is_f = False
+                    try:
+                        is_f = bool(chat.forum)
+                    except Exception:
+                        pass
+                    if is_ch or is_f:
+                        return d.id
+        return None
+
+    def _stop_scroll(self):
+        self._scrolling = False
+        self._cancel_runnable()
+        if self._btn_play is not None:
+            self._update_play_button()
+
+    def _cancel_runnable(self):
+        if self._runnable is not None:
+            try:
+                AndroidUtilities.cancelRunOnUIThread(self._runnable)
+            except Exception:
+                pass
+            self._runnable = None
+
+    def _remove_overlay(self):
+        self._detach_touch_listener()
+        self._remove_overlay_view()
+        self._fragment = None
+
+    def _remove_overlay_view(self):
+        if self._overlay is not None:
+            try:
+                parent = self._overlay.getParent()
+                if parent is not None:
+                    parent.removeView(self._overlay)
+            except Exception:
+                pass
+            self._overlay = None
+            self._overlay_parent = None
+            self._panel = None
+            self._btn_play = None
+            self._btn_up = None
+            self._btn_down = None
+            self._speed_label = None
+            self._chat_list_view = None
