@@ -1,0 +1,703 @@
+import csv
+import json
+import os
+import time
+from typing import Any, Dict, List, Set
+
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, get_user_config, send_document, send_request, send_text
+from file_utils import ensure_dir_exists, get_files_dir
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+from org.telegram.tgnet import TLRPC
+
+__id__          = "chat_member_parser"
+__name__        = "Chat Member Parser"
+__description__ = (
+    "Parses all members of the current chat and exports to JSON/CSV. "
+    "Checkbox filters in the parse dialog: type, activity, profile, role."
+)
+__author__      = "@Nekened"
+__version__     = "1.0.0"
+__icon__        = "NekeStick/1"
+__app_version__ = ">=12.8.1"
+__sdk_version__ = ">=1.4.3.10"
+
+CHANNEL_PARTICIPANTS_PAGE_SIZE = 200
+USER_FULL_DELAY_MS = 120
+
+STATUS_ONLINE     = "online"
+STATUS_RECENTLY   = "recently"
+STATUS_LAST_WEEK  = "last_week"
+STATUS_LAST_MONTH = "last_month"
+STATUS_OFFLINE    = "offline"
+STATUS_UNKNOWN    = "unknown"
+
+ROLE_OWNER  = "owner"
+ROLE_ADMIN  = "admin"
+ROLE_MEMBER = "member"
+
+# (settings_key, label, default_checked)
+FILTER_SPECS = [
+    # ── Type & profile ───────────────────────────────────────────────────────
+    ("exclude_bots",        "Exclude bots",               False),
+    ("only_premium",        "Premium users only",         False),
+    ("only_with_username",  "Has username (@)",           False),
+    ("only_with_phone",     "Has phone number",           False),
+    ("only_with_bio",       "Has bio / about",            False),
+    ("exclude_deleted",     "Exclude deleted accounts",   True),
+    ("exclude_scam",        "Exclude scam accounts",      True),
+    ("exclude_fake",        "Exclude fake accounts",      True),
+    # ── Activity ─────────────────────────────────────────────────────────────
+    ("status_online",       "Activity: Online",           True),
+    ("status_recently",     "Activity: Recently",         True),
+    ("status_last_week",    "Activity: Last week",        True),
+    ("status_last_month",   "Activity: Last month",       True),
+    ("status_offline",      "Activity: Offline",          True),
+    ("status_unknown",      "Activity: Unknown",          True),
+    # ── Role ─────────────────────────────────────────────────────────────────
+    ("role_owner",          "Role: Owner",                True),
+    ("role_admin",          "Role: Admin",                True),
+    ("role_member",         "Role: Member",               True),
+]
+_FILTER_KEYS = [s[0] for s in FILTER_SPECS]
+
+# Section headers: index of first item in section → label
+_SECTIONS = {0: "Type & profile", 8: "Activity", 14: "Role"}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _jlist(java_list) -> list:
+    if java_list is None:
+        return []
+    try:
+        return list(java_list)
+    except TypeError:
+        pass
+    try:
+        return [java_list.get(i) for i in range(java_list.size())]
+    except Exception:
+        return []
+
+
+def _safe(v):
+    return "" if v is None else v
+
+
+def _user_status_str(user) -> str:
+    status = getattr(user, "status", None)
+    if status is None:
+        return STATUS_UNKNOWN
+    n = status.__class__.__name__
+    if n == "TL_userStatusOnline":
+        return STATUS_ONLINE
+    if n == "TL_userStatusOffline":
+        try:    return f"last_seen:{status.was_online}"
+        except: return STATUS_OFFLINE
+    if n == "TL_userStatusRecently":  return STATUS_RECENTLY
+    if n == "TL_userStatusLastWeek":  return STATUS_LAST_WEEK
+    if n == "TL_userStatusLastMonth": return STATUS_LAST_MONTH
+    return STATUS_UNKNOWN
+
+
+def _status_bucket(s: str) -> str:
+    if s == STATUS_ONLINE:         return STATUS_ONLINE
+    if s == STATUS_RECENTLY:       return STATUS_RECENTLY
+    if s == STATUS_LAST_WEEK:      return STATUS_LAST_WEEK
+    if s == STATUS_LAST_MONTH:     return STATUS_LAST_MONTH
+    if s.startswith("last_seen:"): return STATUS_OFFLINE
+    return STATUS_UNKNOWN
+
+
+def _base_row(user, role: str = ROLE_MEMBER) -> Dict[str, Any]:
+    return {
+        "id":          _safe(getattr(user, "id", None)),
+        "first_name":  _safe(getattr(user, "first_name", None)),
+        "last_name":   _safe(getattr(user, "last_name", None)),
+        "username":    _safe(getattr(user, "username", None)),
+        "phone":       _safe(getattr(user, "phone", None)),
+        "is_bot":      bool(getattr(user, "bot",      False)),
+        "is_premium":  bool(getattr(user, "premium",  False)),
+        "is_verified": bool(getattr(user, "verified", False)),
+        "is_scam":     bool(getattr(user, "scam",     False)),
+        "is_fake":     bool(getattr(user, "fake",     False)),
+        "is_deleted":  bool(getattr(user, "deleted",  False)),
+        "status":      _user_status_str(user),
+        "about":       "",
+        "lang_code":   _safe(getattr(user, "lang_code", None)),
+        "role":        role,
+    }
+
+
+def _passes(row: Dict[str, Any], flags: Dict[str, bool]) -> bool:
+    g = flags.get
+    if g("exclude_bots")       and row["is_bot"]:         return False
+    if g("only_premium")       and not row["is_premium"]: return False
+    if g("only_with_username") and not row["username"]:   return False
+    if g("only_with_phone")    and not row["phone"]:      return False
+    if g("only_with_bio")      and not row["about"]:      return False
+    if g("exclude_deleted")    and row["is_deleted"]:     return False
+    if g("exclude_scam")       and row["is_scam"]:        return False
+    if g("exclude_fake")       and row["is_fake"]:        return False
+
+    # activity — only filter if at least one status checkbox is OFF
+    status_keys = ["status_online", "status_recently", "status_last_week",
+                   "status_last_month", "status_offline", "status_unknown"]
+    if not all(g(k, True) for k in status_keys):
+        bucket = _status_bucket(row["status"])
+        key_map = {
+            STATUS_ONLINE:     "status_online",
+            STATUS_RECENTLY:   "status_recently",
+            STATUS_LAST_WEEK:  "status_last_week",
+            STATUS_LAST_MONTH: "status_last_month",
+            STATUS_OFFLINE:    "status_offline",
+            STATUS_UNKNOWN:    "status_unknown",
+        }
+        if not g(key_map.get(bucket, "status_unknown"), True):
+            return False
+
+    role_map = {ROLE_OWNER: "role_owner", ROLE_ADMIN: "role_admin", ROLE_MEMBER: "role_member"}
+    if not g(role_map.get(row.get("role", ROLE_MEMBER), "role_member"), True):
+        return False
+
+    return True
+
+
+# ── Checkbox view ─────────────────────────────────────────────────────────────
+
+def _build_checkbox_view(activity, checked: list):
+    """
+    Build a ScrollView containing CheckBox rows, one per FILTER_SPECS entry.
+    Uses OnClickListener (reading cb.isChecked()) instead of
+    setOnCheckedChangeListener to avoid needing a Java interface proxy.
+    `checked` is a mutable list[bool] that is updated in-place on tap.
+    """
+    from android.widget import CheckBox, LinearLayout, ScrollView, TextView
+    from android.graphics import Color, Typeface
+    from org.telegram.messenger import AndroidUtilities
+
+    dp = AndroidUtilities.dp
+
+    scroll = ScrollView(activity)
+    scroll.setFillViewport(True)
+
+    outer = LinearLayout(activity)
+    outer.setOrientation(LinearLayout.VERTICAL)
+    outer.setPadding(dp(4), dp(4), dp(4), dp(8))
+
+    for idx, (key, label, _default) in enumerate(FILTER_SPECS):
+        # Section header
+        if idx in _SECTIONS:
+            tv = TextView(activity)
+            tv.setText(_SECTIONS[idx])
+            tv.setTypeface(Typeface.DEFAULT_BOLD)
+            try:
+                tv.setTextColor(Color.parseColor("#666666"))
+            except Exception:
+                pass
+            tv.setTextSize(11)
+            tv.setPadding(dp(12), dp(10) if idx else dp(6), dp(12), dp(2))
+            outer.addView(tv)
+
+        cb = CheckBox(activity)
+        cb.setText(label)
+        cb.setChecked(checked[idx])
+        cb.setPadding(dp(8), dp(5), dp(8), dp(5))
+
+        # OnClickListener reads isChecked() AFTER the built-in toggle,
+        # so it already reflects the new state — no Java interface needed.
+        def make_listener(i, checkbox):
+            def on_click(view):
+                checked[i] = checkbox.isChecked()
+            return OnClickListener(on_click)
+
+        cb.setOnClickListener(make_listener(idx, cb))
+        outer.addView(cb)
+
+    scroll.addView(outer)
+    return scroll
+
+
+# ── Plugin ────────────────────────────────────────────────────────────────────
+
+class ChatMemberParserPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Parse Chat Members",
+            on_click=self.on_menu_click,
+            icon="msg_contacts",
+            subtext="Export members to JSON/CSV with filters",
+            priority=5,
+        ))
+        self.add_on_send_message_hook()
+        self.log("Chat Member Parser v3.1 loaded")
+
+    def on_plugin_unload(self):
+        self.log("Chat Member Parser unloaded")
+
+    def on_send_message_hook(self, account: int, params: Any):
+        from base_plugin import HookResult
+        return HookResult()
+
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Chat Member Parser"),
+            Switch(
+                key="fetch_bio",
+                text="Fetch bio for each user",
+                default=True,
+                subtext="One extra request per user. Required for 'Has bio' filter.",
+                icon="msg_info",
+            ),
+            Selector(
+                key="default_format",
+                text="Default export format",
+                default=0,
+                items=["JSON only", "CSV only", "Both"],
+                icon="msg_file",
+            ),
+            Divider(
+                text="Filter checkboxes appear in the parse dialog each time you start parsing."
+            ),
+            Text(
+                text="Output folder",
+                subtext=os.path.join(get_files_dir(), "parsed_members"),
+                icon="msg_folder",
+            ),
+        ]
+
+    # ── Menu entry ────────────────────────────────────────────────────────────
+
+    def on_menu_click(self, context: Dict[str, Any]):
+        chat = context.get("chat")
+        if chat is None:
+            BulletinHelper.show_info("Open a group or channel first.")
+            return
+        run_on_ui_thread(lambda: self._show_filter_dialog(chat))
+
+    # ── Dialogs ───────────────────────────────────────────────────────────────
+
+    def _get_activity(self):
+        frag = get_last_fragment()
+        return frag.getParentActivity() if frag else None
+
+    def _show_filter_dialog(self, chat):
+        activity = self._get_activity()
+        if not activity:
+            BulletinHelper.show_error("No active screen.")
+            return
+
+        # mutable state for this parse session
+        checked = [default for _, _, default in FILTER_SPECS]
+        view    = _build_checkbox_view(activity, checked)
+
+        format_labels = ["JSON only", "CSV only", "Both JSON and CSV"]
+        formats       = ["json",      "csv",       "both"]
+        fmt_box       = [self.get_setting("default_format", 0)]  # mutable
+
+        def on_parse(bld: AlertDialogBuilder, _w):
+            bld.dismiss()
+            flags = {_FILTER_KEYS[i]: checked[i] for i in range(len(FILTER_SPECS))}
+            fmt   = formats[fmt_box[0]]
+            BulletinHelper.show_info(f"Parsing… ({format_labels[fmt_box[0]]})")
+            from client_utils import run_on_queue
+            run_on_queue(lambda: self._parse_chat(chat, fmt, flags))
+
+        def on_format(bld: AlertDialogBuilder, _w):
+            bld.dismiss()
+            run_on_ui_thread(lambda: self._show_format_dialog(chat, checked, fmt_box))
+
+        bld = AlertDialogBuilder(activity)
+        bld.set_title("Parse Chat Members")
+        bld.set_view(view)
+        bld.set_positive_button("Parse ▶", on_parse)
+        bld.set_neutral_button(f"Format: {format_labels[fmt_box[0]]}", on_format)
+        bld.set_negative_button("Cancel", lambda b, w: b.dismiss())
+        bld.show()
+
+    def _show_format_dialog(self, chat, checked, fmt_box):
+        activity = self._get_activity()
+        if not activity:
+            return
+
+        format_labels = ["JSON only", "CSV only", "Both JSON and CSV"]
+        formats       = ["json",      "csv",       "both"]
+
+        def on_pick(bld: AlertDialogBuilder, which: int):
+            bld.dismiss()
+            fmt_box[0] = which
+            # re-open the filter dialog with the same checked state
+            run_on_ui_thread(lambda: self._show_filter_dialog_with_state(chat, checked, fmt_box))
+
+        bld = AlertDialogBuilder(activity)
+        bld.set_title("Export format")
+        bld.set_items(format_labels, on_pick)
+        bld.set_negative_button("← Back", lambda b, w: (
+            b.dismiss(),
+            run_on_ui_thread(lambda: self._show_filter_dialog_with_state(chat, checked, fmt_box))
+        ))
+        bld.show()
+
+    def _show_filter_dialog_with_state(self, chat, checked, fmt_box):
+        """Re-open the filter dialog preserving existing checked[] and fmt_box."""
+        activity = self._get_activity()
+        if not activity:
+            return
+
+        view = _build_checkbox_view(activity, checked)
+
+        format_labels = ["JSON only", "CSV only", "Both JSON and CSV"]
+        formats       = ["json",      "csv",       "both"]
+
+        def on_parse(bld: AlertDialogBuilder, _w):
+            bld.dismiss()
+            flags = {_FILTER_KEYS[i]: checked[i] for i in range(len(FILTER_SPECS))}
+            fmt   = formats[fmt_box[0]]
+            BulletinHelper.show_info(f"Parsing… ({format_labels[fmt_box[0]]})")
+            from client_utils import run_on_queue
+            run_on_queue(lambda: self._parse_chat(chat, fmt, flags))
+
+        def on_format(bld: AlertDialogBuilder, _w):
+            bld.dismiss()
+            run_on_ui_thread(lambda: self._show_format_dialog(chat, checked, fmt_box))
+
+        bld = AlertDialogBuilder(activity)
+        bld.set_title("Parse Chat Members")
+        bld.set_view(view)
+        bld.set_positive_button("Parse ▶", on_parse)
+        bld.set_neutral_button(f"Format: {format_labels[fmt_box[0]]}", on_format)
+        bld.set_negative_button("Cancel", lambda b, w: b.dismiss())
+        bld.show()
+
+    # ── Core parsing ──────────────────────────────────────────────────────────
+
+    def _parse_chat(self, chat, export_format: str, flags: Dict[str, bool]):
+        try:
+            chat_id    = getattr(chat, "id",    "?")
+            chat_title = getattr(chat, "title", str(chat_id))
+            is_channel = (
+                bool(getattr(chat, "megagroup", False)) or
+                bool(getattr(chat, "broadcast", False))
+            )
+            saved_id = get_user_config().getClientUserId()
+
+            if is_channel:
+                users, roles, debug = self._collect_channel_participants(chat)
+                method = "channels.getParticipants"
+            else:
+                users, roles, debug = self._collect_basic_chat_participants(chat)
+                method = "messages.getFullChat"
+
+            before = len(users)
+            pairs  = [
+                (u, roles.get(getattr(u, "id", None), ROLE_MEMBER))
+                for u in users if getattr(u, "id", None) != saved_id
+            ]
+            debug["excluded_self"] = before - len(pairs)
+
+            if not pairs:
+                self._send_diagnostic(saved_id, chat_title, chat_id, is_channel, method, debug)
+                return
+
+            rows = [_base_row(u, role) for u, role in pairs]
+
+            if self.get_setting("fetch_bio", True):
+                self._fill_bios_sync([u for u, _ in pairs], rows)
+
+            before_filter = len(rows)
+            rows = [r for r in rows if _passes(r, flags)]
+            debug["filtered_out"]      = before_filter - len(rows)
+            debug["kept_after_filter"] = len(rows)
+
+            if not rows:
+                msg = f"All {before_filter} members filtered out. Uncheck some filters and try again."
+                run_on_ui_thread(lambda: BulletinHelper.show_error(msg))
+                try:
+                    send_text(saved_id, f"[ChatMemberParser] {msg}\nDebug: {debug}")
+                except Exception:
+                    pass
+                return
+
+            out_dir = os.path.join(get_files_dir(), "parsed_members")
+            ensure_dir_exists(out_dir)
+            ts    = int(time.time())
+            base  = f"chat_{chat_id}_{ts}"
+            count = len(rows)
+            sent  = []
+
+            if export_format in ("json", "both"):
+                p = os.path.join(out_dir, base + ".json")
+                self._write_json(p, rows)
+                sent.append(("JSON", p))
+
+            if export_format in ("csv", "both"):
+                p = os.path.join(out_dir, base + ".csv")
+                self._write_csv(p, rows)
+                sent.append(("CSV", p))
+
+            labels = []
+            for label, path in sent:
+                try:
+                    send_document(
+                        saved_id, path,
+                        caption=(
+                            f"Parsed {count}/{before_filter} members from {chat_title} — {label}\n"
+                            f"({debug['filtered_out']} filtered out)"
+                        ),
+                    )
+                    labels.append(label)
+                except Exception as e:
+                    labels.append(f"{label} (err: {e})")
+
+            run_on_ui_thread(lambda: BulletinHelper.show_success(
+                f"Done: {count} members exported ({', '.join(labels)})."
+            ))
+
+        except Exception as e:
+            try:
+                send_text(get_user_config().getClientUserId(),
+                          f"Chat Member Parser crashed:\n{e}")
+            except Exception:
+                pass
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Parse failed: {e}"))
+
+    # ── Diagnostic ────────────────────────────────────────────────────────────
+
+    def _send_diagnostic(self, saved_id, title, cid, is_channel, method, debug):
+        lines = [
+            "⚠️ Chat Member Parser — no members found",
+            f"Chat: {title} (id={cid})",
+            f"Type: {'channel/megagroup' if is_channel else 'basic group'}",
+            f"Method: {method}",
+        ] + [f"  {k}: {v}" for k, v in debug.items()]
+        try:
+            send_text(saved_id, "\n".join(lines))
+        except Exception:
+            pass
+        run_on_ui_thread(lambda: BulletinHelper.show_error(
+            "No members found. Diagnostic sent to Saved Messages."
+        ))
+
+    # ── Member collection ─────────────────────────────────────────────────────
+
+    def _collect_basic_chat_participants(self, chat):
+        box = {"done": False, "users": [], "roles": {}, "error": None,
+               "migrated": None, "debug": {}}
+
+        def cb(response, error):
+            if error or response is None:
+                box["error"] = str(error) if error else "null response"
+                box["done"]  = True
+                return
+            try:
+                full    = response.full_chat
+                r_users = _jlist(response.users)
+                r_chats = _jlist(response.chats)
+                box["debug"]["full_chat_class"]      = full.__class__.__name__
+                box["debug"]["response_users_count"] = len(r_users)
+                by_id = {u.id: u for u in r_users}
+
+                mig = getattr(full, "migrated_to", None)
+                if mig is not None:
+                    for c in r_chats:
+                        if getattr(c, "id", None) == getattr(mig, "channel_id", None):
+                            box["migrated"] = c
+                            break
+                    box["done"] = True
+                    return
+
+                ph         = getattr(full, "participants", None)
+                collected  = []
+                roles: Dict[int, str] = {}
+                if ph is not None and hasattr(ph, "participants"):
+                    for p in _jlist(ph.participants):
+                        u = by_id.get(p.user_id)
+                        if u is None:
+                            continue
+                        collected.append(u)
+                        cls = p.__class__.__name__
+                        roles[p.user_id] = (
+                            ROLE_OWNER if "Creator" in cls else
+                            ROLE_ADMIN if "Admin"   in cls else ROLE_MEMBER
+                        )
+                box["users"]  = collected
+                box["roles"]  = roles
+            except Exception as e:
+                box["error"] = f"parse error: {e}"
+            box["done"] = True
+
+        req = TLRPC.TL_messages_getFullChat()
+        req.chat_id = chat.id
+        send_request(req, cb)
+        self._wait(box)
+
+        if not box["done"]:
+            return [], {}, {"error": "timeout"}
+        if box["error"]:
+            return [], {}, {"error": box["error"]}
+        if box["migrated"]:
+            u, r, d = self._collect_channel_participants(box["migrated"])
+            d["migrated_from"] = chat.id
+            return u, r, d
+        return box["users"], box["roles"], box["debug"]
+
+    def _collect_channel_participants(self, chat):
+        all_users: List[Any] = []
+        roles:     Dict[int, str] = {}
+        debug:     Dict[str, Any] = {"pages": 0}
+
+        ic = TLRPC.TL_inputChannel()
+        ic.channel_id  = chat.id
+        ic.access_hash = getattr(chat, "access_hash", 0)
+
+        self._fetch_admins(ic, roles, debug)
+
+        offset = 0
+        while True:
+            box = {"done": False, "users": [], "count": 0, "roles": {}, "error": None}
+
+            def cb(response, error, b=box):
+                if error or response is None:
+                    b["error"] = str(error) if error else "null response"
+                    b["done"]  = True
+                    return
+                try:
+                    raw_u = _jlist(response.users)
+                    raw_p = _jlist(response.participants)
+                    b["users"] = raw_u
+                    b["count"] = len(raw_p)
+                    for p in raw_p:
+                        uid = getattr(p, "user_id", None)
+                        if uid is None:
+                            continue
+                        cls = p.__class__.__name__
+                        b["roles"].setdefault(uid,
+                            ROLE_OWNER if "Creator" in cls else
+                            ROLE_ADMIN if "Admin"   in cls else ROLE_MEMBER
+                        )
+                except Exception as e:
+                    b["error"] = f"parse error: {e}"
+                b["done"] = True
+
+            req        = TLRPC.TL_channels_getParticipants()
+            req.channel = ic
+            req.filter  = TLRPC.TL_channelParticipantsRecent()
+            req.offset  = offset
+            req.limit   = CHANNEL_PARTICIPANTS_PAGE_SIZE
+            req.hash    = 0
+            send_request(req, cb)
+            self._wait(box)
+
+            if not box["done"]:
+                debug["error"] = f"timeout at offset={offset}"; break
+            if box["error"]:
+                debug["error"] = f"at offset={offset}: {box['error']}"; break
+
+            debug["pages"] += 1
+            all_users.extend(box["users"])
+            for uid, role in box["roles"].items():
+                roles.setdefault(uid, role)
+
+            if box["count"] < CHANNEL_PARTICIPANTS_PAGE_SIZE or box["count"] == 0:
+                break
+            offset += CHANNEL_PARTICIPANTS_PAGE_SIZE
+            if offset > 200_000:
+                break
+
+        seen:   Set[int]  = set()
+        unique: List[Any] = []
+        for u in all_users:
+            uid = getattr(u, "id", None)
+            if uid is not None and uid not in seen:
+                seen.add(uid)
+                unique.append(u)
+        debug["unique_users"] = len(unique)
+        return unique, roles, debug
+
+    def _fetch_admins(self, ic, roles: dict, debug: dict):
+        box = {"done": False}
+
+        def cb(response, error, b=box):
+            if not (error or response is None):
+                try:
+                    for p in _jlist(response.participants):
+                        uid = getattr(p, "user_id", None)
+                        if uid is None:
+                            continue
+                        cls = p.__class__.__name__
+                        roles[uid] = ROLE_OWNER if "Creator" in cls else ROLE_ADMIN
+                    debug["admins_fetched"] = len(roles)
+                except Exception as e:
+                    debug["admin_fetch_error"] = str(e)
+            b["done"] = True
+
+        try:
+            req         = TLRPC.TL_channels_getParticipants()
+            req.channel = ic
+            req.filter  = TLRPC.TL_channelParticipantsAdmins()
+            req.offset  = 0
+            req.limit   = 200
+            req.hash    = 0
+            send_request(req, cb)
+            self._wait(box, timeout_s=10)
+        except Exception as e:
+            debug["admin_fetch_error"] = str(e)
+
+    # ── Bio fetching ──────────────────────────────────────────────────────────
+
+    def _fill_bios_sync(self, users, rows):
+        for idx, user in enumerate(users):
+            box = {"done": False, "about": ""}
+
+            def cb(response, error, b=box):
+                if not error and response is not None:
+                    try:
+                        b["about"] = response.full_user.about or ""
+                    except Exception:
+                        pass
+                b["done"] = True
+
+            try:
+                iu             = TLRPC.TL_inputUser()
+                iu.user_id     = user.id
+                iu.access_hash = getattr(user, "access_hash", 0)
+                req            = TLRPC.TL_users_getFullUser()
+                req.id         = iu
+                send_request(req, cb)
+                self._wait(box, timeout_s=8)
+                rows[idx]["about"] = box["about"]
+            except Exception as e:
+                self.log(f"getFullUser failed uid={getattr(user, 'id', '?')}: {e}")
+            time.sleep(USER_FULL_DELAY_MS / 1000.0)
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _wait(box: dict, timeout_s: float = 15.0):
+        t, step = 0.0, 0.05
+        while not box.get("done") and t < timeout_s:
+            time.sleep(step)
+            t += step
+
+    @staticmethod
+    def _write_json(path: str, rows: list):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _write_csv(path: str, rows: list):
+        if not rows:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+
