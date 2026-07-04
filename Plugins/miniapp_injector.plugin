@@ -1,0 +1,460 @@
+__id__ = "miniapp_injector"
+__name__ = "MiniApp Injector"
+__description__ = ("DevTools-консоль прямо внутри Telegram мини-аппки + инъект своих JS-ссылок.\n\n"
+    "• eruda-консоль поверх любой аппки — console/network/storage с телефона\n"
+    "• Инъект своих ссылок: вставь любой JS/CDN — плагин докачает и внедрит в аппку\n"
+    "• Работает даже при строгом CSP (канал evaluateJavascript). Всё выкл по умолчанию.\n\n"
+    "by huecoder")
+__author__ = "@huecoder"
+__version__ = "1.0.1"
+__icon__ = "bma_by_W1fmaSnc23f0akxcmbot/0"
+__min_version__ = "11.9.0"
+
+import base64
+import json
+import threading
+import time
+import urllib.request
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, Switch, Input, Divider, Text
+from ui.bulletin import BulletinHelper
+
+# источник по умолчанию: eruda-консоль, тянется с cdn и кешируется в base64
+DEFAULT_SOURCES = [{
+    "id": "eruda", "name": "eruda DevTools",
+    "url": "https://cdn.jsdelivr.net/npm/eruda", "init": "eruda.init();", "on": True,
+}]
+
+# снять залоченный зум в аппках где meta viewport запрещает пинч
+JS_ZOOM = ("(function(){try{var m=document.querySelector('meta[name=viewport]');"
+           "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}"
+           "m.setAttribute('content','width=device-width, initial-scale=1, maximum-scale=6, user-scalable=yes');"
+           "}catch(e){}})();")
+JS_UNLOCK = ("(function(){try{var s=document.createElement('style');"
+             "s.innerHTML='*{-webkit-user-select:text!important;user-select:text!important;"
+             "-webkit-touch-callout:default!important;}';"
+             "(document.head||document.documentElement).appendChild(s);}catch(e){}})();")
+# собрать инфу о WebApp для инспектора
+JS_INFO = ("(function(){try{var w=window.Telegram&&window.Telegram.WebApp||{};"
+           "return JSON.stringify({version:w.version,platform:w.platform,colorScheme:w.colorScheme,"
+           "initData:w.initData,user:(w.initDataUnsafe&&w.initDataUnsafe.user)||null,"
+           "url:location.href},null,2);}catch(e){return 'err: '+e;}})();")
+
+
+def _bulletin(text):
+    try:
+        BulletinHelper.show_info(text)
+    except Exception:
+        pass
+
+
+class _Proxy:
+    # ленивая фабрика java-прокси (Runnable / OnClickListener / ValueCallback)
+    _cache = {}
+
+    @classmethod
+    def runnable(cls, fn):
+        key = "run"
+        if key not in cls._cache:
+            from java import dynamic_proxy
+            from java.lang import Runnable
+
+            class R(dynamic_proxy(Runnable)):
+                def __init__(self, f):
+                    super().__init__()
+                    self.f = f
+
+                def run(self):
+                    try:
+                        self.f()
+                    except Exception:
+                        pass
+            cls._cache[key] = R
+        return cls._cache[key](fn)
+
+    @classmethod
+    def value_cb(cls, fn):
+        key = "vc"
+        if key not in cls._cache:
+            from java import dynamic_proxy
+            from android.webkit import ValueCallback
+
+            class V(dynamic_proxy(ValueCallback)):
+                def __init__(self, f):
+                    super().__init__()
+                    self.f = f
+
+                def onReceiveValue(self, v):
+                    try:
+                        self.f(v)
+                    except Exception:
+                        pass
+            cls._cache[key] = V
+        return cls._cache[key](fn)
+
+
+def _run_ui(fn, delay=0):
+    try:
+        from org.telegram.messenger import AndroidUtilities
+        AndroidUtilities.runOnUIThread(_Proxy.runnable(fn), delay)
+    except Exception:
+        pass
+
+
+def _disclaimer(ctx, on_accept):
+    # непропускаемый дисклеймер на 5с перед добавлением своего источника инъекта
+    try:
+        from org.telegram.ui.ActionBar import AlertDialog
+        from java import dynamic_proxy
+        from android.content import DialogInterface
+
+        class Ok(dynamic_proxy(DialogInterface.OnClickListener)):
+            def onClick(self, d, w):
+                try:
+                    on_accept()
+                except Exception:
+                    pass
+
+        b = AlertDialog.Builder(ctx)
+        b.setTitle("Свой источник инъекта")
+        b.setMessage("Код с этой ссылки выполнится ВНУТРИ мини-аппки в её контексте "
+                     "(доступ к initData/сессии аппки). Добавляй только те скрипты которым доверяешь. "
+                     "Обход CSP тут — та же механика что консоль разработчика.")
+        b.setPositiveButton("Понимаю", Ok())
+        d = b.create()
+        try:
+            d.setCanCancel(False)
+        except Exception:
+            pass
+        d.show()
+        btn = None
+        try:
+            btn = d.getButton(-1)  # BUTTON_POSITIVE
+        except Exception:
+            btn = None
+        if btn is not None:
+            btn.setEnabled(False)
+
+            def tick(n):
+                try:
+                    if n <= 0:
+                        btn.setText("Понимаю")
+                        btn.setEnabled(True)
+                        return
+                    btn.setText("Прочти... %d" % n)
+                    _run_ui(lambda: tick(n - 1), 1000)
+                except Exception:
+                    pass
+            tick(5)
+    except Exception:
+        # фолбэк если диалог не собрался
+        _bulletin("Дисклеймер: код источника выполняется в контексте аппки. Жми ещё раз через 5с")
+        _run_ui(on_accept, 5000)
+
+
+def _info_dialog(ctx, title, msg):
+    try:
+        from org.telegram.ui.ActionBar import AlertDialog
+        b = AlertDialog.Builder(ctx)
+        b.setTitle(title)
+        b.setMessage(msg)
+        b.setPositiveButton("Ок", None)
+        b.create().show()
+    except Exception:
+        _bulletin(title + ": " + msg[:120])
+
+
+class BetterMiniAppPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._last_wv = None
+        self._probe_ts = {}
+        self._cache = {}          # url -> js текст (докачанные источники)
+        self._accepted = False    # принят ли дисклеймер источников
+        self._load_cache()
+        try:
+            wv = find_class("android.webkit.WebView")
+            for m in ("loadUrl", "evaluateJavascript", "loadDataWithBaseURL"):
+                try:
+                    self.hook_all_methods(wv, m, _WvHook(self))
+                except Exception:
+                    pass
+        except Exception as e:
+            _bulletin("BMA: WebView не найден: %s" % e)
+
+    # --- хранилище источников и кеша ---
+    def _sources(self):
+        try:
+            v = json.loads(self.get_setting("sources", ""))
+            return v if isinstance(v, list) and v else list(DEFAULT_SOURCES)
+        except Exception:
+            return list(DEFAULT_SOURCES)
+
+    def _save_sources(self, arr):
+        self.set_setting("sources", json.dumps(arr))
+
+    def _load_cache(self):
+        try:
+            raw = self.get_setting("cache_b64", "")
+            if raw:
+                self._cache = json.loads(base64.b64decode(raw).decode("utf-8"))
+        except Exception:
+            self._cache = {}
+
+    def _save_cache(self):
+        try:
+            raw = base64.b64encode(json.dumps(self._cache).encode("utf-8")).decode("ascii")
+            self.set_setting("cache_b64", raw)
+        except Exception:
+            pass
+
+    def _fetch(self, url):
+        # качаем код источника в фоне и кешируем как base64
+        def work():
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+                self._cache[url] = data
+                self._save_cache()
+                _bulletin("BMA: загружено %s" % url.split("/")[-1][:22])
+            except Exception as e:
+                _bulletin("BMA: не скачалось (%s)" % str(e)[:40])
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- детект аппки и самолечение ---
+    def _handle(self, view):
+        try:
+            cn = view.getClass().getName()
+        except Exception:
+            return
+        if "botwebview" not in cn.lower():
+            return
+        self._last_wv = view
+        try:
+            hc = view.hashCode()
+        except Exception:
+            return
+        now = int(time.time() * 1000)
+        if now - self._probe_ts.get(hc, 0) < 1500:
+            return
+        self._probe_ts[hc] = now
+        try:
+            view.evaluateJavascript(
+                "(typeof window.__bma==='undefined')?'need':'ok'",
+                _Proxy.value_cb(lambda r, v=view: r and "need" in str(r) and self._inject(v)))
+        except Exception:
+            pass
+
+    def _inject(self, view):
+        missing = False
+        for s in self._sources():
+            if not s.get("on"):
+                continue
+            u = s.get("url", "")
+            js = self._cache.get(u)
+            if js is None:
+                missing = True
+                self._fetch(u)  # придёт на следующем проходе
+                continue
+            code = "(function(){try{%s\n;%s}catch(e){}})();" % (js, s.get("init") or "")
+            try:
+                view.evaluateJavascript(code, None)
+            except Exception:
+                pass
+        if self.get_setting("unlock", True):
+            view.evaluateJavascript(JS_UNLOCK, None)
+        if self.get_setting("zoom", False):
+            view.evaluateJavascript(JS_ZOOM, None)
+        if self.get_setting("remote_debug", False):
+            try:
+                find_class("android.webkit.WebView").setWebContentsDebuggingEnabled(True)
+            except Exception:
+                pass
+        if self.get_setting("logs", True):
+            self._log_visit(view)
+        if not missing:
+            view.evaluateJavascript("window.__bma=1;", None)  # ссылка на девтулс поднята
+
+    def _log_visit(self, view):
+        try:
+            url = str(view.getUrl() or "")
+        except Exception:
+            url = ""
+        init = ""
+        low = url.lower()
+        if "tgwebappdata=" in low:
+            from urllib.parse import unquote
+            i = low.index("tgwebappdata=") + 13
+            end = url.find("&", i)
+            init = unquote(url[i:] if end == -1 else url[i:end])
+        try:
+            arr = json.loads(self.get_setting("visits", "[]"))
+        except Exception:
+            arr = []
+        if arr and arr[-1].get("url") == url:
+            return
+        arr.append({"ts": int(time.time()), "url": url, "initData": init})
+        self.set_setting("visits", json.dumps(arr[-200:]))
+
+    # --- действия из настроек ---
+    def _add_source(self, view):
+        url = (self.get_setting("new_url", "") or "").strip()
+        if not url.startswith("http"):
+            _bulletin("Вставь ссылку на .js в поле выше")
+            return
+        ctx = view.getContext()
+
+        def do():
+            arr = self._sources()
+            arr.append({"id": "u%d" % int(time.time()), "name": url.split("/")[-1][:20] or "источник",
+                        "url": url, "init": "", "on": True})
+            self._save_sources(arr)
+            self.set_setting("new_url", "")
+            self._fetch(url)
+            _bulletin("Источник добавлен")
+        if self._accepted:
+            do()
+        else:
+            _disclaimer(ctx, lambda: (setattr(self, "_accepted", True), do()))
+
+    def _inspector(self, view):
+        wv = self._last_wv
+        if wv is None:
+            _bulletin("Открой мини-аппку сначала")
+            return
+        ctx = view.getContext()
+
+        def got(res):
+            txt = str(res or "")
+            if txt.startswith('"') and txt.endswith('"'):
+                try:
+                    txt = json.loads(txt)
+                except Exception:
+                    pass
+            try:
+                from org.telegram.messenger import AndroidUtilities
+                AndroidUtilities.addToClipboard(txt)
+            except Exception:
+                pass
+            _info_dialog(ctx, "WebApp Inspector", (txt[:1500] + "\n\n(скопировано в буфер)"))
+        try:
+            wv.evaluateJavascript(JS_INFO, _Proxy.value_cb(got))
+        except Exception as e:
+            _bulletin("inspector err: %s" % e)
+
+    def _open_browser(self, view):
+        wv = self._last_wv
+        if wv is None:
+            _bulletin("Открой мини-аппку сначала")
+            return
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            url = str(wv.getUrl() or "")
+            it = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            view.getContext().startActivity(it)
+        except Exception as e:
+            _bulletin("browser err: %s" % e)
+
+    def _export_logs(self, view):
+        try:
+            raw = self.get_setting("visits", "[]")
+            ctx = view.getContext()
+            d = ctx.getExternalFilesDir(None)
+            path = str(d.getAbsolutePath()) + "/bma_visits.json"
+            with open(path, "w") as fp:
+                fp.write(raw)
+            from android.content import Intent
+            from android.net import Uri
+            from java.io import File
+            try:
+                from androidx.core.content import FileProvider
+                uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".provider", File(path))
+            except Exception:
+                uri = Uri.fromFile(File(path))
+            it = Intent(Intent.ACTION_SEND)
+            it.setType("application/json")
+            it.putExtra(Intent.EXTRA_STREAM, uri)
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            ctx.startActivity(Intent.createChooser(it, "Экспорт логов").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        except Exception as e:
+            _bulletin("export err: %s" % e)
+
+    def _clear_data(self, view):
+        try:
+            from android.webkit import CookieManager, WebStorage
+            CookieManager.getInstance().removeAllCookies(None)
+            CookieManager.getInstance().flush()
+            WebStorage.getInstance().deleteAllData()
+            if self._last_wv is not None:
+                self._last_wv.clearCache(True)
+            _bulletin("Cookies и кеш аппок очищены")
+        except Exception as e:
+            _bulletin("clear err: %s" % e)
+
+    def _clear_sources(self, view):
+        self._save_sources(list(DEFAULT_SOURCES))
+        _bulletin("Источники сброшены к eruda")
+
+    # --- пояснения-попапы ---
+    def _help_dev(self, view):
+        _info_dialog(view.getContext(), "DevTools / источники",
+                     "Плагин внедряет JS в мини-аппку через evaluateJavascript — канал консоли разработчика, "
+                     "поэтому работает даже при строгом CSP. eruda даёт полноценный DevTools. Через «+» можно "
+                     "добавить свою ссылку на любой JS (другой девтулс, либа) — он докачается в клиент и внедрится.")
+
+    def create_settings(self):
+        rows = [
+            Header(text="DevTools"),
+            Switch(key="unlock", text="Разлок выделения текста", default=True, icon="msg_copy"),
+            Switch(key="zoom", text="Force zoom (снять залоченный пинч)", default=False, icon="msg_search"),
+            Switch(key="remote_debug", text="Remote debug (chrome://inspect)", default=False,
+                   subtext="Открывает вебвью для инспекции с ПК", icon="msg_secret"),
+            Text(text="Что это и как работает", icon="msg_info", on_click=self._help_dev),
+            Divider(),
+            Header(text="Источники инъекта"),
+        ]
+        for s in self._sources():
+            rows.append(Switch(key="src_" + s["id"], text=s.get("name", s["id"]),
+                               default=bool(s.get("on", True)), subtext=s.get("url", "")[:48],
+                               on_change=(lambda val, sid=s["id"]: self._toggle_source(sid, val))))
+        rows += [
+            Input(key="new_url", text="Ссылка на JS (CDN)", default="",
+                  subtext="Напр. https://cdn.jsdelivr.net/npm/vconsole"),
+            Text(text="Добавить источник", icon="msg_addbot", on_click=self._add_source),
+            Text(text="Сбросить источники", icon="msg_delete", red=True, on_click=self._clear_sources),
+            Divider(),
+            Header(text="Инструменты"),
+            Text(text="WebApp Inspector (дамп initData)", icon="msg_info", on_click=self._inspector),
+            Text(text="Открыть аппку в браузере", icon="msg_language", on_click=self._open_browser),
+            Text(text="Очистить cookies/cache аппок", icon="msg_clear", on_click=self._clear_data),
+            Divider(),
+            Header(text="Логи / UA"),
+            Switch(key="logs", text="Логировать заходы", default=True, icon="msg_log"),
+            Text(text="Экспорт логов в файл", icon="msg_shareout", on_click=self._export_logs),
+            Divider(),
+            Text(text="by huecoder with <3"),
+        ]
+        return rows
+
+    def _toggle_source(self, sid, val):
+        arr = self._sources()
+        for s in arr:
+            if s["id"] == sid:
+                s["on"] = bool(val)
+        self._save_sources(arr)
+
+
+class _WvHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._handle(param.thisObject)  # обход CSP: ловим вебвью аппки
+        except Exception:
+            pass
