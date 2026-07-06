@@ -18,7 +18,7 @@ from datetime import datetime
 from android.os import Environment
 from android.view import View
 from android_utils import run_on_ui_thread
-from base_plugin import BasePlugin, HookResult, MethodHook, MethodReplacement
+from base_plugin import BasePlugin, HookResult, MethodHook, MethodReplacement, XposedHook
 from client_utils import get_last_fragment, get_messages_controller
 from file_utils import get_files_dir, get_plugins_dir
 from hook_utils import find_class, get_private_field, set_private_field
@@ -35,7 +35,7 @@ __name__ = "UtilitiesPro"
 __description__ = "Обход лимита пересылки/удаления сообщений и сохранение коротких данных профиля собеседника в одном standalone-плагине. Форк и основная standalone-реализация: @VibeSPluginS при участии @kvuco. Для восстановления bypass использован ориентир из форка @mur_live. Исходная идея плагинов: @zwylair."
 __icon__ = "zwyPluginsIcons/6"
 __id__ = "utilities_pro"
-__version__ = "1.2.0"
+__version__ = "1.2.3"
 __author__ = "@VibeSPluginS; при участии @kvuco; ориентир для bypass: @mur_live; идея: @zwylair"
 __min_version__ = "12.0.1"
 
@@ -94,6 +94,9 @@ update_pinned_msg_view_method = None
 active_dialogs = []
 current_plugin = None
 
+_resolving_dialogs = set()
+_resolving_lock = threading.Lock()
+
 
 # ─────────────────────────────────────────────────────────────
 # SDK-safe helpers
@@ -125,7 +128,7 @@ def arraylist_to_list(value):
 def iterable_to_arraylist(items):
     result = ArrayList()
     for item in items:
-        result.add(item)
+        result.add(Integer(int(item)))
     return result
 
 
@@ -144,7 +147,8 @@ def clone_data(value):
 
 def set_storage_content(storage, content):
     storage.ensure_loaded()
-    storage.content = clone_data(content if isinstance(content, dict) else {})
+    with storage._lock:
+        storage.content = clone_data(content if isinstance(content, dict) else {})
 
 
 def storage_snapshot():
@@ -793,7 +797,7 @@ class JsonStorage:
         self.compress = compress
         self.legacy_specs = legacy_specs
         self.content = self._copy_default()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.loaded = False
         self.selected_path = None
         self.selected_source = "current"
@@ -965,9 +969,10 @@ class JsonStorage:
         self._diag.op("read")
         try:
             data, selected_source, selected_path, diagnostics = self._pick_existing_data()
-            self.content = data if isinstance(data, dict) and data else self._copy_default()
-            self.selected_source = selected_source
-            self.selected_path = selected_path
+            with self._lock:
+                self.content = data if isinstance(data, dict) and data else self._copy_default()
+                self.selected_source = selected_source
+                self.selected_path = selected_path
             self.last_scan = diagnostics
             self._diag.verify_read_end(selected_path, self.content, normalize_fn=normalize_peer_dump)
             self.loaded = True
@@ -980,9 +985,10 @@ class JsonStorage:
             import traceback
             self._trace_read("read_exception", exception=type(e).__name__,
                 traceback=traceback.format_exc())
-            self.content = self._copy_default()
-            self.selected_source = "current"
-            self.selected_path = self.path()
+            with self._lock:
+                self.content = self._copy_default()
+                self.selected_source = "current"
+                self.selected_path = self.path()
             self._diag.verify_read_end(self.path(), self.content, normalize_fn=normalize_peer_dump)
             return False
 
@@ -1018,7 +1024,7 @@ class JsonStorage:
             self.selected_path = path
             self.selected_source = "current"
             self._diag.verify_write_end(path, self.compress)
-            self._diag.record_expected_mutation("write", self.content)
+            self._diag.record_expected_mutation("write", content_snapshot)
             return True
         except Exception:
             logger.error("Failed to write storage %s:", path, exc_info=True)
@@ -1100,13 +1106,24 @@ def import_peer_dump(data):
     if not normalized:
         return 0
     peer_storage.ensure_loaded()
-    peer_storage.content.update(normalized)
+    if not peer_storage._lock.acquire(blocking=False):
+        logger.warning("Storage locked, skipping import")
+        return 0
+    try:
+        old_values = {k: peer_storage.content[k] for k in normalized if k in peer_storage.content}
+        peer_storage.content.update(normalized)
+    finally:
+        peer_storage._lock.release()
     try:
         if not peer_storage.write():
             raise RuntimeError("storage_write_failed")
     except Exception:
-        for k in normalized:
-            peer_storage.content.pop(k, None)
+        with peer_storage._lock:
+            for k in normalized:
+                if k in old_values:
+                    peer_storage.content[k] = old_values[k]
+                else:
+                    peer_storage.content.pop(k, None)
         raise
     return len(normalized)
 
@@ -1114,8 +1131,6 @@ def import_peer_dump(data):
 def is_meaningful_peer_dump(dumped):
     if not isinstance(dumped, dict):
         return False
-    if dumped.get("phone_country") is not None:
-        return True
     if any(dumped.get(field) not in (None, "", 0, False) for field in PRECIOUS_PEER_FIELDS):
         return True
     for field in IMPORTANT_PEER_STATE_FIELDS:
@@ -1333,19 +1348,20 @@ def merge_peer_records(current, incoming):
         for field in PRECIOUS_PEER_FIELDS:
             if not combined.get(field):
                 old_value = existing.get(field)
-                new_value = value.get(field)
                 if old_value not in (None, "", 0, False):
                     combined[field] = old_value
-                elif new_value not in (None, "", 0, False):
-                    combined[field] = new_value
         if is_meaningful_peer_dump(combined):
             merged[key] = combined
     return {key: value for key, value in merged.items() if is_meaningful_peer_dump(value)}
 
 
 def verify_storage_state(expected_peer):
-    peer_storage.read()
-    return normalize_peer_dump(peer_storage.content) == normalize_peer_dump(expected_peer)
+    try:
+        fmt = "gzip_json" if peer_storage.compress else "json"
+        data = peer_storage._read_candidate(peer_storage.path(), fmt)
+    except Exception:
+        return False
+    return normalize_peer_dump(data) == normalize_peer_dump(expected_peer)
 
 
 def apply_storage_transaction(peer_content, safety_prefix=None):
@@ -1446,16 +1462,18 @@ def delete_saved_peer_data(dialog_id):
         return False
     peer_storage.ensure_loaded()
     dialog_key = str(dialog_id)
-    if dialog_key not in peer_storage.content:
-        return False
-    old_value = peer_storage.content.get(dialog_key)
-    del peer_storage.content[dialog_key]
+    with peer_storage._lock:
+        if dialog_key not in peer_storage.content:
+            return False
+        old_value = peer_storage.content.get(dialog_key)
+        del peer_storage.content[dialog_key]
     ok = peer_storage.write()
     if ok:
         notify_success(f"Данные профиля {dialog_id} удалены")
     else:
-        if old_value is not None:
-            peer_storage.content[dialog_key] = old_value
+        with peer_storage._lock:
+            if old_value is not None:
+                peer_storage.content[dialog_key] = old_value
         notify_error("Ошибка при удалении данных профиля")
     return ok
 
@@ -1514,8 +1532,10 @@ def update_select_button_visibility(chat_activity):
         return
 
     java_msgs_main = java_msgs_sparse[0]
+    if java_msgs_main is None:
+        return
     new_select_visibility = View.GONE
-    if java_msgs_main and java_msgs_main.size() > 1:
+    if java_msgs_main.size() > 1:
         all_selected_msg_ids = get_sparsearray_keys(java_msgs_main) + get_sparsearray_keys(java_msgs_sparse[1])
         all_selected_msg_ids.sort()
         if all_selected_msg_ids:
@@ -1523,23 +1543,12 @@ def update_select_button_visibility(chat_activity):
             end = all_selected_msg_ids[-1]
             for i in range(messages.size()):
                 msg = messages.get(i)
+                if msg is None:
+                    continue
                 msg_id = msg.getId()
                 if begin < msg_id < end and java_msgs_main.indexOfKey(msg_id) < 0 and msg.contentType == 0:
                     new_select_visibility = View.VISIBLE
                     break
-    
-    should_show = new_select_visibility == View.VISIBLE
-    if actions_buttons_layout:
-        pass
-    else:
-        select_button = get_private_field(chat_activity, "selectButton")
-        select_button_animator = get_private_field(chat_activity, FIELD_SELECT_BUTTON_ANIMATION)
-        if select_button_animator:
-            select_button_animator.cancel()
-        if new_select_visibility != select_button.getVisibility():
-            select_button.setVisibility(View.VISIBLE if should_show else View.GONE)
-            select_button.setAlpha(1.0 if should_show else 0.0)
-            select_button.setScaleY(1.0 if should_show else 0.0)
 
 
 def cancel_selection_mode(chat_activity):
@@ -1569,13 +1578,27 @@ class SelectorHook(MethodHook):
         self.is_processing_msg_group = False
         self.is_last_in_group = False
         self.handle_end_of_select_msg_group_call = False
+        self._group_dialog_id = None
+
+    def _ensure_correct_dialog(self, chat_activity):
+        dialog_id = str(get_private_field(chat_activity, FIELD_DIALOG_ID))
+        if dialog_id != self._group_dialog_id:
+            self.is_processing_msg_group = False
+            self.is_last_in_group = False
+            self.handle_end_of_select_msg_group_call = False
+            self._group_dialog_id = dialog_id
 
     def before_hooked_method(self, param):
         if not S.enable_forward_bypass:
             return
         try:
             chat_activity = param.thisObject
+            if chat_activity is None or len(param.args) < 3:
+                return
+            self._ensure_correct_dialog(chat_activity)
             selected_msg_obj = param.args[0]
+            if selected_msg_obj is None:
+                return
             tapped_outside = param.args[1]
             is_last = param.args[2]
             is_grouped = selected_msg_obj.getGroupId() != 0
@@ -1588,6 +1611,13 @@ class SelectorHook(MethodHook):
             java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
             if java_msgs_sparse is None:
                 return
+            try:
+                java_msgs_sparse[index] = param.thisObject.SparseArrayWithTouch()
+            except Exception:
+                from java import jclass
+                SparseArray = jclass('android.util.SparseArray')
+                java_msgs_sparse[index] = SparseArray()
+            set_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS, java_msgs_sparse)
         except Exception:
             logger.error("Selector before hook failed:", exc_info=True)
 
@@ -1598,14 +1628,19 @@ class SelectorHook(MethodHook):
             if self.handle_end_of_select_msg_group_call:
                 self.handle_end_of_select_msg_group_call = False
                 return
+            is_group_commit_event = False
             if self.is_processing_msg_group:
                 if not self.is_last_in_group:
                     return
                 self.is_processing_msg_group = False
                 self.is_last_in_group = False
                 self.handle_end_of_select_msg_group_call = True
+                is_group_commit_event = True
 
             chat_activity = param.thisObject
+            if chat_activity is None:
+                return
+            self._ensure_correct_dialog(chat_activity)
             index = get_selected_msgs_array_index(param)
             java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
             if java_msgs_sparse is None:
@@ -1620,14 +1655,15 @@ class SelectorHook(MethodHook):
             chat_mode = get_private_field(chat_activity, FIELD_CHAT_MODE)
             current_chat = get_private_field(chat_activity, FIELD_CURRENT_CHAT)
             is_in_schedule_mode = chat_mode == 1
+            no_forwards = is_in_schedule_mode or self._is_peer_no_forwards(chat_activity)
 
-            for array_index in reversed(range(selected_msgs_array.size())):
-                message_id = selected_msgs_array.keyAt(array_index)
+            for i in reversed(range(selected_msgs_array.size())):
+                message_id = selected_msgs_array.keyAt(i)
                 message_object = selected_msgs_array.get(message_id)
                 if message_object is None:
                     continue
                 if message_id in dialog_msgs:
-                    if not message_object.canForwardMessage():
+                    if not message_object.canForwardMessage() or no_forwards:
                         decrement_private_counter(chat_activity, FIELD_CANT_FORWARD_COUNT, FIELD_FORWARD_BUTTON)
                     if not message_object.canDeleteMessage(is_in_schedule_mode, current_chat):
                         decrement_private_counter(chat_activity, FIELD_CANT_DELETE_COUNT, FIELD_DELETE_ITEM)
@@ -1636,8 +1672,9 @@ class SelectorHook(MethodHook):
                     dialog_msgs[message_id] = message_object
 
             selected_msgs_array.clear()
-            for key, value in dialog_msgs.items():
-                selected_msgs_array.put(key, value)
+            for message_id, message_object in dialog_msgs.items():
+                selected_msgs_array.put(message_id, message_object)
+
             if not dialog_msgs:
                 cancel_selection_mode(chat_activity)
                 return
@@ -1646,11 +1683,18 @@ class SelectorHook(MethodHook):
         except Exception:
             logger.error("Selector after hook failed:", exc_info=True)
 
+    def _is_peer_no_forwards(self, chat_activity):
+        try:
+            return bool(chat_activity.isPeerNoForwards())
+        except Exception:
+            return False
+
     def clear_message_storage(self):
         self.messages_array.clear()
         self.is_processing_msg_group = False
         self.is_last_in_group = False
         self.handle_end_of_select_msg_group_call = False
+        self._group_dialog_id = None
 
 
 class ClearSelectionHook(MethodHook):
@@ -1666,71 +1710,86 @@ class ClearSelectionHook(MethodHook):
                 logger.error("ClearSelectionHook failed:", exc_info=True)
 
 
-
-
-
-
 class MultiSelectorHook(MethodHook):
     def __init__(self, hook_method):
         super().__init__()
         self.hook_method = hook_method
-        self.limit_hooked = False
 
     def after_hooked_method(self, param):
-        if not S.enable_forward_bypass or self.limit_hooked:
+        if not S.enable_forward_bypass:
             return
         try:
             chat_list_view = get_private_field(param.thisObject, FIELD_CHAT_LIST_VIEW)
-            selection_listener = get_private_field(chat_list_view, FIELD_MULTI_SELECTION_LISTENER) if chat_list_view else None
-            if not selection_listener:
+            if chat_list_view is None:
+                return
+            selection_listener = get_private_field(chat_list_view, FIELD_MULTI_SELECTION_LISTENER)
+            if selection_listener is None:
+                cls = chat_list_view.getClass()
+                while cls is not None:
+                    try:
+                        field = cls.getDeclaredField(FIELD_MULTI_SELECTION_LISTENER)
+                        field.setAccessible(True)
+                        selection_listener = field.get(chat_list_view)
+                        if selection_listener is not None:
+                            break
+                    except Exception:
+                        pass
+                    cls = cls.getSuperclass()
+            if selection_listener is None:
                 return
             method = selection_listener.getClass().getMethod("limitReached")
-            self.hook_method(method, self.BypassLimitReachedHook())
-            self.limit_hooked = True
+
+            class _BypassLimitReachedHook:
+                def replace_hooked_method(self, _param):
+                    return False
+
+            self.hook_method(method, _BypassLimitReachedHook())
         except Exception:
             logger.error("Multi-selector hook failed:", exc_info=True)
 
-    class BypassLimitReachedHook(MethodHook):
-        def after_hooked_method(self, param):
-            try:
-                if S.enable_forward_bypass:
-                    param.setResult(False)
-            except Exception:
-                pass
 
-
-class DeleteMessagesHook(MethodHook):
+class DeleteMessagesHook(XposedHook):
     chunk_size = 100
 
     def before_hooked_method(self, param):
         if not S.enable_forward_bypass:
             return
         try:
+            if len(param.args) < 2:
+                return
             first_msg_array = param.args[0]
             second_msg_array = param.args[1]
-            if first_msg_array and first_msg_array.size() > 0:
+            if first_msg_array is not None and first_msg_array.size() > 0:
                 messages_array = first_msg_array
                 selected_arg_index = 0
-            else:
+            elif second_msg_array is not None and second_msg_array.size() > 0:
                 messages_array = second_msg_array
                 selected_arg_index = 1
-            other_array = param.args[1 - selected_arg_index]
-            messages = arraylist_to_list(messages_array)
-            other = arraylist_to_list(other_array) if other_array and other_array.size() > 0 else None
-            if len(messages) <= self.chunk_size:
+            else:
                 return
-            chunks = split_list_into_chunks(messages, self.chunk_size)
-            last_chunk_index = len(chunks) - 1
-            for index, chunk in enumerate(chunks):
-                param.args[selected_arg_index] = iterable_to_arraylist(chunk)
-                if other is not None:
-                    chunk_start = index * self.chunk_size
-                    param.args[1 - selected_arg_index] = iterable_to_arraylist(other[chunk_start:chunk_start + self.chunk_size])
-                if index < last_chunk_index:
+            other_array = param.args[1 - selected_arg_index]
+            total = messages_array.size()
+            if total <= self.chunk_size:
+                return
+            other_total = other_array.size() if other_array is not None else 0
+            for start in range(0, total, self.chunk_size):
+                end = min(start + self.chunk_size, total)
+                chunk = ArrayList()
+                for i in range(start, end):
+                    chunk.add(Integer(int(messages_array.get(i))))
+                param.args[selected_arg_index] = chunk
+                if other_total > 0:
+                    other_start = min(start, other_total)
+                    other_end = min(end, other_total)
+                    other_chunk = ArrayList()
+                    for i in range(other_start, other_end):
+                        other_chunk.add(Long(other_array.get(i)))
+                    param.args[1 - selected_arg_index] = other_chunk
+                if end < total:
                     try:
                         param.method.invoke(param.thisObject, param.args)
                     except Exception:
-                        logger.error("DeleteMessages per-chunk error:", exc_info=True)
+                        logger.error("DeleteMessages per-chunk error (chunk %d-%d/%d):", start, end, total, exc_info=True)
         except Exception:
             logger.error("DeleteMessages hook failed:", exc_info=True)
 
@@ -1867,49 +1926,76 @@ def save_peer_settings(dialog_id, settings):
     if not is_meaningful_peer_dump(new_settings):
         return
     dialog_key = str(dialog_id)
-    old_settings = peer_storage.content.get(dialog_key)
-    peer_storage.content[dialog_key] = new_settings
-    if not peer_storage.write():
-        if old_settings is not None:
-            peer_storage.content[dialog_key] = old_settings
-        else:
-            peer_storage.content.pop(dialog_key, None)
+    with peer_storage._lock:
+        old_settings = clone_data(peer_storage.content.get(dialog_key))
+        peer_storage.content[dialog_key] = new_settings
+        write_ok = peer_storage.write()
+        if not write_ok:
+            if old_settings is not None:
+                peer_storage.content[dialog_key] = old_settings
+            else:
+                peer_storage.content.pop(dialog_key, None)
+    if not write_ok:
         logger.error("Failed to save peer settings for dialog %s", dialog_id, exc_info=True)
 
 
 def resolve_peer_settings(dialog_id, original_settings=None, use_saved=True):
     if original_settings is not None:
         return original_settings
-    msg_controller = get_messages_controller()
-    user_full_settings = None
-    msg_controller_settings = None
+    with _resolving_lock:
+        if dialog_id in _resolving_dialogs:
+            _fast_controller = get_messages_controller()
+            try:
+                _fast_full = _fast_controller.getUserFull(dialog_id)
+                _fast_settings = getattr(_fast_full, "settings", None)
+                if _fast_settings is not None:
+                    return _fast_settings
+            except Exception:
+                pass
+            try:
+                _fast_map = get_user_peer_settings_map(_fast_controller)
+                if _fast_map:
+                    _fast_val = _fast_map.get(dialog_id)
+                    if _fast_val is not None:
+                        return _fast_val
+            except Exception:
+                pass
+            return None
+        _resolving_dialogs.add(dialog_id)
     try:
-        user_full = msg_controller.getUserFull(dialog_id)
-        user_full_settings = getattr(user_full, "settings", None)
-    except Exception:
-        logger.error("resolve_peer_settings: msg_controller.getUserFull failed", exc_info=True)
-    try:
-        user_peer_settings = get_user_peer_settings_map(msg_controller)
-        msg_controller_settings = user_peer_settings.get(dialog_id) if user_peer_settings else None
-    except Exception:
-        logger.error("resolve_peer_settings: get_user_peer_settings_map failed", exc_info=True)
-    if not use_saved or not is_user_dialog(dialog_id):
-        return user_full_settings or msg_controller_settings or original_settings
-    saved_settings = load_saved_peer_settings(dialog_id) if use_saved else None
-    if user_full_settings is not None:
-        merged_user_full = merge_saved_peer_fields(user_full_settings, saved_settings)
-        if merged_user_full is not None:
-            return merged_user_full
-    if msg_controller_settings is not None:
-        merged_controller = merge_saved_peer_fields(msg_controller_settings, saved_settings)
-        if merged_controller is not None:
-            return merged_controller
-    if is_meaningful_peer_dump(saved_settings):
-        restored_settings = dict_to_peer_settings(saved_settings)
-        if restored_settings is not None:
-            cache_restored_peer_settings(msg_controller, dialog_id, restored_settings)
-            return restored_settings
-    return user_full_settings or msg_controller_settings or original_settings
+        msg_controller = get_messages_controller()
+        user_full_settings = None
+        msg_controller_settings = None
+        try:
+            user_full = msg_controller.getUserFull(dialog_id)
+            user_full_settings = getattr(user_full, "settings", None)
+        except Exception:
+            logger.error("resolve_peer_settings: msg_controller.getUserFull failed", exc_info=True)
+        try:
+            user_peer_settings = get_user_peer_settings_map(msg_controller)
+            msg_controller_settings = user_peer_settings.get(dialog_id) if user_peer_settings else None
+        except Exception:
+            logger.error("resolve_peer_settings: get_user_peer_settings_map failed", exc_info=True)
+        if not use_saved or not is_user_dialog(dialog_id):
+            return user_full_settings or msg_controller_settings
+        saved_settings = load_saved_peer_settings(dialog_id) if use_saved else None
+        if user_full_settings is not None:
+            merged_user_full = merge_saved_peer_fields(user_full_settings, saved_settings)
+            if merged_user_full is not None:
+                return merged_user_full
+        if msg_controller_settings is not None:
+            merged_controller = merge_saved_peer_fields(msg_controller_settings, saved_settings)
+            if merged_controller is not None:
+                return merged_controller
+        if is_meaningful_peer_dump(saved_settings):
+            restored_settings = dict_to_peer_settings(saved_settings)
+            if restored_settings is not None:
+                cache_restored_peer_settings(msg_controller, dialog_id, restored_settings)
+                return restored_settings
+        return user_full_settings or msg_controller_settings
+    finally:
+        with _resolving_lock:
+            _resolving_dialogs.discard(dialog_id)
 
 
 class SavePeerSettingsHook(MethodHook):
@@ -2720,7 +2806,8 @@ def self_test_phase1(ctx):
             try:
                 test_key = "999999999999"
                 test_val = {"test": datetime.now().isoformat()}
-                peer_storage.content[test_key] = test_val
+                with peer_storage._lock:
+                    peer_storage.content[test_key] = test_val
                 w_ok = peer_storage.write()
                 if w_ok and peer_storage.content.get(test_key) == test_val:
                     ctx.storage_status["write_temp"] = "PASS"
@@ -2734,8 +2821,9 @@ def self_test_phase1(ctx):
                 else:
                     ctx.storage_status["read_temp"] = "FAIL"
                     ctx.live_reasons["read_temp"] = "Тестовая запись не совпадает после чтения"
-                if test_key in peer_storage.content:
-                    del peer_storage.content[test_key]
+                with peer_storage._lock:
+                    if test_key in peer_storage.content:
+                        del peer_storage.content[test_key]
                 cleanup_ok = peer_storage.write()
                 if not cleanup_ok:
                     logger.error("Failed to save peer settings for dialog %s", test_key, exc_info=True)
@@ -3510,7 +3598,8 @@ class DiagOnBindTraceHook(MethodHook):
             dialog_id = _adapter_dialog_id(adapter)
             user_info_row = -5
             try:
-                user_info_row = int(get_private_field(adapter, "userInfoRow") or -5)
+                val = get_private_field(adapter, "userInfoRow")
+                user_info_row = int(val) if val is not None else -5
             except Exception:
                 logger.debug("userInfoRow not found on adapter %s", type(adapter).__name__)
             if position != user_info_row:
@@ -3554,6 +3643,10 @@ def setup_final_resolution_trace(plugin_instance):
     else:
         logger.warning("[DIAG] ListAdapter class not found")
 
+
+# ─────────────────────────────────────────────────────────────
+# Selection Limit Diagnostics
+# ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
 # Main plugin
