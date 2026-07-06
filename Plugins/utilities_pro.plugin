@@ -10,32 +10,37 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
+import time
 import zipfile
 import zlib
+import traceback
 from datetime import datetime
 
 from android.os import Environment
 from android.view import View
 from android_utils import run_on_ui_thread
 from base_plugin import BasePlugin, HookResult, MethodHook, MethodReplacement, XposedHook
-from client_utils import get_last_fragment, get_messages_controller
+from client_utils import get_last_fragment, get_messages_controller, get_file_loader, get_account_instance
+from com.exteragram.messenger.plugins import PluginsController, PluginsConstants, PythonPluginsEngine
 from file_utils import get_files_dir, get_plugins_dir
 from hook_utils import find_class, get_private_field, set_private_field
-from java import jclass
+from java import jclass, dynamic_proxy
 from java.lang import Boolean, Integer, Long, System as JavaSystem
 from java.util import ArrayList
-from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import FileLoader, MessageObject, UserConfig, Utilities
+from org.telegram.tgnet import ConnectionsManager, TLRPC
 from org.telegram.ui import ChatActivity as RuntimeChatActivity
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
-from ui.settings import Divider, Header, Switch, Text
+from ui.settings import Divider, Header, Switch, Text, Selector, Input
 
 __name__ = "UtilitiesPro"
 __description__ = "Обход лимита пересылки/удаления сообщений и сохранение коротких данных профиля собеседника в одном standalone-плагине. Форк и основная standalone-реализация: @VibeSPluginS при участии @kvuco. Для восстановления bypass использован ориентир из форка @mur_live. Исходная идея плагинов: @zwylair."
 __icon__ = "zwyPluginsIcons/6"
 __id__ = "utilities_pro"
-__version__ = "1.2.3"
+__version__ = "1.4.0"
 __author__ = "@VibeSPluginS; при участии @kvuco; ориентир для bypass: @mur_live; идея: @zwylair"
 __min_version__ = "12.0.1"
 
@@ -96,6 +101,13 @@ current_plugin = None
 
 _resolving_dialogs = set()
 _resolving_lock = threading.Lock()
+_saving_dialogs = {}
+_saving_lock = threading.Lock()
+_save_debounce_seconds = 0.5
+
+_update_timer = None
+_last_update_check = 0
+_UPDATE_INTERVALS = [1, 6, 12, 24, 168]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -429,6 +441,9 @@ def backup_overview_lines():
 class S:
     enable_forward_bypass = True
     enable_peer_info_saver = True
+    auto_update_enabled = False
+    auto_update_interval = 3
+    auto_update_url = "https://t.me/VibeSPluginS/19"
     _loaded = False
 
     @classmethod
@@ -456,6 +471,9 @@ class S:
             return
         cls.enable_forward_bypass = bool(cls.get("enable_forward_bypass", True))
         cls.enable_peer_info_saver = bool(cls.get("enable_peer_info_saver", True))
+        cls.auto_update_enabled = bool(cls.get("auto_update_enabled", False))
+        cls.auto_update_interval = int(cls.get("auto_update_interval", 3))
+        cls.auto_update_url = str(cls.get("auto_update_url", "https://t.me/VibeSPluginS/19"))
         cls._loaded = True
 
 
@@ -465,6 +483,21 @@ def on_forward_toggle(enabled):
 
 def on_peer_saver_toggle(enabled):
     S.set("enable_peer_info_saver", enabled)
+
+
+def handle_auto_update_toggle(enabled):
+    S.set("auto_update_enabled", enabled)
+    if enabled:
+        start_auto_update()
+    else:
+        stop_auto_update()
+
+
+def handle_update_interval_change(index):
+    S.set("auto_update_interval", index)
+    if S.auto_update_enabled:
+        stop_auto_update()
+        start_auto_update()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -501,14 +534,12 @@ class StorageStateMachine:
         self._check_multiple_instances()
 
     def _get_stack(self):
-        import traceback
         return ''.join(traceback.format_stack()[-6:-1])
 
     def _check_multiple_instances(self):
         pass
 
     def _content_hash(self, content):
-        import hashlib
         if not isinstance(content, dict):
             return "non-dict"
         stable = json.dumps(content, sort_keys=True, ensure_ascii=False)
@@ -628,7 +659,6 @@ class StorageStateMachine:
         self.observed_paths.add(abs_path)
 
     def verify_write_end(self, path, compress):
-        import hashlib
         if StorageStateMachine._frozen:
             return False
         ap = os.path.abspath(path)
@@ -673,7 +703,6 @@ class StorageStateMachine:
             return False
 
     def verify_read_end(self, path, loaded_content, normalize_fn=None):
-        import hashlib
         if StorageStateMachine._frozen:
             return False
         ap = os.path.abspath(path) if path else ""
@@ -859,7 +888,6 @@ class JsonStorage:
                     keys=len(data) if isinstance(data, dict) else "N/A")
                 return data
             except Exception as e:
-                import traceback
                 self._trace_read("gzip_open", path=path, success=False,
                     exception=type(e).__name__, traceback=traceback.format_exc())
                 raise
@@ -872,7 +900,6 @@ class JsonStorage:
                     keys=len(data) if isinstance(data, dict) else "N/A")
                 return data
             except Exception as e:
-                import traceback
                 self._trace_read("json_open", path=path, success=False,
                     exception=type(e).__name__, traceback=traceback.format_exc())
                 raise
@@ -884,7 +911,6 @@ class JsonStorage:
                     keys=len(data) if isinstance(data, dict) else "N/A")
                 return data
             except Exception as e:
-                import traceback
                 self._trace_read("zlib_open", path=path, success=False,
                     exception=type(e).__name__, traceback=traceback.format_exc())
                 raise
@@ -982,7 +1008,6 @@ class JsonStorage:
                 len=content_len, first_keys=first_keys)
             return bool(self.content)
         except Exception as e:
-            import traceback
             self._trace_read("read_exception", exception=type(e).__name__,
                 traceback=traceback.format_exc())
             with self._lock:
@@ -1135,6 +1160,13 @@ def is_meaningful_peer_dump(dumped):
         return True
     for field in IMPORTANT_PEER_STATE_FIELDS:
         value = dumped.get(field)
+        if isinstance(value, bool) and value:
+            return True
+        if value not in (None, "", 0, False):
+            return True
+    for key, value in dumped.items():
+        if key in PRECIOUS_PEER_FIELDS or key in IMPORTANT_PEER_STATE_FIELDS:
+            continue
         if isinstance(value, bool) and value:
             return True
         if value not in (None, "", 0, False):
@@ -1457,6 +1489,47 @@ def wipe_saved_peer_data():
     )
 
 
+def clean_empty_profiles():
+    def confirm(_, __):
+        try:
+            peer_storage.ensure_loaded()
+            with peer_storage._lock:
+                before = len(peer_storage.content)
+                empty_keys = [k for k, v in peer_storage.content.items()
+                              if not is_meaningful_peer_dump(v)]
+                old_entries = {k: peer_storage.content[k] for k in empty_keys}
+                for k in empty_keys:
+                    del peer_storage.content[k]
+                write_ok = peer_storage.write()
+                if not write_ok:
+                    for k, v in old_entries.items():
+                        peer_storage.content[k] = v
+                    notify_error("Не удалось записать изменения, данные восстановлены")
+                    return
+            notify_success(f"Удалено пустых профилей: {len(empty_keys)} из {before}")
+        except Exception:
+            logger.error("Clean empty profiles failed:", exc_info=True)
+            peer_storage.ensure_loaded()
+            notify_error("Не удалось очистить пустые профили")
+
+    peer_storage.ensure_loaded()
+    empty_count = sum(1 for v in peer_storage.content.values()
+                      if not is_meaningful_peer_dump(v))
+    if empty_count == 0:
+        notify_info("Пустых профилей не найдено")
+        return
+    show_alert(
+        "Очистить пустые профили?",
+        f"Найдено {empty_count} {decline_word(empty_count)}, в которых нет полезных данных. "
+        "Будут удалены только пустые профили — все ценные данные сохранятся.",
+        buttons=[
+            ("positive", "Очистить", confirm),
+            ("negative", "Отмена", lambda _, __: None),
+        ],
+        cancelable=True,
+    )
+
+
 def delete_saved_peer_data(dialog_id):
     if not is_user_dialog(dialog_id):
         return False
@@ -1739,7 +1812,7 @@ class MultiSelectorHook(MethodHook):
                 return
             method = selection_listener.getClass().getMethod("limitReached")
 
-            class _BypassLimitReachedHook:
+            class _BypassLimitReachedHook(MethodReplacement):
                 def replace_hooked_method(self, _param):
                     return False
 
@@ -1914,6 +1987,12 @@ def load_saved_peer_settings(dialog_id):
 def save_peer_settings(dialog_id, settings):
     if not is_user_dialog(dialog_id):
         return
+    now = JavaSystem.nanoTime()
+    with _saving_lock:
+        last = _saving_dialogs.get(dialog_id, 0)
+        if now - last < _save_debounce_seconds * 1_000_000_000:
+            return
+        _saving_dialogs[dialog_id] = now
     peer_storage.ensure_loaded()
     new_settings = peer_settings_to_dict(settings)
     if not new_settings:
@@ -1951,6 +2030,7 @@ def resolve_peer_settings(dialog_id, original_settings=None, use_saved=True):
                 if _fast_settings is not None:
                     return _fast_settings
             except Exception:
+                logger.debug("resolve_peer_settings: fast-path getUserFull failed for dialog %s", dialog_id)
                 pass
             try:
                 _fast_map = get_user_peer_settings_map(_fast_controller)
@@ -1959,6 +2039,7 @@ def resolve_peer_settings(dialog_id, original_settings=None, use_saved=True):
                     if _fast_val is not None:
                         return _fast_val
             except Exception:
+                logger.debug("resolve_peer_settings: fast-path get_user_peer_settings_map failed for dialog %s", dialog_id)
                 pass
             return None
         _resolving_dialogs.add(dialog_id)
@@ -2269,6 +2350,342 @@ def confirm_backup_import(filename, mode):
 
 
 # ─────────────────────────────────────────────────────────────
+# Auto-Update
+# ─────────────────────────────────────────────────────────────
+
+def _install_plugin_from_path(file_path):
+    engine = PluginsController.engines.get(PluginsConstants.PYTHON)
+    if not engine:
+        logger.error("Auto-update: PythonPluginsEngine not found")
+        return False
+    done = threading.Event()
+    result = [False]
+    class InstallCb(dynamic_proxy(Utilities.Callback)):
+        def run(self_cb, error):
+            if not error:
+                result[0] = True
+            done.set()
+    engine.loadPluginFromFile(str(file_path), None, InstallCb())
+    done.wait(timeout=30)
+    return result[0]
+
+
+def _extract_version_from_plugin(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+        if m:
+            return m.group(1)
+    except Exception:
+        logger.error("Failed to extract version from downloaded plugin", exc_info=True)
+    return None
+
+
+def _parse_update_url(url):
+    m = re.search(r'(?:t\.me/)?(\w+)/(\d+)', url)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None, None
+
+
+def _do_check_update(show_no_update=False):
+    raw_url = S.auto_update_url.strip()
+    channel, msg_id = _parse_update_url(raw_url)
+    logger.debug("AU: check started @%s msg=%s (url=%s)", channel, msg_id, raw_url)
+    if not channel or not msg_id:
+        if show_no_update:
+            notify_error("Неверная ссылка на сообщение. Ожидается: t.me/Канал/123")
+        return
+
+    try:
+        acc = UserConfig.selectedAccount
+        logger.debug("AU: account=%s", acc)
+    except Exception:
+        logger.error("AU: UserConfig.selectedAccount failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Не удалось получить аккаунт"))
+        return
+
+    try:
+        RequestDelegate = jclass("org.telegram.tgnet.RequestDelegate")
+        logger.debug("AU: RequestDelegate loaded")
+    except Exception:
+        logger.error("AU: jclass RequestDelegate failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Ошибка SDK: RequestDelegate"))
+        return
+
+    class MessagesDelegate(dynamic_proxy(RequestDelegate)):
+        def run(self, msg_response, msg_error):
+            logger.debug("AU: msgs_cb err=%s hasResp=%s",
+                         getattr(msg_error, "text", None) if msg_error else None,
+                         msg_response is not None)
+            if msg_error or not msg_response:
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error("Не удалось получить сообщение"))
+                return
+            try:
+                logger.debug("AU: msgs_cb step1 list()")
+                java_msgs = msg_response.messages
+                if java_msgs is None or java_msgs.size() == 0:
+                    logger.debug("AU: msgs_cb empty (null or isEmpty)")
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_info("Сообщение с плагином не найдено"))
+                    return
+                try:
+                    message = java_msgs.get(0)
+                except Exception:
+                    logger.error("AU: msgs_cb get(0) failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: список сообщений"))
+                    return
+                logger.debug("AU: msgs_cb step2 acc_i")
+                try:
+                    acc_i = get_account_instance()
+                except Exception:
+                    logger.error("AU: msgs_cb get_account_instance failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: аккаунт (2)"))
+                    return
+                logger.debug("AU: msgs_cb step3 MessageObject")
+                msg_obj = MessageObject(acc_i.getCurrentAccount(), message, False, False)
+
+                edit_date = getattr(message, "edit_date", 0) or getattr(message, "date", 0)
+                stored_date = int(S.get("last_update_edit_date", "0") or "0")
+                if not show_no_update and edit_date and edit_date <= stored_date:
+                    logger.debug("AU: no newer (edit=%s <= stored=%s)", edit_date, stored_date)
+                    return
+
+                logger.debug("AU: spawning download thread")
+                threading.Thread(
+                    target=lambda: _download_and_install(msg_obj, edit_date, show_no_update),
+                    daemon=True,
+                ).start()
+            except Exception:
+                logger.error("AU: msgs_cb UNKNOWN", exc_info=True)
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error("Ошибка при проверке обновления"))
+
+    class ResolveDelegate(dynamic_proxy(RequestDelegate)):
+        def run(self, response, error):
+            logger.debug("AU: resolve_cb err=%s hasResp=%s",
+                         getattr(error, "text", None) if error else None,
+                         response is not None)
+            if error or not response:
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error(f"Канал @{channel} не найден"))
+                return
+            try:
+                logger.debug("AU: resolve_cb step1 chats")
+                try:
+                    chats = getattr(response, "chats", None)
+                except Exception:
+                    logger.error("AU: resolve_cb getattr(chats) failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: чтение chats"))
+                    return
+                if chats and chats.size() > 0:
+                    chat = chats.get(0)
+                else:
+                    logger.debug("AU: resolve_cb step1b peer")
+                    try:
+                        peer = getattr(response, "peer", None)
+                    except Exception:
+                        logger.error("AU: resolve_cb getattr(peer) failed", exc_info=True)
+                        if show_no_update:
+                            run_on_ui_thread(lambda: notify_error("Ошибка: чтение peer"))
+                        return
+                    if not peer:
+                        if show_no_update:
+                            run_on_ui_thread(lambda: notify_error(f"Канал @{channel} не найден"))
+                        return
+                    chat_id = getattr(peer, "channel_id", 0)
+                    logger.debug("AU: resolve_cb step1c getChat(%s)", -chat_id)
+                    try:
+                        mc = get_messages_controller()
+                        chat = mc.getChat(-chat_id) if chat_id else None
+                    except Exception:
+                        logger.error("AU: resolve_cb getChat failed", exc_info=True)
+                        if show_no_update:
+                            run_on_ui_thread(lambda: notify_error("Ошибка: getChat"))
+                        return
+                if not chat:
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error(f"Канал @{channel} не найден"))
+                    return
+
+                logger.debug("AU: resolve_cb channel_id=%s", chat.id)
+                logger.debug("AU: resolve_cb step2 TL_inputChannel")
+                try:
+                    input_channel = TLRPC.TL_inputChannel()
+                except Exception:
+                    logger.error("AU: resolve_cb TL_inputChannel() failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: InputChannel"))
+                    return
+                input_channel.channel_id = chat.id
+                input_channel.access_hash = getattr(chat, "access_hash", 0)
+                logger.debug("AU: resolve_cb step3 req build")
+                try:
+                    req = TLRPC.TL_channels_getMessages()
+                except Exception:
+                    logger.error("AU: resolve_cb TL_channels_getMessages() failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: getMessages"))
+                    return
+                req.channel = input_channel
+                msg_ids = ArrayList()
+                msg_ids.add(Integer(msg_id))
+                req.id = msg_ids
+                logger.debug("AU: resolve_cb step4 sendRequest")
+                try:
+                    cm = ConnectionsManager.getInstance(acc)
+                    cm.sendRequest(req, MessagesDelegate())
+                    logger.debug("AU: resolve_cb sendRequest dispatched OK")
+                except Exception:
+                    logger.error("AU: resolve_cb sendRequest failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: запрос сообщений"))
+                    return
+            except Exception:
+                logger.error("AU: resolve_cb UNKNOWN", exc_info=True)
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error("Ошибка при проверке обновления"))
+
+    logger.debug("AU: sending resolveUsername for @%s", channel)
+    try:
+        resolve_req = TLRPC.TL_contacts_resolveUsername()
+        resolve_req.username = channel
+        cm = ConnectionsManager.getInstance(acc)
+        cm.sendRequest(resolve_req, ResolveDelegate())
+        logger.debug("AU: resolveUsername dispatched OK")
+    except Exception:
+        logger.error("AU: resolveUsername sendRequest failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Ошибка: запрос канала"))
+        return
+
+
+def _download_and_install(msg_obj, edit_date, show_no_update=False):
+    try:
+        media = MessageObject.getMedia(msg_obj)
+        if not media:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("В сообщении нет файла"))
+            return
+        attachment = media.document or media.photo
+        if not attachment:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось получить файл из сообщения"))
+            return
+
+        fl = get_file_loader()
+        file_path = fl.getPathToAttach(attachment, True)
+        if not file_path or not file_path.exists() or file_path.length() <= 0:
+            file_name = FileLoader.getAttachFileName(attachment)
+            logger.debug("Auto-update: downloading %s...", file_name)
+            run_on_ui_thread(lambda: fl.loadFile(attachment, None, 1, 1))
+            for _ in range(120):
+                time.sleep(1)
+                file_path = fl.getPathToAttach(attachment, True)
+                if file_path and file_path.exists() and file_path.length() > 0:
+                    logger.debug("Auto-update: download complete in %ss", _ + 1)
+                    break
+
+        file_path = fl.getPathToAttach(attachment, True)
+        if not file_path or not file_path.exists() or file_path.length() <= 0:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось загрузить файл плагина"))
+            return
+
+        if not PluginsController.isPlugin(msg_obj):
+            logger.debug("Auto-update: downloaded file is not a plugin")
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_info("Загруженный файл не является плагином"))
+            return
+
+        new_version = _extract_version_from_plugin(str(file_path))
+        if not new_version:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось определить версию в скачанном плагине"))
+            return
+
+        logger.debug("Auto-update: downloaded v%s (current v%s)", new_version, __version__)
+        if not show_no_update and new_version == __version__:
+            logger.debug("Auto-update: already at version %s", __version__)
+            S.set("last_update_edit_date", str(edit_date))
+            return
+
+        logger.info("Auto-update: installing v%s (current v%s)", new_version, __version__)
+        ok = _install_plugin_from_path(str(file_path))
+        if ok:
+            S.set("last_update_edit_date", str(edit_date))
+            run_on_ui_thread(lambda: notify_success(
+                f"Плагин обновлён до v{new_version}\nПерезапустите приложение для применения"
+            ))
+        else:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось установить обновление"))
+    except Exception:
+        logger.error("Auto-update: download/install failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Ошибка при установке обновления"))
+
+
+def check_for_update_now():
+    global _last_update_check
+    _last_update_check = time.monotonic()
+    BulletinHelper.show_info("Проверка обновлений...", None)
+    threading.Thread(target=lambda: _do_check_update(show_no_update=True), daemon=True).start()
+
+
+def _schedule_next_check(interval_hours):
+    global _update_timer
+    _cancel_scheduled_check()
+    interval_seconds = interval_hours * 3600
+    _update_timer = threading.Timer(interval_seconds, _on_scheduled_check)
+    _update_timer.daemon = True
+    _update_timer.start()
+    logger.debug("Auto-update: next check in %d seconds", interval_seconds)
+
+
+def _cancel_scheduled_check():
+    global _update_timer
+    if _update_timer:
+        _update_timer.cancel()
+        _update_timer = None
+
+
+def _on_scheduled_check():
+    global _last_update_check
+    try:
+        _last_update_check = time.monotonic()
+        _do_check_update()
+    except Exception:
+        logger.error("Auto-update: scheduled check failed", exc_info=True)
+    finally:
+        if S.auto_update_enabled:
+            idx = S.auto_update_interval
+            if 0 <= idx < len(_UPDATE_INTERVALS):
+                _schedule_next_check(_UPDATE_INTERVALS[idx])
+
+
+def start_auto_update():
+    if not S.auto_update_enabled:
+        return
+    idx = S.auto_update_interval
+    if 0 <= idx < len(_UPDATE_INTERVALS):
+        _schedule_next_check(_UPDATE_INTERVALS[idx])
+    else:
+        _schedule_next_check(24)
+
+
+def stop_auto_update():
+    _cancel_scheduled_check()
+
+
+# ─────────────────────────────────────────────────────────────
 # Settings UI
 # ─────────────────────────────────────────────────────────────
 
@@ -2279,6 +2696,7 @@ PAGE_BACKUP_IMPORT = "backup_import"
 PAGE_REPAIR = "repair"
 PAGE_ABOUT = "about"
 PAGE_VIEW_SAVED = "view_saved"
+PAGE_UPDATES = "updates"
 
 
 def create_settings(page_id=PAGE_MAIN):
@@ -2291,25 +2709,24 @@ def create_settings(page_id=PAGE_MAIN):
         summary = backup_file_summary(filename)
         return [
             Header("Резервная копия"),
-            Divider("Выберите, как восстановить данные из этой копии."),
-            Divider(f"Размер: {summary['size_label']}"),
-            Divider(f"Дата: {summary['created_label']}"),
+            Divider("Выберите способ восстановления данных из этой копии."),
+            Divider(f"Размер: {summary['size_label']}  ·  Дата: {summary['created_label']}"),
             Divider(f"Профилей: {summary['peer_count']}"),
             Text(
                 text="Заменить",
-                subtext="Полностью заменить текущие данные. Перед импортом автоматически создаётся страховочная копия, при ошибке выполняется откат.",
+                subtext="Полная замена текущих данных. Перед импортом создаётся страховочная копия, при ошибке — откат.",
                 icon="msg_delete",
                 red=True,
                 on_click=lambda _: confirm_backup_import(filename, "replace"),
             ),
             Text(
                 text="Объединить",
-                subtext="Сохранить текущие данные и аккуратно объединить их с резервной копией без дублей.",
+                subtext="Сохранить текущие данные и аккуратно объединить с копией без дублей.",
                 icon="msg_download",
                 accent=True,
                 on_click=lambda _: confirm_backup_import(filename, "merge"),
             ),
-            Header("Технические сведения"),
+            Header("Сведения"),
             Divider(f"Файл: {summary['filename']}"),
             Divider(f"Версия плагина: {summary['version']}"),
             Divider(f"Источник: {summary['plugin']}"),
@@ -2318,63 +2735,73 @@ def create_settings(page_id=PAGE_MAIN):
 
     if page_id == PAGE_FEATURES:
         return [
-            Header("Защита и лимиты"),
-            Divider("Два основных модуля, без лишних технических деталей."),
+            Header("Функции"),
+            Divider("Два основных модуля и автообновление. Включайте нужное."),
             Switch(
                 key="enable_forward_bypass",
                 text="Снять лимит выделения и удаления",
-                subtext="Позволяет работать с большими пачками сообщений без лимита 100.",
+                subtext="Работа с большими пачками сообщений без ограничения в 100 штук.",
                 default=S.enable_forward_bypass,
                 icon="msg_share",
                 on_change=on_forward_toggle,
+                link_alias="bypass",
             ),
             Switch(
                 key="enable_peer_info_saver",
                 text="Сохранять данные профиля",
-                subtext="Сохраняет полезные поля профиля и восстанавливает их, если Telegram перестал их отдавать.",
+                subtext="Страна, дата регистрации, смена имени и фото. Восстанавливает, если Telegram перестал отдавать.",
                 default=S.enable_peer_info_saver,
                 icon="msg_openprofile",
                 on_change=on_peer_saver_toggle,
+                link_alias="saver",
             ),
-            Header("Что входит"),
-            Divider("Страна телефона, месяц регистрации, даты изменения имени и фото."),
-            Divider("Если используются похожие старые плагины, лучше выключить их, чтобы избежать конфликтов."),
+            Header("Совместимость"),
+            Divider("Если используются похожие старые плагины — отключите их во избежание конфликтов."),
         ]
 
     if page_id == PAGE_DATA:
         return [
-            Header("Данные и резервные копии"),
-            Divider("Здесь собраны действия для сохранения, восстановления и очистки данных."),
+            Header("Данные"),
+            Divider("Сохранение, восстановление и очистка профилей. Все операции со страховкой."),
             *divider_lines(backup_overview_lines()),
             Text(
                 text="Создать резервную копию",
-                subtext="Сохраняет текущее состояние плагина для безопасного восстановления.",
+                subtext="Текущее состояние плагина — для безопасного восстановления.",
                 icon="msg_share",
                 accent=True,
                 on_click=lambda _: export_backup(),
             ),
             Text(
-                text="Импортировать резервную копию",
-                subtext="Открывает список копий с режимами замены и объединения.",
+                text="Восстановить из копии",
+                subtext="Список сохранённых копий с режимами замены и объединения.",
                 icon="msg_download",
                 accent=True,
                 create_sub_fragment=subpage(PAGE_BACKUP_IMPORT),
+                link_alias="backup_import",
             ),
             Text(
-                text="Восстановить последнюю копию",
-                subtext="Быстро вернуть последнее сохранённое состояние. Перед заменой создаётся страховочная копия.",
+                text="Восстановить последнюю",
+                subtext="Один клик до последнего сохранённого состояния со страховкой.",
                 icon="msg_restore",
                 on_click=lambda _: confirm_restore_latest_backup(),
             ),
             Text(
-                text="Просмотреть сохранённые профили",
-                subtext="Ценные поля, сохранённые для каждого профиля.",
+                text="Сохранённые профили",
+                subtext=f"Просмотр {health['peer_count']} профилей с ценными полями.",
                 icon="msg_openprofile",
                 create_sub_fragment=subpage(PAGE_VIEW_SAVED),
+                link_alias="view_saved",
+            ),
+            Header("Очистка"),
+            Text(
+                text="Удалить пустые профили",
+                subtext="Только те, в которых нет полезных данных. Ценные не трогаются.",
+                icon="msg_clear",
+                on_click=lambda _: clean_empty_profiles(),
             ),
             Text(
-                text="Очистить локальные данные",
-                subtext="Удаляет только данные UtilitiesPro. Резервные копии остаются нетронутыми.",
+                text="Очистить всё",
+                subtext="Полное удаление данных UtilitiesPro. Резервные копии сохраняются.",
                 icon="msg_delete",
                 red=True,
                 on_click=lambda _: wipe_saved_peer_data(),
@@ -2383,7 +2810,7 @@ def create_settings(page_id=PAGE_MAIN):
 
     if page_id == PAGE_BACKUP_IMPORT:
         files = list_backup_files()
-        entries = [Header("Импорт резервной копии"), Divider("Выберите копию для восстановления или объединения.")]
+        entries = [Header("Восстановить из копии"), Divider("Выберите резервную копию для восстановления или объединения.")]
         if not files:
             entries.append(Divider("Резервные копии пока не найдены."))
             return entries
@@ -2392,7 +2819,7 @@ def create_settings(page_id=PAGE_MAIN):
             summary = backup_file_summary(filename)
             entries.append(Text(
                 text=summary["created_label"],
-                subtext=f"Профилей: {summary['peer_count']} · Размер: {summary['size_label']}",
+                subtext=f"Профилей: {summary['peer_count']}  ·  Размер: {summary['size_label']}",
                 icon="msg_download",
                 create_sub_fragment=subpage(("backup_file", filename)),
             ))
@@ -2406,21 +2833,21 @@ def create_settings(page_id=PAGE_MAIN):
             Divider(main_status_text(health)),
             Text(
                 text="Проверить",
-                subtext="Проверяет данные и показывает понятный статус без технического шума.",
+                subtext="Диагностика данных и хуков, понятный результат без технического шума.",
                 icon="msg_stats",
                 accent=True,
                 on_click=lambda _: run_health_check_now(),
             ),
             Text(
                 text="Исправить автоматически",
-                subtext="Сам выполняет основные шаги восстановления и проверяет результат.",
+                subtext="Основные шаги восстановления с проверкой результата.",
                 icon="msg_download_settings",
                 accent=True,
                 on_click=lambda _: auto_fix_now(),
             ),
             Text(
                 text="Оптимизировать",
-                subtext="Аккуратно пересобирает локальные данные и оставляет страховочную копию.",
+                subtext="Пересборка локальных данных со страховочной копией.",
                 icon="msg_settings",
                 on_click=lambda _: optimize_storage_now(),
             ),
@@ -2428,14 +2855,15 @@ def create_settings(page_id=PAGE_MAIN):
         if old_info.get("exists"):
             entries.append(Text(
                 text="Импортировать старые данные",
-                subtext=f"Найдено записей: {old_info['count']}. Оригинал останется нетронутым.",
+                subtext=f"Найдено {old_info['count']} записей. Оригинал останется нетронутым.",
                 icon="msg_download",
+                accent=True,
                 on_click=lambda _: import_old_storage_now(),
             ))
         if has_resolved_legacy_storage():
             entries.append(Text(
                 text="Перенести в текущее хранилище",
-                subtext="Помогает закрепить найденные старые данные в актуальном месте хранения.",
+                subtext="Закрепить найденные старые данные в актуальном хранилище.",
                 icon="files_storage",
                 on_click=lambda _: migrate_detected_legacy_now(),
             ))
@@ -2444,18 +2872,61 @@ def create_settings(page_id=PAGE_MAIN):
         ]))
         return entries
 
+    if page_id == PAGE_UPDATES:
+        update_status = "включено" if S.auto_update_enabled else "выключено"
+        interval_labels = ["каждый час", "каждые 6 ч", "каждые 12 ч", "каждые 24 ч", "каждые 7 д", "вручную"]
+        interval_text = interval_labels[S.auto_update_interval] if 0 <= S.auto_update_interval < len(interval_labels) else "—"
+        return [
+            Header("Автообновление"),
+            Divider(f"Статус: {update_status}  ·  Интервал: {interval_text}"),
+            Divider("Плагин сам проверяет канал, скачивает и устанавливает новую версию."),
+            Switch(
+                key="auto_update_enabled",
+                text="Автообновление",
+                subtext="Автоматическая проверка и установка обновлений из канала.",
+                default=S.auto_update_enabled,
+                icon="msg_download",
+                on_change=lambda v: handle_auto_update_toggle(v),
+                link_alias="auto_update",
+            ),
+            Selector(
+                key="auto_update_interval",
+                text="Интервал проверки",
+                default=S.auto_update_interval,
+                items=interval_labels,
+                icon="msg_settings",
+                on_change=lambda i: handle_update_interval_change(i),
+                link_alias="interval",
+            ),
+            Input(
+                key="auto_update_url",
+                text="Ссылка на сообщение",
+                subtext="Вставьте ссылку вида t.me/Канал/123 — канал и ID определятся автоматически.",
+                default=S.auto_update_url,
+                icon="msg_download",
+            ),
+            Text(
+                text="Проверить обновления",
+                subtext="Немедленно проверить канал и установить новую версию.",
+                icon="msg_share",
+                accent=True,
+                on_click=lambda _: check_for_update_now(),
+            ),
+        ]
+
     if page_id == PAGE_ABOUT:
         return [
-            Header("О плагине"),
-            Divider("UtilitiesPro объединяет обход лимитов, сохранение полезных данных профиля и безопасные резервные копии."),
-            Divider(f"Версия: {__version__}"),
-            Divider("Главный автор форка: @VibeSPluginS"),
+            Header("UtilitiesPro"),
+            Divider(f"v{__version__}  ·  {main_status_badge(health)}"),
+            Divider("Обход лимитов · Сохранение профилей · Резервные копии · Автообновление"),
+            Header("Авторы"),
+            Divider("Форк и разработка: @VibeSPluginS"),
             Divider("Помощь с кодом: @kvuco"),
-            Divider("Автор исходной идеи: @zwylair"),
-            Header("Что умеет"),
-            Divider("Работает локально и не требует внешних библиотек."),
-            Divider("Сохраняет данные профиля и помогает восстановить их, если Telegram перестал их отдавать."),
-            Divider("Поддерживает безопасное резервное копирование и восстановление со страховочной копией."),
+            Divider("Исходная идея плагинов: @zwylair"),
+            Header("Принципы"),
+            Divider("Работает локально, без внешних библиотек и серверов."),
+            Divider("Сохраняет данные профиля и восстанавливает их, если Telegram перестал их отдавать."),
+            Divider("Поддерживает резервное копирование со страховочной копией и автообновление из канала."),
         ]
 
     if isinstance(page_id, tuple) and len(page_id) == 2 and page_id[0] == "view_saved_detail":
@@ -2508,8 +2979,8 @@ def create_settings(page_id=PAGE_MAIN):
 
         entries.append(Header("Действия"))
         entries.append(Text(
-            text="Удалить этот профиль",
-            subtext="Безвозвратно удаляет сохранённые данные для этого профиля.",
+            text="Удалить профиль",
+            subtext="Безвозвратное удаление сохранённых данных этого профиля.",
             icon="msg_delete",
             red=True,
             on_click=lambda _: confirm_delete(dialog_id),
@@ -2521,7 +2992,7 @@ def create_settings(page_id=PAGE_MAIN):
         raw = normalize_peer_dump(peer_storage.content)
         entries = [Header("Сохранённые профили")]
         if not raw:
-            entries.append(Divider("Нет сохранённых данных"))
+            entries.append(Divider("Нет сохранённых данных."))
             return entries
         entries.append(Divider(f"Всего профилей: {len(raw)}"))
         for did in sorted(raw.keys(), key=int):
@@ -2537,71 +3008,75 @@ def create_settings(page_id=PAGE_MAIN):
 
     return [
         Header("UtilitiesPro"),
-        Divider(main_status_badge(health)),
+        Divider(f"v{__version__}  ·  {main_status_badge(health)}"),
         Divider(main_status_text(health)),
         Header("Быстрые действия"),
         Text(
-            text="Проверить",
-            subtext="Быстро проверяет состояние данных и показывает понятный результат.",
+            text="Проверить состояние",
+            subtext="Быстрая проверка хранилища и хуков, понятный результат.",
             icon="msg_stats",
             accent=True,
             on_click=lambda _: run_health_check_now(),
         ),
         Text(
-            text="Исправить автоматически",
-            subtext="Сам выполняет основные шаги восстановления, если что-то пошло не так.",
+            text="Автоисправление",
+            subtext="Один клик для восстановления, если что-то пошло не так.",
             icon="msg_download_settings",
             accent=True,
             on_click=lambda _: auto_fix_now(),
         ),
         Text(
-            text="Создать резервную копию",
-            subtext="Сохраняет текущее состояние плагина для безопасного восстановления.",
+            text="Резервная копия",
+            subtext="Сохранить текущие данные для безопасного восстановления.",
             icon="msg_share",
             on_click=lambda _: export_backup(),
         ),
+        Header("Управление"),
         Text(
-            text="Восстановить последнюю копию",
-            subtext="Возвращает последнее сохранённое состояние в пару нажатий.",
-            icon="msg_restore",
-            on_click=lambda _: confirm_restore_latest_backup(),
-        ),
-        Header("Диагностика"),
-        Text(
-            text="Проверить сохранение профилей",
-            subtext="Автоматическая проверка всей цепочки: хуки, хранилище, загрузка, отображение.",
-            icon="msg_stats",
-            accent=True,
-            on_click=lambda _: self_test_show_diagnostics_options(),
-        ),
-        *_diagnostics_continue_entries(),
-        Header("Разделы"),
-        Text(
-            text="Основные функции",
-            subtext=f"Лимиты: {'включены' if S.enable_forward_bypass else 'выключены'} · Профиль: {'включён' if S.enable_peer_info_saver else 'выключен'}",
+            text="Функции",
+            subtext=f"Лимиты: {'вкл' if S.enable_forward_bypass else 'выкл'}  ·  Профили: {'вкл' if S.enable_peer_info_saver else 'выкл'}"
+                    f"  ·  Обновления: {'вкл' if S.auto_update_enabled else 'выкл'}",
             icon="msg_openprofile",
             accent=True,
             create_sub_fragment=subpage(PAGE_FEATURES),
+            link_alias="features",
         ),
         Text(
-            text="Данные и резервные копии",
-            subtext="Импорт, экспорт, очистка и восстановление сохранённых данных.",
+            text="Данные",
+            subtext="Импорт, экспорт, очистка и просмотр сохранённых профилей.",
             icon="files_storage",
             accent=True,
             create_sub_fragment=subpage(PAGE_DATA),
+            link_alias="data",
         ),
+        Text(
+            text="Обновления",
+            subtext="Автопроверка новых версий из канала и установка в один клик.",
+            icon="msg_download",
+            accent=True,
+            create_sub_fragment=subpage(PAGE_UPDATES),
+            link_alias="updates",
+        ),
+        Text(
+            text="Диагностика",
+            subtext="Проверка цепочки: хуки → хранилище → загрузка → отображение.",
+            icon="msg_stats",
+            on_click=lambda _: self_test_show_diagnostics_options(),
+        ),
+        *_diagnostics_continue_entries(),
         Text(
             text="Исправление проблем",
             subtext=health["description"],
             icon="msg_download_settings",
-            accent=True,
             create_sub_fragment=subpage(PAGE_REPAIR),
+            link_alias="repair",
         ),
         Text(
             text="О плагине",
-            subtext="Авторы, возможности и краткая справка.",
+            subtext="Версия, авторы, возможности и краткая справка.",
             icon="msg_info",
             create_sub_fragment=subpage(PAGE_ABOUT),
+            link_alias="about",
         ),
     ]
 
@@ -3679,15 +4154,36 @@ class UtilitiesPro(BasePlugin):
         except Exception:
             logger.error("Self-test hook setup failed:", exc_info=True)
         self.add_hook("TL_messages_forwardMessages")
+        try:
+            if S.auto_update_enabled:
+                threading.Thread(target=lambda: start_auto_update(), daemon=True).start()
+        except Exception:
+            logger.error("Auto-update init failed:", exc_info=True)
         logger.info("Loaded.")
 
     def on_plugin_unload(self):
         global current_plugin, _self_test
+        stop_auto_update()
         selector_hook.clear_message_storage()
         dismiss_active_dialogs()
         _self_test = None
         current_plugin = None
         logger.info("Unloaded.")
+
+    def on_app_event(self, event_type):
+        global _last_update_check
+        try:
+            from base_plugin import AppEvent
+            if event_type == AppEvent.RESUME:
+                if S.auto_update_enabled:
+                    idx = S.auto_update_interval
+                    if 0 <= idx < len(_UPDATE_INTERVALS):
+                        elapsed = time.monotonic() - _last_update_check
+                        interval_s = _UPDATE_INTERVALS[idx] * 3600
+                        if elapsed >= interval_s:
+                            threading.Thread(target=lambda: _do_check_update(), daemon=True).start()
+        except Exception:
+            logger.error("Auto-update resume check failed:", exc_info=True)
 
     def create_settings(self):
         global current_plugin
