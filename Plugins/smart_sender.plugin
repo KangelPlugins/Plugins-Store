@@ -1,7 +1,7 @@
 __id__ = "smart_sender"
 __name__ = "Smart Sender"
 __description__ = "Добавляет в меню предпросмотра отправки (MessageSendPreview) пункт «когда будет прочитано» — сообщение отправится автоматически, как только собеседник прочитает ваше предыдущее сообщение в этом чате."
-__version__ = "2.0"
+__version__ = "3.0"
 __author__ = "@van1lLove"
 __min_version__ = "11.12.0"
 
@@ -12,15 +12,25 @@ from base_plugin import BasePlugin, MethodHook
 from android_utils import run_on_ui_thread, OnClickListener
 from client_utils import get_last_fragment
 from hook_utils import get_private_field
+from java.lang import Long as JLong
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Input, Switch, Divider
+from ui.settings import Header, Input, Switch, Divider, Text
 
-from org.telegram.ui import MessageSendPreview, ChatActivity
+from android.widget import LinearLayout, TextView
+from android.view import Gravity
+from android.graphics import Typeface
+
+from org.telegram.messenger import AndroidUtilities
+from org.telegram.ui.ActionBar import AlertDialog, Theme
+from org.telegram.ui.Components import BackupImageView, AvatarDrawable
+
+from org.telegram.ui import MessageSendPreview, ChatActivity, ProfileActivity
 from org.telegram.ui.Components import ItemOptions
 from org.telegram.ui.ActionBar import ActionBarMenuSubItem
 from org.telegram.messenger import MessagesController
+from android.os import Bundle
 
-ICON_CANDIDATES = ("msg_markread_solar", "msg_seen")
+ICON_CANDIDATES = ("msg_mini_checks", "msg_seen", "msg_markread_solar")
 DEFAULT_BUTTON_TEXT = "когда будет прочитано"
 DEFAULT_POLL_INTERVAL_SEC = 3.0  # основной (и единственный) механизм проверки
 
@@ -59,12 +69,28 @@ class SetItemOptionsHook(MethodHook):
             if enter_view is None:
                 return
 
+            dialog_id = get_private_field(enter_view, "dialog_id")
+            context = options.getContext()
+            preview = param.thisObject
+
+            with self.plugin.lock:
+                pending_info = self.plugin.pending.get(dialog_id)
+
+            if pending_info is not None:
+                preview_text = pending_info["text"]
+                short = preview_text if len(preview_text) <= 30 else preview_text[:30] + "…"
+                cancel_cell = ActionBarMenuSubItem(context, False, False)
+                cancel_cell.setText(f'Отменить отправку: "{short}"')
+                cancel_cell.setOnClickListener(OnClickListener(
+                    lambda *_: self.plugin.on_cancel_clicked(options, preview, enter_view, dialog_id)))
+                options.add(cancel_cell)
+                return  # уже есть отложенное — не даём поставить второе поверх
+
             edit_text = get_private_field(enter_view, "messageEditText")
             text = str(edit_text.getText())
             if not text.strip():
                 return
 
-            context = options.getContext()
             cell = ActionBarMenuSubItem(context, False, False)
 
             button_text = self.plugin.get_setting("button_text", DEFAULT_BUTTON_TEXT)
@@ -78,7 +104,6 @@ class SetItemOptionsHook(MethodHook):
             else:
                 cell.setText(button_text)
 
-            preview = param.thisObject
             cell.setOnClickListener(OnClickListener(
                 lambda *_: self.plugin.on_button_clicked(options, preview, enter_view, text)))
 
@@ -109,9 +134,13 @@ class SmartSenderPlugin(BasePlugin):
         return [
             Header("Smart Sender"),
             Switch(key="enabled", text="Включено", default=True),
+            Text(text="Очередь отправки", icon="msg_message", on_click=self._on_queue_click),
             Input(key="button_text", text="Текст кнопки", default=DEFAULT_BUTTON_TEXT,
                   subtext="Текст пункта в меню предпросмотра отправки"),
             Switch(key="show_icon", text="Показывать иконку", default=True),
+            Switch(key="restore_text_on_cancel", text="Возвращать текст в поле при отмене", default=True),
+            Switch(key="queue_click_opens_chat", text="Открывать чат вместо профиля",
+                   subtext="Куда переходить по нажатию на человека в очереди отправки", default=False),
             Divider(),
             Input(key="poll_interval", text="Интервал проверки (сек)",
                   default=str(int(DEFAULT_POLL_INTERVAL_SEC)),
@@ -124,12 +153,197 @@ class SmartSenderPlugin(BasePlugin):
         except Exception:
             return DEFAULT_POLL_INTERVAL_SEC
 
+    # ---- экран очереди (настройки -> «Очередь отправки») ------------------
+
+    def _get_activity(self):
+        try:
+            f = get_last_fragment()
+            return f.getParentActivity() if f is not None else None
+        except Exception:
+            return None
+
+    def _get_display_info(self, account, dialog_id):
+        try:
+            mc = MessagesController.getInstance(account)
+            if dialog_id > 0:
+                obj = mc.getUser(JLong.valueOf(dialog_id))
+                name = ""
+                if obj is not None:
+                    name = f"{obj.first_name or ''} {obj.last_name or ''}".strip()
+                return obj, (name or str(dialog_id))
+            else:
+                obj = mc.getChat(JLong.valueOf(-dialog_id))
+                name = obj.title if obj is not None else str(dialog_id)
+                return obj, name
+        except Exception as e:
+            self.log(f"[SmartSender] display info error: {e}\n{traceback.format_exc()}")
+            return None, str(dialog_id)
+
+    def _on_queue_click(self, view):
+        try:
+            activity = self._get_activity()
+            if activity is None:
+                return
+
+            with self.lock:
+                items = list(self.pending.items())
+
+            builder = AlertDialog.Builder(activity)
+            builder.setTitle("Очередь отправки")
+
+            container = LinearLayout(activity)
+            container.setOrientation(LinearLayout.VERTICAL)
+            pad = AndroidUtilities.dp(8)
+            container.setPadding(pad, pad, pad, pad)
+
+            if not items:
+                empty_tv = TextView(activity)
+                empty_tv.setText("Очередь пуста")
+                empty_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                empty_tv.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(8),
+                                     AndroidUtilities.dp(8), AndroidUtilities.dp(8))
+                container.addView(empty_tv)
+            else:
+                dialog_ref = []
+                for dialog_id, info in items:
+                    row = self._build_queue_row(activity, dialog_id, info, container, dialog_ref)
+                    container.addView(row)
+
+            builder.setView(container)
+            builder.setPositiveButton("Закрыть", None)
+            dialog = builder.show()
+            if items:
+                dialog_ref.append(dialog)
+        except Exception as e:
+            self.log(f"[SmartSender] queue screen error: {e}\n{traceback.format_exc()}")
+
+    def _build_queue_row(self, activity, dialog_id, info, container, dialog_ref):
+        row = LinearLayout(activity)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(0, AndroidUtilities.dp(8), 0, AndroidUtilities.dp(8))
+
+        size = AndroidUtilities.dp(42)
+        avatar = BackupImageView(activity)
+        avatar.setLayoutParams(LinearLayout.LayoutParams(size, size))
+        obj, name = self._get_display_info(info["account"], dialog_id)
+        try:
+            avatar_drawable = AvatarDrawable()
+            avatar_drawable.setInfo(info["account"], obj)
+            avatar.setForUserOrChat(obj, avatar_drawable)
+        except Exception as e:
+            self.log(f"[SmartSender] avatar error: {e}")
+        row.addView(avatar)
+
+        text_col = LinearLayout(activity)
+        text_col.setOrientation(LinearLayout.VERTICAL)
+        text_col_params = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+        text_col_params.setMargins(AndroidUtilities.dp(10), 0, AndroidUtilities.dp(10), 0)
+
+        name_tv = TextView(activity)
+        name_tv.setText(name)
+        name_tv.setTypeface(Typeface.DEFAULT_BOLD)
+        name_tv.setTextSize(1, 15.0)
+        name_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        text_col.addView(name_tv)
+
+        preview_text = info["text"]
+        short = preview_text if len(preview_text) <= 40 else preview_text[:40] + "…"
+        text_tv = TextView(activity)
+        text_tv.setText(short)
+        text_tv.setTextSize(1, 13.0)
+        text_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        text_col.addView(text_tv)
+
+        row.addView(text_col, text_col_params)
+
+        row_click = OnClickListener(
+            lambda *_: self._open_target_from_queue(dialog_id, dialog_ref))
+        avatar.setOnClickListener(row_click)
+        text_col.setOnClickListener(row_click)
+
+        cancel_tv = TextView(activity)
+        cancel_tv.setText("Отмена")
+        try:
+            cancel_tv.setTextColor(Theme.getColor(Theme.key_text_RedRegular))
+        except Exception:
+            pass
+        cancel_tv.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(8),
+                              AndroidUtilities.dp(8), AndroidUtilities.dp(8))
+        cancel_tv.setOnClickListener(OnClickListener(
+            lambda *_: self._cancel_from_queue_screen(dialog_id, row, container)))
+        row.addView(cancel_tv)
+
+        return row
+
+    def _live_enter_view(self, dialog_id, fallback):
+        try:
+            fragment = get_last_fragment()
+            if isinstance(fragment, ChatActivity):
+                enter_view = get_private_field(fragment, "chatActivityEnterView")
+                if enter_view is not None and get_private_field(enter_view, "dialog_id") == dialog_id:
+                    return enter_view
+        except Exception:
+            pass
+        return fallback
+
+    def _cancel_from_queue_screen(self, dialog_id, row, container):
+        try:
+            with self.lock:
+                info = self.pending.pop(dialog_id, None)
+            restored = False
+            if info is not None and self.get_setting("restore_text_on_cancel", True):
+                try:
+                    enter_view = self._live_enter_view(dialog_id, info["enter_view"])
+                    edit_text = get_private_field(enter_view, "messageEditText")
+                    edit_text.setText(info["text"])
+                    try:
+                        edit_text.setSelection(len(info["text"]))
+                    except Exception:
+                        pass
+                    restored = True
+                except Exception as e:
+                    self.log(f"[SmartSender] restore text error: {e}\n{traceback.format_exc()}")
+            container.removeView(row)
+            if container.getChildCount() == 0:
+                empty_tv = TextView(container.getContext())
+                empty_tv.setText("Очередь пуста")
+                empty_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                container.addView(empty_tv)
+            message = "Отправка отменена, текст возвращён в поле" if restored else "Отправка отменена"
+            BulletinHelper.show_success(message, get_last_fragment())
+        except Exception as e:
+            self.log(f"[SmartSender] cancel from queue error: {e}\n{traceback.format_exc()}")
+
+    def _open_target_from_queue(self, dialog_id, dialog_ref):
+        try:
+            if dialog_ref:
+                try:
+                    dialog_ref[0].dismiss()
+                except Exception:
+                    pass
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            args = Bundle()
+            if dialog_id > 0:
+                args.putLong("user_id", dialog_id)
+            else:
+                args.putLong("chat_id", -dialog_id)
+            if self.get_setting("queue_click_opens_chat", False):
+                fragment.presentFragment(ChatActivity(args))
+            else:
+                fragment.presentFragment(ProfileActivity(args))
+        except Exception as e:
+            self.log(f"[SmartSender] open target error: {e}\n{traceback.format_exc()}")
+
     # ---- загрузка / выгрузка -------------------------------------------
 
     def on_plugin_load(self):
         try:
             method = MessageSendPreview.getClass().getDeclaredMethod("setItemOptions", ItemOptions)
             self.hook_obj = self.hook_method(method, SetItemOptionsHook(self))
+
             run_on_ui_thread(lambda: BulletinHelper.show_success("Smart Sender: загружен", get_last_fragment()))
         except Exception as e:
             self.log(f"[SmartSender] load error: {e}\n{traceback.format_exc()}")
@@ -227,6 +441,7 @@ class SmartSenderPlugin(BasePlugin):
                     "baseline": baseline,
                     "enter_view": enter_view,
                     "mc": mc,
+                    "account": account,
                 }
             edit_text.setText("")
             self.log(f"[SmartSender] pending registered: dialog_id={dialog_id} baseline={baseline}")
@@ -242,6 +457,30 @@ class SmartSenderPlugin(BasePlugin):
             run_on_ui_thread(lambda: BulletinHelper.show_error(f"Smart Sender: {msg}", get_last_fragment()))
         except Exception:
             pass
+
+    def on_cancel_clicked(self, options, preview, enter_view, dialog_id):
+        try:
+            self.collapse(options, preview)
+        except Exception:
+            pass
+        try:
+            with self.lock:
+                info = self.pending.pop(dialog_id, None)
+            if info is None:
+                return
+            if self.get_setting("restore_text_on_cancel", True):
+                edit_text = get_private_field(enter_view, "messageEditText")
+                edit_text.setText(info["text"])
+                try:
+                    edit_text.setSelection(len(info["text"]))
+                except Exception:
+                    pass
+                message = "Отправка отменена, текст возвращён в поле"
+            else:
+                message = "Отправка отменена"
+            run_on_ui_thread(lambda: BulletinHelper.show_success(message, get_last_fragment()))
+        except Exception as e:
+            self.log(f"[SmartSender] cancel error: {e}\n{traceback.format_exc()}")
 
     # ---- проверка (по событию + подстраховка таймером) ---------------------
 
