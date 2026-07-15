@@ -1,5 +1,6 @@
 # Огромное спасибо всем, кто выражал свою поддержку и благодарность в процессе разработки этого плагина, а так же участвовал в его тестировании
 # @DefinitelyNotDekma
+# Фикс дропа ФПС в темноте взят у @vrshm, так же это позволило сделать видео более стабильным, т.к отсутствуют скачки кадров
 
 import time
 import threading
@@ -7,21 +8,26 @@ from java.nio import IntBuffer, ByteBuffer, ByteOrder
 from java import jclass, jint, jfloat, dynamic_proxy
 
 from base_plugin import BasePlugin, MethodHook
+from java.lang import Integer, Long
 from hook_utils import find_class, get_private_field, set_private_field
 from client_utils import run_on_queue, PLUGINS_QUEUE, run_on_ui_thread
 from ui.settings import Selector, Divider, Switch, Header, Input
+from ui.bulletin import BulletinHelper
 from typing import List, Any
 
 __id__ = "camera_enhancer"
 __name__ = "RVCE"
 __description__ = "Round videos camera enhancer. Wide Angle, Round Configurator, HEVC"
 __author__ = "@dekma0091"
-__version__ = "1.4"
+__version__ = "1.5"
 __icon__ = "pixelcamera/0"
 __min_version__ = "12.5.1"
 
 MIME_AVC = "video/avc"
 MIME_HEVC = "video/hevc"
+
+_ArrayList = None
+_Camera2CameraInfo = None
 
 class WideCameraFilter(dynamic_proxy(find_class("androidx.camera.core.CameraFilter"))):
     def __init__(self, target_id):
@@ -30,12 +36,12 @@ class WideCameraFilter(dynamic_proxy(find_class("androidx.camera.core.CameraFilt
 
     def filter(self, camera_infos):
         try:
-            ArrayList = find_class("java.util.ArrayList")
-            Camera2CameraInfo = find_class("androidx.camera.camera2.interop.Camera2CameraInfo")
-            filtered = ArrayList()
+            if _ArrayList is None or _Camera2CameraInfo is None:
+                return camera_infos
+            filtered = _ArrayList()
             for info in camera_infos:
                 try:
-                    c2_info = getattr(Camera2CameraInfo, "from")(info)
+                    c2_info = getattr(_Camera2CameraInfo, "from")(info)
                     c_id = str(c2_info.getCameraId())
                     if c_id == self.target_id:
                         filtered.add(info)
@@ -165,32 +171,49 @@ def _find_cls(name):
             pass
     return None
 
+class FadeState:
+    __slots__ = (
+        "active", "start_time", "camera_switched", "switch_scheduled",
+        "icv", "plugin", "session_id", "method_to_call", "half", "hold",
+        "total", "switch_thresh", "ignore_next_switch"
+    )
+    def __init__(self):
+        self.active = False
+        self.start_time = 0.0
+        self.camera_switched = False
+        self.switch_scheduled = False
+        self.icv = None
+        self.plugin = None
+        self.session_id = 0
+        self.method_to_call = "switchCameraX"
+        self.half = 0
+        self.hold = 0
+        self.total = 0
+        self.switch_thresh = 0.0
+        self.ignore_next_switch = False
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+class GlRes:
+    __slots__ = ("program", "u_alpha", "a_pos", "vbo", "initialized")
+    def __init__(self):
+        self.program = 0
+        self.u_alpha = -1
+        self.a_pos = -1
+        self.vbo = None
+        self.initialized = False
+
+class FadeSession:
+    __slots__ = ("id",)
+    def __init__(self):
+        self.id = 0
+
+_fade_state = FadeState()
+_gl_res = GlRes()
+_fade_session = FadeSession()
 _state_lock = threading.Lock()
-_fade_state = {
-    "active":           False,
-    "start_time":       0.0,
-    "camera_switched":  False,
-    "switch_scheduled": False,
-    "icv":              None,
-    "plugin":           None,
-    "session_id":       0,
-    "method_to_call":   "switchCameraX",
-    "half":             0,
-    "hold":             0,
-    "total":            0,
-    "switch_thresh":    0.0,
-    "ignore_next_switch": False,
-}
-
-_fade_session = {"id": 0}
-
-_gl_res = {
-    "program":     0,
-    "u_alpha":    -1,
-    "a_pos":      -1,
-    "vbo":         None,
-    "initialized": False,
-}
 
 _VERT_SRC = (
     "attribute vec4 aPosition;\n"
@@ -217,6 +240,15 @@ def _build_vbo():
 
 _VBO_DATA = _build_vbo()
 
+_field_cameraContainer = None
+_field_flipAnimationInProgress = None
+_field_cameraReady = None
+_field_switchCameraDrawable = None
+_field_isFrontface = None
+_field_cameraSelector = None
+_field_camera = None
+_field_switchCameraButton = None
+
 def _invoke_icv(icv, method_name):
     try:
         ICV = _find_cls("InstantCameraView")
@@ -235,12 +267,13 @@ def _invoke_icv(icv, method_name):
         return False
 
 def _find_camera_container(icv):
-    try:
-        container = get_private_field(icv, "cameraContainer")
-        if container is not None:
-            return container
-    except Exception:
-        pass
+    if _field_cameraContainer:
+        try:
+            container = _field_cameraContainer.get(icv)
+            if container is not None:
+                return container
+        except Exception:
+            pass
     try:
         count = int(icv.getChildCount())
         for i in range(count):
@@ -259,29 +292,32 @@ def _smootherstep(t):
 
 def _calc_fade_alpha():
     fs      = _fade_state
-    elapsed = time.perf_counter() * 1000.0 - fs["start_time"]
-    half    = fs["half"]
-    hold    = fs["hold"]
-    total   = fs["total"]
+    elapsed = time.perf_counter() * 1000.0 - fs.start_time
+    half    = fs.half
+    hold    = fs.hold
+    total   = fs.total
 
     if elapsed >= total:
         return 1.0, False, elapsed >= total + _grace_ms
 
     if elapsed < half:
-        alpha = 1.0 - _smootherstep(elapsed / half)
+        t = elapsed / half
+        alpha = (1.0 - t) * (1.0 - t) * (1.0 - t)
         should_switch = False
-        if not fs["camera_switched"] and not fs["switch_scheduled"] \
-                and elapsed >= fs["switch_thresh"]:
+        if not fs.camera_switched and not fs.switch_scheduled \
+                and elapsed >= fs.switch_thresh:
             with _state_lock:
-                if not fs["camera_switched"] and not fs["switch_scheduled"]:
-                    fs["switch_scheduled"] = True
+                if not fs.camera_switched and not fs.switch_scheduled:
+                    fs.switch_scheduled = True
                     should_switch = True
         return max(0.0, min(1.0, alpha)), should_switch, False
 
     if elapsed < half + hold:
         return 0.0, False, False
 
-    return max(0.0, min(1.0, _smootherstep((elapsed - half - hold) / half))), False, False
+    t = (elapsed - half - hold) / half
+    alpha = t * t * t
+    return max(0.0, min(1.0, alpha)), False, False
 
 def _init_gl(plugin):
     GLES20 = plugin._gles_class
@@ -301,11 +337,11 @@ def _init_gl(plugin):
     GLES20.glAttachShader(prog, fs)
     GLES20.glLinkProgram(prog)
 
-    _gl_res["program"]     = int(prog)
-    _gl_res["u_alpha"]     = int(GLES20.glGetUniformLocation(prog, "uAlpha"))
-    _gl_res["a_pos"]       = int(GLES20.glGetAttribLocation(prog, "aPosition"))
-    _gl_res["vbo"]         = _VBO_DATA
-    _gl_res["initialized"] = True
+    _gl_res.program     = int(prog)
+    _gl_res.u_alpha     = int(GLES20.glGetUniformLocation(prog, "uAlpha"))
+    _gl_res.a_pos       = int(GLES20.glGetAttribLocation(prog, "aPosition"))
+    _gl_res.vbo         = _VBO_DATA
+    _gl_res.initialized = True
 
 def _apply_darken(plugin, alpha):
     gl     = _gl_res
@@ -316,26 +352,26 @@ def _apply_darken(plugin, alpha):
     GLES20.glEnable(GL_BLEND)
     GLES20.glBlendFunc(GL_DST_COLOR, GL_ZERO)
 
-    GLES20.glUseProgram(gl["program"])
-    GLES20.glUniform1f(gl["u_alpha"], float(alpha))
+    GLES20.glUseProgram(gl.program)
+    GLES20.glUniform1f(gl.u_alpha, float(alpha))
 
-    vbo = gl["vbo"]
+    vbo = gl.vbo
     vbo.position(0)
-    GLES20.glVertexAttribPointer(gl["a_pos"], 3, GL_FLOAT, False, 12, vbo)
-    GLES20.glEnableVertexAttribArray(gl["a_pos"])
+    GLES20.glVertexAttribPointer(gl.a_pos, 3, GL_FLOAT, False, 12, vbo)
+    GLES20.glEnableVertexAttribArray(gl.a_pos)
     GLES20.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
-    GLES20.glDisableVertexAttribArray(gl["a_pos"])
+    GLES20.glDisableVertexAttribArray(gl.a_pos)
 
     GLES20.glUseProgram(0)
     GLES20.glDisable(GL_BLEND)
 
 def _do_switch(plugin, icv):
-    method = _fade_state["method_to_call"]
+    method = _fade_state.method_to_call
     with _state_lock:
-        _fade_state["ignore_next_switch"] = True
+        _fade_state.ignore_next_switch = True
     _invoke_icv(icv, method)
     with _state_lock:
-        _fade_state["camera_switched"] = True
+        _fade_state.camera_switched = True
     _vibrate(plugin)
 
 def _vibrate(plugin):
@@ -361,70 +397,88 @@ def _vibrate(plugin):
     run_on_ui_thread(_run)
 
 class _RenderHook(MethodHook):
-
-    __slots__ = ("plugin",)
-
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
-        if not self.plugin._is_enabled("enable_camera_fade"):
-            return
-        if not _fade_state["active"]:
-            return
-        try:
-            if _fade_state["session_id"] != _fade_session["id"]:
-                _fade_state["active"] = False
-                return
-
-            if not _gl_res["initialized"]:
-                _init_gl(self.plugin)
-
-            alpha, should_switch, complete = _calc_fade_alpha()
-
-            if complete:
-                _fade_state["active"] = False
-                icv = _fade_state["icv"]
-                if icv is not None:
-                    try:
-                        set_private_field(icv, "flipAnimationInProgress", False)
-                    except Exception:
-                        pass
-                return
-
-            if should_switch:
-                icv_ref = _fade_state["icv"]
-                pl      = self.plugin
-                run_on_ui_thread(lambda: _do_switch(pl, icv_ref))
-
-            _apply_darken(self.plugin, alpha)
-
-        except Exception:
-            _fade_state["active"] = False
-            icv = _fade_state["icv"]
-            if icv is not None:
-                try:
-                    set_private_field(icv, "flipAnimationInProgress", False)
-                except Exception:
-                    pass
-
-class _SwitchHook(MethodHook):
-
     __slots__ = ("plugin",)
 
     def __init__(self, plugin):
         self.plugin = plugin
 
     def before_hooked_method(self, param):
-        if not self.plugin._is_enabled("enable_camera_fade"):
+        try:
+            pass
+        finally:
+            del param
+
+    def after_hooked_method(self, param):
+        if not self.plugin._cached_enable_camera_fade:
+            try:
+                pass
+            finally:
+                del param
+            return
+        if not _fade_state.active:
+            try:
+                pass
+            finally:
+                del param
+            return
+        try:
+            if _fade_state.session_id != _fade_session.id:
+                _fade_state.active = False
+                return
+
+            if not _gl_res.initialized:
+                _init_gl(self.plugin)
+
+            alpha, should_switch, complete = _calc_fade_alpha()
+
+            if complete:
+                _fade_state.active = False
+                icv = _fade_state.icv
+                if icv is not None and _field_flipAnimationInProgress:
+                    try:
+                        _field_flipAnimationInProgress.set(icv, False)
+                    except Exception:
+                        pass
+                return
+
+            if should_switch:
+                icv_ref = _fade_state.icv
+                pl      = self.plugin
+                run_on_ui_thread(lambda: _do_switch(pl, icv_ref))
+
+            _apply_darken(self.plugin, alpha)
+
+        except Exception:
+            _fade_state.active = False
+            icv = _fade_state.icv
+            if icv is not None and _field_flipAnimationInProgress:
+                try:
+                    _field_flipAnimationInProgress.set(icv, False)
+                except Exception:
+                    pass
+        finally:
+            del param
+
+class _SwitchHook(MethodHook):
+    __slots__ = ("plugin",)
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin._cached_enable_camera_fade:
+            try:
+                pass
+            finally:
+                del param
             return
         try:
             with _state_lock:
-                if _fade_state["ignore_next_switch"]:
-                    _fade_state["ignore_next_switch"] = False
+                if _fade_state.ignore_next_switch:
+                    _fade_state.ignore_next_switch = False
                     return
 
-            if _fade_state["active"]:
+            if _fade_state.active:
                 param.setResult(None)
                 return
 
@@ -440,15 +494,17 @@ class _SwitchHook(MethodHook):
                 except Exception:
                     pass
 
-            flip_anim = get_private_field(icv, "flipAnimationInProgress")
-            if flip_anim is not None and bool(flip_anim):
-                param.setResult(None)
-                return
+            if _field_flipAnimationInProgress:
+                flip_anim = _field_flipAnimationInProgress.get(icv)
+                if flip_anim is not None and bool(flip_anim):
+                    param.setResult(None)
+                    return
 
-            cam_ready = get_private_field(icv, "cameraReady")
-            if cam_ready is not None and not bool(cam_ready):
-                param.setResult(None)
-                return
+            if _field_cameraReady:
+                cam_ready = _field_cameraReady.get(icv)
+                if cam_ready is not None and not bool(cam_ready):
+                    param.setResult(None)
+                    return
 
             method_name = "switchCameraX"
             if param.method is not None:
@@ -462,45 +518,55 @@ class _SwitchHook(MethodHook):
 
         except Exception:
             pass
+        finally:
+            del param
+
+    def after_hooked_method(self, param):
+        try:
+            pass
+        finally:
+            del param
 
 def _start_fade(plugin, icv, method_to_call):
-    _fade_session["id"] += 1
-    sid = _fade_session["id"]
+    _fade_session.id += 1
+    sid = _fade_session.id
 
-    half  = _fade_half_ms
-    hold  = _hold_ms
+    half = _fade_half_ms
+    hold = _hold_ms
     total = half * 2 + hold
 
-    try:
-        d = get_private_field(icv, "switchCameraDrawable")
-        if d is not None:
-            d.setCurrentFrame(0)
-            d.start()
-    except Exception:
-        pass
+    if _field_switchCameraDrawable:
+        try:
+            d = _field_switchCameraDrawable.get(icv)
+            if d is not None:
+                d.setCurrentFrame(0)
+                d.start()
+        except Exception:
+            pass
 
-    try:
-        set_private_field(icv, "flipAnimationInProgress", True)
-    except Exception:
-        pass
-    _gl_res["initialized"] = False
+    if _field_flipAnimationInProgress:
+        try:
+            _field_flipAnimationInProgress.set(icv, True)
+        except Exception:
+            pass
+    _gl_res.initialized = False
 
     with _state_lock:
-        _fade_state.update({
-            "active":           True,
-            "start_time":       time.perf_counter() * 1000.0,
-            "camera_switched":  False,
-            "switch_scheduled": False,
-            "icv":              icv,
-            "plugin":           plugin,
-            "session_id":       sid,
-            "method_to_call":   method_to_call,
-            "half":             half,
-            "hold":             hold,
-            "total":            total,
-            "switch_thresh":    _switch_point * half,
-            "ignore_next_switch": False,
-        })
+        _fade_state.update(
+            active=True,
+            start_time=time.perf_counter() * 1000.0,
+            camera_switched=False,
+            switch_scheduled=False,
+            icv=icv,
+            plugin=plugin,
+            session_id=sid,
+            method_to_call=method_to_call,
+            half=half,
+            hold=hold,
+            total=total,
+            switch_thresh=_switch_point * half,
+            ignore_next_switch=False
+        )
 
     container = _find_camera_container(icv)
     interp    = None
@@ -520,7 +586,7 @@ def _start_fade(plugin, icv, method_to_call):
             pass
 
         def _fade_in():
-            if _fade_session["id"] != sid:
+            if _fade_session.id != sid:
                 return
             try:
                 a2 = container.animate().setDuration(half).alpha(1.0)
@@ -533,14 +599,14 @@ def _start_fade(plugin, icv, method_to_call):
         run_on_ui_thread(_fade_in, half + hold + 50)
 
     def _fallback():
-        if _fade_session["id"] != sid:
+        if _fade_session.id != sid:
             return
         with _state_lock:
-            if (_fade_state["active"]
-                    and not _fade_state["switch_scheduled"]
-                    and not _fade_state["camera_switched"]):
-                _fade_state["switch_scheduled"] = True
-                icv_ref = _fade_state["icv"]
+            if (_fade_state.active
+                    and not _fade_state.switch_scheduled
+                    and not _fade_state.camera_switched):
+                _fade_state.switch_scheduled = True
+                icv_ref = _fade_state.icv
             else:
                 icv_ref = None
         if icv_ref is not None:
@@ -549,17 +615,18 @@ def _start_fade(plugin, icv, method_to_call):
     run_on_ui_thread(_fallback, int(half * (0.5 + _switch_point)) + 100)
 
     def _cleanup():
-        if _fade_session["id"] != sid:
+        if _fade_session.id != sid:
             return
         try:
             with _state_lock:
-                _fade_state["active"] = False
-                _fade_state["ignore_next_switch"] = False
-            _fade_state["icv"]    = None
-            try:
-                set_private_field(icv, "flipAnimationInProgress", False)
-            except Exception:
-                pass
+                _fade_state.active = False
+                _fade_state.ignore_next_switch = False
+            _fade_state.icv    = None
+            if _field_flipAnimationInProgress:
+                try:
+                    _field_flipAnimationInProgress.set(icv, False)
+                except Exception:
+                    pass
             c = _find_camera_container(icv)
             if c is not None:
                 c.setAlpha(1.0)
@@ -591,6 +658,7 @@ class AdvancedCameraPlugin(BasePlugin):
         self._key_af_mode     = None
         self._key_scene_mode  = None
         self._key_af_trigger  = None
+        self._key_ae_lock     = None
 
         self._camera_controller_instance = None
         self._process_class = None
@@ -608,8 +676,27 @@ class AdvancedCameraPlugin(BasePlugin):
         self._round_dual_method = None
         self._vibrator_instance = None
 
+        self._cached_enable_wide_angle = True
+        self._cached_enable_camera_fade = False
+        self._cached_enable_hevc = False
+        self._cached_enable_round_config = True
+        self._cached_zoom_api_type = ""
+        self._cached_double_tap_switch = True
+
+    def _update_cached_settings(self):
+        self._cached_enable_wide_angle = self._is_enabled("enable_wide_angle")
+        self._cached_enable_camera_fade = self._is_enabled("enable_camera_fade")
+        self._cached_enable_hevc = self._is_enabled("enable_hevc")
+        self._cached_enable_round_config = self._is_enabled("enable_round_config")
+        self._cached_zoom_api_type = self.get_setting("_zoom_api_type", "")
+        self._cached_double_tap_switch = self._is_enabled("enable_double_tap_switch")
+
+    def set_setting(self, key, value, reload_settings=False):
+        super().set_setting(key, value, reload_settings)
+        self._update_cached_settings()
+
     def create_settings(self):
-        zoom_api_type = self.get_setting("_zoom_api_type", "Ожидание инициализации")
+        zoom_api_type = self._cached_zoom_api_type if self._cached_zoom_api_type else "Ожидание инициализации"
         if self._min_zoom is not None:
             zoom_sub = f"Минимальный зум: {self._min_zoom:.2f}x ({zoom_api_type})"
         else:
@@ -639,6 +726,13 @@ class AdvancedCameraPlugin(BasePlugin):
                 icon="msg_info"
             ),
             Divider(text="Повысит качество видео на бюджетных устройствах ценой незначительного снижения производительности"),
+            Switch(
+                key="enable_double_tap_switch",
+                text="Переключение по дабл тапу",
+                default=True,
+                on_change=self._on_double_tap_setting_changed,
+                icon="msg_retry"
+            ),
 
             Header(text="Конфигурация видео и аудио"),
             Switch(
@@ -693,10 +787,10 @@ class AdvancedCameraPlugin(BasePlugin):
                 on_change=self._on_fade_toggle_changed,
                 icon="msg_retry"
             ),
-            Divider(text="⚠️ Плавное переключение не работает, если в настройках чатов включена функция «Бесшовное переключение»"),
+            Divider(text="⚠️ Плавное переключение не работает, если в настройках чатов включено «Бесшовное переключение»"),
         ]
 
-        if self._is_enabled("enable_camera_fade"):
+        if self._cached_enable_camera_fade:
             settings.extend([
                 Header(text="Настройки плавного переключения"),
                 Divider(text="Все значения перехода необходимо подбирать САМОСТОЯТЕЛЬНО, исходя из фактической скорости переключения камер ВАШЕГО устройства"),
@@ -750,6 +844,12 @@ class AdvancedCameraPlugin(BasePlugin):
         except Exception:
             pass
 
+    def _on_double_tap_setting_changed(self, val):
+        try:
+            self.set_setting("enable_double_tap_switch", val)
+        except Exception:
+            pass
+
     def _is_enabled(self, key):
         return self.get_setting(key, True)
 
@@ -774,8 +874,8 @@ class AdvancedCameraPlugin(BasePlugin):
         run_on_queue(self._load_plugin_async, PLUGINS_QUEUE)
 
     def on_plugin_unload(self):
-        _fade_state["active"] = False
-        _fade_state["icv"]    = None
+        _fade_state.active = False
+        _fade_state.icv    = None
 
         if self._boosted and self._camera_controller_instance and self._process_class:
             try:
@@ -814,7 +914,7 @@ class AdvancedCameraPlugin(BasePlugin):
         self._key_zoom_ratio  = None
         self._key_af_mode     = None
         self._key_scene_mode  = None
-        self._key_af_trigger  = None
+        self._key_af_trigger = None
 
         self._boosted       = False
         self._hevc_profile  = None
@@ -827,6 +927,7 @@ class AdvancedCameraPlugin(BasePlugin):
         try:
             self._load_fade_settings()
             self._do_init()
+            self._update_cached_settings()
             self._initialized = True
         except Exception:
             pass
@@ -858,6 +959,21 @@ class AdvancedCameraPlugin(BasePlugin):
         except Exception:
             return None
 
+    def _apply_hook(self, class_name, method_name, hook_object):
+        try:
+            target_class = find_class(class_name)
+            if target_class:
+                unhook = self.hook_all_methods(target_class, method_name, hook_object)
+                if unhook:
+                    if isinstance(unhook, list):
+                        self._registered_unhooks.extend(unhook)
+                    else:
+                        self._registered_unhooks.append(unhook)
+                return unhook
+        except Exception:
+            pass
+        return None
+
     def _load_fade_settings(self):
         global _fade_half_ms, _hold_ms, _switch_point, _grace_ms, _vibration_ms
 
@@ -887,6 +1003,12 @@ class AdvancedCameraPlugin(BasePlugin):
             pass
 
     def _do_init(self):
+        global _ArrayList, _Camera2CameraInfo
+        global _field_cameraContainer, _field_flipAnimationInProgress, _field_cameraReady, _field_switchCameraDrawable, _field_isFrontface, _field_cameraSelector, _field_camera
+
+        _ArrayList = find_class("java.util.ArrayList")
+        _Camera2CameraInfo = find_class("androidx.camera.camera2.interop.Camera2CameraInfo")
+
         classes = {
             "MediaFormatClass": "android.media.MediaFormat",
             "CameraCharsClass": "android.hardware.camera2.CameraCharacteristics",
@@ -960,6 +1082,9 @@ class AdvancedCameraPlugin(BasePlugin):
                 self._key_af_mode     = cr_java.getDeclaredField("CONTROL_AF_MODE").get(None)
                 self._key_scene_mode  = cr_java.getDeclaredField("CONTROL_SCENE_MODE").get(None)
                 self._key_af_trigger  = cr_java.getDeclaredField("CONTROL_AF_TRIGGER").get(None)
+                self._key_ae_lock     = cr_java.getDeclaredField("CONTROL_AE_LOCK").get(None)
+                self._key_ae_target_fps_range = cr_java.getDeclaredField("CONTROL_AE_TARGET_FPS_RANGE").get(None)
+                self._key_sensor_frame_duration = cr_java.getDeclaredField("SENSOR_FRAME_DURATION").get(None)
             except Exception:
                 pass
 
@@ -1026,6 +1151,83 @@ class AdvancedCameraPlugin(BasePlugin):
                 if str(m.getName()) in ("switchCamera", "switchCameraX"):
                     self._safe_hook_method(m, _SwitchHook(self))
 
+            try:
+                _field_cameraContainer = ICV_cls.getDeclaredField("cameraContainer")
+                _field_cameraContainer.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                _field_flipAnimationInProgress = ICV_cls.getDeclaredField("flipAnimationInProgress")
+                _field_flipAnimationInProgress.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                _field_cameraReady = ICV_cls.getDeclaredField("cameraReady")
+                _field_cameraReady.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                _field_switchCameraDrawable = ICV_cls.getDeclaredField("switchCameraDrawable")
+                _field_switchCameraDrawable.setAccessible(True)
+            except Exception:
+                pass
+            try:
+                _field_switchCameraButton = ICV_cls.getDeclaredField("switchCameraButton")
+                _field_switchCameraButton.setAccessible(True)
+            except Exception:
+                pass
+
+            class TouchHook(MethodHook):
+                def __init__(self, plugin):
+                    self.plugin = plugin
+                    self.last_tap_time = 0.0
+                    self.down_time = 0.0
+                    self.is_down = False
+                    self.down_x = 0.0
+                    self.down_y = 0.0
+                def before_hooked_method(self, p):
+                    try:
+                        motion_event = p.args[1]
+                        action = motion_event.getAction()
+                        if action == 0:
+                            self.is_down = True
+                            self.down_x = float(motion_event.getX())
+                            self.down_y = float(motion_event.getY())
+                            self.down_time = time.time()
+                            now = time.time()
+                            if self.plugin._cached_double_tap_switch and now - self.last_tap_time < 0.35:
+                                self.is_down = False
+                                icv = p.thisObject
+                                if _field_switchCameraButton:
+                                    btn = _field_switchCameraButton.get(icv)
+                                    if btn:
+                                        run_on_ui_thread(lambda: btn.callOnClick())
+                                p.setResult(True)
+                                self.last_tap_time = 0.0
+                                return
+                            self.last_tap_time = now
+                        elif action in (1, 3):
+                            self.is_down = False
+                        elif action == 2:
+                            dx = motion_event.getX() - self.down_x
+                            dy = motion_event.getY() - self.down_y
+                            if dx*dx + dy*dy > 10000.0:
+                                self.is_down = False
+                    except Exception:
+                        pass
+                    finally:
+                        del p
+                def after_hooked_method(self, p):
+                    try:
+                        pass
+                    finally:
+                        del p
+
+            for m in ICV_cls.getDeclaredMethods():
+                if m.getName() == "lambda$new$0":
+                    self._safe_hook_method(m, TouchHook(self))
+                    break
+
         OVH = _find_cls("InstantCameraVideoEncoderOverlayHelper")
         if OVH:
             OVH_cls = get_java_class(OVH)
@@ -1045,21 +1247,21 @@ class AdvancedCameraPlugin(BasePlugin):
                         return
                     key = p.args[0]
 
-                    if self.plugin._is_enabled("enable_wide_angle"):
+                    if self.plugin._cached_enable_wide_angle:
                         if key.equals(self.plugin._key_crop_region):
                             p.setResult(None)
                             return
                         elif key.equals(self.plugin._key_zoom_ratio) and p.args[1] is not None:
                             try:
                                 if abs(float(p.args[1]) - 1.0) < 1e-3:
-                                    zoom_api_type = self.plugin.get_setting("_zoom_api_type", "")
+                                    zoom_api_type = self.plugin._cached_zoom_api_type
                                     if "Physical Focal" not in zoom_api_type:
                                         zoom = self.plugin._min_zoom if self.plugin._min_zoom is not None else 0.5
                                         p.args[1] = jfloat(zoom)
                             except Exception:
                                 pass
 
-                    if self.plugin._is_enabled("enable_round_config"):
+                    if self.plugin._cached_enable_round_config:
                         if key.equals(self.plugin._key_af_mode):
                             p.args[1] = jint(self.plugin._get_config_value("af_mode", 3))
                         elif key.equals(self.plugin._key_scene_mode):
@@ -1068,6 +1270,14 @@ class AdvancedCameraPlugin(BasePlugin):
                             p.args[1] = jint(0)
                 except Exception:
                     pass
+                finally:
+                    del p
+
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
 
         try:
             if builder_cls and request_key_cls and object_cls:
@@ -1083,106 +1293,131 @@ class AdvancedCameraPlugin(BasePlugin):
                 size_java = get_java_class(size_cls)
                 constr    = size_java.getConstructors()[0]
 
-                try:
-                    context = find_class("org.telegram.messenger.ApplicationLoader").applicationContext
-                    cam_mgr = context.getSystemService("camera")
-                    id_list = None
+                def _async_cam_search():
                     try:
-                        id_list = cam_mgr.getCameraIdList()
-                    except Exception:
-                        pass
-
-                    if not id_list or len(id_list) == 0:
-                        id_list = ["0", "1"]
-
-                    chars = None
-                    try:
-                        chars = cam_mgr.getCameraCharacteristics(id_list[0])
-                    except Exception:
-                        pass
-
-                    if chars and self.CameraCharsClass:
-                        zoom_api_str = "Legacy"
+                        context = find_class("org.telegram.messenger.ApplicationLoader").applicationContext
+                        cam_mgr = context.getSystemService("camera")
+                        id_list = None
                         try:
-                            zrange = chars.get(self.CameraCharsClass.CONTROL_ZOOM_RATIO_RANGE)
-                            if zrange is not None and float(zrange.getLower()) < 0.99:
-                                self._min_zoom      = float(zrange.getLower())
-                                self._zoom_detected = True
-                                zoom_api_str        = "Camera2 API Zoom"
+                            id_list = cam_mgr.getCameraIdList()
                         except Exception:
                             pass
 
-                        if not self._zoom_detected or self._min_zoom >= 1.0:
-                            cached_wide_id  = self.get_setting("_cached_wide_id",  None)
-                            cached_min_zoom = self.get_setting("_cached_min_zoom", None)
-                            if cached_wide_id is not None and cached_min_zoom is not None:
-                                try:
-                                    self._wide_camera_id = str(cached_wide_id)
-                                    self._min_zoom       = float(cached_min_zoom)
-                                    self._zoom_detected  = True
-                                    zoom_api_str         = "Physical Focal Fallback"
-                                except Exception:
-                                    cached_wide_id = None
-                            if cached_wide_id is None:
-                                main_focal = None
-                                wide_focal = None
-                                for i in range(10):
-                                    try:
-                                        c_id = str(i)
-                                        temp_chars = cam_mgr.getCameraCharacteristics(c_id)
-                                        if temp_chars is None:
-                                            continue
-                                        facing = temp_chars.get(self.CameraCharsClass.LENS_FACING)
-                                        if facing is None or int(facing) != 1:
-                                            continue
-                                        focals = temp_chars.get(self.CameraCharsClass.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                                        if focals and len(focals) > 0:
-                                            f_val = float(focals[0])
-                                            if i == 0:
-                                                main_focal = f_val
-                                            else:
-                                                if wide_focal is None or f_val < wide_focal:
-                                                    wide_focal = f_val
-                                                    self._wide_camera_id = c_id
-                                    except Exception:
-                                        pass
-                                if main_focal and wide_focal and wide_focal < main_focal:
-                                    self._min_zoom      = wide_focal / main_focal
+                        if not id_list or len(id_list) == 0:
+                            id_list = ["0", "1"]
+
+                        chars = None
+                        try:
+                            chars = cam_mgr.getCameraCharacteristics(id_list[0])
+                        except Exception:
+                            pass
+
+                        if chars and self.CameraCharsClass:
+                            zoom_api_str = "Legacy"
+                            try:
+                                zrange = chars.get(self.CameraCharsClass.CONTROL_ZOOM_RATIO_RANGE)
+                                if zrange is not None and float(zrange.getLower()) < 0.99:
+                                    self._min_zoom      = float(zrange.getLower())
                                     self._zoom_detected = True
-                                    zoom_api_str        = "Physical Focal Fallback"
-                                    run_on_ui_thread(lambda: (
-                                        self.set_setting("_cached_wide_id",  self._wide_camera_id),
-                                        self.set_setting("_cached_min_zoom", self._min_zoom)
-                                    ))
-                                else:
-                                    self._min_zoom = 0.5
-                                    zoom_api_str   = "Camera2/Physical Focal Недоступны"
+                                    zoom_api_str        = "Camera2 API Zoom"
+                            except Exception:
+                                pass
 
-                        run_on_ui_thread(
-                            lambda: (
-                                self.set_setting("_zoom_api_type", zoom_api_str),
-                                self.set_setting("_zoom_cache", self._min_zoom, reload_settings=True)
+                            if not self._zoom_detected or self._min_zoom >= 1.0:
+                                cached_wide_id  = self.get_setting("_cached_wide_id",  None)
+                                cached_min_zoom = self.get_setting("_cached_min_zoom", None)
+                                if cached_wide_id is not None and cached_min_zoom is not None:
+                                    try:
+                                        self._wide_camera_id = str(cached_wide_id)
+                                        self._min_zoom       = float(cached_min_zoom)
+                                        self._zoom_detected  = True
+                                        zoom_api_str         = "Physical Focal Fallback"
+                                    except Exception:
+                                        cached_wide_id = None
+                                if cached_wide_id is None:
+                                    main_focal = None
+                                    wide_focal = None
+                                    for i in range(10):
+                                        try:
+                                            c_id = str(i)
+                                            temp_chars = cam_mgr.getCameraCharacteristics(c_id)
+                                            if temp_chars is None:
+                                                continue
+                                            facing = temp_chars.get(self.CameraCharsClass.LENS_FACING)
+                                            if facing is None or int(facing) != 1:
+                                                continue
+                                            focals = temp_chars.get(self.CameraCharsClass.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                                            if focals and len(focals) > 0:
+                                                f_val = float(focals[0])
+                                                if i == 0:
+                                                    main_focal = f_val
+                                                else:
+                                                    if wide_focal is None or f_val < wide_focal:
+                                                        wide_focal = f_val
+                                                        self._wide_camera_id = c_id
+                                        except Exception:
+                                            pass
+                                    if main_focal and wide_focal and wide_focal < main_focal:
+                                        self._min_zoom      = wide_focal / main_focal
+                                        self._zoom_detected = True
+                                        zoom_api_str        = "Physical Focal Fallback"
+                                        run_on_ui_thread(lambda: (
+                                            self.set_setting("_cached_wide_id",  self._wide_camera_id),
+                                            self.set_setting("_cached_min_zoom", self._min_zoom)
+                                        ))
+                                    else:
+                                        self._min_zoom = 0.5
+                                        zoom_api_str   = "Camera2/Physical Focal Недоступны"
+
+                            run_on_ui_thread(
+                                lambda: (
+                                    self.set_setting("_zoom_api_type", zoom_api_str),
+                                    self.set_setting("_zoom_cache", self._min_zoom, reload_settings=True)
+                                )
                             )
-                        )
-                    else:
+                        else:
+                            self._min_zoom = 0.5
+                    except Exception:
                         self._min_zoom = 0.5
-                except Exception:
-                    self._min_zoom = 0.5
 
-                class ChooseOptimalSizeHook(MethodHook):
-                    def __init__(self, plugin, constr):
+                threading.Thread(target=_async_cam_search).start()
+
+                class PreviewAspectRatioHook(MethodHook):
+                    def __init__(self, plugin):
                         self.plugin = plugin
-                        self.constr = constr
                     def before_hooked_method(self, p):
-                        if self.plugin._is_enabled("enable_wide_angle") and self.plugin._is_camera_active():
-                            if p.args and len(p.args) > 3:
-                                p.args[3] = self.constr.newInstance(jint(4), jint(3))
+                        try:
+                            if self.plugin._cached_enable_wide_angle:
+                                p.args[0] = jint(0)
+                        except Exception:
+                            pass
+                        finally:
+                            del p
+                    def after_hooked_method(self, p):
+                        try:
+                            pass
+                        finally:
+                            del p
 
-                ctrl_java = get_java_class(ctrl_cls)
-                for m in ctrl_java.getDeclaredMethods():
-                    if m.getName() == "chooseOptimalSize":
-                        self._safe_hook_method(m, ChooseOptimalSizeHook(self, constr))
-                        break
+                class PreviewResolutionSelectorHook(MethodHook):
+                    def __init__(self, plugin):
+                        self.plugin = plugin
+                    def before_hooked_method(self, p):
+                        try:
+                            if self.plugin._cached_enable_wide_angle:
+                                p.setResult(p.thisObject)
+                        except Exception:
+                            pass
+                        finally:
+                            del p
+                    def after_hooked_method(self, p):
+                        try:
+                            pass
+                        finally:
+                            del p
+
+                self._apply_hook("androidx.camera.core.Preview$Builder", "setTargetAspectRatio", PreviewAspectRatioHook(self))
+                self._apply_hook("androidx.camera.core.Preview$Builder", "setResolutionSelector", PreviewResolutionSelectorHook(self))
         except Exception:
             pass
 
@@ -1191,16 +1426,24 @@ class AdvancedCameraPlugin(BasePlugin):
                 self.plugin = plugin
             def before_hooked_method(self, p):
                 try:
-                    if self.plugin._is_enabled("enable_wide_angle"):
-                        zoom_api_type = self.plugin.get_setting("_zoom_api_type", "")
+                    if self.plugin._cached_enable_wide_angle:
+                        zoom_api_type = self.plugin._cached_zoom_api_type
                         if "Physical Focal" in zoom_api_type and self.plugin._wide_camera_id:
-                            is_front = bool(get_private_field(p.thisObject, "isFrontface"))
-                            if not is_front:
-                                wide_selector = self.plugin._get_wide_camera_selector()
-                                if wide_selector is not None:
-                                    set_private_field(p.thisObject, "cameraSelector", wide_selector)
+                            if _field_isFrontface:
+                                is_front = bool(_field_isFrontface.get(p.thisObject))
+                                if not is_front:
+                                    wide_selector = self.plugin._get_wide_camera_selector()
+                                    if wide_selector is not None and _field_cameraSelector:
+                                        _field_cameraSelector.set(p.thisObject, wide_selector)
                 except Exception as e:
                     self.plugin.log(f"bindSingleUseCases hook error: {e}")
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
 
         class SetZoomHook(MethodHook):
             def __init__(self, plugin):
@@ -1208,62 +1451,78 @@ class AdvancedCameraPlugin(BasePlugin):
                 self.last_update_time = 0.0
                 self.start_zoom_ratio = None
                 self.gesture_scale = 1.0
+                self.min_z = 1.0
+                self.max_z = 10.0
             def before_hooked_method(self, p):
                 try:
                     if p.args and p.args[0] is not None:
                         f = float(p.args[0])
                         now = time.time()
                         cx_session = p.thisObject
-                        camera = get_private_field(cx_session, "camera")
-                        if camera is None:
-                            return
-                        zoom_state = camera.getCameraInfo().getZoomState().getValue()
-                        if zoom_state is None:
-                            return
                         if now - self.last_update_time > 0.35 or self.start_zoom_ratio is None:
-                            self.start_zoom_ratio = float(zoom_state.getZoomRatio())
-                            self.gesture_scale = 1.0
-                        self.last_update_time = now
-                        self.gesture_scale *= f
-                        sens_idx = self.plugin.get_setting("zoom_sensitivity", 13)
-                        try:
-                            sens = float(self.plugin.CONFIGS["zoom_sensitivity"][int(sens_idx)])
-                        except Exception:
-                            sens = 1.4
-                        scale_change = 1.0 + (self.gesture_scale - 1.0) * sens
-                        new_zoom = self.start_zoom_ratio * scale_change
-                        min_z = float(zoom_state.getMinZoomRatio())
-                        max_z = float(zoom_state.getMaxZoomRatio())
-                        if new_zoom < min_z:
-                            new_zoom = min_z
-                        elif new_zoom > max_z:
-                            new_zoom = max_z
-                        cx_session.setZoomRatio(jfloat(new_zoom))
-                        p.setResult(None)
+                            if _field_camera:
+                                camera = _field_camera.get(cx_session)
+                                if camera is not None:
+                                    zoom_state = camera.getCameraInfo().getZoomState().getValue()
+                                    if zoom_state is not None:
+                                        self.start_zoom_ratio = float(zoom_state.getZoomRatio())
+                                        self.min_z = float(zoom_state.getMinZoomRatio())
+                                        self.max_z = float(zoom_state.getMaxZoomRatio())
+                                        self.gesture_scale = 1.0
+                        if self.start_zoom_ratio is not None:
+                            self.last_update_time = now
+                            self.gesture_scale *= f
+                            sens_idx = self.plugin.get_setting("zoom_sensitivity", 13)
+                            try:
+                                sens = float(self.plugin.CONFIGS["zoom_sensitivity"][int(sens_idx)])
+                            except Exception:
+                                sens = 1.4
+                            scale_change = 1.0 + (self.gesture_scale - 1.0) * sens
+                            new_zoom = self.start_zoom_ratio * scale_change
+                            if new_zoom < self.min_z:
+                                new_zoom = self.min_z
+                            elif new_zoom > self.max_z:
+                                new_zoom = self.max_z
+                            cx_session.setZoomRatio(jfloat(new_zoom))
+                            p.setResult(None)
                 except Exception:
                     pass
-
-        class GetVideoQualityHook(MethodHook):
-            def __init__(self, plugin):
-                self.plugin = plugin
+                finally:
+                    del p
             def after_hooked_method(self, p):
                 try:
-                    Quality = find_class("androidx.camera.video.Quality")
-                    p.setResult(Quality.HD)
-                except Exception:
                     pass
+                finally:
+                    del p
+
+
 
         try:
             cx_session_cls = find_class("com.exteragram.messenger.camera.CameraXSession")
             if cx_session_cls:
                 cx_session_java = get_java_class(cx_session_cls)
+                try:
+                    _field_isFrontface = cx_session_java.getDeclaredField("isFrontface")
+                    _field_isFrontface.setAccessible(True)
+                except Exception:
+                    pass
+                try:
+                    _field_cameraSelector = cx_session_java.getDeclaredField("cameraSelector")
+                    _field_cameraSelector.setAccessible(True)
+                except Exception:
+                    pass
+                try:
+                    _field_camera = cx_session_java.getDeclaredField("camera")
+                    _field_camera.setAccessible(True)
+                except Exception:
+                    pass
+
                 for m in cx_session_java.getDeclaredMethods():
                     if m.getName() == "bindSingleUseCases":
                         self._safe_hook_method(m, BindSingleUseCasesHook(self))
                     elif m.getName() == "setZoom":
                         self._safe_hook_method(m, SetZoomHook(self))
-                    elif m.getName() == "getVideoQuality":
-                        self._safe_hook_method(m, GetVideoQualityHook(self))
+
         except Exception:
             pass
 
@@ -1274,23 +1533,31 @@ class AdvancedCameraPlugin(BasePlugin):
                 self.default = default
 
             def before_hooked_method(self, p):
-                if self.plugin._is_enabled("enable_hevc"):
-                    _activate_round_mode()
-                if self.plugin._is_enabled("enable_round_config"):
-                    val = self.plugin._get_config_value(self.key, self.default)
-                    if self.key == "bitrate_video" and str(val) == "Авто":
-                        res = self.plugin._get_config_value("resolution", 9)
-                        is_hevc = self.plugin._is_enabled("enable_hevc")
-                        coef = 0.0016 if is_hevc else 0.0030
-                        val = int(res * res * coef)
-                        if val < 100:
-                            val = 100
-                    if self.key == "bitrate_video":
-                        self.plugin.log(f"getVideoBitrate: {val}")
-                    try:
-                        p.setResult(jint(int(val)))
-                    except Exception:
-                        pass
+                try:
+                    if self.plugin._cached_enable_hevc:
+                        _activate_round_mode()
+                    if self.plugin._cached_enable_round_config:
+                        val = self.plugin._get_config_value(self.key, self.default)
+                        if self.key == "bitrate_video" and str(val) == "Авто":
+                            res = self.plugin._get_config_value("resolution", 9)
+                            is_hevc = self.plugin._cached_enable_hevc
+                            coef = 0.0016 if is_hevc else 0.0030
+                            val = int(res * res * coef)
+                            if val < 100:
+                                val = 100
+                        try:
+                            p.setResult(jint(int(val)))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
 
         for path in ["com.exteragram.messenger.utils.system.SystemUtils",
                      "com.exteragram.messenger.utils.SystemUtils"]:
@@ -1316,16 +1583,18 @@ class AdvancedCameraPlugin(BasePlugin):
             def before_hooked_method(self, p):
                 try:
                     if p.method.getName() == "setVideoEncoder":
-                        if self.plugin._is_enabled("enable_hevc"):
+                        if self.plugin._cached_enable_hevc:
                             p.args[0] = jint(5)
                 except Exception:
                     pass
+                finally:
+                    del p
 
             def after_hooked_method(self, p):
                 try:
                     if p.method.getName() != "setVideoEncoder":
                         return
-                    if not self.plugin._is_enabled("enable_hevc") or not self.plugin._hevc_profile:
+                    if not self.plugin._cached_enable_hevc or not self.plugin._hevc_profile:
                         return
                     rec = p.thisObject
                     if rec:
@@ -1333,6 +1602,8 @@ class AdvancedCameraPlugin(BasePlugin):
                         rec.setVideoEncodingProfileLevel(profile, level)
                 except Exception:
                     pass
+                finally:
+                    del p
 
         try:
             if rec_cls:
@@ -1345,39 +1616,53 @@ class AdvancedCameraPlugin(BasePlugin):
             def __init__(self, plugin):
                 self.plugin = plugin
             def before_hooked_method(self, p):
-                if not self.plugin._is_enabled("enable_hevc") and not self.plugin._is_enabled("enable_round_config"):
-                    return
                 try:
+                    if not self.plugin._cached_enable_hevc and not self.plugin._cached_enable_round_config:
+                        return
                     w, h = int(p.args[1]), int(p.args[2])
                     if w > 0 and w == h:
-                        if self.plugin._is_enabled("enable_hevc") and str(p.args[0]) == MIME_AVC:
+                        if self.plugin._cached_enable_hevc and str(p.args[0]) == MIME_AVC:
                             _activate_round_mode()
                             p.args[0] = MIME_HEVC
-                        if self.plugin._is_enabled("enable_round_config"):
+                        if self.plugin._cached_enable_round_config:
                             res = self.plugin._get_config_value("resolution", 9)
                             p.args[1], p.args[2] = jint(res), jint(res)
                 except Exception:
                     pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
 
         class MediaCodecCreateHook(MethodHook):
             def __init__(self, plugin):
                 self.plugin = plugin
             def before_hooked_method(self, p):
-                if not self.plugin._is_enabled("enable_hevc"):
-                    return
                 try:
+                    if not self.plugin._cached_enable_hevc:
+                        return
                     if str(p.args[0]) == MIME_AVC and _is_round_mode():
                         p.args[0] = MIME_HEVC
                 except Exception:
                     pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
 
         class UnifiedMediaCodecConfigureHook(MethodHook):
             def __init__(self, plugin):
                 self.plugin = plugin
             def before_hooked_method(self, p):
-                if not self.plugin._is_enabled("enable_hevc") and not self.plugin._is_enabled("enable_round_config"):
-                    return
                 try:
+                    if not self.plugin._cached_enable_hevc and not self.plugin._cached_enable_round_config:
+                        return
                     fmt = p.args[0]
                     if not fmt:
                         return
@@ -1398,7 +1683,7 @@ class AdvancedCameraPlugin(BasePlugin):
                         except Exception:
                             pass
 
-                    if self.plugin._is_enabled("enable_hevc") and active and mime == MIME_AVC:
+                    if self.plugin._cached_enable_hevc and active and mime == MIME_AVC:
                         fmt.setString("mime", MIME_HEVC)
                         mime = MIME_HEVC
 
@@ -1408,6 +1693,13 @@ class AdvancedCameraPlugin(BasePlugin):
                         fmt.setInteger("level",   jint(level))
                 except Exception:
                     pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
 
         try:
             if self.MediaFormatClass and self.StringClass:
@@ -1443,5 +1735,76 @@ class AdvancedCameraPlugin(BasePlugin):
                 )
         except Exception:
             pass
+
+        class ResolveFPSHook(MethodHook):
+            def __init__(self, plugin):
+                self.plugin = plugin
+            def before_hooked_method(self, p):
+                try:
+                    p.setResult(jint(30))
+                except Exception:
+                    pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
+
+        class RangeFPSHook(MethodHook):
+            def __init__(self, plugin):
+                self.plugin = plugin
+            def before_hooked_method(self, p):
+                try:
+                    Range = find_class("android.util.Range")
+                    if Range:
+                        p.setResult(Range(Integer(30), Integer(30)))
+                except Exception:
+                    pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
+
+        class BuilderHook(MethodHook):
+            def __init__(self, plugin):
+                self.plugin = plugin
+            def before_hooked_method(self, p):
+                try:
+                    builder = p.thisObject
+                    if builder:
+                        Range = find_class("android.util.Range")
+                        if Range and self.plugin._key_ae_target_fps_range:
+                            builder.set(self.plugin._key_ae_target_fps_range, Range(Integer(30), Integer(30)))
+                        if self.plugin._key_sensor_frame_duration:
+                            builder.set(self.plugin._key_sensor_frame_duration, Long(33333333))
+                except Exception:
+                    pass
+                finally:
+                    del p
+            def after_hooked_method(self, p):
+                try:
+                    pass
+                finally:
+                    del p
+
+        try:
+            if builder_cls:
+                b_java = get_java_class(builder_cls)
+                self._safe_hook_method(
+                    b_java.getDeclaredMethod("build", []),
+                    BuilderHook(self)
+                )
+        except Exception:
+            pass
+
+        self._apply_hook("com.exteragram.messenger.camera.CameraXSession", "getRecordingFrameRate", ResolveFPSHook(self))
+        self._apply_hook("com.exteragram.messenger.camera.CameraXSession", "selectSessionFrameRate", RangeFPSHook(self))
+        self._apply_hook("org.telegram.messenger.camera.Camera2Session", "getRecordingFrameRate", ResolveFPSHook(self))
+        self._apply_hook("org.telegram.ui.Components.InstantCameraView", "resolveEncoderFrameRate", ResolveFPSHook(self))
 
 plugin = AdvancedCameraPlugin()
