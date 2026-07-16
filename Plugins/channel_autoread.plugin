@@ -1,0 +1,256 @@
+__id__ = "channel_autoread"
+__name__ = "Channel Post Auto-Read"
+__description__ = "В обсуждениях каналов автоматически помечает прочитанными посты от самого канала и убирает по ним уведомление. Комментарии живых людей не трогает."
+__version__ = "1.0"
+__author__ = "@van1lLove (идея: @zhka_h)"
+__min_version__ = "11.12.0"
+
+import json
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook, HookResult
+from client_utils import get_last_fragment, get_messages_controller
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Divider, Text
+
+from java.util import ArrayList
+from java.util.concurrent import CountDownLatch
+from java.lang import Boolean
+
+from org.telegram.messenger import NotificationsController
+
+jbool = Boolean.TYPE
+
+
+# Пост канала в обсуждении приходит через processNewMessages ДО показа пуша —
+# убираем его из списка, чтобы уведомление не всплывало (как в mute-плагинах).
+class ProcessNewMessagesHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.get_setting("enabled", True):
+                return
+            messages = param.args[0]
+            if messages is None:
+                return
+            suppress = self.plugin.get_setting("suppress_notification", True)
+            for i in range(messages.size() - 1, -1, -1):
+                msg = messages.get(i)
+                try:
+                    owner = msg.messageOwner
+                    dialog_id = int(msg.getDialogId())
+                    msg_id = int(msg.getId())
+                except Exception:
+                    continue
+                if self.plugin.is_channel_post(dialog_id, owner):
+                    if suppress:
+                        messages.remove(i)
+                    run_on_ui_thread(lambda d=dialog_id, m=msg_id: self.plugin.mark_read(d, m))
+        except Exception as e:
+            self.plugin.log(f"[ChannelAutoRead] notify hook: {e}")
+
+
+class ChannelAutoReadPlugin(BasePlugin):
+    MENU_ITEM_ID = "channel_autoread_toggle"
+
+    def on_plugin_load(self):
+        self._load_chats()
+        self.hook_notify = None
+        for update in ("TL_updateNewMessage", "TL_updateNewChannelMessage",
+                       "TL_updates", "TL_updatesCombined"):
+            self.add_hook(update)
+        try:
+            method = NotificationsController.getClass().getDeclaredMethod(
+                "processNewMessages", ArrayList, jbool, jbool, CountDownLatch)
+            self.hook_notify = self.hook_method(method, ProcessNewMessagesHook(self))
+        except Exception as e:
+            self.log(f"[ChannelAutoRead] hook processNewMessages: {e}")
+        self._refresh_menu()
+
+    def on_plugin_unload(self):
+        if self.hook_notify:
+            try:
+                self.unhook_method(self.hook_notify)
+            except Exception:
+                pass
+            self.hook_notify = None
+
+    # ---- список выбранных чатов -----------------------------------------
+
+    def _load_chats(self):
+        try:
+            self._chats = set(int(x) for x in json.loads(self.get_setting("chat_ids", "[]")))
+        except Exception:
+            self._chats = set()
+
+    def _save_chats(self):
+        self.set_setting("chat_ids", json.dumps(list(self._chats)), reload_settings=True)
+
+    def _chat_enabled(self, dialog_id):
+        return self.get_setting("all_discussions", False) or int(dialog_id) in self._chats
+
+    # ---- пункт в меню чата ----------------------------------------------
+
+    def _refresh_menu(self):
+        try:
+            self.remove_menu_item(self.MENU_ITEM_ID)
+        except Exception:
+            pass
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Авто-чтение постов канала",
+            on_click=self._on_toggle_click,
+            icon="msg_markread",
+            item_id=self.MENU_ITEM_ID,
+        ))
+
+    def _dialog_id_from_context(self, context):
+        for key in ("dialog_id", "dialogId", "chatId", "chat_id"):
+            try:
+                val = context.get(key)
+                if val is not None:
+                    return int(val)
+            except Exception:
+                pass
+        chat = context.get("chat")
+        if chat is not None:
+            return -int(chat.id)
+        fragment = get_last_fragment()
+        if fragment and hasattr(fragment, "getDialogId"):
+            return int(fragment.getDialogId())
+        return 0
+
+    def _on_toggle_click(self, context):
+        did = self._dialog_id_from_context(context)
+        if did == 0:
+            BulletinHelper.show_error("Не удалось определить чат")
+            return
+        if did in self._chats:
+            self._chats.discard(did)
+            BulletinHelper.show_info("❌ Авто-чтение постов канала отключено для этого чата")
+        else:
+            self._chats.add(did)
+            BulletinHelper.show_info("✅ Авто-чтение постов канала включено для этого чата")
+        self._save_chats()
+
+    # ---- определение поста канала ---------------------------------------
+
+    def _peer_to_dialog_id(self, peer):
+        if peer is None:
+            return 0
+        if getattr(peer, "channel_id", 0):
+            return -peer.channel_id
+        if getattr(peer, "chat_id", 0):
+            return -peer.chat_id
+        if getattr(peer, "user_id", 0):
+            return peer.user_id
+        return 0
+
+    def _is_megagroup(self, dialog_id):
+        if int(dialog_id) >= 0:
+            return False
+        chat = get_messages_controller().getChat(-int(dialog_id))
+        return bool(chat and getattr(chat, "megagroup", False))
+
+    def is_channel_post(self, dialog_id, message):
+        # Настоящий авто-репост поста в обсуждение: отправитель — канал, и он
+        # же источник пересылки. Это отсекает комментарии людей (from_id =
+        # пользователь), пересылку поста человеком (from_id = пользователь),
+        # комментарии «от имени канала» без пересылки и анонимных админов.
+        try:
+            if not self._chat_enabled(dialog_id) or not self._is_megagroup(dialog_id):
+                return False
+            from_id = getattr(message, "from_id", None)
+            from_channel = int(getattr(from_id, "channel_id", 0) or 0)
+            if from_channel <= 0 or -from_channel == int(dialog_id):
+                return False
+            fwd = getattr(message, "fwd_from", None)
+            fwd_from = getattr(fwd, "from_id", None) if fwd is not None else None
+            return int(getattr(fwd_from, "channel_id", 0) or 0) == from_channel
+        except Exception:
+            return False
+
+    # ---- приём новых сообщений ------------------------------------------
+
+    def _handle_message(self, message):
+        dialog_id = self._peer_to_dialog_id(getattr(message, "peer_id", None))
+        if dialog_id and self.is_channel_post(dialog_id, message):
+            msg_id = getattr(message, "id", 0)
+            run_on_ui_thread(lambda: self.mark_read(dialog_id, msg_id))
+
+    def on_update_hook(self, update_name, account, update):
+        try:
+            if self.get_setting("enabled", True) and update_name in (
+                    "TL_updateNewMessage", "TL_updateNewChannelMessage"):
+                message = getattr(update, "message", None)
+                if message is not None:
+                    self._handle_message(message)
+        except Exception as e:
+            self.log(f"[ChannelAutoRead] on_update_hook: {e}")
+        return HookResult()
+
+    def on_updates_hook(self, container_name, account, updates):
+        try:
+            if not self.get_setting("enabled", True) or not hasattr(updates, "updates"):
+                return HookResult()
+            upd_list = updates.updates
+            for i in range(upd_list.size()):
+                upd = upd_list.get(i)
+                if "NewMessage" in type(upd).__name__:
+                    message = getattr(upd, "message", None)
+                    if message is not None:
+                        self._handle_message(message)
+        except Exception as e:
+            self.log(f"[ChannelAutoRead] on_updates_hook: {e}")
+        return HookResult()
+
+    def mark_read(self, dialog_id, max_id):
+        # markDialogAsRead помечает прочитанным и локально (сбрасывает счётчик),
+        # и на сервере — за один вызов.
+        try:
+            get_messages_controller().markDialogAsRead(
+                int(dialog_id), int(max_id), 0, 0, False, 0, 0, True, 0)
+        except Exception as e:
+            self.log(f"[ChannelAutoRead] mark_read: {e}")
+
+    # ---- настройки -------------------------------------------------------
+
+    def _chat_title(self, dialog_id):
+        chat = get_messages_controller().getChat(-int(dialog_id))
+        return str(getattr(chat, "title", "") or dialog_id) if chat else str(dialog_id)
+
+    def create_settings(self):
+        # рисуем список прямо из памяти (self._chats всегда актуален,
+        # get_setting мог бы вернуть устаревший кэш)
+        if not hasattr(self, "_chats"):
+            self._load_chats()
+        entries = [
+            Header(text="Channel Post Auto-Read"),
+            Switch(key="enabled", text="Включено", default=True),
+            Switch(key="suppress_notification", text="Убирать уведомление", default=True),
+            Switch(key="all_discussions", text="Во всех обсуждениях",
+                   subtext="Действовать во всех обсуждениях. Если выключено — только в чатах, "
+                           "добавленных через меню чата (⋮ → «Авто-чтение постов канала»).",
+                   default=False),
+        ]
+        if not self.get_setting("all_discussions", False):
+            entries.append(Divider())
+            entries.append(Header(text="Выбранные чаты"))
+            if not self._chats:
+                entries.append(Text(text="Нет добавленных чатов",
+                                    subtext="Добавь чат через ⋮ меню внутри обсуждения"))
+            else:
+                def remover(did):
+                    def on_click(view):
+                        self._chats.discard(int(did))
+                        self._save_chats()
+                        BulletinHelper.show_info("❌ Чат удалён (обнови настройки)")
+                    return on_click
+
+                for did in sorted(self._chats):
+                    entries.append(Text(text=self._chat_title(did),
+                                        subtext="Нажми, чтобы убрать из списка",
+                                        icon="msg_delete", red=True, on_click=remover(did)))
+        return entries
