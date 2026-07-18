@@ -1,0 +1,4196 @@
+"""
+UtilitiesPro — standalone объединение обхода лимитов и сохранения данных профиля.
+
+Плагин построен на локальных реализациях нужных helper-функций и не требует
+дополнительных библиотек, каналов обновления или внешних сервисов.
+"""
+
+import gzip
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import time
+import zipfile
+import zlib
+import traceback
+from datetime import datetime
+
+from android.os import Environment
+from android.view import View
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, MethodHook, MethodReplacement, XposedHook
+from client_utils import get_last_fragment, get_messages_controller, get_file_loader, get_account_instance
+from com.exteragram.messenger.plugins import PluginsController, PluginsConstants, PythonPluginsEngine
+from file_utils import get_files_dir, get_plugins_dir
+from hook_utils import find_class, get_private_field, set_private_field
+from java import jclass, dynamic_proxy
+from java.lang import Boolean, Integer, Long, System as JavaSystem
+from java.util import ArrayList
+from org.telegram.messenger import FileLoader, MessageObject, UserConfig, Utilities
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+from org.telegram.ui import ChatActivity as RuntimeChatActivity
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text, Selector, Input
+
+__name__ = "UtilitiesPro"
+__description__ = "Обход лимита пересылки/удаления сообщений и сохранение коротких данных профиля собеседника в одном standalone-плагине. Форк и основная standalone-реализация: @VibeSPluginS при участии @kvuco. Для восстановления bypass использован ориентир из форка @mur_live. Исходная идея плагинов: @zwylair."
+__icon__ = "zwyPluginsIcons/6"
+__id__ = "utilities_pro"
+__version__ = "1.4.0"
+__author__ = "@VibeSPluginS; при участии @kvuco; ориентир для bypass: @mur_live; идея: @zwylair"
+__min_version__ = "12.0.1"
+
+logger = logging.getLogger(__name__)
+
+PLUGIN_PREFIX = "UtilitiesPro"
+PEER_STORAGE_NAME = "utilities_pro__peer_settings"
+BACKUP_PREFIX = "utilities_pro_backup_"
+OLD_PEER_STORAGE_NAME = "zwyUserInfoSaver__peer_settings_storage"
+PRECIOUS_PEER_FIELDS = ("registration_month", "phone_country", "name_change_date", "photo_change_date")
+EXTENDED_DIAGNOSTIC = False
+IMPORTANT_PEER_STATE_FIELDS = (
+    "flags",
+    "report_spam",
+    "block_contact",
+    "add_contact",
+    "share_contact",
+    "need_contacts_exception",
+    "report_geo",
+    "geo_distance",
+    "autoarchived",
+    "invite_members",
+    "request_chat_title",
+    "request_chat_broadcast",
+    "request_chat_date",
+    "business_bot_id",
+    "business_bot_manage_url",
+    "business_bot_paused",
+    "business_bot_can_reply",
+    "charge_paid_message_stars",
+)
+
+FIELD_DIALOG_ID = "dialog_id"
+FIELD_SELECTED_MESSAGES_IDS = "selectedMessagesIds"
+FIELD_MESSAGES = "messages"
+FIELD_ACTIONS_BUTTONS_LAYOUT = "actionsButtonsLayout"
+FIELD_SELECT_BUTTON_ANIMATION = "selectButtonAnimation"
+FIELD_CHAT_MODE = "chatMode"
+FIELD_CURRENT_CHAT = "currentChat"
+FIELD_CANT_FORWARD_COUNT = "cantForwardMessagesCount"
+FIELD_FORWARD_BUTTON = "forwardButton"
+FIELD_CANT_DELETE_COUNT = "cantDeleteMessagesCount"
+FIELD_DELETE_ITEM = "deleteItem"
+FIELD_CHAT_LIST_VIEW = "chatListView"
+FIELD_MULTI_SELECTION_LISTENER = "multiSelectionListener"
+FIELD_USER_PEER_SETTINGS = "userPeerSettings"
+
+ChatActivityClass = None
+MessagesControllerClass = None
+MessagesControllerClassSource = None
+MessageObjectClass = None
+TLObjectClass = None
+TLRPCEncryptedChatClass = None
+hide_action_mode_method = None
+update_pinned_msg_view_method = None
+active_dialogs = []
+current_plugin = None
+
+_resolving_dialogs = set()
+_resolving_lock = threading.Lock()
+_saving_dialogs = {}
+_saving_lock = threading.Lock()
+_save_debounce_seconds = 0.5
+
+_update_timer = None
+_last_update_check = 0
+_UPDATE_INTERVALS = [1, 6, 12, 24, 168]
+
+
+# ─────────────────────────────────────────────────────────────
+# SDK-safe helpers
+# ─────────────────────────────────────────────────────────────
+
+def notify_info(message):
+    fragment = get_last_fragment()
+    BulletinHelper.show_info(f"{PLUGIN_PREFIX}: {message}", fragment)
+
+
+def notify_success(message):
+    fragment = get_last_fragment()
+    BulletinHelper.show_success(f"{PLUGIN_PREFIX}: {message}", fragment)
+
+
+def notify_error(message):
+    fragment = get_last_fragment()
+    BulletinHelper.show_error(f"{PLUGIN_PREFIX}: {message}", fragment)
+
+
+def run_ui(fn):
+    run_on_ui_thread(fn)
+
+
+def arraylist_to_list(value):
+    return list(value.toArray()) if value and value.size() > 0 else []
+
+
+def iterable_to_arraylist(items):
+    result = ArrayList()
+    for item in items:
+        result.add(Integer(int(item)))
+    return result
+
+
+def split_list_into_chunks(items, chunk_size):
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+
+def clone_data(value):
+    if isinstance(value, dict):
+        return {str(key): clone_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clone_data(item) for item in value]
+    return value
+
+
+def set_storage_content(storage, content):
+    storage.ensure_loaded()
+    with storage._lock:
+        storage.content = clone_data(content if isinstance(content, dict) else {})
+
+
+def storage_snapshot():
+    peer_storage.ensure_loaded()
+    return {
+        "peer_records": normalize_peer_dump(peer_storage.content),
+    }
+
+
+def restore_snapshot(snapshot):
+    set_storage_content(peer_storage, snapshot.get("peer_records"))
+    peer_ok = peer_storage.write()
+    return peer_ok
+
+
+def human_date_from_iso(value):
+    if not value:
+        return "неизвестно"
+    try:
+        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(value)
+
+
+def human_size(num_bytes):
+    try:
+        value = float(num_bytes)
+    except Exception:
+        return "неизвестно"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+
+
+def hook_all_matching_methods(clazz, method_name, hook_factory, hook_method, preferred_param_counts=None):
+    try:
+        methods = [m for m in clazz.getDeclaredMethods() if m.getName() == method_name]
+        if not methods:
+            logger.warning("Method not found: %s", method_name)
+            return False
+        preferred_param_counts = tuple(preferred_param_counts or ())
+        if preferred_param_counts:
+            preferred = [m for m in methods if m.getParameterCount() in preferred_param_counts]
+            fallback = [m for m in methods if m.getParameterCount() not in preferred_param_counts]
+            methods = preferred + fallback
+        attached = 0
+        for method in methods:
+            try:
+                method.setAccessible(True)
+                hook_instance = hook_factory()
+                hook_method(method, hook_instance)
+                attached += 1
+            except Exception:
+                logger.error("Failed to hook overload %s:", method.getName(), exc_info=True)
+        return attached > 0
+    except Exception:
+        logger.error("Failed to hook %s:", method_name, exc_info=True)
+        return False
+
+
+def get_declared_method(clazz, method_name, *param_types):
+    if not clazz:
+        return None
+    try:
+        method = clazz.getDeclaredMethod(method_name, *param_types)
+        method.setAccessible(True)
+        return method
+    except Exception:
+        logger.error("Failed to resolve %s.%s:", clazz.getName() if hasattr(clazz, "getName") else clazz, method_name, exc_info=True)
+        return None
+
+
+def ensure_chat_activity_class():
+    global ChatActivityClass
+    if ChatActivityClass:
+        return ChatActivityClass
+    try:
+        ChatActivityClass = RuntimeChatActivity.getClass()
+    except Exception:
+        logger.error("Failed to resolve ChatActivity via direct import:", exc_info=True)
+    if not ChatActivityClass:
+        try:
+            ChatActivityClass = jclass("org.telegram.ui.ChatActivity").getClass()
+        except Exception:
+            logger.error("Failed to resolve ChatActivity via jclass:", exc_info=True)
+    if not ChatActivityClass:
+        try:
+            ChatActivityClass = find_class("org.telegram.ui.ChatActivity")
+        except Exception:
+            logger.error("Failed to resolve ChatActivity via find_class:", exc_info=True)
+    return ChatActivityClass
+
+
+def ensure_messages_controller_class():
+    global MessagesControllerClass, MessagesControllerClassSource
+    if MessagesControllerClass:
+        return MessagesControllerClass
+    try:
+        controller = get_messages_controller()
+        if controller is not None:
+            MessagesControllerClass = controller.getClass()
+            MessagesControllerClassSource = "instance_class"
+    except Exception:
+        logger.error("Failed to resolve MessagesController from runtime instance:", exc_info=True)
+    if not MessagesControllerClass:
+        try:
+            MessagesControllerClass = jclass("org.telegram.messenger.MessagesController").getClass()
+            MessagesControllerClassSource = "jclass"
+        except Exception:
+            logger.error("Failed to resolve MessagesController via jclass:", exc_info=True)
+    if not MessagesControllerClass:
+        try:
+            MessagesControllerClass = find_class("org.telegram.messenger.MessagesController")
+            MessagesControllerClassSource = "find_class"
+        except Exception:
+            logger.error("Failed to resolve MessagesController via find_class:", exc_info=True)
+    if not MessagesControllerClass:
+        MessagesControllerClassSource = None
+        logger.warning("MessagesController class not found")
+    return MessagesControllerClass
+
+
+def ensure_message_object_class():
+    global MessageObjectClass
+    if MessageObjectClass:
+        return MessageObjectClass
+    MessageObjectClass = find_class("org.telegram.messenger.MessageObject")
+    if not MessageObjectClass:
+        logger.warning("MessageObject class not found")
+    return MessageObjectClass
+
+
+def ensure_tlobject_class():
+    global TLObjectClass
+    if TLObjectClass:
+        return TLObjectClass
+    TLObjectClass = find_class("org.telegram.tgnet.TLObject")
+    if not TLObjectClass:
+        logger.warning("TLObject class not found")
+    return TLObjectClass
+
+
+def ensure_encrypted_chat_class():
+    global TLRPCEncryptedChatClass
+    if TLRPCEncryptedChatClass:
+        return TLRPCEncryptedChatClass
+    TLRPCEncryptedChatClass = find_class("org.telegram.tgnet.TLRPC$EncryptedChat")
+    if not TLRPCEncryptedChatClass:
+        logger.warning("TLRPC.EncryptedChat class not found")
+    return TLRPCEncryptedChatClass
+
+
+_app_files_dir = None
+
+def get_app_files_dir_path():
+    global _app_files_dir
+    if _app_files_dir:
+        return _app_files_dir
+    result = get_files_dir()
+    if result and "cache" not in result:
+        _app_files_dir = result
+    return result
+
+
+def get_downloads_dir():
+    try:
+        return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+    except Exception:
+        return os.path.join(Environment.getExternalStorageDirectory().getAbsolutePath(), "Download")
+
+
+def get_backup_dir():
+    return os.path.join(get_downloads_dir(), "exteraGram", __id__)
+
+
+def get_activity_context():
+    fragment = get_last_fragment()
+    if not fragment:
+        return None
+    return fragment.getParentActivity()
+
+
+def show_alert(title, message, buttons=None, cancelable=True):
+    context = get_activity_context()
+    if not context:
+        notify_error("Не удалось открыть диалог: нет активного окна")
+        return None
+    builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+    builder.set_title(title)
+    builder.set_message(message)
+    builder.create()
+    builder.set_cancelable(cancelable)
+    builder.set_canceled_on_touch_outside(cancelable)
+    for kind, text, callback in buttons or []:
+        if kind == "positive":
+            builder.set_positive_button(text, callback)
+        elif kind == "negative":
+            builder.set_negative_button(text, callback)
+        elif kind == "neutral":
+            builder.set_neutral_button(text, callback)
+    builder.show()
+    register_dialog(builder)
+    return builder
+
+
+def register_dialog(builder):
+    compact_active_dialogs()
+    if builder and builder not in active_dialogs:
+        active_dialogs.append(builder)
+    return builder
+
+
+def dismiss_active_dialogs():
+    for builder in list(active_dialogs):
+        try:
+            builder.dismiss()
+        except Exception:
+            pass
+    active_dialogs.clear()
+
+
+def compact_active_dialogs():
+    alive = []
+    for builder in list(active_dialogs):
+        try:
+            dialog = builder.get_dialog() if hasattr(builder, "get_dialog") else None
+            if dialog and dialog.isShowing():
+                alive.append(builder)
+        except Exception:
+            pass
+    active_dialogs[:] = alive
+
+
+def divider_lines(lines):
+    return [Divider(line) for line in lines]
+
+
+def open_settings_page(target_page):
+    return lambda: create_settings(target_page)
+
+
+def main_status_badge(health):
+    if health["status"] == "ok":
+        return "Всё работает нормально"
+    if health["status"] == "problem":
+        return "Обнаружена проблема"
+    return "Требуется внимание"
+
+
+def main_status_text(health):
+    if health["status"] == "ok":
+        return "Хранилище исправно, данные сохраняются локально и готовы к восстановлению."
+    return health["description"]
+
+
+def _format_backup_filename(name):
+    try:
+        ts = datetime.strptime(name, BACKUP_PREFIX + "%Y%m%d_%H%M%S.json")
+        return ts.strftime("Резервная копия от %d.%m.%Y %H:%M:%S")
+    except (ValueError, IndexError):
+        return name
+
+
+def backup_overview_lines():
+    backup_files = list_backup_files()
+    latest_label = _format_backup_filename(backup_files[0]) if backup_files else "ещё не создавались"
+    return [
+        f"Последняя копия: {latest_label}",
+        f"Профилей сохранено: {peer_storage.count()}",
+    ]
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────
+
+class S:
+    enable_forward_bypass = True
+    enable_peer_info_saver = True
+    auto_update_enabled = False
+    auto_update_interval = 3
+    auto_update_url = "https://t.me/VibeSPluginS/19"
+    _loaded = False
+
+    @classmethod
+    def get(cls, key, default=None):
+        plugin = current_plugin
+        if not plugin:
+            return default
+        return plugin.get_setting(key, default)
+
+    @classmethod
+    def set(cls, key, value):
+        plugin = current_plugin
+        if not plugin:
+            return
+        try:
+            plugin.set_setting(key, value, reload_settings=False)
+        except Exception:
+            logger.error("Failed to save setting %s", key, exc_info=True)
+        cls._loaded = False
+        cls.load()
+
+    @classmethod
+    def load(cls):
+        if cls._loaded:
+            return
+        cls.enable_forward_bypass = bool(cls.get("enable_forward_bypass", True))
+        cls.enable_peer_info_saver = bool(cls.get("enable_peer_info_saver", True))
+        cls.auto_update_enabled = bool(cls.get("auto_update_enabled", False))
+        cls.auto_update_interval = int(cls.get("auto_update_interval", 3))
+        cls.auto_update_url = str(cls.get("auto_update_url", "https://t.me/VibeSPluginS/19"))
+        cls._loaded = True
+
+
+def on_forward_toggle(enabled):
+    S.set("enable_forward_bypass", enabled)
+
+
+def on_peer_saver_toggle(enabled):
+    S.set("enable_peer_info_saver", enabled)
+
+
+def handle_auto_update_toggle(enabled):
+    S.set("auto_update_enabled", enabled)
+    if enabled:
+        start_auto_update()
+    else:
+        stop_auto_update()
+
+
+def handle_update_interval_change(index):
+    S.set("auto_update_interval", index)
+    if S.auto_update_enabled:
+        stop_auto_update()
+        start_auto_update()
+
+
+# ─────────────────────────────────────────────────────────────
+# Storage State Machine — Automatic Root-Cause Localization
+# ─────────────────────────────────────────────────────────────
+
+class StorageStateMachine:
+    """Per-instance diagnostic that checks invariants after every storage operation.
+    
+    Automatically detects and reports the FIRST root cause:
+      WRITE_LAYER, READ_LAYER, POST_READ_OVERWRITE, PATH_MISMATCH, MULTIPLE_STORAGE_INSTANCES, HASH_MISMATCH_EMPTY_DIFF
+    
+    Freezes after first failure — never overwrites ROOT_CAUSE.
+    Differentiates expected mutations (write, transaction, migration, import, wipe)
+    from unexpected mutations (ensure_loaded, _pick_existing_data).
+    """
+    _instances = []
+    _first_failure = None
+    _conclusion_printed = False
+    _frozen = False
+
+    def __init__(self, storage):
+        self.storage = storage
+        self.instance_id = hex(id(storage))
+        self.op_counter = 0
+        self.last_content_hash = None
+        self.last_content = None
+        self.last_content_keys = None
+        self.observed_paths = set()
+        self._committed_path = None
+        self._last_path = None
+        self._creation_stack = self._get_stack()
+        StorageStateMachine._instances.append(self)
+        self._check_multiple_instances()
+
+    def _get_stack(self):
+        return ''.join(traceback.format_stack()[-6:-1])
+
+    def _check_multiple_instances(self):
+        pass
+
+    def _content_hash(self, content):
+        if not isinstance(content, dict):
+            return "non-dict"
+        stable = json.dumps(content, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(stable.encode('utf-8')).hexdigest()
+
+    def _content_keys(self, content):
+        if not isinstance(content, dict):
+            return set()
+        return set(str(k) for k in content.keys())
+
+    def _compute_diff(self, old_content, new_content):
+        """Compute added, removed, and changed keys between two dicts."""
+        if old_content is None:
+            return {"added": set(), "removed": set(), "changed": set()}
+        old_keys = set(str(k) for k in old_content.keys())
+        new_keys = set(str(k) for k in new_content.keys())
+        added = new_keys - old_keys
+        removed = old_keys - new_keys
+        common = old_keys & new_keys
+        if not isinstance(old_content, dict) or not isinstance(new_content, dict):
+            changed = set()
+        else:
+            changed = set()
+            for k in common:
+                ov = old_content.get(k)
+                nv = new_content.get(k)
+                if json.dumps(ov, sort_keys=True, default=str) != json.dumps(nv, sort_keys=True, default=str):
+                    changed.add(k)
+        return {"added": added, "removed": removed, "changed": changed}
+
+    def _print_diff(self, diff):
+        if diff["added"]:
+            print(f"    added_keys({len(diff['added'])}): {sorted(diff['added'])[:10]}", flush=True)
+        if diff["removed"]:
+            print(f"    removed_keys({len(diff['removed'])}): {sorted(diff['removed'])[:10]}", flush=True)
+        if diff["changed"]:
+            print(f"    changed_keys({len(diff['changed'])}): {sorted(diff['changed'])[:10]}", flush=True)
+
+    def _fail(self, root_cause, caller="", details=""):
+        if StorageStateMachine._frozen:
+            return
+        StorageStateMachine._frozen = True
+        StorageStateMachine._first_failure = {
+            "root_cause": root_cause,
+            "first_operation": self.op_counter,
+            "first_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "first_caller": caller,
+            "first_storage_instance": self.instance_id,
+            "first_path": self._last_path or "N/A",
+            "details": details,
+        }
+        self._print_conclusion()
+
+    def _print_conclusion(self):
+        if StorageStateMachine._conclusion_printed:
+            return
+        StorageStateMachine._conclusion_printed = True
+        f = StorageStateMachine._first_failure
+        if f:
+            rc = f["root_cause"]
+            if rc in ("WRITE_LAYER", "READ_LAYER", "POST_READ_OVERWRITE", "PATH_MISMATCH", "MULTIPLE_STORAGE_INSTANCES"):
+                confidence = "HIGH"
+            elif rc == "HASH_MISMATCH_EMPTY_DIFF":
+                confidence = "MEDIUM"
+            else:
+                confidence = "HIGH"
+            conclusion = (
+                f"\n{'='*60}\n"
+                f"ROOT_CAUSE = {rc}\n"
+                f"CONFIDENCE = {confidence}\n"
+                f"EVIDENCE = [op #{f['first_operation']}]\n"
+                f"first_timestamp = {f['first_timestamp']}\n"
+                f"first_caller = {f['first_caller']}\n"
+                f"first_storage_instance = {f['first_storage_instance']}\n"
+                f"first_path = {f['first_path']}\n"
+                f"{f['details']}\n"
+                f"{'='*60}\n"
+            )
+        else:
+            conclusion = (
+                f"\n{'='*60}\n"
+                f"ROOT_CAUSE = UNKNOWN\n"
+                f"CONFIDENCE = LOW\n"
+                f"EVIDENCE = none\n"
+                f"{'='*60}\n"
+            )
+        print(conclusion, flush=True)
+        logger.error(conclusion)
+
+    @classmethod
+    def has_failed(cls):
+        return cls._frozen
+
+    def op(self, event_name):
+        if StorageStateMachine._frozen:
+            return self.op_counter
+        self.op_counter += 1
+        print(f"op={self.op_counter} storage={self.instance_id} event={event_name}", flush=True)
+        return self.op_counter
+
+    def check_path(self, path):
+        if not path or StorageStateMachine._frozen:
+            return
+        abs_path = os.path.abspath(path)
+        self._last_path = abs_path
+        self.observed_paths.add(abs_path)
+
+    def commit_path(self, path):
+        if not path or StorageStateMachine._frozen:
+            return
+        abs_path = os.path.abspath(path)
+        self._last_path = abs_path
+        if self._committed_path is not None and abs_path != self._committed_path:
+            self._fail("PATH_MISMATCH", caller="commit_path",
+                details=f"Committed path changed: was '{self._committed_path}', now '{abs_path}'")
+        self._committed_path = abs_path
+        self.observed_paths.add(abs_path)
+
+    def verify_write_end(self, path, compress):
+        if StorageStateMachine._frozen:
+            return False
+        ap = os.path.abspath(path)
+        self._last_path = ap
+        self.commit_path(ap)
+        print(f"  path={ap}", flush=True)
+        try:
+            exists = os.path.exists(ap)
+            print(f"  exists={str(exists).lower()}", flush=True)
+            if not exists:
+                self._fail("WRITE_LAYER", caller="verify_write_end",
+                    details=f"File does not exist after write: {ap}")
+                return False
+            size = os.path.getsize(ap)
+            print(f"  size={size}", flush=True)
+            try:
+                if compress:
+                    with gzip.open(ap, "rt", encoding="utf-8") as f:
+                        data = json.load(f)
+                else:
+                    with open(ap, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                print(f"  gzip_readable=true  json_valid=true", flush=True)
+            except Exception as e:
+                print(f"  gzip_readable=false  json_valid=false  error={e}", flush=True)
+                self._fail("WRITE_LAYER", caller="verify_write_end",
+                    details=f"Cannot parse file as JSON: {e}")
+                return False
+            entries = len(data) if isinstance(data, (dict, list)) else 1
+            print(f"  entries={entries}", flush=True)
+            sjson = json.dumps(data, sort_keys=True, ensure_ascii=False)
+            sha256_content = hashlib.sha256(sjson.encode('utf-8')).hexdigest()
+            with open(ap, "rb") as f:
+                file_bytes = f.read()
+            sha256_file = hashlib.sha256(file_bytes).hexdigest()
+            print(f"  sha256_file={sha256_file}", flush=True)
+            print(f"  sha256_content={sha256_content}", flush=True)
+            return True
+        except Exception as e:
+            self._fail("WRITE_LAYER", caller="verify_write_end",
+                details=f"Verification exception: {e}")
+            return False
+
+    def verify_read_end(self, path, loaded_content, normalize_fn=None):
+        if StorageStateMachine._frozen:
+            return False
+        ap = os.path.abspath(path) if path else ""
+        self._last_path = ap
+        self.check_path(ap)
+        try:
+            file_entries = 0
+            file_hash = "N/A"
+            if os.path.exists(ap):
+                size = os.path.getsize(ap)
+                is_gzip = False
+                if size > 2:
+                    with open(ap, "rb") as f:
+                        magic = f.read(2)
+                        is_gzip = (magic == b'\x1f\x8b')
+                if is_gzip:
+                    with gzip.open(ap, "rt", encoding="utf-8") as f:
+                        file_data = json.load(f)
+                else:
+                    with open(ap, "r", encoding="utf-8") as f:
+                        file_data = json.load(f)
+                if normalize_fn:
+                    file_data = normalize_fn(file_data)
+                file_entries = len(file_data) if isinstance(file_data, (dict, list)) else 1
+                sjson = json.dumps(file_data, sort_keys=True, ensure_ascii=False)
+                file_hash = hashlib.sha256(sjson.encode('utf-8')).hexdigest()
+            loaded_entries = len(loaded_content) if isinstance(loaded_content, dict) else 0
+            loaded_hash = self._content_hash(loaded_content)
+            print(f"  entries_in_file={file_entries}  entries_loaded={loaded_entries}", flush=True)
+            if file_entries != loaded_entries:
+                self._fail("READ_LAYER", caller="verify_read_end",
+                    details=f"File has {file_entries} entries, read loaded {loaded_entries}\n"
+                    f"File hash={file_hash} loaded hash={loaded_hash}\n"
+                    f"Path={ap}")
+                return False
+            if file_hash != loaded_hash and file_hash != "N/A":
+                self._fail("READ_LAYER", caller="verify_read_end",
+                    details=f"Content hash mismatch: file={file_hash} loaded={loaded_hash}\n"
+                    f"Path={ap}")
+                return False
+            print(f"  read_verified=true", flush=True)
+            return True
+        except Exception as e:
+            self._fail("READ_LAYER", caller="verify_read_end",
+                details=f"Verification exception: {e}")
+            return False
+
+    def record_expected_mutation(self, caller, content):
+        """Expected mutation: write, transaction, wipe, migration, import.
+        
+        Establishes new baseline hash. Logs structural diff.
+        Never triggers POST_READ_OVERWRITE.
+        """
+        if StorageStateMachine._frozen:
+            return
+        current_hash = self._content_hash(content)
+        if self.last_content_hash is not None and current_hash != self.last_content_hash:
+            diff = self._compute_diff(self.last_content, content)
+            print(f"  mutation: caller={caller}", flush=True)
+            self._print_diff(diff)
+            if not diff["added"] and not diff["removed"] and not diff["changed"]:
+                self._fail("HASH_MISMATCH_EMPTY_DIFF", caller=caller,
+                    details=f"Hash changed but structural diff is empty for {caller}")
+        self.last_content_hash = current_hash
+        self.last_content_keys = self._content_keys(content)
+        self.last_content = content
+
+    def check_unexpected_mutation(self, caller, content):
+        """Unexpected mutation: ensure_loaded, _pick_existing_data.
+        
+        Triggers POST_READ_OVERWRITE on any content change.
+        """
+        if StorageStateMachine._frozen:
+            return
+        current_hash = self._content_hash(content)
+        if self.last_content_hash is not None and current_hash != self.last_content_hash:
+            diff = self._compute_diff(self.last_content, content)
+            print(f"  unexpected_content_change: caller={caller}", flush=True)
+            self._print_diff(diff)
+            if not diff["added"] and not diff["removed"] and not diff["changed"]:
+                self._fail("HASH_MISMATCH_EMPTY_DIFF", caller=caller,
+                    details=f"Hash changed but structural diff is empty for {caller}")
+                return
+            zeroed = (len(self._content_keys(content)) == 0 and self.last_content_keys and len(self.last_content_keys) > 0)
+            if zeroed:
+                summary = f"Entries went to zero after {caller}: was {len(self.last_content_keys)}, now 0"
+            else:
+                summary = (f"Content changed unexpectedly after {caller}: "
+                           f"+{len(diff['added'])} -{len(diff['removed'])} ~{len(diff['changed'])}")
+            self._fail("POST_READ_OVERWRITE", caller=caller,
+                details=summary + f"\nPrevious entries: {len(self.last_content_keys or [])}")
+            return
+        self.last_content_hash = current_hash
+        self.last_content_keys = self._content_keys(content)
+        self.last_content = content
+
+    def trace_event(self, event, path=None, extra_info=None):
+        if StorageStateMachine._frozen:
+            return
+        self.op_counter += 1
+        if path:
+            self._last_path = os.path.abspath(path)
+        info = extra_info or ""
+        print(f"op={self.op_counter} storage={self.instance_id} event={event} path={path or 'N/A'} {info}".strip(), flush=True)
+def reset_storage_diagnostics():
+    """Reset diagnostics for testing."""
+    StorageStateMachine._instances.clear()
+    StorageStateMachine._first_failure = None
+    StorageStateMachine._conclusion_printed = False
+    StorageStateMachine._frozen = False
+
+
+# ─────────────────────────────────────────────────────────────
+# Storage
+# ─────────────────────────────────────────────────────────────
+
+class JsonStorage:
+    def __init__(self, name, default=None, compress=True, legacy_specs=None):
+        self.name = name
+        self.default = default if default is not None else {}
+        self.compress = compress
+        self.legacy_specs = legacy_specs
+        self.content = self._copy_default()
+        self._lock = threading.RLock()
+        self.loaded = False
+        self.selected_path = None
+        self.selected_source = "current"
+        self.last_scan = []
+        self._cached_path = None
+        self.storage_instance_id = hex(id(self))
+        self.read_trace = []
+        self._read_seq = 0
+        self._read_trigger = "unknown"
+        self._diag = StorageStateMachine(self)
+
+    def _copy_default(self):
+        return dict(self.default) if isinstance(self.default, dict) else self.default
+
+    def path(self):
+        if self._cached_path:
+            return self._cached_path
+        base = get_app_files_dir_path()
+        suffix = ".jsonz" if self.compress else ".json"
+        path = os.path.join(base, "plugins_data", self.name + suffix)
+        if "cache" not in path:
+            self._cached_path = path
+            self._diag.commit_path(path)
+        return path
+
+    def legacy_paths(self):
+        if self.legacy_specs is not None:
+            return list(self.legacy_specs)
+        files_dir = get_app_files_dir_path()
+        return [
+            ("legacy_utilities_root_jsonz", os.path.join(files_dir, self.name + ".jsonz"), "gzip_json"),
+            ("legacy_utilities_root_json", os.path.join(files_dir, self.name + ".json"), "json"),
+            ("user_info_saver_root", os.path.join(files_dir, OLD_PEER_STORAGE_NAME), "zlib_json"),
+        ]
+
+    def candidate_paths(self):
+        candidates = [("current", self.path(), "gzip_json" if self.compress else "json")]
+        candidates.extend(self.legacy_paths())
+        old_cache_path = get_old_cache_path()
+        if self.name == PEER_STORAGE_NAME and old_cache_path:
+            candidates.append(("user_info_saver_cache", old_cache_path, "zlib_json"))
+        return candidates
+
+    def _trace_read(self, stage, **kwargs):
+        if not EXTENDED_DIAGNOSTIC:
+            return
+        entry = {"stage": stage, "timestamp": datetime.now().isoformat(),
+            "read_seq": self._read_seq, "trigger": self._read_trigger}
+        entry.update(kwargs)
+        self.read_trace.append(entry)
+
+    def _read_payload_by_format(self, path, fmt):
+        if fmt == "gzip_json":
+            try:
+                with gzip.open(path, "rt", encoding="utf-8") as file:
+                    data = json.load(file)
+                self._trace_read("gzip_open", path=path, success=True)
+                self._trace_read("json_load", path=path, type=type(data).__name__,
+                    keys=len(data) if isinstance(data, dict) else "N/A")
+                return data
+            except Exception as e:
+                self._trace_read("gzip_open", path=path, success=False,
+                    exception=type(e).__name__, traceback=traceback.format_exc())
+                raise
+        if fmt == "json":
+            try:
+                with open(path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                self._trace_read("json_open", path=path, success=True)
+                self._trace_read("json_load", path=path, type=type(data).__name__,
+                    keys=len(data) if isinstance(data, dict) else "N/A")
+                return data
+            except Exception as e:
+                self._trace_read("json_open", path=path, success=False,
+                    exception=type(e).__name__, traceback=traceback.format_exc())
+                raise
+        if fmt == "zlib_json":
+            try:
+                data = read_maybe_zlib_json(path)
+                self._trace_read("zlib_open", path=path, success=True)
+                self._trace_read("zlib_json_load", path=path, type=type(data).__name__,
+                    keys=len(data) if isinstance(data, dict) else "N/A")
+                return data
+            except Exception as e:
+                self._trace_read("zlib_open", path=path, success=False,
+                    exception=type(e).__name__, traceback=traceback.format_exc())
+                raise
+        raise ValueError(f"unknown_storage_format:{fmt}")
+
+    def _read_candidate(self, path, fmt):
+        data = self._read_payload_by_format(path, fmt)
+        if not isinstance(data, dict):
+            self._trace_read("normalize", path=path, input_type=type(data).__name__,
+                input_count="N/A", output_count=0, removed=[], reason="not_a_dict")
+            return {}
+        input_count = len(data)
+        normalized = {}
+        removed_keys = []
+        for key, value in data.items():
+            if not isinstance(value, dict):
+                removed_keys.append(f"{key}:value_not_dict")
+                continue
+            key_str = str(key)
+            try:
+                if int(key_str) <= 0:
+                    removed_keys.append(f"{key}:non_positive_int")
+                    continue
+            except (ValueError, TypeError):
+                removed_keys.append(f"{key}:int_conversion_failed")
+                continue
+            normalized[key_str] = value
+        output_count = len(normalized)
+        self._trace_read("normalize", path=path, input_count=input_count,
+            output_count=output_count, removed=removed_keys,
+            reason="ok" if not removed_keys else f"removed_{len(removed_keys)}_keys")
+        return normalized
+
+    def inspect_candidates(self):
+        diagnostics = []
+        for source, path, fmt in self.candidate_paths():
+            entry = {
+                "source": source,
+                "path": path,
+                "format": fmt,
+                "exists": bool(path and os.path.exists(path)),
+                "count": 0,
+                "error": None,
+            }
+            if entry["exists"]:
+                try:
+                    data = self._read_candidate(path, fmt)
+                    entry["count"] = len(data)
+                    entry["_data"] = data
+                except Exception:
+                    entry["error"] = "read_failed"
+                    logger.error("Failed to inspect storage candidate %s:", path, exc_info=True)
+            diagnostics.append(entry)
+        self.last_scan = diagnostics
+        return diagnostics
+
+    def _pick_existing_data(self):
+        self._diag.op("_pick_existing_data")
+        diagnostics = self.inspect_candidates()
+        merged = {}
+        selected_source = "current"
+        selected_path = self.path()
+        precedence = [entry for entry in diagnostics if entry["exists"] and not entry["error"] and entry["count"] > 0]
+        merge_order = list(reversed(precedence))
+        for entry in merge_order:
+            try:
+                data = entry.get("_data")
+                if data is None:
+                    data = self._read_candidate(entry["path"], entry["format"])
+                merged.update(data)
+            except Exception:
+                logger.error("Failed to merge storage candidate %s:", entry["path"], exc_info=True)
+        if precedence:
+            selected_source = precedence[0]["source"]
+            selected_path = precedence[0]["path"]
+        self._diag.check_unexpected_mutation("_pick_existing_data", merged)
+        return merged, selected_source, selected_path, diagnostics
+
+    def read(self, trigger="explicit_reload"):
+        self._read_trigger = trigger
+        self._read_seq += 1
+        self._diag.op("read")
+        try:
+            data, selected_source, selected_path, diagnostics = self._pick_existing_data()
+            with self._lock:
+                self.content = data if isinstance(data, dict) and data else self._copy_default()
+                self.selected_source = selected_source
+                self.selected_path = selected_path
+            self.last_scan = diagnostics
+            self._diag.verify_read_end(selected_path, self.content, normalize_fn=normalize_peer_dump)
+            self.loaded = True
+            content_len = len(self.content) if isinstance(self.content, dict) else -1
+            first_keys = list(self.content.keys())[:10] if isinstance(self.content, dict) else []
+            self._trace_read("assign_content", selected_path=selected_path,
+                len=content_len, first_keys=first_keys)
+            return bool(self.content)
+        except Exception as e:
+            self._trace_read("read_exception", exception=type(e).__name__,
+                traceback=traceback.format_exc())
+            with self._lock:
+                self.content = self._copy_default()
+                self.selected_source = "current"
+                self.selected_path = self.path()
+            self._diag.verify_read_end(self.path(), self.content, normalize_fn=normalize_peer_dump)
+            return False
+
+    def ensure_loaded(self):
+        if not self.loaded:
+            self._diag.op("ensure_loaded")
+            self.read(trigger="initial_load")
+            self._diag.check_unexpected_mutation("ensure_loaded", self.content)
+        elif self._cached_path and self.selected_path and "cache" in self.selected_path:
+            self._diag.op("ensure_loaded(reload)")
+            self.read(trigger="ensure_loaded_cache_reread")
+            self._diag.record_expected_mutation("reload_from_cache_path", self.content)
+
+    def write(self):
+        if not self.loaded and not self.content:
+            logger.error("Refusing to write empty content: storage never successfully loaded")
+            return False
+        with self._lock:
+            content_snapshot = dict(self.content)
+        path = self.path()
+        temp_path = path + ".tmp"
+        self._diag.op("write")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if self.compress:
+                with gzip.open(temp_path, "wt", encoding="utf-8") as file:
+                    json.dump(content_snapshot, file, ensure_ascii=False, separators=(",", ":"))
+            else:
+                with open(temp_path, "w", encoding="utf-8") as file:
+                    json.dump(content_snapshot, file, ensure_ascii=False, separators=(",", ":"))
+            os.replace(temp_path, path)
+            self.loaded = True
+            self.selected_path = path
+            self.selected_source = "current"
+            self._diag.verify_write_end(path, self.compress)
+            self._diag.record_expected_mutation("write", content_snapshot)
+            return True
+        except Exception:
+            logger.error("Failed to write storage %s:", path, exc_info=True)
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return False
+
+    def count(self):
+        self.ensure_loaded()
+        return len(self.content) if isinstance(self.content, dict) else 0
+
+    def diagnostics(self):
+        self.ensure_loaded()
+        return {
+            "selected_source": self.selected_source,
+            "selected_path": self.selected_path or self.path(),
+            "current_path": self.path(),
+            "entries": self.inspect_candidates(),
+        }
+
+
+peer_storage = JsonStorage(PEER_STORAGE_NAME, default={}, compress=True)
+
+
+def normalize_peer_dump(data):
+    if not isinstance(data, dict):
+        return {}
+    normalized = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        key_str = str(key)
+        if not is_user_dialog(key_str):
+            continue
+        normalized[key_str] = value
+    return normalized
+
+
+# ─────────────────────────────────────────────────────────────
+# Migration and backup
+# ─────────────────────────────────────────────────────────────
+
+def get_old_cache_path():
+    try:
+        return os.path.join(get_plugins_dir(), "cache", OLD_PEER_STORAGE_NAME)
+    except Exception:
+        return None
+
+
+def read_maybe_zlib_json(path):
+    with open(path, "rb") as file:
+        raw = file.read()
+    if not raw:
+        return {}
+    is_zlib = len(raw) >= 2 and (raw[0] & 0x0F) == 8 and (raw[0] * 256 + raw[1]) % 31 == 0
+    if is_zlib:
+        raw = zlib.decompress(raw)
+    return normalize_peer_dump(json.loads(raw.decode("utf-8", errors="replace")))
+
+
+def _pluralize_records(n):
+    n100 = abs(n) % 100
+    if 11 <= n100 <= 19:
+        return f"{n} записей"
+    n10 = n100 % 10
+    if n10 == 1:
+        return f"{n} запись"
+    if 2 <= n10 <= 4:
+        return f"{n} записи"
+    return f"{n} записей"
+
+
+def import_peer_dump(data):
+    normalized = normalize_peer_dump(data)
+    normalized = {key: value for key, value in normalized.items() if is_meaningful_peer_dump(value)}
+    if not normalized:
+        return 0
+    peer_storage.ensure_loaded()
+    if not peer_storage._lock.acquire(blocking=False):
+        logger.warning("Storage locked, skipping import")
+        return 0
+    try:
+        old_values = {k: peer_storage.content[k] for k in normalized if k in peer_storage.content}
+        peer_storage.content.update(normalized)
+    finally:
+        peer_storage._lock.release()
+    try:
+        if not peer_storage.write():
+            raise RuntimeError("storage_write_failed")
+    except Exception:
+        with peer_storage._lock:
+            for k in normalized:
+                if k in old_values:
+                    peer_storage.content[k] = old_values[k]
+                else:
+                    peer_storage.content.pop(k, None)
+        raise
+    return len(normalized)
+
+
+def is_meaningful_peer_dump(dumped):
+    if not isinstance(dumped, dict):
+        return False
+    if any(dumped.get(field) not in (None, "", 0, False) for field in PRECIOUS_PEER_FIELDS):
+        return True
+    for field in IMPORTANT_PEER_STATE_FIELDS:
+        value = dumped.get(field)
+        if isinstance(value, bool) and value:
+            return True
+        if value not in (None, "", 0, False):
+            return True
+    for key, value in dumped.items():
+        if key in PRECIOUS_PEER_FIELDS or key in IMPORTANT_PEER_STATE_FIELDS:
+            continue
+        if isinstance(value, bool) and value:
+            return True
+        if value not in (None, "", 0, False):
+            return True
+    return False
+
+
+def is_user_dialog(dialog_id):
+    try:
+        return int(dialog_id) > 0
+    except Exception:
+        return False
+
+
+def get_user_peer_settings_map(msg_controller):
+    try:
+        return get_private_field(msg_controller, FIELD_USER_PEER_SETTINGS)
+    except Exception:
+        return None
+
+
+def cache_restored_peer_settings(msg_controller, dialog_id, settings):
+    if not msg_controller or not settings or not is_user_dialog(dialog_id):
+        return False
+    try:
+        user_peer_settings = get_user_peer_settings_map(msg_controller)
+        if not user_peer_settings:
+            return False
+        user_peer_settings.put(dialog_id, settings)
+        return True
+    except Exception:
+        logger.error("Failed to cache restored peer settings for %s", dialog_id, exc_info=True)
+        return False
+
+
+def migrate_old_storage(delete_after_success=True):
+    old_path = get_old_cache_path()
+    if not old_path or not os.path.exists(old_path):
+        peer_storage._diag.op("MIGRATION_OLD_STORAGE_SKIPPED")
+        return 0
+    peer_storage._diag.op("MIGRATION_OLD_STORAGE")
+    peer_storage._diag.check_path(old_path)
+    data = read_maybe_zlib_json(old_path)
+    count = import_peer_dump(data)
+    if count and delete_after_success:
+        try:
+            os.remove(old_path)
+            peer_storage._diag.op("MIGRATION_OLD_STORAGE_DELETE")
+        except Exception:
+            logger.error("Failed to delete old storage after migration:", exc_info=True)
+    peer_storage._diag.record_expected_mutation("migrate_old_storage", peer_storage.content)
+    return count
+
+
+def inspect_old_storage():
+    old_path = get_old_cache_path()
+    try:
+        if not old_path or not os.path.exists(old_path):
+            peer_storage._diag.op("INSPECT_OLD_STORAGE_NOT_EXISTS")
+            return {"exists": False, "count": 0, "path": old_path, "error": None}
+        count = len(read_maybe_zlib_json(old_path))
+        peer_storage._diag.op("INSPECT_OLD_STORAGE")
+        peer_storage._diag.check_path(old_path)
+        return {"exists": True, "count": count, "path": old_path, "error": None}
+    except Exception:
+        logger.error("Failed to inspect old storage:", exc_info=True)
+        return {"exists": False, "count": 0, "path": old_path, "error": "inspect_failed"}
+
+
+def migrate_resolved_legacy_storage():
+    peer_storage._diag.op("MIGRATION_RESOLVED_LEGACY")
+    peer_storage.ensure_loaded()
+    selected_path = peer_storage.selected_path
+    if not selected_path or selected_path == peer_storage.path():
+        peer_storage._diag.op("MIGRATION_RESOLVED_LEGACY_SKIPPED_NO_LEGACY")
+        return 0
+    if not peer_storage.count():
+        peer_storage._diag.op("MIGRATION_RESOLVED_LEGACY_SKIPPED_ZERO")
+        return 0
+    if not peer_storage.write():
+        raise RuntimeError("storage_write_failed")
+    peer_storage._diag.record_expected_mutation("migrate_resolved_legacy_storage", peer_storage.content)
+    return peer_storage.count()
+
+
+def migrate_detected_legacy_now():
+    try:
+        migrated = migrate_resolved_legacy_storage()
+        if migrated > 0:
+            notify_success(f"Перенесено {_pluralize_records(migrated)} в текущее хранилище")
+        else:
+            notify_info("Активное хранилище уже текущее или перенос не требуется")
+    except Exception:
+        logger.error("Resolved legacy migration failed:", exc_info=True)
+        notify_error("Ошибка переноса в текущее хранилище")
+
+
+def import_old_storage_now():
+    try:
+        imported = migrate_old_storage(delete_after_success=False)
+        if imported > 0:
+            notify_success(f"Импортировано {_pluralize_records(imported)}")
+        else:
+            notify_info("Старые данные не найдены или уже пусты")
+    except Exception:
+        logger.error("Migration failed:", exc_info=True)
+        notify_error("Ошибка миграции старых данных")
+
+
+def build_backup_payload():
+    snapshot = storage_snapshot()
+    return {
+        "plugin": __id__,
+        "version": __version__,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "records": snapshot["peer_records"],
+    }
+
+
+def write_backup_payload(payload, filename=None):
+    backup_dir = get_backup_dir()
+    os.makedirs(backup_dir, exist_ok=True)
+    filename = filename or (BACKUP_PREFIX + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json")
+    path = os.path.join(backup_dir, filename)
+    peer_storage._diag.trace_event("BACKUP_WRITE_BEGIN", path=path, extra_info=f"peer_count={len(payload.get('records', {}))}")
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    peer_storage._diag.trace_event("BACKUP_WRITE_END", path=path)
+    return path, filename
+
+
+def export_backup(silent=False, filename=None, payload=None):
+    try:
+        payload = payload or build_backup_payload()
+        peer_storage._diag.trace_event("EXPORT_BACKUP_BEGIN", path=backup_file_path(filename) if filename else "N/A", extra_info=f"peer_count={len(payload.get('records', {}))}")
+        _path, written_name = write_backup_payload(payload, filename=filename)
+        peer_storage._diag.trace_event("EXPORT_BACKUP_END", path=_path, extra_info=f"written={written_name}")
+        if not silent:
+            run_ui(lambda: notify_success(f"Резервная копия создана\n{written_name}"))
+        return written_name
+    except Exception:
+        logger.error("Export failed:", exc_info=True)
+        if not silent:
+            run_ui(lambda: notify_error("Ошибка экспорта"))
+        raise
+
+
+def list_backup_files():
+    backup_dir = get_backup_dir()
+    if not os.path.exists(backup_dir):
+        return []
+    files = [name for name in os.listdir(backup_dir) if name.startswith(BACKUP_PREFIX) and name.endswith(".json")]
+    return sorted(files, reverse=True)
+
+
+def backup_file_path(filename):
+    return os.path.join(get_backup_dir(), filename)
+
+
+def read_backup_file(path):
+    peer_storage._diag.trace_event("BACKUP_READ_BEGIN", path=path)
+    with open(path, "r", encoding="utf-8") as file:
+        payload = json.load(file)
+    peer_records = {}
+    if isinstance(payload, dict):
+        if isinstance(payload.get("records"), dict):
+            peer_records = normalize_peer_dump(payload["records"])
+        else:
+            peer_records = normalize_peer_dump(payload)
+    else:
+        peer_records = normalize_peer_dump(payload)
+    peer_storage._diag.trace_event("BACKUP_READ_END", path=path, extra_info=f"peer_count={len(peer_records)}")
+    return {
+        "peer_records": peer_records,
+        "raw": payload,
+    }
+
+
+def backup_file_summary(filename):
+    path = backup_file_path(filename)
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return {"filename": filename, "path": path, "size_bytes": 0, "size_label": "0 B",
+                "created_at": "", "created_label": "файл не найден",
+                "peer_count": 0, "version": "", "plugin": __id__}
+    backup = read_backup_file(path)
+    raw = backup["raw"] if isinstance(backup.get("raw"), dict) else {}
+    return {
+        "filename": filename,
+        "path": path,
+        "size_bytes": stat.st_size,
+        "size_label": human_size(stat.st_size),
+        "created_at": raw.get("created_at") or datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "created_label": human_date_from_iso(raw.get("created_at")) if raw.get("created_at") else datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m.%Y %H:%M"),
+        "peer_count": len(backup["peer_records"]),
+        "version": raw.get("version") or "неизвестно",
+        "plugin": raw.get("plugin") or __id__,
+    }
+
+
+def merge_peer_records(current, incoming):
+    merged = normalize_peer_dump(current)
+    for key, value in normalize_peer_dump(incoming).items():
+        existing = merged.get(key)
+        if not isinstance(existing, dict):
+            merged[key] = clone_data(value)
+            continue
+        combined = clone_data(existing)
+        combined.update(value)
+        for field in PRECIOUS_PEER_FIELDS:
+            if not combined.get(field):
+                old_value = existing.get(field)
+                if old_value not in (None, "", 0, False):
+                    combined[field] = old_value
+        if is_meaningful_peer_dump(combined):
+            merged[key] = combined
+    return {key: value for key, value in merged.items() if is_meaningful_peer_dump(value)}
+
+
+def verify_storage_state(expected_peer):
+    try:
+        fmt = "gzip_json" if peer_storage.compress else "json"
+        data = peer_storage._read_candidate(peer_storage.path(), fmt)
+    except Exception:
+        return False
+    return normalize_peer_dump(data) == normalize_peer_dump(expected_peer)
+
+
+def apply_storage_transaction(peer_content, safety_prefix=None):
+    snapshot = storage_snapshot()
+    safety_name = None
+    peer_storage._diag.trace_event("TRANSACTION_BEGIN", path=peer_storage.path(), extra_info=f"mode={safety_prefix or 'none'} incoming_keys={len(normalize_peer_dump(peer_content))} snapshot_keys={len(snapshot.get('peer_records', {}))}")
+    try:
+        if safety_prefix:
+            safety_name = export_backup(
+                silent=True,
+                filename=BACKUP_PREFIX + safety_prefix + "_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json",
+            )
+        final_peer = normalize_peer_dump(peer_content)
+        set_storage_content(peer_storage, final_peer)
+        peer_storage._diag.record_expected_mutation("apply_storage_transaction:after_set_content", peer_storage.content)
+        if not peer_storage.write():
+            peer_storage._diag.trace_event("TRANSACTION_END", path=peer_storage.path(), extra_info="FAILED: write_failed")
+            raise RuntimeError("write_failed")
+        if not verify_storage_state(final_peer):
+            peer_storage._diag.trace_event("TRANSACTION_END", path=peer_storage.path(), extra_info="FAILED: verify_failed")
+            raise RuntimeError("verify_failed")
+        peer_storage._diag.record_expected_mutation("apply_storage_transaction", peer_storage.content)
+        peer_storage._diag.trace_event("TRANSACTION_END", path=peer_storage.path(), extra_info=f"SUCCESS safety_backup={safety_name} final_keys={len(final_peer)}")
+        return {
+            "peer": final_peer,
+            "safety_backup": safety_name,
+            "snapshot": snapshot,
+        }
+    except Exception:
+        peer_storage._diag.trace_event("TRANSACTION_END", path=peer_storage.path(), extra_info="EXCEPTION: restore_snapshot")
+        rollback_ok = restore_snapshot(snapshot)
+        if not rollback_ok:
+            logger.error("Rollback write failed during apply_storage_transaction")
+        raise
+
+
+def import_backup_payload(backup_data, mode="replace"):
+    snapshot = storage_snapshot()
+    incoming_peer = backup_data["peer_records"]
+    peer_storage._diag.trace_event("IMPORT_BACKUP_PAYLOAD_BEGIN", path=peer_storage.path(), extra_info=f"mode={mode} incoming_keys={len(incoming_peer)} current_keys={len(snapshot.get('peer_records', {}))}")
+    if mode == "replace":
+        final_peer = normalize_peer_dump(incoming_peer)
+    else:
+        final_peer = merge_peer_records(snapshot["peer_records"], incoming_peer)
+    peer_storage._diag.trace_event("IMPORT_BACKUP_PAYLOAD_MERGED", path=peer_storage.path(), extra_info=f"final_keys={len(final_peer)}")
+    result = apply_storage_transaction(final_peer, safety_prefix="autosave")
+    peer_storage._diag.trace_event("IMPORT_BACKUP_PAYLOAD_END", path=peer_storage.path(), extra_info=f"peer_count={len(result['peer'])} safety_backup={result['safety_backup']}")
+    return {
+        "peer_count": len(result["peer"]),
+        "safety_backup": result["safety_backup"],
+    }
+
+
+def import_backup_file(filename, mode):
+    path = backup_file_path(filename)
+    peer_storage._diag.trace_event("IMPORT_BACKUP_FILE_BEGIN", path=path, extra_info=f"mode={mode}")
+    try:
+        backup_data = read_backup_file(path)
+        result = import_backup_payload(backup_data, mode)
+        peer_storage._diag.trace_event("IMPORT_BACKUP_FILE_END", path=path, extra_info=f"SUCCESS peer_count={result['peer_count']} safety_backup={result['safety_backup']}")
+        run_ui(lambda: notify_success(
+            f"Импорт завершён: {result['peer_count']} профилей\nСтраховочная копия: {result['safety_backup']}"
+        ))
+        return result
+    except Exception:
+        logger.error("Import failed:", exc_info=True)
+        peer_storage._diag.trace_event("IMPORT_BACKUP_FILE_END", path=path, extra_info="FAILED: exception rollback")
+        run_ui(lambda: notify_error("Ошибка импорта, выполнен откат"))
+        return None
+
+
+def wipe_saved_peer_data():
+    def confirm(_, __):
+        try:
+            peer_storage._diag.trace_event("WIPE_BEGIN", path=peer_storage.path())
+            result = apply_storage_transaction({}, safety_prefix="wipe")
+            peer_storage._diag.record_expected_mutation("wipe_saved_peer_data", peer_storage.content)
+            peer_storage._diag.trace_event("WIPE_END", path=peer_storage.path(), extra_info=f"SUCCESS safety_backup={result['safety_backup']}")
+            notify_success(f"Сохранённые данные очищены\nСтраховочная копия: {result['safety_backup']}")
+        except Exception:
+            logger.error("Wipe failed:", exc_info=True)
+            peer_storage._diag.trace_event("WIPE_END", path=peer_storage.path(), extra_info="FAILED: exception rollback")
+            notify_error("Не удалось очистить данные, выполнен откат")
+
+    show_alert(
+        "Очистить данные?",
+        "Будут удалены только данные UtilitiesPro. Файлы резервных копий и старые плагины не затрагиваются.",
+        buttons=[
+            ("positive", "Очистить", confirm),
+            ("negative", "Отмена", lambda _, __: None),
+        ],
+        cancelable=True,
+    )
+
+
+def clean_empty_profiles():
+    def confirm(_, __):
+        try:
+            peer_storage.ensure_loaded()
+            with peer_storage._lock:
+                before = len(peer_storage.content)
+                empty_keys = [k for k, v in peer_storage.content.items()
+                              if not is_meaningful_peer_dump(v)]
+                old_entries = {k: peer_storage.content[k] for k in empty_keys}
+                for k in empty_keys:
+                    del peer_storage.content[k]
+                write_ok = peer_storage.write()
+                if not write_ok:
+                    for k, v in old_entries.items():
+                        peer_storage.content[k] = v
+                    notify_error("Не удалось записать изменения, данные восстановлены")
+                    return
+            notify_success(f"Удалено пустых профилей: {len(empty_keys)} из {before}")
+        except Exception:
+            logger.error("Clean empty profiles failed:", exc_info=True)
+            peer_storage.ensure_loaded()
+            notify_error("Не удалось очистить пустые профили")
+
+    peer_storage.ensure_loaded()
+    empty_count = sum(1 for v in peer_storage.content.values()
+                      if not is_meaningful_peer_dump(v))
+    if empty_count == 0:
+        notify_info("Пустых профилей не найдено")
+        return
+    show_alert(
+        "Очистить пустые профили?",
+        f"Найдено {empty_count} {decline_word(empty_count)}, в которых нет полезных данных. "
+        "Будут удалены только пустые профили — все ценные данные сохранятся.",
+        buttons=[
+            ("positive", "Очистить", confirm),
+            ("negative", "Отмена", lambda _, __: None),
+        ],
+        cancelable=True,
+    )
+
+
+def delete_saved_peer_data(dialog_id):
+    if not is_user_dialog(dialog_id):
+        return False
+    peer_storage.ensure_loaded()
+    dialog_key = str(dialog_id)
+    with peer_storage._lock:
+        if dialog_key not in peer_storage.content:
+            return False
+        old_value = peer_storage.content.get(dialog_key)
+        del peer_storage.content[dialog_key]
+    ok = peer_storage.write()
+    if ok:
+        notify_success(f"Данные профиля {dialog_id} удалены")
+    else:
+        with peer_storage._lock:
+            if old_value is not None:
+                peer_storage.content[dialog_key] = old_value
+        notify_error("Ошибка при удалении данных профиля")
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+# Forward/delete limit bypass
+# ─────────────────────────────────────────────────────────────
+
+def ensure_chat_activity_methods():
+    global ChatActivityClass, hide_action_mode_method, update_pinned_msg_view_method
+    if ChatActivityClass:
+        return True
+    try:
+        ChatActivityClass = ensure_chat_activity_class()
+        if not ChatActivityClass:
+            return False
+        hide_action_mode_method = get_declared_method(ChatActivityClass, "hideActionMode")
+        if not hide_action_mode_method:
+            return False
+        update_pinned_msg_view_method = get_declared_method(ChatActivityClass, "updatePinnedMessageView", Boolean.TYPE)
+        if not update_pinned_msg_view_method:
+            return False
+        return True
+    except Exception:
+        logger.error("Failed to resolve ChatActivity methods:", exc_info=True)
+        return False
+
+
+def get_selected_msgs_array_index(param):
+    if not param.args or param.args[0] is None:
+        return 0
+    message_object = param.args[0]
+    current_dialog_id = get_private_field(param.thisObject, FIELD_DIALOG_ID)
+    return int(message_object.getDialogId() != current_dialog_id)
+
+
+def get_sparsearray_keys(sparse_array):
+    return [] if sparse_array is None else [sparse_array.keyAt(i) for i in range(sparse_array.size())]
+
+
+def get_actions_buttons_layout(chat_activity):
+    return get_private_field(chat_activity, FIELD_ACTIONS_BUTTONS_LAYOUT)
+
+
+def update_reply_button_visibility(chat_activity, should_show):
+    actions_buttons_layout = get_actions_buttons_layout(chat_activity)
+    if actions_buttons_layout:
+        actions_buttons_layout.showReplyButton(should_show, True)
+
+
+def update_select_button_visibility(chat_activity):
+    java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
+    messages = get_private_field(chat_activity, FIELD_MESSAGES)
+    actions_buttons_layout = get_actions_buttons_layout(chat_activity)
+    if actions_buttons_layout is None or java_msgs_sparse is None or messages is None:
+        return
+
+    java_msgs_main = java_msgs_sparse[0]
+    if java_msgs_main is None:
+        return
+    new_select_visibility = View.GONE
+    if java_msgs_main.size() > 1:
+        all_selected_msg_ids = get_sparsearray_keys(java_msgs_main) + get_sparsearray_keys(java_msgs_sparse[1])
+        all_selected_msg_ids.sort()
+        if all_selected_msg_ids:
+            begin = all_selected_msg_ids[0]
+            end = all_selected_msg_ids[-1]
+            for i in range(messages.size()):
+                msg = messages.get(i)
+                if msg is None:
+                    continue
+                msg_id = msg.getId()
+                if begin < msg_id < end and java_msgs_main.indexOfKey(msg_id) < 0 and msg.contentType == 0:
+                    new_select_visibility = View.VISIBLE
+                    break
+
+
+def cancel_selection_mode(chat_activity):
+    if hide_action_mode_method:
+        hide_action_mode_method.invoke(chat_activity)
+    if update_pinned_msg_view_method:
+        update_pinned_msg_view_method.invoke(chat_activity, [True])
+
+
+def decrement_private_counter(chat_activity, field_name, target_field_name=None):
+    value = get_private_field(chat_activity, field_name)
+    if value is None:
+        return
+    value = max(0, int(value) - 2)
+    set_private_field(chat_activity, field_name, Integer(value))
+    if value == 0 and target_field_name and target_field_name == FIELD_FORWARD_BUTTON:
+        target = get_private_field(chat_activity, target_field_name)
+        if target:
+            target.setEnabled(True)
+            target.setAlpha(1.0)
+
+
+class SelectorHook(MethodHook):
+    def __init__(self):
+        super().__init__()
+        self.messages_array = {}
+        self.is_processing_msg_group = False
+        self.is_last_in_group = False
+        self.handle_end_of_select_msg_group_call = False
+        self._group_dialog_id = None
+
+    def _ensure_correct_dialog(self, chat_activity):
+        dialog_id = str(get_private_field(chat_activity, FIELD_DIALOG_ID))
+        if dialog_id != self._group_dialog_id:
+            self.is_processing_msg_group = False
+            self.is_last_in_group = False
+            self.handle_end_of_select_msg_group_call = False
+            self._group_dialog_id = dialog_id
+
+    def before_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            chat_activity = param.thisObject
+            if chat_activity is None or len(param.args) < 3:
+                return
+            self._ensure_correct_dialog(chat_activity)
+            selected_msg_obj = param.args[0]
+            if selected_msg_obj is None:
+                return
+            tapped_outside = param.args[1]
+            is_last = param.args[2]
+            is_grouped = selected_msg_obj.getGroupId() != 0
+            if self.is_processing_msg_group:
+                self.is_last_in_group = is_last
+                return
+            if tapped_outside and is_last and is_grouped:
+                self.is_processing_msg_group = True
+            index = get_selected_msgs_array_index(param)
+            java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
+            if java_msgs_sparse is None:
+                return
+            try:
+                java_msgs_sparse[index] = param.thisObject.SparseArrayWithTouch()
+            except Exception:
+                from java import jclass
+                SparseArray = jclass('android.util.SparseArray')
+                java_msgs_sparse[index] = SparseArray()
+            set_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS, java_msgs_sparse)
+        except Exception:
+            logger.error("Selector before hook failed:", exc_info=True)
+
+    def after_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            if self.handle_end_of_select_msg_group_call:
+                self.handle_end_of_select_msg_group_call = False
+                return
+            is_group_commit_event = False
+            if self.is_processing_msg_group:
+                if not self.is_last_in_group:
+                    return
+                self.is_processing_msg_group = False
+                self.is_last_in_group = False
+                self.handle_end_of_select_msg_group_call = True
+                is_group_commit_event = True
+
+            chat_activity = param.thisObject
+            if chat_activity is None:
+                return
+            self._ensure_correct_dialog(chat_activity)
+            index = get_selected_msgs_array_index(param)
+            java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
+            if java_msgs_sparse is None:
+                return
+            selected_msgs_array = java_msgs_sparse[index]
+            if selected_msgs_array is None:
+                return
+
+            dialog_key = str(get_private_field(chat_activity, FIELD_DIALOG_ID))
+            dialog_msgs = self.messages_array.setdefault(dialog_key, {})
+
+            chat_mode = get_private_field(chat_activity, FIELD_CHAT_MODE)
+            current_chat = get_private_field(chat_activity, FIELD_CURRENT_CHAT)
+            is_in_schedule_mode = chat_mode == 1
+            no_forwards = is_in_schedule_mode or self._is_peer_no_forwards(chat_activity)
+
+            for i in reversed(range(selected_msgs_array.size())):
+                message_id = selected_msgs_array.keyAt(i)
+                message_object = selected_msgs_array.get(message_id)
+                if message_object is None:
+                    continue
+                if message_id in dialog_msgs:
+                    if not message_object.canForwardMessage() or no_forwards:
+                        decrement_private_counter(chat_activity, FIELD_CANT_FORWARD_COUNT, FIELD_FORWARD_BUTTON)
+                    if not message_object.canDeleteMessage(is_in_schedule_mode, current_chat):
+                        decrement_private_counter(chat_activity, FIELD_CANT_DELETE_COUNT, FIELD_DELETE_ITEM)
+                    dialog_msgs.pop(message_id)
+                else:
+                    dialog_msgs[message_id] = message_object
+
+            selected_msgs_array.clear()
+            for message_id, message_object in dialog_msgs.items():
+                selected_msgs_array.put(message_id, message_object)
+
+            if not dialog_msgs:
+                cancel_selection_mode(chat_activity)
+                return
+            update_reply_button_visibility(chat_activity, len(dialog_msgs) == 1)
+            update_select_button_visibility(chat_activity)
+        except Exception:
+            logger.error("Selector after hook failed:", exc_info=True)
+
+    def _is_peer_no_forwards(self, chat_activity):
+        try:
+            return bool(chat_activity.isPeerNoForwards())
+        except Exception:
+            return False
+
+    def clear_message_storage(self):
+        self.messages_array.clear()
+        self.is_processing_msg_group = False
+        self.is_last_in_group = False
+        self.handle_end_of_select_msg_group_call = False
+        self._group_dialog_id = None
+
+
+class ClearSelectionHook(MethodHook):
+    def __init__(self, selector):
+        super().__init__()
+        self.selector = selector
+
+    def before_hooked_method(self, _param):
+        if S.enable_forward_bypass:
+            try:
+                self.selector.clear_message_storage()
+            except Exception:
+                logger.error("ClearSelectionHook failed:", exc_info=True)
+
+
+class MultiSelectorHook(MethodHook):
+    def __init__(self, hook_method):
+        super().__init__()
+        self.hook_method = hook_method
+
+    def after_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            chat_list_view = get_private_field(param.thisObject, FIELD_CHAT_LIST_VIEW)
+            if chat_list_view is None:
+                return
+            selection_listener = get_private_field(chat_list_view, FIELD_MULTI_SELECTION_LISTENER)
+            if selection_listener is None:
+                cls = chat_list_view.getClass()
+                while cls is not None:
+                    try:
+                        field = cls.getDeclaredField(FIELD_MULTI_SELECTION_LISTENER)
+                        field.setAccessible(True)
+                        selection_listener = field.get(chat_list_view)
+                        if selection_listener is not None:
+                            break
+                    except Exception:
+                        pass
+                    cls = cls.getSuperclass()
+            if selection_listener is None:
+                return
+            method = selection_listener.getClass().getMethod("limitReached")
+
+            class _BypassLimitReachedHook(MethodReplacement):
+                def replace_hooked_method(self, _param):
+                    return False
+
+            self.hook_method(method, _BypassLimitReachedHook())
+        except Exception:
+            logger.error("Multi-selector hook failed:", exc_info=True)
+
+
+class DeleteMessagesHook(XposedHook):
+    chunk_size = 100
+
+    def before_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            if len(param.args) < 2:
+                return
+            first_msg_array = param.args[0]
+            second_msg_array = param.args[1]
+            if first_msg_array is not None and first_msg_array.size() > 0:
+                messages_array = first_msg_array
+                selected_arg_index = 0
+            elif second_msg_array is not None and second_msg_array.size() > 0:
+                messages_array = second_msg_array
+                selected_arg_index = 1
+            else:
+                return
+            other_array = param.args[1 - selected_arg_index]
+            total = messages_array.size()
+            if total <= self.chunk_size:
+                return
+            other_total = other_array.size() if other_array is not None else 0
+            for start in range(0, total, self.chunk_size):
+                end = min(start + self.chunk_size, total)
+                chunk = ArrayList()
+                for i in range(start, end):
+                    chunk.add(Integer(int(messages_array.get(i))))
+                param.args[selected_arg_index] = chunk
+                if other_total > 0:
+                    other_start = min(start, other_total)
+                    other_end = min(end, other_total)
+                    other_chunk = ArrayList()
+                    for i in range(other_start, other_end):
+                        other_chunk.add(Long(other_array.get(i)))
+                    param.args[1 - selected_arg_index] = other_chunk
+                if end < total:
+                    try:
+                        param.method.invoke(param.thisObject, param.args)
+                    except Exception:
+                        logger.error("DeleteMessages per-chunk error (chunk %d-%d/%d):", start, end, total, exc_info=True)
+        except Exception:
+            logger.error("DeleteMessages hook failed:", exc_info=True)
+
+
+selector_hook = SelectorHook()
+
+
+def setup_forward_limit_bypass(plugin_instance):
+    if not ensure_chat_activity_methods():
+        return False
+    ok = True
+    hook_method = plugin_instance.hook_method
+    message_object_class = ensure_message_object_class()
+    encrypted_chat_class = ensure_encrypted_chat_class()
+    tlobject_class = ensure_tlobject_class()
+    if not message_object_class or not encrypted_chat_class or not tlobject_class:
+        return False
+    try:
+        selector_method = get_declared_method(ChatActivityClass, "addToSelectedMessages", message_object_class, Boolean.TYPE, Boolean.TYPE)
+        if selector_method:
+            hook_method(selector_method, selector_hook)
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook message selection:", exc_info=True)
+    try:
+        clear_selection_method = get_declared_method(ChatActivityClass, "hideActionMode")
+        if clear_selection_method:
+            hook_method(clear_selection_method, ClearSelectionHook(selector_hook))
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook selection clear:", exc_info=True)
+    try:
+        multi_selector_method = get_declared_method(ChatActivityClass, "startMultiselect", Integer.TYPE)
+        if multi_selector_method:
+            hook_method(multi_selector_method, MultiSelectorHook(hook_method))
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook multiselect:", exc_info=True)
+    try:
+        clazz = ensure_messages_controller_class()
+        delete_messages_method = get_declared_method(
+            clazz,
+            "deleteMessages",
+            ArrayList, ArrayList, encrypted_chat_class, Long.TYPE, Boolean.TYPE,
+            Integer.TYPE, Boolean.TYPE, Long.TYPE, tlobject_class, Integer.TYPE,
+            Boolean.TYPE, Integer.TYPE,
+        )
+        if delete_messages_method:
+            hook_method(delete_messages_method, DeleteMessagesHook())
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook deleteMessages:", exc_info=True)
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+# Peer info saver
+# ─────────────────────────────────────────────────────────────
+
+def peer_settings_to_dict(settings):
+    if not settings:
+        return None
+    data = {}
+    fields_failed = 0
+    for field in settings.getClass().getFields():
+        try:
+            key = field.getName()
+            if not key.islower() or key.startswith("_"):
+                continue
+            data[key] = field.get(settings)
+        except Exception:
+            fields_failed += 1
+    if fields_failed:
+        logger.warning("peer_settings_to_dict: %d fields failed", fields_failed)
+    return data if data else None
+
+
+def dict_to_peer_settings(dumped):
+    dumped = dumped if isinstance(dumped, dict) else None
+    if not dumped:
+        return None
+    settings = TLRPC.TL_peerSettings()
+    for key, value in dumped.items():
+        try:
+            setattr(settings, key, value)
+        except Exception:
+            logger.error("Failed to restore peer field %s", key, exc_info=True)
+    return settings
+
+
+def merge_saved_peer_fields(base_settings, saved_settings):
+    saved_settings = saved_settings if isinstance(saved_settings, dict) else None
+    if not saved_settings:
+        return base_settings
+    if base_settings is None:
+        return dict_to_peer_settings(saved_settings)
+    base_dump = peer_settings_to_dict(base_settings)
+    if not isinstance(base_dump, dict):
+        return base_settings
+    merged = clone_data(base_dump)
+    for field in PRECIOUS_PEER_FIELDS:
+        if merged.get(field) in (None, "", 0, False) and saved_settings.get(field) not in (None, "", 0, False):
+            merged[field] = saved_settings.get(field)
+    return dict_to_peer_settings(merged)
+
+
+def load_saved_peer_settings(dialog_id):
+    if not is_user_dialog(dialog_id):
+        return None
+    peer_storage.ensure_loaded()
+    return peer_storage.content.get(str(dialog_id)) if isinstance(peer_storage.content, dict) else None
+
+
+def save_peer_settings(dialog_id, settings):
+    if not is_user_dialog(dialog_id):
+        return
+    now = JavaSystem.nanoTime()
+    with _saving_lock:
+        last = _saving_dialogs.get(dialog_id, 0)
+        if now - last < _save_debounce_seconds * 1_000_000_000:
+            return
+        _saving_dialogs[dialog_id] = now
+    peer_storage.ensure_loaded()
+    new_settings = peer_settings_to_dict(settings)
+    if not new_settings:
+        return
+    old_settings = load_saved_peer_settings(dialog_id)
+    if old_settings:
+        for field in PRECIOUS_PEER_FIELDS:
+            if not new_settings.get(field) and old_settings.get(field):
+                new_settings[field] = old_settings[field]
+    if not is_meaningful_peer_dump(new_settings):
+        return
+    dialog_key = str(dialog_id)
+    with peer_storage._lock:
+        old_settings = clone_data(peer_storage.content.get(dialog_key))
+        peer_storage.content[dialog_key] = new_settings
+        write_ok = peer_storage.write()
+        if not write_ok:
+            if old_settings is not None:
+                peer_storage.content[dialog_key] = old_settings
+            else:
+                peer_storage.content.pop(dialog_key, None)
+    if not write_ok:
+        logger.error("Failed to save peer settings for dialog %s", dialog_id, exc_info=True)
+
+
+def resolve_peer_settings(dialog_id, original_settings=None, use_saved=True):
+    if original_settings is not None:
+        return original_settings
+    with _resolving_lock:
+        if dialog_id in _resolving_dialogs:
+            _fast_controller = get_messages_controller()
+            try:
+                _fast_full = _fast_controller.getUserFull(dialog_id)
+                _fast_settings = getattr(_fast_full, "settings", None)
+                if _fast_settings is not None:
+                    return _fast_settings
+            except Exception:
+                logger.debug("resolve_peer_settings: fast-path getUserFull failed for dialog %s", dialog_id)
+                pass
+            try:
+                _fast_map = get_user_peer_settings_map(_fast_controller)
+                if _fast_map:
+                    _fast_val = _fast_map.get(dialog_id)
+                    if _fast_val is not None:
+                        return _fast_val
+            except Exception:
+                logger.debug("resolve_peer_settings: fast-path get_user_peer_settings_map failed for dialog %s", dialog_id)
+                pass
+            return None
+        _resolving_dialogs.add(dialog_id)
+    try:
+        msg_controller = get_messages_controller()
+        user_full_settings = None
+        msg_controller_settings = None
+        try:
+            user_full = msg_controller.getUserFull(dialog_id)
+            user_full_settings = getattr(user_full, "settings", None)
+        except Exception:
+            logger.error("resolve_peer_settings: msg_controller.getUserFull failed", exc_info=True)
+        try:
+            user_peer_settings = get_user_peer_settings_map(msg_controller)
+            msg_controller_settings = user_peer_settings.get(dialog_id) if user_peer_settings else None
+        except Exception:
+            logger.error("resolve_peer_settings: get_user_peer_settings_map failed", exc_info=True)
+        if not use_saved or not is_user_dialog(dialog_id):
+            return user_full_settings or msg_controller_settings
+        saved_settings = load_saved_peer_settings(dialog_id) if use_saved else None
+        if user_full_settings is not None:
+            merged_user_full = merge_saved_peer_fields(user_full_settings, saved_settings)
+            if merged_user_full is not None:
+                return merged_user_full
+        if msg_controller_settings is not None:
+            merged_controller = merge_saved_peer_fields(msg_controller_settings, saved_settings)
+            if merged_controller is not None:
+                return merged_controller
+        if is_meaningful_peer_dump(saved_settings):
+            restored_settings = dict_to_peer_settings(saved_settings)
+            if restored_settings is not None:
+                cache_restored_peer_settings(msg_controller, dialog_id, restored_settings)
+                return restored_settings
+        return user_full_settings or msg_controller_settings
+    finally:
+        with _resolving_lock:
+            _resolving_dialogs.discard(dialog_id)
+
+
+class SavePeerSettingsHook(MethodHook):
+    def before_hooked_method(self, param):
+        if not S.enable_peer_info_saver:
+            return
+        try:
+            if len(param.args) >= 2:
+                save_peer_settings(param.args[0], param.args[1])
+        except Exception:
+            logger.error("SavePeerSettings hook failed:", exc_info=True)
+
+
+_diag_seq = [0]
+_diag_trace = [None]
+_diag_file_path = None
+
+
+def _diag_file_init():
+    global _diag_file_path
+    if _diag_file_path is None:
+        try:
+            d = get_backup_dir()
+            os.makedirs(d, exist_ok=True)
+            _diag_file_path = os.path.join(d, "diag_trace.log")
+        except Exception:
+            _diag_file_path = ""
+
+
+def _diag_file_write(line):
+    _diag_file_init()
+    if not _diag_file_path:
+        return
+    try:
+        with open(_diag_file_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+def _diag_peer_signature(obj):
+    if not obj:
+        return "None"
+    parts = []
+    for field in ("registration_month", "phone_country", "name_change_date", "photo_change_date", "flags"):
+        try:
+            v = getattr(obj, field, None)
+            parts.append(f"{field}={v}")
+        except Exception:
+            parts.append(f"{field}=ERR")
+    return "|".join(parts)
+
+
+def _diag_identity_tag(obj, dialog_id, tag):
+    _diag_seq[0] += 1
+    trace = _diag_trace[0] or f"auto:{_diag_seq[0]}"
+    try:
+        identity = str(JavaSystem.identityHashCode(obj)) if obj is not None else "None"
+    except Exception:
+        identity = "ERR"
+    signature = _diag_peer_signature(obj)
+    line = f"[DIAG_TRACE] trace={trace} tag={tag} identity={identity} signature={signature}"
+    logger.info("%s", line)
+    _diag_file_write(line)
+
+
+def _fallback_get_peer_settings(controller, dialog_id):
+    try:
+        if controller is None or dialog_id is None:
+            return None
+        user_full = controller.getUserFull(dialog_id)
+        if user_full is not None:
+            settings = getattr(user_full, "settings", None)
+            if settings is not None:
+                return settings
+        user_peer_settings = get_user_peer_settings_map(controller)
+        if user_peer_settings:
+            return user_peer_settings.get(dialog_id)
+    except Exception:
+        logger.error("_fallback_get_peer_settings failed:", exc_info=True)
+    return None
+
+
+class LoadPeerSettingsHook(MethodReplacement):
+    def replace_hooked_method(self, param):
+        try:
+            if len(param.args) < 1:
+                return None
+            dialog_id = param.args[0]
+            result = resolve_peer_settings(dialog_id, use_saved=S.enable_peer_info_saver)
+            if _self_test is not None:
+                _self_test.live["getPeerSettings"] = True
+                _self_test.live["resolve_peer_settings"] = True
+                try:
+                    saved = load_saved_peer_settings(dialog_id)
+                    if is_meaningful_peer_dump(saved):
+                        _self_test.live["merge"] = True
+                except Exception:
+                    pass
+                if result is not None:
+                    for f in PRECIOUS_PEER_FIELDS:
+                        if getattr(result, f, None) not in (None, 0, ""):
+                            _self_test.live["has_precious"] = True
+                            break
+            if EXTENDED_DIAGNOSTIC:
+                _diag_identity_tag(result, str(dialog_id), "RETURN")
+            return result
+        except Exception:
+            logger.error("LoadPeerSettings hook failed:", exc_info=True)
+            return _fallback_get_peer_settings(param.thisObject, param.args[0] if len(param.args) >= 1 else None)
+
+
+def setup_peer_info_saver(plugin_instance):
+    try:
+        clazz = ensure_messages_controller_class()
+        if not clazz:
+            return False
+        get_ok = hook_all_matching_methods(clazz, "getPeerSettings", LoadPeerSettingsHook, plugin_instance.hook_method, preferred_param_counts=(1,))
+        save_ok = hook_all_matching_methods(clazz, "savePeerSettings", SavePeerSettingsHook, plugin_instance.hook_method, preferred_param_counts=(2,))
+        return get_ok and save_ok
+    except Exception:
+        logger.error("Failed to setup peer info saver:", exc_info=True)
+        return False
+
+
+def has_resolved_legacy_storage():
+    return bool(peer_storage.selected_path and peer_storage.selected_path != peer_storage.path() and peer_storage.count() > 0)
+
+
+def get_storage_health():
+    peer_storage.ensure_loaded()
+    old_info = inspect_old_storage()
+    issues = []
+    actions = []
+    if has_resolved_legacy_storage():
+        issues.append("Данные ещё работают из старого места")
+        actions.append("Перенести в текущее хранилище")
+    if old_info.get("exists") and old_info.get("count", 0) > 0:
+        issues.append("Найдены старые данные для импорта")
+        actions.append("Импортировать старые данные")
+    if peer_storage.count() == 0:
+        issues.append("Пока нет сохранённых данных")
+        actions.append("Открыть профиль и дать плагину сохранить данные")
+    status = "ok"
+    title = "Всё работает нормально"
+    description = "Плагин готов и хранилище выглядит исправным."
+    if issues:
+        status = "attention"
+        title = "Требуется внимание"
+        description = issues[0]
+    if old_info.get("error"):
+        status = "problem"
+        title = "Обнаружена проблема"
+        description = "Не удалось проверить старое хранилище."
+    return {
+        "status": status,
+        "title": title,
+        "description": description,
+        "issues": issues,
+        "actions": actions,
+        "old_info": old_info,
+        "peer_count": peer_storage.count(),
+    }
+
+
+def optimize_storage_now():
+    try:
+        snapshot = storage_snapshot()
+        peer_clean = merge_peer_records({}, snapshot["peer_records"])
+        result = apply_storage_transaction(peer_clean, safety_prefix="optimize")
+        notify_success(f"Оптимизация завершена\nСтраховочная копия: {result['safety_backup']}")
+        return True
+    except Exception:
+        logger.error("Optimize failed:", exc_info=True)
+        notify_error("Оптимизация не удалась, выполнен откат")
+        return False
+
+
+def auto_fix_now():
+    try:
+        actions = []
+        imported = migrate_old_storage(delete_after_success=False)
+        if imported > 0:
+            actions.append(f"Импортировано старых данных: {imported}")
+        migrated = migrate_resolved_legacy_storage()
+        if migrated > 0:
+            actions.append(f"Перенесено в текущее хранилище: {migrated}")
+        peer_clean = merge_peer_records({}, peer_storage.content)
+        result = apply_storage_transaction(peer_clean, safety_prefix="repair")
+        if not actions:
+            notify_success("Проверка завершена\nПроблем не найдено\n" + f"Страховочная копия: {result['safety_backup']}")
+        else:
+            notify_success("Исправление завершено\n" + "\n".join(actions) + f"\nСтраховочная копия: {result['safety_backup']}")
+        return True
+    except Exception:
+        logger.error("Auto-fix failed:", exc_info=True)
+        notify_error("Автоисправление не удалось, выполнен откат")
+        return False
+
+
+def run_health_check_now():
+    health = get_storage_health()
+    lines = [
+        health["title"],
+        health["description"],
+        f"Профилей сохранено: {health['peer_count']}",
+    ]
+    lines.extend(health["issues"][:2] if health["issues"] else ["Проблем не найдено"])
+    notify_info("\n".join(lines))
+    return health
+
+
+def restore_latest_backup_now():
+    files = list_backup_files()
+    if not files:
+        peer_storage._diag.trace_event("RESTORE_LATEST_BACKUP", path="N/A", extra_info="NO_BACKUP_FILES")
+        notify_info("Резервные копии не найдены")
+        return False
+    peer_storage._diag.trace_event("RESTORE_LATEST_BACKUP_BEGIN", path=backup_file_path(files[0]), extra_info=f"filename={files[0]}")
+    result = import_backup_file(files[0], "replace")
+    peer_storage._diag.trace_event("RESTORE_LATEST_BACKUP_END", path=backup_file_path(files[0]), extra_info=f"success={bool(result)}")
+    return bool(result)
+
+
+def confirm_restore_latest_backup():
+    files = list_backup_files()
+    if not files:
+        notify_info("Резервные копии не найдены")
+        return
+
+    def proceed(_, __):
+        restore_latest_backup_now()
+
+    show_alert(
+        "Восстановить последнюю копию?",
+        "Текущие данные будут заменены содержимым последней резервной копии. Перед восстановлением автоматически создаётся страховочная копия.",
+        buttons=[
+            ("positive", "Восстановить", proceed),
+            ("negative", "Отмена", lambda _, __: None),
+        ],
+        cancelable=True,
+    )
+
+
+def confirm_backup_import(filename, mode):
+    summary = backup_file_summary(filename)
+
+    def proceed(_, __):
+        import_backup_file(filename, mode)
+
+    mode_label = "Заменить" if mode == "replace" else "Объединить"
+    message = (
+        f"Файл: {summary['filename']}\n"
+        f"Профилей: {summary['peer_count']}\n"
+        "\n"
+    )
+    if mode == "replace":
+        message += "Текущие данные будут полностью заменены. Перед импортом автоматически создаётся страховочная копия."
+    else:
+        message += "Текущие данные будут сохранены и аккуратно объединены с резервной копией. Перед импортом автоматически создаётся страховочная копия."
+    show_alert(
+        f"{mode_label} данные?",
+        message,
+        buttons=[
+            ("positive", mode_label, proceed),
+            ("negative", "Отмена", lambda _, __: None),
+        ],
+        cancelable=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Auto-Update
+# ─────────────────────────────────────────────────────────────
+
+def _install_plugin_from_path(file_path):
+    engine = PluginsController.engines.get(PluginsConstants.PYTHON)
+    if not engine:
+        logger.error("Auto-update: PythonPluginsEngine not found")
+        return False
+    done = threading.Event()
+    result = [False]
+    class InstallCb(dynamic_proxy(Utilities.Callback)):
+        def run(self_cb, error):
+            if not error:
+                result[0] = True
+            done.set()
+    engine.loadPluginFromFile(str(file_path), None, InstallCb())
+    done.wait(timeout=30)
+    return result[0]
+
+
+def _extract_version_from_plugin(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+        if m:
+            return m.group(1)
+    except Exception:
+        logger.error("Failed to extract version from downloaded plugin", exc_info=True)
+    return None
+
+
+def _parse_update_url(url):
+    m = re.search(r'(?:t\.me/)?(\w+)/(\d+)', url)
+    if m:
+        return m.group(1), int(m.group(2))
+    return None, None
+
+
+def _do_check_update(show_no_update=False):
+    raw_url = S.auto_update_url.strip()
+    channel, msg_id = _parse_update_url(raw_url)
+    logger.debug("AU: check started @%s msg=%s (url=%s)", channel, msg_id, raw_url)
+    if not channel or not msg_id:
+        if show_no_update:
+            notify_error("Неверная ссылка на сообщение. Ожидается: t.me/Канал/123")
+        return
+
+    try:
+        acc = UserConfig.selectedAccount
+        logger.debug("AU: account=%s", acc)
+    except Exception:
+        logger.error("AU: UserConfig.selectedAccount failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Не удалось получить аккаунт"))
+        return
+
+    try:
+        RequestDelegate = jclass("org.telegram.tgnet.RequestDelegate")
+        logger.debug("AU: RequestDelegate loaded")
+    except Exception:
+        logger.error("AU: jclass RequestDelegate failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Ошибка SDK: RequestDelegate"))
+        return
+
+    class MessagesDelegate(dynamic_proxy(RequestDelegate)):
+        def run(self, msg_response, msg_error):
+            logger.debug("AU: msgs_cb err=%s hasResp=%s",
+                         getattr(msg_error, "text", None) if msg_error else None,
+                         msg_response is not None)
+            if msg_error or not msg_response:
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error("Не удалось получить сообщение"))
+                return
+            try:
+                logger.debug("AU: msgs_cb step1 list()")
+                java_msgs = msg_response.messages
+                if java_msgs is None or java_msgs.size() == 0:
+                    logger.debug("AU: msgs_cb empty (null or isEmpty)")
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_info("Сообщение с плагином не найдено"))
+                    return
+                try:
+                    message = java_msgs.get(0)
+                except Exception:
+                    logger.error("AU: msgs_cb get(0) failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: список сообщений"))
+                    return
+                logger.debug("AU: msgs_cb step2 acc_i")
+                try:
+                    acc_i = get_account_instance()
+                except Exception:
+                    logger.error("AU: msgs_cb get_account_instance failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: аккаунт (2)"))
+                    return
+                logger.debug("AU: msgs_cb step3 MessageObject")
+                msg_obj = MessageObject(acc_i.getCurrentAccount(), message, False, False)
+
+                edit_date = getattr(message, "edit_date", 0) or getattr(message, "date", 0)
+                stored_date = int(S.get("last_update_edit_date", "0") or "0")
+                if not show_no_update and edit_date and edit_date <= stored_date:
+                    logger.debug("AU: no newer (edit=%s <= stored=%s)", edit_date, stored_date)
+                    return
+
+                logger.debug("AU: spawning download thread")
+                threading.Thread(
+                    target=lambda: _download_and_install(msg_obj, edit_date, show_no_update),
+                    daemon=True,
+                ).start()
+            except Exception:
+                logger.error("AU: msgs_cb UNKNOWN", exc_info=True)
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error("Ошибка при проверке обновления"))
+
+    class ResolveDelegate(dynamic_proxy(RequestDelegate)):
+        def run(self, response, error):
+            logger.debug("AU: resolve_cb err=%s hasResp=%s",
+                         getattr(error, "text", None) if error else None,
+                         response is not None)
+            if error or not response:
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error(f"Канал @{channel} не найден"))
+                return
+            try:
+                logger.debug("AU: resolve_cb step1 chats")
+                try:
+                    chats = getattr(response, "chats", None)
+                except Exception:
+                    logger.error("AU: resolve_cb getattr(chats) failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: чтение chats"))
+                    return
+                if chats and chats.size() > 0:
+                    chat = chats.get(0)
+                else:
+                    logger.debug("AU: resolve_cb step1b peer")
+                    try:
+                        peer = getattr(response, "peer", None)
+                    except Exception:
+                        logger.error("AU: resolve_cb getattr(peer) failed", exc_info=True)
+                        if show_no_update:
+                            run_on_ui_thread(lambda: notify_error("Ошибка: чтение peer"))
+                        return
+                    if not peer:
+                        if show_no_update:
+                            run_on_ui_thread(lambda: notify_error(f"Канал @{channel} не найден"))
+                        return
+                    chat_id = getattr(peer, "channel_id", 0)
+                    logger.debug("AU: resolve_cb step1c getChat(%s)", -chat_id)
+                    try:
+                        mc = get_messages_controller()
+                        chat = mc.getChat(-chat_id) if chat_id else None
+                    except Exception:
+                        logger.error("AU: resolve_cb getChat failed", exc_info=True)
+                        if show_no_update:
+                            run_on_ui_thread(lambda: notify_error("Ошибка: getChat"))
+                        return
+                if not chat:
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error(f"Канал @{channel} не найден"))
+                    return
+
+                logger.debug("AU: resolve_cb channel_id=%s", chat.id)
+                logger.debug("AU: resolve_cb step2 TL_inputChannel")
+                try:
+                    input_channel = TLRPC.TL_inputChannel()
+                except Exception:
+                    logger.error("AU: resolve_cb TL_inputChannel() failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: InputChannel"))
+                    return
+                input_channel.channel_id = chat.id
+                input_channel.access_hash = getattr(chat, "access_hash", 0)
+                logger.debug("AU: resolve_cb step3 req build")
+                try:
+                    req = TLRPC.TL_channels_getMessages()
+                except Exception:
+                    logger.error("AU: resolve_cb TL_channels_getMessages() failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: getMessages"))
+                    return
+                req.channel = input_channel
+                msg_ids = ArrayList()
+                msg_ids.add(Integer(msg_id))
+                req.id = msg_ids
+                logger.debug("AU: resolve_cb step4 sendRequest")
+                try:
+                    cm = ConnectionsManager.getInstance(acc)
+                    cm.sendRequest(req, MessagesDelegate())
+                    logger.debug("AU: resolve_cb sendRequest dispatched OK")
+                except Exception:
+                    logger.error("AU: resolve_cb sendRequest failed", exc_info=True)
+                    if show_no_update:
+                        run_on_ui_thread(lambda: notify_error("Ошибка: запрос сообщений"))
+                    return
+            except Exception:
+                logger.error("AU: resolve_cb UNKNOWN", exc_info=True)
+                if show_no_update:
+                    run_on_ui_thread(lambda: notify_error("Ошибка при проверке обновления"))
+
+    logger.debug("AU: sending resolveUsername for @%s", channel)
+    try:
+        resolve_req = TLRPC.TL_contacts_resolveUsername()
+        resolve_req.username = channel
+        cm = ConnectionsManager.getInstance(acc)
+        cm.sendRequest(resolve_req, ResolveDelegate())
+        logger.debug("AU: resolveUsername dispatched OK")
+    except Exception:
+        logger.error("AU: resolveUsername sendRequest failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Ошибка: запрос канала"))
+        return
+
+
+def _download_and_install(msg_obj, edit_date, show_no_update=False):
+    try:
+        media = MessageObject.getMedia(msg_obj)
+        if not media:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("В сообщении нет файла"))
+            return
+        attachment = media.document or media.photo
+        if not attachment:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось получить файл из сообщения"))
+            return
+
+        fl = get_file_loader()
+        file_path = fl.getPathToAttach(attachment, True)
+        if not file_path or not file_path.exists() or file_path.length() <= 0:
+            file_name = FileLoader.getAttachFileName(attachment)
+            logger.debug("Auto-update: downloading %s...", file_name)
+            run_on_ui_thread(lambda: fl.loadFile(attachment, None, 1, 1))
+            for _ in range(120):
+                time.sleep(1)
+                file_path = fl.getPathToAttach(attachment, True)
+                if file_path and file_path.exists() and file_path.length() > 0:
+                    logger.debug("Auto-update: download complete in %ss", _ + 1)
+                    break
+
+        file_path = fl.getPathToAttach(attachment, True)
+        if not file_path or not file_path.exists() or file_path.length() <= 0:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось загрузить файл плагина"))
+            return
+
+        if not PluginsController.isPlugin(msg_obj):
+            logger.debug("Auto-update: downloaded file is not a plugin")
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_info("Загруженный файл не является плагином"))
+            return
+
+        new_version = _extract_version_from_plugin(str(file_path))
+        if not new_version:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось определить версию в скачанном плагине"))
+            return
+
+        logger.debug("Auto-update: downloaded v%s (current v%s)", new_version, __version__)
+        if not show_no_update and new_version == __version__:
+            logger.debug("Auto-update: already at version %s", __version__)
+            S.set("last_update_edit_date", str(edit_date))
+            return
+
+        logger.info("Auto-update: installing v%s (current v%s)", new_version, __version__)
+        ok = _install_plugin_from_path(str(file_path))
+        if ok:
+            S.set("last_update_edit_date", str(edit_date))
+            run_on_ui_thread(lambda: notify_success(
+                f"Плагин обновлён до v{new_version}\nПерезапустите приложение для применения"
+            ))
+        else:
+            if show_no_update:
+                run_on_ui_thread(lambda: notify_error("Не удалось установить обновление"))
+    except Exception:
+        logger.error("Auto-update: download/install failed", exc_info=True)
+        if show_no_update:
+            run_on_ui_thread(lambda: notify_error("Ошибка при установке обновления"))
+
+
+def check_for_update_now():
+    global _last_update_check
+    _last_update_check = time.monotonic()
+    BulletinHelper.show_info("Проверка обновлений...", None)
+    threading.Thread(target=lambda: _do_check_update(show_no_update=True), daemon=True).start()
+
+
+def _schedule_next_check(interval_hours):
+    global _update_timer
+    _cancel_scheduled_check()
+    interval_seconds = interval_hours * 3600
+    _update_timer = threading.Timer(interval_seconds, _on_scheduled_check)
+    _update_timer.daemon = True
+    _update_timer.start()
+    logger.debug("Auto-update: next check in %d seconds", interval_seconds)
+
+
+def _cancel_scheduled_check():
+    global _update_timer
+    if _update_timer:
+        _update_timer.cancel()
+        _update_timer = None
+
+
+def _on_scheduled_check():
+    global _last_update_check
+    try:
+        _last_update_check = time.monotonic()
+        _do_check_update()
+    except Exception:
+        logger.error("Auto-update: scheduled check failed", exc_info=True)
+    finally:
+        if S.auto_update_enabled:
+            idx = S.auto_update_interval
+            if 0 <= idx < len(_UPDATE_INTERVALS):
+                _schedule_next_check(_UPDATE_INTERVALS[idx])
+
+
+def start_auto_update():
+    if not S.auto_update_enabled:
+        return
+    idx = S.auto_update_interval
+    if 0 <= idx < len(_UPDATE_INTERVALS):
+        _schedule_next_check(_UPDATE_INTERVALS[idx])
+    else:
+        _schedule_next_check(24)
+
+
+def stop_auto_update():
+    _cancel_scheduled_check()
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings UI
+# ─────────────────────────────────────────────────────────────
+
+PAGE_MAIN = "main"
+PAGE_FEATURES = "features"
+PAGE_DATA = "data"
+PAGE_BACKUP_IMPORT = "backup_import"
+PAGE_REPAIR = "repair"
+PAGE_ABOUT = "about"
+PAGE_VIEW_SAVED = "view_saved"
+PAGE_UPDATES = "updates"
+
+
+def create_settings(page_id=PAGE_MAIN):
+    S.load()
+    health = get_storage_health()
+    subpage = open_settings_page
+
+    if isinstance(page_id, tuple) and len(page_id) == 2 and page_id[0] == "backup_file":
+        filename = page_id[1]
+        summary = backup_file_summary(filename)
+        return [
+            Header("Резервная копия"),
+            Divider("Выберите способ восстановления данных из этой копии."),
+            Divider(f"Размер: {summary['size_label']}  ·  Дата: {summary['created_label']}"),
+            Divider(f"Профилей: {summary['peer_count']}"),
+            Text(
+                text="Заменить",
+                subtext="Полная замена текущих данных. Перед импортом создаётся страховочная копия, при ошибке — откат.",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda _: confirm_backup_import(filename, "replace"),
+            ),
+            Text(
+                text="Объединить",
+                subtext="Сохранить текущие данные и аккуратно объединить с копией без дублей.",
+                icon="msg_download",
+                accent=True,
+                on_click=lambda _: confirm_backup_import(filename, "merge"),
+            ),
+            Header("Сведения"),
+            Divider(f"Файл: {summary['filename']}"),
+            Divider(f"Версия плагина: {summary['version']}"),
+            Divider(f"Источник: {summary['plugin']}"),
+            Divider(f"Путь: {summary['path']}"),
+        ]
+
+    if page_id == PAGE_FEATURES:
+        return [
+            Header("Функции"),
+            Divider("Два основных модуля и автообновление. Включайте нужное."),
+            Switch(
+                key="enable_forward_bypass",
+                text="Снять лимит выделения и удаления",
+                subtext="Работа с большими пачками сообщений без ограничения в 100 штук.",
+                default=S.enable_forward_bypass,
+                icon="msg_share",
+                on_change=on_forward_toggle,
+                link_alias="bypass",
+            ),
+            Switch(
+                key="enable_peer_info_saver",
+                text="Сохранять данные профиля",
+                subtext="Страна, дата регистрации, смена имени и фото. Восстанавливает, если Telegram перестал отдавать.",
+                default=S.enable_peer_info_saver,
+                icon="msg_openprofile",
+                on_change=on_peer_saver_toggle,
+                link_alias="saver",
+            ),
+            Header("Совместимость"),
+            Divider("Если используются похожие старые плагины — отключите их во избежание конфликтов."),
+        ]
+
+    if page_id == PAGE_DATA:
+        return [
+            Header("Данные"),
+            Divider("Сохранение, восстановление и очистка профилей. Все операции со страховкой."),
+            *divider_lines(backup_overview_lines()),
+            Text(
+                text="Создать резервную копию",
+                subtext="Текущее состояние плагина — для безопасного восстановления.",
+                icon="msg_share",
+                accent=True,
+                on_click=lambda _: export_backup(),
+            ),
+            Text(
+                text="Восстановить из копии",
+                subtext="Список сохранённых копий с режимами замены и объединения.",
+                icon="msg_download",
+                accent=True,
+                create_sub_fragment=subpage(PAGE_BACKUP_IMPORT),
+                link_alias="backup_import",
+            ),
+            Text(
+                text="Восстановить последнюю",
+                subtext="Один клик до последнего сохранённого состояния со страховкой.",
+                icon="msg_restore",
+                on_click=lambda _: confirm_restore_latest_backup(),
+            ),
+            Text(
+                text="Сохранённые профили",
+                subtext=f"Просмотр {health['peer_count']} профилей с ценными полями.",
+                icon="msg_openprofile",
+                create_sub_fragment=subpage(PAGE_VIEW_SAVED),
+                link_alias="view_saved",
+            ),
+            Header("Очистка"),
+            Text(
+                text="Удалить пустые профили",
+                subtext="Только те, в которых нет полезных данных. Ценные не трогаются.",
+                icon="msg_clear",
+                on_click=lambda _: clean_empty_profiles(),
+            ),
+            Text(
+                text="Очистить всё",
+                subtext="Полное удаление данных UtilitiesPro. Резервные копии сохраняются.",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda _: wipe_saved_peer_data(),
+            ),
+        ]
+
+    if page_id == PAGE_BACKUP_IMPORT:
+        files = list_backup_files()
+        entries = [Header("Восстановить из копии"), Divider("Выберите резервную копию для восстановления или объединения.")]
+        if not files:
+            entries.append(Divider("Резервные копии пока не найдены."))
+            return entries
+        entries.append(Divider(f"Найдено копий: {len(files)}"))
+        for filename in files:
+            summary = backup_file_summary(filename)
+            entries.append(Text(
+                text=summary["created_label"],
+                subtext=f"Профилей: {summary['peer_count']}  ·  Размер: {summary['size_label']}",
+                icon="msg_download",
+                create_sub_fragment=subpage(("backup_file", filename)),
+            ))
+        return entries
+
+    if page_id == PAGE_REPAIR:
+        old_info = health["old_info"]
+        entries = [
+            Header("Исправление проблем"),
+            Divider(main_status_badge(health)),
+            Divider(main_status_text(health)),
+            Text(
+                text="Проверить",
+                subtext="Диагностика данных и хуков, понятный результат без технического шума.",
+                icon="msg_stats",
+                accent=True,
+                on_click=lambda _: run_health_check_now(),
+            ),
+            Text(
+                text="Исправить автоматически",
+                subtext="Основные шаги восстановления с проверкой результата.",
+                icon="msg_download_settings",
+                accent=True,
+                on_click=lambda _: auto_fix_now(),
+            ),
+            Text(
+                text="Оптимизировать",
+                subtext="Пересборка локальных данных со страховочной копией.",
+                icon="msg_settings",
+                on_click=lambda _: optimize_storage_now(),
+            ),
+        ]
+        if old_info.get("exists"):
+            entries.append(Text(
+                text="Импортировать старые данные",
+                subtext=f"Найдено {old_info['count']} записей. Оригинал останется нетронутым.",
+                icon="msg_download",
+                accent=True,
+                on_click=lambda _: import_old_storage_now(),
+            ))
+        if has_resolved_legacy_storage():
+            entries.append(Text(
+                text="Перенести в текущее хранилище",
+                subtext="Закрепить найденные старые данные в актуальном хранилище.",
+                icon="files_storage",
+                on_click=lambda _: migrate_detected_legacy_now(),
+            ))
+        entries.extend(divider_lines([
+            f"Профилей сохранено: {health['peer_count']}",
+        ]))
+        return entries
+
+    if page_id == PAGE_UPDATES:
+        update_status = "включено" if S.auto_update_enabled else "выключено"
+        interval_labels = ["каждый час", "каждые 6 ч", "каждые 12 ч", "каждые 24 ч", "каждые 7 д", "вручную"]
+        interval_text = interval_labels[S.auto_update_interval] if 0 <= S.auto_update_interval < len(interval_labels) else "—"
+        return [
+            Header("Автообновление"),
+            Divider(f"Статус: {update_status}  ·  Интервал: {interval_text}"),
+            Divider("Плагин сам проверяет канал, скачивает и устанавливает новую версию."),
+            Switch(
+                key="auto_update_enabled",
+                text="Автообновление",
+                subtext="Автоматическая проверка и установка обновлений из канала.",
+                default=S.auto_update_enabled,
+                icon="msg_download",
+                on_change=lambda v: handle_auto_update_toggle(v),
+                link_alias="auto_update",
+            ),
+            Selector(
+                key="auto_update_interval",
+                text="Интервал проверки",
+                default=S.auto_update_interval,
+                items=interval_labels,
+                icon="msg_settings",
+                on_change=lambda i: handle_update_interval_change(i),
+                link_alias="interval",
+            ),
+            Input(
+                key="auto_update_url",
+                text="Ссылка на сообщение",
+                subtext="Вставьте ссылку вида t.me/Канал/123 — канал и ID определятся автоматически.",
+                default=S.auto_update_url,
+                icon="msg_download",
+            ),
+            Text(
+                text="Проверить обновления",
+                subtext="Немедленно проверить канал и установить новую версию.",
+                icon="msg_share",
+                accent=True,
+                on_click=lambda _: check_for_update_now(),
+            ),
+        ]
+
+    if page_id == PAGE_ABOUT:
+        return [
+            Header("UtilitiesPro"),
+            Divider(f"v{__version__}  ·  {main_status_badge(health)}"),
+            Divider("Обход лимитов · Сохранение профилей · Резервные копии · Автообновление"),
+            Header("Авторы"),
+            Divider("Форк и разработка: @VibeSPluginS"),
+            Divider("Помощь с кодом: @kvuco"),
+            Divider("Исходная идея плагинов: @zwylair"),
+            Header("Принципы"),
+            Divider("Работает локально, без внешних библиотек и серверов."),
+            Divider("Сохраняет данные профиля и восстанавливает их, если Telegram перестал их отдавать."),
+            Divider("Поддерживает резервное копирование со страховочной копией и автообновление из канала."),
+        ]
+
+    if isinstance(page_id, tuple) and len(page_id) == 2 and page_id[0] == "view_saved_detail":
+        dialog_id = page_id[1]
+        peer_storage.ensure_loaded()
+        record = peer_storage.content.get(str(dialog_id), {})
+        entries = [Header(f"Профиль {dialog_id}")]
+        if not isinstance(record, dict) or not record:
+            entries.append(Divider("Нет сохранённых данных для этого профиля"))
+            return entries
+        precious = []
+        for field in PRECIOUS_PEER_FIELDS:
+            v = record.get(field)
+            if v not in (None, "", 0, False):
+                precious.append(f"{field}: {v}")
+        state = []
+        for field in IMPORTANT_PEER_STATE_FIELDS:
+            v = record.get(field)
+            if v not in (None, "", 0, False):
+                state.append(f"{field}: {v}")
+        if precious:
+            entries.append(Header("Ценные поля"))
+            for line in precious:
+                entries.append(Divider(line))
+        if state:
+            entries.append(Header("Состояние"))
+            for line in state:
+                entries.append(Divider(line))
+        if not precious and not state:
+            entries.append(Divider("Нет сохранённых полей"))
+
+        def make_on_delete(did):
+            def on_delete(_, __):
+                delete_saved_peer_data(did)
+                f = get_last_fragment()
+                if f:
+                    run_ui(f.finishFragment)
+            return on_delete
+
+        def confirm_delete(did):
+            show_alert(
+                f"Удалить профиль {did}?",
+                "Сохранённые данные для этого профиля будут удалены без возможности восстановления.",
+                buttons=[
+                    ("positive", "Удалить", make_on_delete(did)),
+                    ("negative", "Отмена", lambda _, __: None),
+                ],
+                cancelable=True,
+            )
+
+        entries.append(Header("Действия"))
+        entries.append(Text(
+            text="Удалить профиль",
+            subtext="Безвозвратное удаление сохранённых данных этого профиля.",
+            icon="msg_delete",
+            red=True,
+            on_click=lambda _: confirm_delete(dialog_id),
+        ))
+        return entries
+
+    if page_id == PAGE_VIEW_SAVED:
+        peer_storage.ensure_loaded()
+        raw = normalize_peer_dump(peer_storage.content)
+        entries = [Header("Сохранённые профили")]
+        if not raw:
+            entries.append(Divider("Нет сохранённых данных."))
+            return entries
+        entries.append(Divider(f"Всего профилей: {len(raw)}"))
+        for did in sorted(raw.keys(), key=int):
+            record = raw[did]
+            field_count = sum(1 for f in PRECIOUS_PEER_FIELDS if record.get(f) not in (None, "", 0, False))
+            entries.append(Text(
+                text=f"Профиль {did}",
+                subtext=f"Ценных полей: {field_count}",
+                icon="msg_openprofile",
+                create_sub_fragment=subpage(("view_saved_detail", did)),
+            ))
+        return entries
+
+    return [
+        Header("UtilitiesPro"),
+        Divider(f"v{__version__}  ·  {main_status_badge(health)}"),
+        Divider(main_status_text(health)),
+        Header("Быстрые действия"),
+        Text(
+            text="Проверить состояние",
+            subtext="Быстрая проверка хранилища и хуков, понятный результат.",
+            icon="msg_stats",
+            accent=True,
+            on_click=lambda _: run_health_check_now(),
+        ),
+        Text(
+            text="Автоисправление",
+            subtext="Один клик для восстановления, если что-то пошло не так.",
+            icon="msg_download_settings",
+            accent=True,
+            on_click=lambda _: auto_fix_now(),
+        ),
+        Text(
+            text="Резервная копия",
+            subtext="Сохранить текущие данные для безопасного восстановления.",
+            icon="msg_share",
+            on_click=lambda _: export_backup(),
+        ),
+        Header("Управление"),
+        Text(
+            text="Функции",
+            subtext=f"Лимиты: {'вкл' if S.enable_forward_bypass else 'выкл'}  ·  Профили: {'вкл' if S.enable_peer_info_saver else 'выкл'}"
+                    f"  ·  Обновления: {'вкл' if S.auto_update_enabled else 'выкл'}",
+            icon="msg_openprofile",
+            accent=True,
+            create_sub_fragment=subpage(PAGE_FEATURES),
+            link_alias="features",
+        ),
+        Text(
+            text="Данные",
+            subtext="Импорт, экспорт, очистка и просмотр сохранённых профилей.",
+            icon="files_storage",
+            accent=True,
+            create_sub_fragment=subpage(PAGE_DATA),
+            link_alias="data",
+        ),
+        Text(
+            text="Обновления",
+            subtext="Автопроверка новых версий из канала и установка в один клик.",
+            icon="msg_download",
+            accent=True,
+            create_sub_fragment=subpage(PAGE_UPDATES),
+            link_alias="updates",
+        ),
+        Text(
+            text="Диагностика",
+            subtext="Проверка цепочки: хуки → хранилище → загрузка → отображение.",
+            icon="msg_stats",
+            on_click=lambda _: self_test_show_diagnostics_options(),
+        ),
+        *_diagnostics_continue_entries(),
+        Text(
+            text="Исправление проблем",
+            subtext=health["description"],
+            icon="msg_download_settings",
+            create_sub_fragment=subpage(PAGE_REPAIR),
+            link_alias="repair",
+        ),
+        Text(
+            text="О плагине",
+            subtext="Версия, авторы, возможности и краткая справка.",
+            icon="msg_info",
+            create_sub_fragment=subpage(PAGE_ABOUT),
+            link_alias="about",
+        ),
+    ]
+
+
+# ─────────────────────────────────────────────────────────────
+# Self-Test Diagnostic System
+# ─────────────────────────────────────────────────────────────
+
+SELFTEST_TIMEOUT = 300
+PERSISTENCE_CHECKPOINT_FILE = "utilities_pro_persistence_checkpoint.json"
+VERIFIED_STATUS_FILE = "utilities_pro_verified_status.json"
+
+_self_test = None
+_peer_info_saver_ok = False
+
+
+def _load_verified_status():
+    try:
+        d = get_backup_dir()
+        path = os.path.join(d, VERIFIED_STATUS_FILE)
+        if os.path.isfile(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        logger.error("Failed to load verified status:", exc_info=True)
+    return {}
+
+
+def _save_verified_status(status):
+    try:
+        d = get_backup_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, VERIFIED_STATUS_FILE)
+        with open(path, "w") as f:
+            json.dump(status, f, indent=2)
+    except Exception:
+        logger.error("Failed to save verified status:", exc_info=True)
+
+
+def _check_storage_verified():
+    status = _load_verified_status()
+    if not status.get("storage_verified"):
+        return False
+    try:
+        if status.get("plugin_version") != __version__:
+            return False
+        di = _collect_device_info()
+        if status.get("telegram_build") != di.get("telegram_build"):
+            return False
+        if status.get("sdk_int") != di.get("sdk_int"):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _generate_report_id():
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    h = hashlib.sha256(ts.encode()).hexdigest()[:8].upper()
+    return f"{ts}-{h}"
+
+
+def _collect_device_info():
+    info = {"plugin_version": __version__}
+    try:
+        from android.os import Build
+        info["device_manufacturer"] = str(Build.MANUFACTURER)
+        info["device_model"] = str(Build.MODEL)
+        info["sdk_int"] = int(str(Build.VERSION.SDK_INT))
+        abis = list(Build.SUPPORTED_ABIS) if hasattr(Build, "SUPPORTED_ABIS") else [str(Build.CPU_ABI)]
+        info["abis"] = abis
+    except Exception:
+        pass
+    try:
+        from org.telegram.messenger import BuildVars
+        info["telegram_version"] = str(getattr(BuildVars, "BUILD_VERSION_STRING", ""))
+        info["telegram_build"] = str(getattr(BuildVars, "BUILD_VERSION", ""))
+    except Exception:
+        pass
+    return info
+
+
+class SelfTestContext:
+    def __init__(self, quick=True):
+        self.quick = quick
+        self.started_at = datetime.now().isoformat(timespec="seconds")
+        self.phases = {}
+        self.cancelled = False
+        self.hooks_status = {}
+        self.storage_status = {}
+        self.profile_count = 0
+        self.sorted_dialog_ids = []
+        self.profile_sha256 = ""
+        self.corrupt_ids = []
+        self.live = {
+            "updateRowsInternal": False,
+            "getPeerSettings": False,
+            "resolve_peer_settings": False,
+            "merge": False,
+            "has_precious": False,
+            "onBindViewHolder": False,
+        }
+        self.live_reasons = {}
+        self.bind_dialog_id = False
+        self.persistence = None
+        self.persistence_reasons = []
+        self.display = None
+        self.device_info = {}
+        self.report_path = None
+        self.report_id = None
+        self.timeout_timer = None
+
+
+class SelfTestUpdateRowsHook(MethodHook):
+    def before_hooked_method(self, param):
+        if _self_test is None:
+            return
+        try:
+            _self_test.live["updateRowsInternal"] = True
+        except Exception:
+            pass
+
+
+def self_test_show_diagnostics_options():
+    verified = _check_storage_verified()
+    lines = [
+        "Выберите режим диагностики:",
+        "",
+        "Быстрая (~5 с) — проверка хуков,",
+        "цепочки загрузки и отображения.",
+        "" if verified else "⚠ Включает полную проверку хранилища.",
+    ]
+    if verified:
+        lines.append("Хранилище уже проверено — полная проверка не требуется.")
+
+    def run_quick():
+        self_test_start(quick=True)
+
+    def run_extended():
+        self_test_start(quick=False)
+
+    buttons = [
+        ("positive", "Быстрая", lambda _, __: run_quick()),
+    ]
+    if not verified:
+        buttons.append(("neutral", "Полная (~30 с)", lambda _, __: run_extended()))
+    else:
+        buttons.append(("neutral", "Полная (~30 с)", lambda _, __: run_extended()))
+
+    run_ui(lambda: show_alert(
+        "Диагностика",
+        "\n".join(lines),
+        buttons=buttons + [("negative", "Отмена", lambda _, __: None)],
+        cancelable=True,
+    ))
+
+
+def self_test_start(quick=True):
+    global _self_test
+    if _self_test is not None:
+        return
+    try:
+        ctx = SelfTestContext(quick=quick)
+        _self_test = ctx
+        ctx.phases["phase1"] = {"started_at": datetime.now().isoformat(timespec="seconds")}
+        ctx.device_info = _collect_device_info()
+        self_test_phase1(ctx)
+        p1 = ctx.phases["phase1"]
+        p1["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        d1 = datetime.fromisoformat(p1["started_at"])
+        d2 = datetime.fromisoformat(p1["finished_at"])
+        p1["duration_ms"] = int((d2 - d1).total_seconds() * 1000)
+        show_self_test_live_prompt(ctx)
+    except Exception:
+        logger.error("Self-test failed:", exc_info=True)
+        _self_test = None
+        notify_error("Диагностика прервана из-за ошибки")
+
+
+def self_test_phase1(ctx):
+    mc = ensure_messages_controller_class()
+    ctx.hooks_status["MessagesController"] = "PASS" if mc else "FAIL"
+    if not mc:
+        ctx.live_reasons["MessagesController"] = "Класс MessagesController не найден"
+    ctx.hooks_status["getPeerSettings"] = "PASS" if _peer_info_saver_ok else "FAIL"
+    ctx.hooks_status["savePeerSettings"] = "PASS" if _peer_info_saver_ok else "FAIL"
+    try:
+        back_dir = get_backup_dir()
+        ctx.storage_status["directory"] = "PASS" if os.path.isdir(back_dir) else "FAIL"
+        if not os.path.isdir(back_dir):
+            ctx.live_reasons["storage_directory"] = f"Директория не существует: {back_dir}"
+        peer_storage.ensure_loaded()
+        sp = peer_storage.path()
+        ctx.storage_status["file_exists"] = "PASS" if (sp and os.path.isfile(sp)) else "FAIL"
+        if not sp or not os.path.isfile(sp):
+            ctx.live_reasons["storage_file"] = "Файл хранилища не найден"
+        if ctx.quick and _check_storage_verified():
+            ctx.storage_status["write_temp"] = "SKIP"
+            ctx.storage_status["read_temp"] = "SKIP"
+            ctx.storage_status["cleanup"] = "SKIP"
+        else:
+            try:
+                test_key = "999999999999"
+                test_val = {"test": datetime.now().isoformat()}
+                with peer_storage._lock:
+                    peer_storage.content[test_key] = test_val
+                w_ok = peer_storage.write()
+                if w_ok and peer_storage.content.get(test_key) == test_val:
+                    ctx.storage_status["write_temp"] = "PASS"
+                else:
+                    ctx.storage_status["write_temp"] = "FAIL"
+                    ctx.live_reasons["write_temp"] = "Не удалось записать тестовую запись"
+                peer_storage.read()
+                read_val = peer_storage.content.get(test_key)
+                if read_val == test_val:
+                    ctx.storage_status["read_temp"] = "PASS"
+                else:
+                    ctx.storage_status["read_temp"] = "FAIL"
+                    ctx.live_reasons["read_temp"] = "Тестовая запись не совпадает после чтения"
+                with peer_storage._lock:
+                    if test_key in peer_storage.content:
+                        del peer_storage.content[test_key]
+                cleanup_ok = peer_storage.write()
+                if not cleanup_ok:
+                    logger.error("Failed to save peer settings for dialog %s", test_key, exc_info=True)
+                ctx.storage_status["cleanup"] = "PASS" if cleanup_ok else "FAIL"
+            except Exception as e:
+                ctx.storage_status["write_temp"] = "FAIL"
+                ctx.storage_status.setdefault("read_temp", "FAIL")
+                ctx.storage_status.setdefault("cleanup", "FAIL")
+                ctx.live_reasons["storage_write_test"] = str(e)
+    except Exception as e:
+        for k in ("directory", "file_exists", "write_temp", "read_temp", "cleanup"):
+            ctx.storage_status.setdefault(k, "FAIL")
+        ctx.live_reasons["storage_check"] = str(e)
+    raw = {}
+    try:
+        peer_storage.ensure_loaded()
+        raw = normalize_peer_dump(peer_storage.content)
+        ctx.profile_count = len(raw)
+        ctx.sorted_dialog_ids = sorted(raw.keys(), key=int)
+        ctx.profile_sha256 = hashlib.sha256(
+            json.dumps(raw, sort_keys=True, ensure_ascii=False).encode('utf-8')
+        ).hexdigest()
+    except Exception:
+        ctx.profile_count = -1
+        ctx.sorted_dialog_ids = []
+        ctx.profile_sha256 = ""
+    corrupt = []
+    try:
+        for did, rec in raw.items():
+            if not isinstance(rec, dict):
+                corrupt.append(did)
+                continue
+            if rec.get("registration_month") is None and rec.get("phone_country") is None:
+                if not is_meaningful_peer_dump(rec):
+                    corrupt.append(did)
+    except Exception:
+        pass
+    ctx.corrupt_ids = corrupt
+
+
+def show_self_test_live_prompt(ctx):
+    lines = ["═ Фаза 1: Самодиагностика ═\n"]
+    lines.append("Хуки:")
+    for name, st in sorted(ctx.hooks_status.items()):
+        m = "✓" if st == "PASS" else "✗"
+        lines.append(f"  {m} {name}: {st}")
+    lines.append("")
+    lines.append("Хранилище:")
+    for name, st in sorted(ctx.storage_status.items()):
+        if st == "PASS":
+            m = "✓"
+        elif st == "SKIP":
+            m = "➖"
+        else:
+            m = "✗"
+        lines.append(f"  {m} {name}: {st}")
+    lines.append("")
+    lines.append(f"Сохранено профилей: {ctx.profile_count}")
+    if ctx.corrupt_ids:
+        lines.append(f"Повреждено записей: {len(ctx.corrupt_ids)}")
+        for cid in ctx.corrupt_ids[:5]:
+            lines.append(f"  {cid}")
+    lines.append("")
+    lines.append("═ Фаза 2: Проверка цепочки ═")
+    lines.append("")
+    lines.append("Откройте любой чат с сохранёнными данными.")
+    lines.append("Плагин автоматически проверит всю цепочку.")
+
+    def on_cancel():
+        global _self_test
+        ctx = _self_test
+        if ctx:
+            ctx.cancelled = True
+            if ctx.timeout_timer:
+                try:
+                    ctx.timeout_timer.cancel()
+                except Exception:
+                    pass
+            ctx.phases["live"] = {"status": "NOT_PERFORMED", "reason": "Отменено пользователем"}
+            self_test_generate_report(ctx)
+            self_test_show_result(ctx)
+        _self_test = None
+
+    try:
+        ctx.timeout_timer = threading.Timer(SELFTEST_TIMEOUT, lambda: self_test_timeout(ctx))
+        ctx.timeout_timer.daemon = True
+        ctx.timeout_timer.start()
+    except Exception:
+        logger.error("Failed to start self-test timeout timer:", exc_info=True)
+
+    run_ui(lambda: show_alert(
+        "Диагностика",
+        "\n".join(lines),
+        buttons=[("negative", "Отмена", lambda _, __: on_cancel())],
+        cancelable=True,
+    ))
+
+
+def self_test_timeout(ctx):
+    if ctx is None or ctx.cancelled:
+        return
+    try:
+        ctx.live_reasons["timeout"] = "Истекло время ожидания: чат не был открыт"
+        run_ui(lambda: self_test_finish_live())
+    except Exception:
+        logger.error("Self-test timeout UI dispatch failed:", exc_info=True)
+
+
+def self_test_on_bind(dialog_id):
+    ctx = _self_test
+    if ctx is None or ctx.cancelled:
+        return
+    ctx.live["onBindViewHolder"] = True
+    ctx.bind_dialog_id = dialog_id
+    if ctx.timeout_timer:
+        try:
+            ctx.timeout_timer.cancel()
+        except Exception:
+            pass
+    if not ctx.live["getPeerSettings"]:
+        ctx.live_reasons["getPeerSettings"] = "Хук getPeerSettings не сработал"
+    if not ctx.live["resolve_peer_settings"]:
+        ctx.live_reasons["resolve_peer_settings"] = "resolve_peer_settings не была вызвана"
+    if not ctx.live["merge"]:
+        ctx.live_reasons["merge"] = "Слияние сохранённых данных не выполнено"
+    if not ctx.live["updateRowsInternal"]:
+        ctx.live_reasons["updateRowsInternal"] = "Хук updateRowsInternal не сработал"
+    run_ui(self_test_finish_live)
+
+
+def self_test_finish_live():
+    global _self_test
+    ctx = _self_test
+    if ctx is None or ctx.cancelled:
+        return
+    ctx.phases["live"] = {
+        "started_at": "",
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if not ctx.live["onBindViewHolder"]:
+        live_pass = all(v for k, v in ctx.live.items() if k != "has_precious")
+        ctx.phases["live"]["status"] = "FAIL" if not live_pass else "PASS"
+        ctx.phases["live"]["reason"] = ctx.live_reasons.get("timeout", "Чат не был открыт")
+        self_test_show_persistence_prompt(ctx)
+        return
+    live_pass = all(v for k, v in ctx.live.items() if k != "has_precious")
+    ctx.phases["live"]["status"] = "PASS" if live_pass else "FAIL"
+    issues = [ctx.live_reasons[k] for k in ctx.live if not ctx.live[k] and k in ctx.live_reasons]
+    ctx.phases["live"]["reason"] = "; ".join(issues) if issues else ""
+    self_test_show_persistence_prompt(ctx)
+
+
+def self_test_show_persistence_prompt(ctx):
+    checkpoint_path = _write_checkpoint(ctx)
+    lines = ["═ Фаза 2: Цепочка загрузки ═\n"]
+    lines.append(f"Результат: {ctx.phases['live'].get('status', 'UNKNOWN')}")
+    rsn = ctx.phases["live"].get("reason", "")
+    if rsn:
+        lines.append(f"Подробности: {rsn}")
+    lines.append("")
+    lines.append("═ Фаза 3: Проверка сохранения ═")
+    lines.append("")
+    lines.append("Для полной проверки:")
+    lines.append("1. Нажмите «Продолжить»")
+    lines.append("2. Перезапустите Telegram")
+    lines.append("3. Откройте Настройки → UtilitiesPro")
+    lines.append("4. Нажмите «Продолжить проверку»")
+    if checkpoint_path:
+        lines.append("")
+        lines.append("✓ Контрольная точка сохранена.")
+
+    def on_continue():
+        dismiss_active_dialogs()
+        notify_info("Перезапустите Telegram и откройте настройки плагина")
+
+    def on_later():
+        global _self_test
+        _self_test = None
+        dismiss_active_dialogs()
+        notify_info("Контрольная точка сохранена. Перезапустите Telegram для продолжения.")
+
+    def on_stop():
+        global _self_test
+        ctx = _self_test
+        if ctx:
+            ctx.cancelled = True
+            _clear_checkpoint()
+            self_test_generate_report(ctx)
+            self_test_show_result(ctx)
+        _self_test = None
+
+    run_ui(lambda: show_alert(
+        "Диагностика",
+        "\n".join(lines),
+        buttons=[
+            ("positive", "Продолжить", lambda _, __: on_continue()),
+            ("neutral", "Позже", lambda _, __: on_later()),
+            ("negative", "Завершить", lambda _, __: on_stop()),
+        ],
+        cancelable=True,
+    ))
+
+
+def _write_checkpoint(ctx):
+    try:
+        d = get_backup_dir()
+        os.makedirs(d, exist_ok=True)
+        peer_storage.ensure_loaded()
+        raw = normalize_peer_dump(peer_storage.content)
+        sample = None
+        for did, rec in sorted(raw.items()):
+            sample = {"dialog_id": did, "fields": dict(rec)}
+            break
+        raw_json = json.dumps(raw, sort_keys=True)
+        storage_hash = str(zlib.adler32(raw_json.encode()))
+        checkpoint = {
+            "stage": "live_complete",
+            "plugin_version": __version__,
+            "device_info": ctx.device_info,
+            "hooks_status": ctx.hooks_status,
+            "storage_status": ctx.storage_status,
+            "profile_count": ctx.profile_count,
+            "sorted_dialog_ids": ctx.sorted_dialog_ids,
+            "profile_sha256": ctx.profile_sha256,
+            "corrupt_ids": ctx.corrupt_ids,
+            "live": dict(ctx.live),
+            "live_reasons": dict(ctx.live_reasons),
+            "bind_dialog_id": ctx.bind_dialog_id,
+            "phase1_timings": ctx.phases.get("phase1", {}),
+            "live_timings": ctx.phases.get("live", {}),
+            "persistence_checkpoint": {
+                "profile_count": len(raw),
+                "storage_hash": storage_hash,
+                "sample_record": sample,
+            },
+            "created_at": datetime.now().isoformat(),
+        }
+        path = os.path.join(d, PERSISTENCE_CHECKPOINT_FILE)
+        peer_storage._diag.trace_event("CHECKPOINT_WRITE_BEGIN", path=path, extra_info=f"profile_count={len(raw)} storage_hash={storage_hash}")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+        peer_storage._diag.trace_event("CHECKPOINT_WRITE_END", path=path)
+        return path
+    except Exception:
+        logger.error("Failed to write checkpoint:", exc_info=True)
+        peer_storage._diag.trace_event("CHECKPOINT_WRITE_END", path=os.path.join(get_backup_dir(), PERSISTENCE_CHECKPOINT_FILE), extra_info="FAILED: exception")
+        return None
+
+
+def _load_checkpoint():
+    try:
+        d = get_backup_dir()
+        path = os.path.join(d, PERSISTENCE_CHECKPOINT_FILE)
+        if os.path.isfile(path):
+            peer_storage._diag.trace_event("CHECKPOINT_READ_BEGIN", path=path)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            peer_storage._diag.trace_event("CHECKPOINT_READ_END", path=path, extra_info=f"stage={data.get('stage', 'unknown')}")
+            return data
+    except Exception:
+        peer_storage._diag.trace_event("CHECKPOINT_READ_END", path=os.path.join(get_backup_dir(), PERSISTENCE_CHECKPOINT_FILE), extra_info="FAILED: exception")
+        logger.error("Failed to load checkpoint:", exc_info=True)
+    return None
+
+
+def _clear_checkpoint():
+    try:
+        d = get_backup_dir()
+        path = os.path.join(d, PERSISTENCE_CHECKPOINT_FILE)
+        if os.path.isfile(path):
+            peer_storage._diag.trace_event("CHECKPOINT_CLEAR", path=path)
+            os.remove(path)
+    except Exception:
+        logger.error("Failed to clear checkpoint:", exc_info=True)
+
+
+def _diagnostics_continue_entries():
+    try:
+        cp = _load_checkpoint()
+        if cp and cp.get("stage") == "live_complete":
+            return [Text(
+                text="Продолжить проверку сохранения",
+                subtext="Найдена незавершённая проверка. Нажмите для продолжения.",
+                icon="msg_stats",
+                accent=True,
+                on_click=lambda _: self_test_continue_persistence(),
+            )]
+    except Exception:
+        logger.error("Failed to get continue entries:", exc_info=True)
+    return []
+
+
+def self_test_continue_persistence():
+    global _self_test
+    checkpoint = _load_checkpoint()
+    if not checkpoint or checkpoint.get("stage") != "live_complete":
+        notify_info("Не найдено незавершённых проверок")
+        return
+    try:
+        ctx = SelfTestContext()
+        ctx.started_at = checkpoint.get("created_at", datetime.now().isoformat())
+        ctx.device_info = checkpoint.get("device_info", {})
+        ctx.hooks_status = checkpoint.get("hooks_status", {})
+        ctx.storage_status = checkpoint.get("storage_status", {})
+        ctx.profile_count = checkpoint.get("profile_count", -1)
+        ctx.sorted_dialog_ids = checkpoint.get("sorted_dialog_ids", [])
+        ctx.profile_sha256 = checkpoint.get("profile_sha256", "")
+        ctx.corrupt_ids = checkpoint.get("corrupt_ids", [])
+        ctx.live = checkpoint.get("live", {k: False for k in ctx.live})
+        ctx.live_reasons = checkpoint.get("live_reasons", {})
+        ctx.bind_dialog_id = checkpoint.get("bind_dialog_id", False)
+        ctx.phases["phase1"] = checkpoint.get("phase1_timings", {})
+        ctx.phases["live"] = checkpoint.get("live_timings", {})
+        _self_test = ctx
+
+        pers_check = checkpoint.get("persistence_checkpoint", {})
+        peer_storage._diag.trace_event("PERSISTENCE_CHECK_BEGIN", path=peer_storage.path(), extra_info=f"saved_count={pers_check.get('profile_count', -1)} saved_hash={pers_check.get('storage_hash', '')}")
+        peer_storage.ensure_loaded()
+        raw = normalize_peer_dump(peer_storage.content)
+        current_count = len(raw)
+        current_raw_json = json.dumps(raw, sort_keys=True)
+        current_hash = str(zlib.adler32(current_raw_json.encode()))
+        saved_count = pers_check.get("profile_count", -1)
+        saved_hash = pers_check.get("storage_hash", "")
+        saved_sample = pers_check.get("sample_record", {})
+        issues = []
+        pers_pass = True
+
+        if current_count == saved_count:
+            count_check = "PASS"
+        else:
+            count_check = "FAIL"
+            pers_pass = False
+            issues.append(f"Количество профилей: было {saved_count}, стало {current_count}")
+
+        if current_hash == saved_hash:
+            hash_check = "PASS"
+        else:
+            hash_check = "FAIL"
+            pers_pass = False
+            issues.append("Хеш хранилища изменился после перезапуска")
+
+        sample_check = "SKIP"
+        if saved_sample and saved_sample.get("dialog_id"):
+            sample_did = str(saved_sample["dialog_id"])
+            sample_fields = saved_sample.get("fields", {})
+            current_record = raw.get(sample_did)
+            if current_record:
+                field_ok = all(current_record.get(k) == v for k, v in sample_fields.items())
+                if field_ok and len(current_record) == len(sample_fields):
+                    sample_check = "PASS"
+                else:
+                    sample_check = "FAIL"
+                    pers_pass = False
+                    for k, v in sample_fields.items():
+                        cv = current_record.get(k)
+                        if cv != v:
+                            issues.append(f"Поле '{k}' в записи {sample_did}: было '{v}', стало '{cv}'")
+            else:
+                sample_check = "FAIL"
+                pers_pass = False
+                issues.append(f"Запись {sample_did} не найдена после перезапуска")
+
+        peer_storage._diag.trace_event("PERSISTENCE_CHECK_END", path=peer_storage.path(), extra_info=f"count_check={count_check} hash_check={hash_check} sample_check={sample_check} pers_pass={pers_pass}")
+        ctx.persistence = "PASS" if pers_pass else "FAIL"
+        ctx.persistence_reasons = issues
+        ctx.phases["persistence"] = {
+            "started_at": "",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "status": ctx.persistence,
+            "reason": "; ".join(issues) if issues else "",
+            "details": {
+                "count_check": count_check,
+                "hash_check": hash_check,
+                "sample_check": sample_check,
+            },
+        }
+        ctx.display = "PASS" if ctx.live.get("onBindViewHolder") else "FAIL"
+        ctx.cancelled = False
+        _clear_checkpoint()
+        self_test_generate_report(ctx)
+        self_test_show_result(ctx)
+        _self_test = None
+    except Exception:
+        logger.error("Persistence stage 2 failed:", exc_info=True)
+        _self_test = None
+        notify_error("Ошибка проверки сохранения")
+
+
+def _compute_shared_verdict_state(ctx):
+    hook_pass = all(v == "PASS" for v in ctx.hooks_status.values())
+    stor_pass = all(v in ("PASS", "SKIP") for v in ctx.storage_status.values())
+    live_status = ctx.phases.get("live", {}).get("status", "NOT_PERFORMED")
+    live_pass = live_status == "PASS"
+    pers_status = ctx.phases.get("persistence", {}).get("status", "NOT_PERFORMED")
+    pers_pass = pers_status == "PASS"
+    disp_pass = ctx.display == "PASS" if ctx.display else False
+    pers_attempted = ctx.persistence is not None
+    sm_failure = StorageStateMachine._first_failure
+    sm_frozen = StorageStateMachine._frozen
+    root_cause_user = None
+    if sm_frozen and sm_failure:
+        rc_map = {
+            "WRITE_LAYER": "Ошибка записи хранилища. Данные могут не сохраниться на диск.",
+            "READ_LAYER": "Ошибка чтения хранилища. Ранее сохранённые данные могут быть потеряны после перезапуска.",
+            "POST_READ_OVERWRITE": "Данные хранилища были неожиданно изменены после загрузки.",
+            "PATH_MISMATCH": "Обнаружено несоответствие пути хранилища.",
+            "MULTIPLE_STORAGE_INSTANCES": "Обнаружено несколько экземпляров хранилища.",
+            "HASH_MISMATCH_EMPTY_DIFF": "Проверка целостности хранилища не пройдена (несовпадение хеша).",
+        }
+        root_cause_user = rc_map.get(sm_failure["root_cause"],
+            f"Нарушение инварианта хранилища: {sm_failure['root_cause']}")
+    live_attempted = live_status != "NOT_PERFORMED"
+    all_pass = hook_pass and stor_pass and live_pass and pers_pass and disp_pass and not ctx.corrupt_ids and not sm_frozen
+    return {
+        "hook_pass": hook_pass, "stor_pass": stor_pass, "live_pass": live_pass,
+        "pers_pass": pers_pass, "disp_pass": disp_pass,
+        "live_status": live_status, "pers_status": pers_status,
+        "pers_attempted": pers_attempted, "live_attempted": live_attempted,
+        "sm_frozen": sm_frozen, "sm_failure": sm_failure,
+        "root_cause_user": root_cause_user, "all_pass": all_pass,
+    }
+
+
+def self_test_generate_report(ctx):
+    try:
+        d = get_backup_dir()
+        os.makedirs(d, exist_ok=True)
+        now_ts = datetime.now().isoformat(timespec="seconds")
+        ctx.phases.setdefault("phase1", {})
+        ctx.phases.setdefault("live", {"status": "NOT_PERFORMED"})
+        ctx.phases.setdefault("persistence", {"status": "NOT_PERFORMED"})
+
+        vs = _compute_shared_verdict_state(ctx)
+        hook_pass = vs["hook_pass"]
+        stor_pass = vs["stor_pass"]
+        live_pass = vs["live_pass"]
+        pers_pass = vs["pers_pass"]
+        disp_pass = vs["disp_pass"]
+        live_status = vs["live_status"]
+        pers_status = vs["pers_status"]
+        pers_attempted = vs["pers_attempted"]
+        live_attempted = vs["live_attempted"]
+        sm_frozen = vs["sm_frozen"]
+        sm_failure = vs["sm_failure"]
+        all_pass = vs["all_pass"]
+
+        # StorageStateMachine verdict
+        sm_conclusion = None
+        if sm_failure:
+            sm_conclusion = {
+                "root_cause": sm_failure["root_cause"],
+                "first_operation": sm_failure["first_operation"],
+                "first_timestamp": sm_failure["first_timestamp"],
+                "first_caller": sm_failure["first_caller"],
+                "first_storage_instance": sm_failure["first_storage_instance"],
+                "first_path": sm_failure["first_path"],
+                "details": sm_failure["details"],
+            }
+
+        # Single snapshot of normalized content for all summary fields
+        snapshot_raw = {}
+        try:
+            peer_storage.ensure_loaded()
+            snapshot_raw = normalize_peer_dump(peer_storage.content)
+        except Exception:
+            logger.error("Failed to snapshot storage content:", exc_info=True)
+        snapshot_profiles = len(snapshot_raw)
+        snapshot_sorted_ids = sorted(snapshot_raw.keys(), key=int) if snapshot_profiles > 0 else []
+        snapshot_sha = hashlib.sha256(
+            json.dumps(snapshot_raw, sort_keys=True, ensure_ascii=False).encode('utf-8')
+        ).hexdigest() if snapshot_raw else ""
+
+        storage_path = ""
+        storage_file_size = -1
+        storage_file_mtime = 0.0
+        storage_sha256 = ""
+        try:
+            storage_path = peer_storage.path()
+            if os.path.exists(storage_path):
+                storage_file_size = os.path.getsize(storage_path)
+                storage_file_mtime = os.path.getmtime(storage_path)
+            storage_sha256 = snapshot_sha
+        except Exception:
+            logger.error("Failed to stat storage file:", exc_info=True)
+
+        issues = []
+        if not hook_pass:
+            issues.append("Некоторые хуки не зарегистрированы")
+        if not stor_pass:
+            issues.append("Проблемы с хранилищем")
+        if sm_frozen:
+            issues.append(f"STORAGE_STATE_MACHINE: {sm_failure['root_cause']}")
+        if live_status == "NOT_PERFORMED":
+            issues.append("Проверка цепочки не выполнена")
+        elif not live_pass:
+            r = ctx.phases["live"].get("reason", "")
+            if r:
+                issues.append(r)
+        if ctx.persistence == "FAIL":
+            issues.extend(ctx.persistence_reasons)
+        if ctx.display == "FAIL":
+            issues.append("onBindViewHolder не достигнут")
+        if ctx.corrupt_ids:
+            issues.append(f"Повреждено записей: {len(ctx.corrupt_ids)}")
+
+        if all_pass:
+            result = "PASS"
+        elif not live_attempted and not pers_attempted:
+            result = "INCOMPLETE"
+        elif hook_pass and stor_pass and not live_attempted:
+            result = "INCOMPLETE"
+        else:
+            result = "FAIL"
+
+        phases_report = {}
+        for pname in ("phase1", "live", "persistence"):
+            pd = ctx.phases.get(pname, {})
+            entry = {"status": pd.get("status", "NOT_PERFORMED")}
+            for k in ("started_at", "finished_at", "duration_ms", "reason"):
+                if pd.get(k):
+                    entry[k] = pd[k]
+            if pd.get("details"):
+                entry["details"] = pd["details"]
+            phases_report[pname] = entry
+
+        pipeline = {k: "PASS" if v else "FAIL" for k, v in ctx.live.items()}
+        for k, v in ctx.live_reasons.items():
+            if k not in pipeline:
+                pipeline[k + "_reason"] = v
+            elif not ctx.live.get(k):
+                pipeline[k + "_reason"] = v
+
+        diag = {
+            "result": result,
+            "plugin_version": __version__,
+            "telegram_version": ctx.device_info.get("telegram_version", ""),
+            "telegram_build": ctx.device_info.get("telegram_build", ""),
+            "sdk_int": ctx.device_info.get("sdk_int", -1),
+            "android_sdk": ctx.device_info.get("sdk_int", -1),
+            "abis": ctx.device_info.get("abis", []),
+            "device_manufacturer": ctx.device_info.get("device_manufacturer", ""),
+            "device_model": ctx.device_info.get("device_model", ""),
+            "started_at": ctx.started_at,
+            "finished_at": now_ts,
+            "profiles": snapshot_profiles,
+            "sorted_dialog_ids": snapshot_sorted_ids,
+            "normalized_storage_sha256": snapshot_sha,
+            "hooks": dict(ctx.hooks_status),
+            "storage_status": dict(ctx.storage_status),
+            "pipeline": pipeline,
+            "persistence": ctx.persistence or "SKIP",
+            "persistence_details": ctx.phases["persistence"].get("details", {}),
+            "persistence_reasons": list(ctx.persistence_reasons),
+            "display_boundary": ctx.display or "SKIP",
+            "corrupt_records": list(ctx.corrupt_ids),
+            "phases": phases_report,
+            "reason": "; ".join(issues) if issues else "",
+            # StorageStateMachine diagnostic
+            "storage_diagnostic": sm_conclusion,
+            "storage_sha256": storage_sha256,
+            "storage_path": storage_path,
+            "storage_file_path": storage_path,
+            "storage_file_size": storage_file_size,
+            "storage_file_mtime": storage_file_mtime,
+        }
+        if EXTENDED_DIAGNOSTIC:
+            diag["read_trace"] = peer_storage.read_trace
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_id = _generate_report_id()
+        diag["report_id"] = report_id
+        zname = f"utilities_pro_diagnostic_{ts}.zip"
+        zpath = os.path.join(d, zname)
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("diagnostic.json", json.dumps(diag, ensure_ascii=False, indent=2))
+            if EXTENDED_DIAGNOSTIC:
+                trace_path = getattr(ctx, "_trace_path", None) or _diag_file_path
+                if trace_path and os.path.isfile(trace_path):
+                    zf.write(trace_path, "diag_trace.log")
+        ctx.report_path = zpath
+        ctx.report_id = report_id
+        # Update verification status if PASS
+        if result == "PASS":
+            vstatus = _load_verified_status()
+            plugin_v = vstatus.get("plugin_version", "")
+            tg_build = vstatus.get("telegram_build", "")
+            sdk = vstatus.get("sdk_int", -1)
+            cur_tg = ctx.device_info.get("telegram_build", "")
+            cur_sdk = ctx.device_info.get("sdk_int", -1)
+            if plugin_v == __version__ and tg_build == cur_tg and sdk == cur_sdk:
+                vstatus["pass_count"] = vstatus.get("pass_count", 0) + 1
+            else:
+                vstatus = {
+                    "plugin_version": __version__,
+                    "telegram_build": cur_tg,
+                    "sdk_int": cur_sdk,
+                    "pass_count": 1,
+                    "storage_verified": False,
+                }
+            if vstatus.get("pass_count", 0) >= 3:
+                vstatus["storage_verified"] = True
+            vstatus["last_pass_timestamp"] = datetime.now().isoformat()
+            _save_verified_status(vstatus)
+        ctx.diag_data = diag
+    except Exception:
+        logger.error("Report generation failed:", exc_info=True)
+
+
+def self_test_show_result(ctx):
+    vs = _compute_shared_verdict_state(ctx)
+    hook_pass = vs["hook_pass"]
+    stor_pass = vs["stor_pass"]
+    live_pass = vs["live_pass"]
+    pers_pass = vs["pers_pass"]
+    disp_pass = vs["disp_pass"]
+    live_status = vs["live_status"]
+    pers_attempted = vs["pers_attempted"]
+    live_attempted = vs["live_attempted"]
+    sm_frozen = vs["sm_frozen"]
+    sm_failure = vs["sm_failure"]
+    root_cause_user = vs["root_cause_user"]
+    all_pass = vs["all_pass"]
+
+    # Regression status lines
+    reg_lines = []
+    reg_lines.append("Статус:")
+    reg_lines.append("")
+    if not ctx.quick:
+        if stor_pass and not sm_frozen:
+            reg_lines.append("Хранилище     ✔ PASS")
+        elif sm_frozen:
+            reg_lines.append(f"Хранилище     ✗ FAIL — {root_cause_user}")
+        else:
+            reg_lines.append(f"Хранилище     ✗ FAIL")
+    else:
+        verified = _check_storage_verified()
+        if verified:
+            reg_lines.append("Хранилище     ✔ PASS (ранее верифицировано)")
+        else:
+            reg_lines.append("Хранилище     ⚠ SKIP (не верифицировано, требуется полная диагностика)")
+    pipeline_ok = all(ctx.live.get(k) for k in ("updateRowsInternal", "getPeerSettings", "resolve_peer_settings", "merge"))
+    if pipeline_ok:
+        reg_lines.append("Цепочка       ✔ PASS")
+    elif live_status == "NOT_PERFORMED":
+        reg_lines.append("Цепочка       ⚠ Не проверено")
+    else:
+        reg_lines.append("Цепочка       ✗ FAIL")
+    if pers_pass:
+        reg_lines.append("Сохранение    ✔ PASS")
+    elif pers_attempted:
+        reg_lines.append("Сохранение    ✗ FAIL")
+    else:
+        reg_lines.append("Сохранение    ⚠ Не проверено")
+    if disp_pass:
+        reg_lines.append("Отображение   ✔ PASS")
+    elif ctx.display == "FAIL":
+        reg_lines.append("Отображение   ✗ FAIL")
+    else:
+        reg_lines.append("Отображение   ⚠ Не проверено")
+
+    if all_pass:
+        icon, verdict = "🟢", "PASS"
+        user_title = "Всё работает корректно."
+        detail = ""
+    elif hook_pass and stor_pass and live_pass and not pers_attempted:
+        icon, verdict = "🟡", "INCOMPLETE"
+        user_title = "Live-тест пройден. Сохранение после перезапуска не проверено."
+        detail = "Перезапустите Telegram для проверки сохранения."
+    elif hook_pass and stor_pass and live_status == "NOT_PERFORMED" and not pers_attempted:
+        icon, verdict = "🟡", "INCOMPLETE"
+        user_title = "Live-тест не был завершён."
+        detail = "Откройте чат с сохранёнными данными для продолжения."
+    elif hook_pass and stor_pass and live_pass and pers_pass and ctx.corrupt_ids:
+        icon, verdict = "🟡", "INCOMPLETE"
+        user_title = f"Профили частично повреждены ({len(ctx.corrupt_ids)} записей)."
+        detail = ""
+    elif sm_frozen:
+        icon, verdict = "🔴", "FAIL"
+        user_title = root_cause_user or "Диагностика хранилища не пройдена."
+        detail = ""
+    else:
+        icon, verdict = "🔴", "FAIL"
+        issues_list = []
+        if not hook_pass:
+            issues_list.append("Хуки не зарегистрированы")
+        if sm_frozen:
+            issues_list.append(root_cause_user or "Диагностика хранилища не пройдена")
+        elif not stor_pass:
+            issues_list.append("Проверка хранилища не пройдена")
+        if not live_pass and live_attempted:
+            issues_list.append(ctx.phases.get("live", {}).get("reason", "Цепочка не пройдена"))
+        if ctx.persistence == "FAIL":
+            issues_list.extend(ctx.persistence_reasons)
+        if ctx.display == "FAIL":
+            issues_list.append("Привязка отображения не пройдена")
+        user_title = "; ".join(issues_list[:3])
+        detail = ""
+
+    lines = [
+        f"ВЕРДИКТ: {verdict} {icon}",
+        "",
+        user_title,
+    ]
+    if detail:
+        lines.extend(["", detail])
+    lines.extend(["", "─" * 30, ""])
+    lines.extend(reg_lines)
+    if ctx.report_id:
+        lines.extend(["", "─" * 30, "", f"ID отчёта: {ctx.report_id}"])
+    if ctx.report_path:
+        lines.extend(["", "Отчёт:", ctx.report_path])
+
+    def copy_report_id():
+        if ctx.report_id:
+            try:
+                from android_utils import copy_to_clipboard
+                copy_to_clipboard(ctx.report_id)
+                notify_success("ID отчёта скопирован")
+            except Exception:
+                notify_error("Не удалось скопировать ID отчёта")
+
+    def save_report():
+        if ctx.report_path:
+            notify_success(f"Отчёт:\n{ctx.report_path}")
+
+    buttons = [
+        ("positive", "Сохранить отчёт", lambda _, __: save_report()),
+    ]
+    if ctx.report_id:
+        buttons.insert(0, ("neutral", "Копировать ID отчёта", lambda _, __: copy_report_id()))
+    buttons.append(("negative", "Закрыть", lambda _, __: None))
+
+    run_ui(lambda: show_alert(
+        "Результат диагностики",
+        "\n".join(lines),
+        buttons=buttons,
+        cancelable=True,
+    ))
+
+
+def setup_self_test_hooks(plugin_instance):
+    hook_method = plugin_instance.hook_method
+    clazz = _find_list_adapter_class()
+    if clazz:
+        try:
+            ok = hook_all_matching_methods(clazz, "updateRowsInternal", SelfTestUpdateRowsHook, hook_method)
+            logger.info("[SelfTest] updateRowsInternal hook: %s", "OK" if ok else "FAIL")
+        except Exception:
+            logger.error("[SelfTest] Failed to hook updateRowsInternal:", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Final resolution trace (diagnostic)
+# ─────────────────────────────────────────────────────────────
+
+
+def _adapter_dialog_id(adapter):
+    try:
+        f = adapter.getClass().getDeclaredField("this$0")
+        f.setAccessible(True)
+        chat = f.get(adapter)
+        return str(get_private_field(chat, "dialog_id"))
+    except Exception:
+        return "?"
+
+
+class DiagOnBindTraceHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            adapter = param.thisObject
+            position = int(param.args[1]) if len(param.args) > 1 else -1
+            dialog_id = _adapter_dialog_id(adapter)
+            user_info_row = -5
+            try:
+                val = get_private_field(adapter, "userInfoRow")
+                user_info_row = int(val) if val is not None else -5
+            except Exception:
+                logger.debug("userInfoRow not found on adapter %s", type(adapter).__name__)
+            if position != user_info_row:
+                return
+            if EXTENDED_DIAGNOSTIC:
+                _diag_trace[0] = f"{dialog_id}:onBind"
+                line = "[DIAG_TRACE] trace=%s tag=BIND_HIT position=%s" % (_diag_trace[0], position)
+                logger.info("%s", line)
+                _diag_file_write(line)
+            if _self_test is not None:
+                self_test_on_bind(dialog_id)
+        except Exception:
+            logger.error("DiagOnBindTraceHook failed:", exc_info=True)
+
+
+def _find_list_adapter_class():
+    chat_class = ensure_chat_activity_class()
+    if not chat_class:
+        return None
+    for inner in chat_class.getDeclaredClasses():
+        try:
+            for method in inner.getDeclaredMethods():
+                mn = method.getName()
+                if mn in ("updateRowsInternal", "updateRowsSafe", "onBindViewHolder"):
+                    return inner
+        except Exception:
+            logger.debug("Skipping inner class %s during adapter search", inner.getName())
+            continue
+    return None
+
+
+def setup_final_resolution_trace(plugin_instance):
+    hook_method = plugin_instance.hook_method
+    list_adapter_class = _find_list_adapter_class()
+    if list_adapter_class:
+        try:
+            ok = hook_all_matching_methods(list_adapter_class, "onBindViewHolder", DiagOnBindTraceHook, hook_method)
+            logger.info("[DIAG] onBindViewHolder trace hook: %s", "OK" if ok else "FAIL")
+        except Exception:
+            logger.error("[DIAG] Failed to hook onBindViewHolder trace:", exc_info=True)
+    else:
+        logger.warning("[DIAG] ListAdapter class not found")
+
+
+# ─────────────────────────────────────────────────────────────
+# Selection Limit Diagnostics
+# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Main plugin
+# ─────────────────────────────────────────────────────────────
+
+class UtilitiesPro(BasePlugin):
+    def on_plugin_load(self):
+        global current_plugin, MessagesControllerClass, MessagesControllerClassSource, _peer_info_saver_ok
+        current_plugin = self
+        MessagesControllerClass = None
+        MessagesControllerClassSource = None
+        S.load()
+        reset_storage_diagnostics()
+        peer_storage.ensure_loaded()
+        try:
+            setup_forward_limit_bypass(self)
+        except Exception:
+            logger.error("Forward bypass setup failed:", exc_info=True)
+        try:
+            _peer_info_saver_ok = setup_peer_info_saver(self)
+        except Exception:
+            _peer_info_saver_ok = False
+            logger.error("Peer info saver setup failed:", exc_info=True)
+        try:
+            setup_final_resolution_trace(self)
+        except Exception:
+            logger.error("Final resolution trace setup failed:", exc_info=True)
+        try:
+            setup_self_test_hooks(self)
+        except Exception:
+            logger.error("Self-test hook setup failed:", exc_info=True)
+        self.add_hook("TL_messages_forwardMessages")
+        try:
+            if S.auto_update_enabled:
+                threading.Thread(target=lambda: start_auto_update(), daemon=True).start()
+        except Exception:
+            logger.error("Auto-update init failed:", exc_info=True)
+        logger.info("Loaded.")
+
+    def on_plugin_unload(self):
+        global current_plugin, _self_test
+        stop_auto_update()
+        selector_hook.clear_message_storage()
+        dismiss_active_dialogs()
+        _self_test = None
+        current_plugin = None
+        logger.info("Unloaded.")
+
+    def on_app_event(self, event_type):
+        global _last_update_check
+        try:
+            from base_plugin import AppEvent
+            if event_type == AppEvent.RESUME:
+                if S.auto_update_enabled:
+                    idx = S.auto_update_interval
+                    if 0 <= idx < len(_UPDATE_INTERVALS):
+                        elapsed = time.monotonic() - _last_update_check
+                        interval_s = _UPDATE_INTERVALS[idx] * 3600
+                        if elapsed >= interval_s:
+                            threading.Thread(target=lambda: _do_check_update(), daemon=True).start()
+        except Exception:
+            logger.error("Auto-update resume check failed:", exc_info=True)
+
+    def create_settings(self):
+        global current_plugin
+        current_plugin = self
+        return create_settings()
+
+    def pre_request_hook(self, req_name, account, req):
+        if req_name == "TL_messages_forwardMessages" and S.enable_forward_bypass:
+            selector_hook.clear_message_storage()
+        return HookResult()

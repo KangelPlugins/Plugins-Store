@@ -1,0 +1,3782 @@
+### Powered by xarmaq
+# //      _     _             _   _ ______ _______
+# //     | |   | |           | \ | |  ____|__   __|
+# //   ___| |__ | | __ _ _ __ |  \| | |__     | |
+# //  / _ \ '_ \| |/ _` | '_ \| . ` |  __|    | |
+# // |  __/ |_) | | (_| | | | | |\  | |       | |
+# //  \___|_.__/|_|\__,_|_| |_|_| \_|_|       |_|
+# //
+# // Self-bootstrapping loader-wrapper with auto-update.
+# //   * On first enable: downloads eblannft_runtime/ into Downloads/eblannft/
+# //   * On every enable + on a 4-hour throttle: polls GitHub manifest and, if
+# //     a newer version is published, shows an MD3 BottomSheet with change
+# //     notes, a real per-byte progress bar, and a Restart button.
+
+from base_plugin import BasePlugin
+import importlib
+import importlib.util
+import json
+import os
+import re
+import sys
+import threading
+import time
+
+__id__ = "eblannft"
+__name__ = "eblanNFT"
+__description__ = "Это релиз eblanNFT.\n\nПозволяет визуально добавлять NFT подарки в профиль, менять свой номер телефона, ставить коллекционные юзернеймы. Имеет систему конфигов.\n\n• Обновления выходят в [vc дополнения](https://t.me/vcvk1)"
+__author__ = "@xarmaq"
+__version__ = "1.0.8"
+__icon__ = "HappyHappyPepe/31"
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap section: locate or download the eblannft_runtime/ package and
+# import its NftClonerPlugin class. Mirrors the previously-shipped wrapper.
+# ---------------------------------------------------------------------------
+
+_RUNTIME_REPO = "xarmaq/eblannft"
+_RUNTIME_BRANCH = "main"
+_RUNTIME_DIR_NAME = "eblannft"
+_RUNTIME_PACKAGE_NAME = "eblannft_runtime"
+_RUNTIME_PACKAGE_ALIAS = "_eblannft_runtime_pkg"
+_IMPL_ATTR_CANDIDATES = ("EblanNftPlugin", "NftClonerPlugin")
+_RUNTIME_FILES = (
+    f"{_RUNTIME_PACKAGE_NAME}/__init__.py",
+    f"{_RUNTIME_PACKAGE_NAME}/plugin.py",
+    f"{_RUNTIME_PACKAGE_NAME}/sync_client.py",
+)
+_DOWNLOAD_TIMEOUT_SEC = 35
+
+_UPDATE_MANIFEST_PATH = "eblannft_update.json"
+_UPDATE_CHECK_RESUME_THROTTLE_SEC = 30         # 30s between resume-triggered polls (was 2 min)
+
+# User-selectable load-time check intervals (key in settings:
+# 'eblannft_update_interval_idx', default 0 = 5 hours).
+_UPDATE_INTERVAL_OPTIONS = (
+    (5 * 60 * 60,        "Каждые 5 часов"),
+    (24 * 60 * 60,       "Каждый день"),
+    (7 * 24 * 60 * 60,   "Каждую неделю"),
+    (30 * 24 * 60 * 60,  "Каждый месяц"),
+)
+_UPDATE_INTERVAL_DEFAULT_IDX = 0
+# Back-compat — used to live as a constant; now derived from the user's
+# setting via _get_update_interval_sec().
+_UPDATE_CHECK_INTERVAL_SEC = _UPDATE_INTERVAL_OPTIONS[_UPDATE_INTERVAL_DEFAULT_IDX][0]
+_UPDATE_CHECK_DELAY_MS = 2200                  # let the UI settle first
+_UPDATE_POPUP_RETRY_DELAY_MS = 2000            # 2s between popup-show retries
+_UPDATE_POPUP_MAX_RETRIES = 8                  # ~16s total — covers slow cold starts
+_UPDATE_TIMESTAMP_FILE = ".eblannft_last_update_check"
+
+
+def _bootstrap_log(msg):
+    try:
+        from android_utils import log as _log
+        _log(f"[eblannft-bootstrap] {msg}")
+    except Exception:
+        pass
+
+
+def _looks_like_permission_error(err):
+    """Best-effort detect of a storage-permission failure across Python and
+    Java exception flavours. Returns True for EACCES, Errno 13, or any text
+    containing 'Permission denied'."""
+    if err is None:
+        return False
+    try:
+        if isinstance(err, PermissionError):
+            return True
+    except Exception:
+        pass
+    try:
+        if isinstance(err, OSError) and getattr(err, "errno", None) == 13:
+            return True
+    except Exception:
+        pass
+    try:
+        msg = str(err) or ""
+    except Exception:
+        msg = ""
+    low = msg.lower()
+    return ("permission denied" in low) or ("errno 13" in low) or ("eacces" in low)
+
+
+def _request_storage_permission_async():
+    """Fire a runtime permission request for WRITE_EXTERNAL_STORAGE on the
+    foreground Activity. Best-effort — some Android versions / SDK targets
+    silently ignore the request (Android 11+ moved to scoped storage), but
+    on Android 10 and below it surfaces a real dialog. Returns True if the
+    call was issued, False if no Activity was reachable."""
+    try:
+        from java import jclass
+    except Exception as e:
+        _bootstrap_log(f"permission request: jclass missing: {e}")
+        return False
+    activity = None
+    try:
+        from client_utils import get_last_fragment
+        frag = get_last_fragment()
+        if frag is not None:
+            activity = frag.getParentActivity()
+    except Exception:
+        activity = None
+    if activity is None:
+        try:
+            from org.telegram.messenger import LaunchActivity  # noqa: F401
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            try:
+                cur = ctx.getCurrentActivity() if hasattr(ctx, "getCurrentActivity") else None
+            except Exception:
+                cur = None
+            if cur is not None:
+                activity = cur
+        except Exception:
+            pass
+    if activity is None:
+        _bootstrap_log("permission request skipped: no Activity")
+        return False
+    try:
+        StringArr = jclass("java.lang.String")
+        # Build a String[1] of the permission name. Chaquopy can pass a
+        # Python list directly to Java arrays in most cases.
+        perms = ["android.permission.WRITE_EXTERNAL_STORAGE"]
+        try:
+            ActivityCompat = jclass("androidx.core.app.ActivityCompat")
+            ActivityCompat.requestPermissions(activity, perms, 0xEB1A)
+        except Exception:
+            # Fallback: bare Activity.requestPermissions (API 23+)
+            try:
+                activity.requestPermissions(perms, 0xEB1A)
+            except Exception as e2:
+                _bootstrap_log(f"permission request fallback failed: {e2}")
+                return False
+        _bootstrap_log("WRITE_EXTERNAL_STORAGE permission requested")
+        return True
+    except Exception as e:
+        _bootstrap_log(f"permission request error: {e}")
+        return False
+
+
+def _show_storage_permission_alert():
+    """Show an AlertDialog asking the user to grant storage permission /
+    re-enable the plugin. Falls back to a Bulletin or a Toast when the
+    AlertDialog scaffolding isn't reachable from the bootstrap context."""
+    try:
+        from android_utils import run_on_ui_thread
+    except Exception:
+        run_on_ui_thread = None
+
+    def _show():
+        # Plan A — full MD3 AlertDialog with explanation + button.
+        try:
+            from java import jclass
+            from client_utils import get_last_fragment
+            frag = get_last_fragment()
+            ctx = frag.getParentActivity() if frag and frag.getParentActivity() else None
+            if ctx is None:
+                from org.telegram.messenger import ApplicationLoader
+                ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                return
+            from org.telegram.ui.ActionBar import AlertDialog
+            builder = AlertDialog.Builder(ctx)
+            builder.setTitle("Нужно разрешение")
+            builder.setMessage(
+                "eblanNFT не смог записать свои файлы. Дай Telegram доступ "
+                "к памяти/файлам в настройках Android, потом снова включи "
+                "плагин в exteraGram → Настройки → Плагины."
+            )
+            builder.setPositiveButton("Открыть настройки", lambda di, w: _open_app_settings(ctx))
+            builder.setNegativeButton("Закрыть", None)
+            builder.show()
+            return
+        except Exception as e:
+            _bootstrap_log(f"alert show failed, falling back to bulletin: {e}")
+        # Plan B — Bulletin via existing helper.
+        try:
+            from ui.bulletin import BulletinHelper
+            BulletinHelper.show_error(
+                "eblanNFT: нет разрешения на запись файлов. Дай Telegram "
+                "доступ к памяти и снова включи плагин."
+            )
+            return
+        except Exception:
+            pass
+        # Plan C — last resort Toast.
+        try:
+            from java import jclass
+            from org.telegram.messenger import ApplicationLoader
+            Toast = jclass("android.widget.Toast")
+            ctx = ApplicationLoader.applicationContext
+            t = Toast.makeText(ctx, "eblanNFT: нет разрешения на запись файлов", 1)
+            t.show()
+        except Exception:
+            pass
+
+    if run_on_ui_thread is not None:
+        try:
+            run_on_ui_thread(_show)
+            return
+        except Exception:
+            pass
+    try:
+        _show()
+    except Exception:
+        pass
+
+
+def _open_app_settings(ctx):
+    """Open Android's app-info screen for Telegram so the user can grant
+    storage permission in two taps."""
+    try:
+        from java import jclass
+        Intent = jclass("android.content.Intent")
+        Settings = jclass("android.provider.Settings")
+        Uri = jclass("android.net.Uri")
+        intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+        try:
+            pkg = ctx.getPackageName()
+        except Exception:
+            pkg = None
+        if pkg:
+            intent.setData(Uri.parse(f"package:{pkg}"))
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    except Exception as e:
+        _bootstrap_log(f"open app settings failed: {e}")
+
+
+def _maybe_show_storage_permission_alert(err):
+    """If the load error looks like a permission denial, show the user a
+    helpful alert and try (best-effort) to surface the runtime permission
+    prompt. Otherwise no-op so non-permission failures still raise plainly."""
+    try:
+        if not _looks_like_permission_error(err):
+            return
+        try:
+            _request_storage_permission_async()
+        except Exception:
+            pass
+        _show_storage_permission_alert()
+    except Exception as e:
+        try:
+            _bootstrap_log(f"permission alert dispatch failed: {e}")
+        except Exception:
+            pass
+
+
+def _raw_url(rel_path):
+    rel = str(rel_path or "").replace("\\", "/").lstrip("/")
+    # Append a timestamp query so raw.githubusercontent.com's CDN always
+    # serves the freshest commit instead of a 5-10 min stale copy.
+    bust = int(time.time())
+    return f"https://raw.githubusercontent.com/{_RUNTIME_REPO}/{_RUNTIME_BRANCH}/{rel}?_={bust}"
+
+
+def _detect_client_storage_dir_name():
+    """Pick the on-storage folder name based on the host client's package.
+    exteraGram → "exteragram", ayugram → "ayugram", anything else falls back
+    to "eblannft" so we still avoid the generic Downloads bucket."""
+    pkg = ""
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        ctx = ApplicationLoader.applicationContext
+        if ctx is not None:
+            pkg = str(ctx.getPackageName() or "").lower()
+    except Exception as e:
+        _bootstrap_log(f"package name lookup failed: {e}")
+    if "extera" in pkg:
+        return "exteraGram"
+    if "ayu" in pkg:
+        return "AyuGram"
+    return _RUNTIME_DIR_NAME
+
+
+def _candidate_install_roots():
+    """Order matters. App-private dirs (no permission needed) come FIRST so
+    a fresh install on Android 11+ never has to ask for storage permission.
+    Public Downloads is only useful when the user already has files there
+    from an older install (or has explicitly granted WRITE_EXTERNAL_STORAGE
+    on Android <11)."""
+    seen = set()
+    roots = []
+
+    def _push(path):
+        if not path:
+            return
+        try:
+            ap = os.path.abspath(str(path))
+        except Exception:
+            return
+        if ap and ap not in seen:
+            seen.add(ap)
+            roots.append(ap)
+
+    # 1) App-private external (always writable, scoped-storage friendly).
+    # 2) App-private internal (always writable, no SD card needed).
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        ctx = ApplicationLoader.applicationContext
+        if ctx is not None:
+            try:
+                ext = ctx.getExternalFilesDir(None)
+                if ext is not None:
+                    _push(os.path.join(str(ext.getAbsolutePath()), _RUNTIME_DIR_NAME))
+            except Exception:
+                pass
+            try:
+                files_dir = ctx.getFilesDir()
+                if files_dir is not None:
+                    _push(os.path.join(str(files_dir.getAbsolutePath()), _RUNTIME_DIR_NAME))
+            except Exception:
+                pass
+    except Exception as e:
+        _bootstrap_log(f"app dir lookup failed: {e}")
+
+    # 3) Public Download/<exteraGram|AyuGram>/eblannft. The client itself
+    # already writes its media into Download/<ClientName>/, so we piggy-back
+    # on that directory and add our own eblannft subfolder. Needs
+    # WRITE_EXTERNAL_STORAGE on Android < 11 or MANAGE_EXTERNAL_STORAGE on
+    # Android >= 11; only reached when app-private dirs above fail.
+    try:
+        from java import jclass
+        Environment = jclass("android.os.Environment")
+        downloads = Environment.getExternalStoragePublicDirectory(
+            Environment.DIRECTORY_DOWNLOADS
+        )
+        if downloads is not None:
+            client_dir = _detect_client_storage_dir_name()
+            _push(os.path.join(str(downloads.getAbsolutePath()), client_dir, _RUNTIME_DIR_NAME))
+            # Backwards-compat: older installs wrote straight into
+            # Download/eblannft. Keep that as a fallback so existing files
+            # are still picked up.
+            _push(os.path.join(str(downloads.getAbsolutePath()), _RUNTIME_DIR_NAME))
+    except Exception as e:
+        _bootstrap_log(f"public Downloads lookup failed: {e}")
+
+    # 4) Last-resort: wherever the bootstrap .plugin file itself lives.
+    try:
+        _push(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+
+    return roots
+
+
+def _runtime_present(root):
+    for rel in _RUNTIME_FILES:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        if not os.path.isfile(path):
+            return False
+        try:
+            if os.path.getsize(path) <= 0:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _existing_runtime_root():
+    """Return the first install root that is BOTH present and writable.
+
+    We deliberately do NOT fall back to a present-but-read-only root any
+    more: that path used to land us on a legacy Download/eblannft install
+    where the runtime imported fine but every subsequent write (self-heal
+    re-download, auto-update, .tmp probe) crashed with EACCES on
+    Android 11+ scoped storage. Better to ignore the stale read-only files
+    and let `_bootstrap_runtime` download a fresh copy into the first
+    writable candidate (normally app-private)."""
+    for root in _candidate_install_roots():
+        if _runtime_present(root) and _is_dir_writable(root):
+            return root
+    return None
+
+
+def _is_dir_writable(path):
+    """Check that `path` can host the runtime — root-level probe is not enough.
+
+    On Android 11+ scoped storage, writes to a *public* directory like
+    /storage/emulated/0/Download/eblannft can pass for a top-level file but
+    fail for a file under an existing subdirectory like
+    /storage/emulated/0/Download/eblannft/eblannft_runtime/__init__.py.tmp
+    (when the subdirectory was created by a different uid / under different
+    permissions, e.g. an older WRITE_EXTERNAL_STORAGE-era install). We
+    explicitly probe with the same path shape as the real runtime files —
+    subdirectory + `.tmp` sibling — so the candidate is rejected before
+    `_download_to` faceplants with EACCES."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".eblannft_write_probe")
+        with open(probe, "wb") as f:
+            f.write(b"x")
+        os.remove(probe)
+    except Exception:
+        return False
+    # Subdirectory probe — must match the layout `_download_to` will use.
+    try:
+        subdir = os.path.join(path, _RUNTIME_PACKAGE_NAME)
+        os.makedirs(subdir, exist_ok=True)
+        subprobe = os.path.join(subdir, ".eblannft_write_probe.tmp")
+        with open(subprobe, "wb") as f:
+            f.write(b"x")
+        os.remove(subprobe)
+        return True
+    except Exception:
+        return False
+
+
+def _pick_writable_install_root():
+    for root in _candidate_install_roots():
+        if _is_dir_writable(root):
+            return root
+    raise RuntimeError("No writable directory available for eblannft runtime")
+
+
+def _http_get(url, timeout=None, progress_cb=None):
+    """Blocking GET. Returns (bytes_payload, total_bytes_hint)."""
+    from urllib.request import Request, urlopen
+    req = Request(
+        url,
+        headers={
+            "User-Agent": f"eblannft-bootstrap/{__version__}",
+            "Accept": "*/*",
+            "Cache-Control": "no-cache",
+        },
+    )
+    timeout = float(timeout) if timeout else _DOWNLOAD_TIMEOUT_SEC
+    # Keep chunk size small so the progress bar gets enough updates even on
+    # tiny files (the 38 KB wrapper used to fit in a single 64 KB chunk and
+    # the bar jumped 0% → 100% with no fill animation in between).
+    chunk_size = 4096
+    with urlopen(req, timeout=timeout) as resp:
+        try:
+            total = int(resp.headers.get("Content-Length", "0") or 0)
+        except Exception:
+            total = 0
+        chunks = []
+        loaded = 0
+        while True:
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            loaded += len(chunk)
+            if callable(progress_cb):
+                try:
+                    progress_cb(loaded, total)
+                except Exception:
+                    pass
+    data = b"".join(chunks)
+    return data, (total or len(data))
+
+
+def _download_to(path, url, progress_cb=None):
+    data, _total = _http_get(url, progress_cb=progress_cb)
+    if not data:
+        raise RuntimeError(f"Empty response: {url}")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return len(data)
+
+
+def _bootstrap_runtime():
+    existing = _existing_runtime_root()
+    if existing:
+        _bootstrap_log(f"runtime found at {existing}")
+        return existing, "reused"
+
+    # Walk every candidate root, not just the first writable one. A probe
+    # may pass on a public dir (Downloads) yet the actual file write later
+    # fails with EACCES on Android 11+ scoped storage / MIUI quirks. If
+    # that happens we transparently fall through to the next candidate
+    # instead of bubbling up a hostile permission error to the user.
+    last_err = None
+    candidates = _candidate_install_roots()
+    if not candidates:
+        raise RuntimeError("No candidate install roots available")
+    for target_root in candidates:
+        try:
+            if not _is_dir_writable(target_root):
+                continue
+            _bootstrap_log(f"downloading runtime into {target_root}")
+            for rel in _RUNTIME_FILES:
+                dest = os.path.join(target_root, rel.replace("/", os.sep))
+                size = _download_to(dest, _raw_url(rel))
+                _bootstrap_log(f"  {rel} -> {size} bytes")
+            return target_root, "downloaded"
+        except PermissionError as e:
+            last_err = e
+            _bootstrap_log(f"download to {target_root} hit EACCES: {e} — trying next candidate")
+            # Best-effort cleanup of partial files at this root so the next
+            # iteration starts clean (and so we don't leave a half-written
+            # __init__.py.tmp behind).
+            try:
+                pkg_dir = os.path.join(target_root, _RUNTIME_PACKAGE_NAME)
+                if os.path.isdir(pkg_dir):
+                    for fn in os.listdir(pkg_dir):
+                        try:
+                            os.remove(os.path.join(pkg_dir, fn))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            continue
+        except OSError as e:
+            # Errno 13 (EACCES) is sometimes wrapped as plain OSError on
+            # older Pythons / Chaquopy. Treat it the same.
+            if getattr(e, "errno", None) == 13:
+                last_err = e
+                _bootstrap_log(f"download to {target_root} hit OSError(13): {e} — trying next candidate")
+                continue
+            raise
+    if last_err is not None:
+        raise RuntimeError(
+            "Не удалось записать runtime ни в одну из доступных папок "
+            "(последняя ошибка: Permission denied). "
+            "Разреши приложению доступ к памяти в настройках Android."
+        )
+    raise RuntimeError("No writable directory available for eblannft runtime")
+
+
+def _import_runtime_from(install_root):
+    pkg_dir = os.path.join(install_root, _RUNTIME_PACKAGE_NAME)
+    init_py = os.path.join(pkg_dir, "__init__.py")
+    plugin_py = os.path.join(pkg_dir, "plugin.py")
+
+    if _RUNTIME_PACKAGE_ALIAS not in sys.modules:
+        pkg_spec = importlib.util.spec_from_file_location(
+            _RUNTIME_PACKAGE_ALIAS,
+            init_py,
+            submodule_search_locations=[pkg_dir],
+        )
+        if pkg_spec is None or pkg_spec.loader is None:
+            raise ImportError(f"Cannot build spec for runtime package at {pkg_dir}")
+        pkg_mod = importlib.util.module_from_spec(pkg_spec)
+        sys.modules[_RUNTIME_PACKAGE_ALIAS] = pkg_mod
+        pkg_spec.loader.exec_module(pkg_mod)
+
+    plugin_mod_name = f"{_RUNTIME_PACKAGE_ALIAS}.plugin"
+    plugin_mod = sys.modules.get(plugin_mod_name)
+    if plugin_mod is None:
+        plugin_spec = importlib.util.spec_from_file_location(plugin_mod_name, plugin_py)
+        if plugin_spec is None or plugin_spec.loader is None:
+            raise ImportError(f"Cannot build spec for runtime plugin at {plugin_py}")
+        plugin_mod = importlib.util.module_from_spec(plugin_spec)
+        sys.modules[plugin_mod_name] = plugin_mod
+        plugin_spec.loader.exec_module(plugin_mod)
+
+    for attr in _IMPL_ATTR_CANDIDATES:
+        impl = getattr(plugin_mod, attr, None)
+        if isinstance(impl, type):
+            return impl
+    raise ImportError(
+        f"Runtime module {plugin_py} has no class in {_IMPL_ATTR_CANDIDATES}"
+    )
+
+
+def _force_redownload_runtime(target_root):
+    """Wipe the runtime files at target_root and pull fresh copies from
+    GitHub. Used when an existing on-disk runtime fails to expose the
+    expected class (e.g. half-written download or accidental overwrite).
+
+    If `target_root` is no longer writable (legacy install on a now-scoped
+    Android), switch to the first writable candidate so we don't crash with
+    EACCES on `__init__.py.tmp`."""
+    if not _is_dir_writable(target_root):
+        _bootstrap_log(
+            f"force re-download: {target_root} is read-only, "
+            f"falling back to a writable candidate"
+        )
+        try:
+            target_root = _pick_writable_install_root()
+        except Exception as e:
+            _bootstrap_log(f"  no writable fallback: {e}")
+            raise
+    _bootstrap_log(f"force re-download into {target_root}")
+    for rel in _RUNTIME_FILES:
+        dest = os.path.join(target_root, rel.replace("/", os.sep))
+        try:
+            if os.path.isfile(dest):
+                os.remove(dest)
+        except Exception as e:
+            _bootstrap_log(f"  remove {rel} failed: {e}")
+        # Drop any cached module bytecode so the re-imported file is fresh.
+        for cache_rel in (
+            os.path.join(os.path.dirname(rel), "__pycache__"),
+        ):
+            try:
+                cache_dir = os.path.join(target_root, cache_rel.replace("/", os.sep))
+                if os.path.isdir(cache_dir):
+                    for fn in os.listdir(cache_dir):
+                        try:
+                            os.remove(os.path.join(cache_dir, fn))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        size = _download_to(dest, _raw_url(rel))
+        _bootstrap_log(f"  {rel} -> {size} bytes (re-download)")
+    return target_root
+
+
+def _impl_is_baseplugin_subclass(impl):
+    """Check if impl is a class that subclasses *this* bootstrap's BasePlugin
+    by IDENTITY. When the user disables/re-enables the plugin, exteraGram
+    can reload the bootstrap module while leaving the runtime module in
+    sys.modules — the runtime's NftClonerPlugin then extends the OLD
+    BasePlugin object while the new bootstrap is referencing a fresh
+    BasePlugin object. Plain `issubclass(impl, BasePlugin)` returns False
+    in that case and the bootstrap falls into the «runtime unavailable»
+    error branch even though the runtime files are perfectly fine.
+
+    This helper does the strict subclass check first, then falls back to
+    a name-based check on the MRO so we can detect the cross-reload case
+    and trigger a re-import of the runtime against the current BasePlugin.
+    """
+    if not isinstance(impl, type):
+        return False, False
+    try:
+        if issubclass(impl, BasePlugin):
+            return True, True
+    except Exception:
+        pass
+    # Fallback: walk the MRO and look for any class with the same name as
+    # BasePlugin coming from the same module path. If found, the runtime
+    # IS effectively a BasePlugin subclass — just bound to a stale
+    # BasePlugin reference. Caller should re-import the runtime fresh.
+    try:
+        bp_name = BasePlugin.__name__
+        bp_mod = getattr(BasePlugin, "__module__", "")
+        for cls in impl.__mro__:
+            try:
+                if cls.__name__ == bp_name and getattr(cls, "__module__", "") == bp_mod:
+                    return False, True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False, False
+
+
+def _evict_runtime_from_sys_modules():
+    for cached in (
+        f"{_RUNTIME_PACKAGE_ALIAS}.plugin",
+        _RUNTIME_PACKAGE_ALIAS,
+        f"{_RUNTIME_PACKAGE_NAME}.plugin",
+        _RUNTIME_PACKAGE_NAME,
+    ):
+        try:
+            sys.modules.pop(cached, None)
+        except Exception:
+            pass
+
+
+def _load_eblannft_impl():
+    try:
+        plugin_mod = importlib.import_module(f"{_RUNTIME_PACKAGE_NAME}.plugin")
+        for attr in _IMPL_ATTR_CANDIDATES:
+            impl = getattr(plugin_mod, attr, None)
+            if not isinstance(impl, type):
+                continue
+            strict_ok, looks_like = _impl_is_baseplugin_subclass(impl)
+            if strict_ok:
+                _bootstrap_log("loaded runtime via existing sys.path import")
+                return impl, None
+            if looks_like:
+                # Stale BasePlugin reference (plugin re-enable cycle). Evict
+                # cached modules and let the install_root path below
+                # re-import everything fresh against the current BasePlugin.
+                _bootstrap_log(
+                    "runtime impl extends a stale BasePlugin (re-enable cycle); "
+                    "evicting cached modules and re-importing"
+                )
+                _evict_runtime_from_sys_modules()
+                break
+            # Some other type with the right name but wrong base — keep scanning.
+    except Exception:
+        pass
+
+    install_root, mode = _bootstrap_runtime()
+    _bootstrap_log(f"using runtime root ({mode}): {install_root}")
+    try:
+        impl = _import_runtime_from(install_root)
+        strict_ok, looks_like = _impl_is_baseplugin_subclass(impl)
+        if strict_ok:
+            return impl, install_root
+        if looks_like:
+            # Same stale-BasePlugin scenario after a fresh import — happens
+            # if the bootstrap was hot-reloaded but the runtime files
+            # weren't touched. Force re-import via spec_from_file_location
+            # against the current BasePlugin reference.
+            _bootstrap_log(
+                "fresh runtime import still bound to stale BasePlugin; "
+                "self-healing via re-import"
+            )
+            _evict_runtime_from_sys_modules()
+        else:
+            raise ImportError(
+                f"Runtime class {impl!r} is not a BasePlugin subclass "
+                "and does not match by name — likely a corrupt download"
+            )
+    except Exception as e:
+        _bootstrap_log(f"first import attempt failed: {e}")
+
+    # Self-heal: the runtime files exist but either don't expose the impl
+    # class, fail to import, or are bound to a stale BasePlugin reference.
+    # Drop them, evict from sys.modules, refetch, retry.
+    _evict_runtime_from_sys_modules()
+
+    try:
+        new_root = _force_redownload_runtime(install_root)
+        if new_root and new_root != install_root:
+            _bootstrap_log(
+                f"force re-download moved install root: {install_root} → {new_root}"
+            )
+            install_root = new_root
+    except Exception as e:
+        _bootstrap_log(f"force re-download failed: {e}")
+        raise
+
+    impl = _import_runtime_from(install_root)
+    strict_ok, _looks_like = _impl_is_baseplugin_subclass(impl)
+    if not strict_ok:
+        raise ImportError(
+            f"Runtime impl {impl!r} still not a BasePlugin subclass after self-heal"
+        )
+    _bootstrap_log("self-heal succeeded — runtime re-downloaded and imported")
+    return impl, install_root
+
+
+_LOAD_ERROR = None
+_RUNTIME_INSTALL_ROOT = None
+# Captured at on_plugin_load so popup code can reach runtime instance helpers
+# (e.g. _bind_sticker_from_set) without having to thread `self` through every
+# call site.
+_plugin_instance = None
+try:
+    _EblanNftImpl, _RUNTIME_INSTALL_ROOT = _load_eblannft_impl()
+except Exception as _e:
+    _EblanNftImpl = BasePlugin
+    _LOAD_ERROR = _e
+    _bootstrap_log(f"FATAL bootstrap failure: {_e}")
+
+
+def _patch_runtime_service_menu():
+    """Replace _create_service_settings_subfragment on the runtime class so the
+    new 'Версия и обновления' row is injected regardless of which class
+    exteraGram instantiates."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        _bootstrap_log("service menu patch skipped: no runtime impl")
+        return
+    try:
+        original = _EblanNftImpl.__dict__.get("_create_service_settings_subfragment")
+    except Exception as e:
+        _bootstrap_log(f"service menu patch lookup failed: {e}")
+        return
+    if original is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("_create_service_settings_subfragment") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original = cand
+                break
+    if original is None:
+        _bootstrap_log("service menu patch: no original method found in MRO")
+        return
+    if getattr(original, "_eblannft_patched", False):
+        _bootstrap_log("service menu patch: already patched, skipping")
+        return
+
+    def patched(self, parent_view=None):
+        _bootstrap_log("service menu builder invoked (patched)")
+        base_items = []
+        try:
+            base_items = list(original(self, parent_view) or [])
+        except Exception as e:
+            _bootstrap_log(f"service base build failed: {e}")
+        try:
+            from ui.settings import Text
+        except Exception as e:
+            _bootstrap_log(f"ui.settings import failed in patch: {e}")
+            return base_items
+        try:
+            row_version = Text(
+                text="Версия и обновления",
+                subtext=f"v{__version__} • проверить на GitHub",
+                icon="msg_retry",
+                on_click=lambda _: _check_for_update_interactive(),
+            )
+            row_interval = Text(
+                text="Интервал проверки",
+                subtext=_get_update_interval_label(),
+                icon="msg_calendar",
+                on_click=lambda _: _show_update_interval_picker(),
+            )
+
+            insert_at = 0
+            for i, item in enumerate(base_items):
+                if type(item).__name__ == "Divider":
+                    insert_at = i + 1
+                    break
+            base_items.insert(insert_at, row_version)
+            base_items.insert(insert_at + 1, row_interval)
+            _bootstrap_log(
+                f"service menu: 2 rows injected at {insert_at}, total={len(base_items)}"
+            )
+        except Exception as e:
+            _bootstrap_log(f"service menu inject failed: {e}")
+        return base_items
+
+    patched._eblannft_patched = True
+    try:
+        _EblanNftImpl._create_service_settings_subfragment = patched
+        _bootstrap_log(
+            f"service menu patched on {getattr(_EblanNftImpl, '__name__', '?')}"
+        )
+    except Exception as e:
+        _bootstrap_log(f"service menu attribute set failed: {e}")
+
+
+_patch_runtime_service_menu()
+
+
+def _patch_runtime_about_relocation():
+    """Move 'О плагине' from the Service submenu to the bottom of the main menu."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+    try:
+        original_main = _EblanNftImpl.__dict__.get("create_settings")
+        original_service = _EblanNftImpl.__dict__.get("_create_service_settings_subfragment")
+    except Exception as e:
+        _bootstrap_log(f"about-relocation lookup failed: {e}")
+        return
+    if original_main is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("create_settings") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original_main = cand
+                break
+    if original_main is None:
+        _bootstrap_log("about-relocation: no create_settings found in MRO")
+        return
+    if getattr(original_main, "_eblannft_about_moved", False):
+        return
+
+    def _is_about_row(item):
+        try:
+            return type(item).__name__ == "Text" and "плагине" in str(getattr(item, "text", "")).lower()
+        except Exception:
+            return False
+
+    def _strip_about(items):
+        out = []
+        for it in items or []:
+            if _is_about_row(it):
+                continue
+            out.append(it)
+        return out
+
+    def patched_main(self, *a, **kw):
+        try:
+            base_items = list(original_main(self, *a, **kw) or [])
+        except Exception as e:
+            _bootstrap_log(f"main settings base build failed: {e}")
+            return []
+        try:
+            from ui.settings import Text, Divider
+        except Exception as e:
+            _bootstrap_log(f"ui.settings import failed in main patch: {e}")
+            return base_items
+        try:
+            about = Text(
+                text="О плагине",
+                subtext="Информация и поддержка",
+                icon="msg2_reactions2",
+                on_click=lambda _: self._on_about_click(),
+            )
+            base_items.append(Divider())
+            base_items.append(about)
+            _bootstrap_log(
+                f"main settings: 'О плагине' appended, total={len(base_items)}"
+            )
+        except Exception as e:
+            _bootstrap_log(f"main settings append failed: {e}")
+        return base_items
+
+    patched_main._eblannft_about_moved = True
+    try:
+        _EblanNftImpl.create_settings = patched_main
+        _bootstrap_log("main settings patched (about row appended)")
+    except Exception as e:
+        _bootstrap_log(f"main settings attribute set failed: {e}")
+        return
+
+    # Strip 'О плагине' from whatever Service-menu builder is currently
+    # installed (could be the original or our earlier version-row patch).
+    current_service = _EblanNftImpl.__dict__.get("_create_service_settings_subfragment")
+    if current_service is None:
+        current_service = original_service
+    if current_service is None:
+        _bootstrap_log("about-relocation: no service builder to wrap, skipping strip")
+        return
+    if getattr(current_service, "_eblannft_about_stripped", False):
+        return
+
+    def patched_service(self, *a, **kw):
+        try:
+            items = list(current_service(self, *a, **kw) or [])
+        except Exception as e:
+            _bootstrap_log(f"service-strip base build failed: {e}")
+            return []
+        return _strip_about(items)
+
+    patched_service._eblannft_about_stripped = True
+    if getattr(current_service, "_eblannft_patched", False):
+        patched_service._eblannft_patched = True
+    try:
+        _EblanNftImpl._create_service_settings_subfragment = patched_service
+        _bootstrap_log("service menu re-patched: about row stripped")
+    except Exception as e:
+        _bootstrap_log(f"service-strip attribute set failed: {e}")
+
+
+_patch_runtime_about_relocation()
+
+
+def _patch_runtime_nft_to_chat():
+    """Add 'NFT в чат' to the chat 'three-dots → My Plugins' menu.
+
+    Click flow: pick a unique gift from the eblannft library → choose sender
+    (incoming / outgoing) → inject as a local TL_messageService carrying a
+    TL_messageActionStarGiftUnique. Mirrors Vv1.plugin's NFT-in-chat path
+    but reuses eblannft's library, peer-builder and id-allocator helpers.
+    """
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+    try:
+        original_load = _EblanNftImpl.__dict__.get("on_plugin_load")
+    except Exception as e:
+        _bootstrap_log(f"NFT-to-chat lookup failed: {e}")
+        return
+    if original_load is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("on_plugin_load") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original_load = cand
+                break
+    if original_load is None:
+        _bootstrap_log("NFT-to-chat: no on_plugin_load found in MRO")
+        return
+    if getattr(original_load, "_eblannft_nft_chat_patched", False):
+        return
+
+    def patched_load(self, *a, **kw):
+        # Stash the live plugin instance so the update popup can reach
+        # _bind_sticker_from_set and other instance methods on the runtime.
+        try:
+            global _plugin_instance
+            _plugin_instance = self
+        except Exception:
+            pass
+        try:
+            result = original_load(self, *a, **kw)
+        except Exception as e:
+            _bootstrap_log(f"on_plugin_load original error: {e}")
+            result = None
+        try:
+            from base_plugin import MenuItemData, MenuItemType
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    item_id="eblannft_nft_to_chat",
+                    text="NFT в чат",
+                    icon="msg_emoji_gem",
+                    on_click=self._open_nft_to_chat_menu,
+                    condition="user != null",
+                )
+            )
+            _bootstrap_log("CHAT_ACTION_MENU 'NFT в чат' registered")
+        except Exception as e:
+            _bootstrap_log(f"NFT-to-chat menu register failed: {e}")
+        return result
+
+    patched_load._eblannft_nft_chat_patched = True
+
+    def _open_nft_to_chat_menu(self, context=None):
+        try:
+            account, dialog_id = self._resolve_fake_incoming_target(context)
+        except Exception as e:
+            _bootstrap_log(f"NFT-to-chat resolve failed: {e}")
+            account, dialog_id = 0, 0
+        try:
+            from ui.bulletin import BulletinHelper
+        except Exception:
+            BulletinHelper = None
+        if not dialog_id:
+            if BulletinHelper:
+                BulletinHelper.show_error("Не удалось определить чат")
+            return
+
+        actions = [
+            (
+                "Из библиотеки",
+                lambda: self._nft_chat_pick_from_library(account, dialog_id),
+            ),
+            (
+                "Конструктор (создать новый)",
+                lambda: self._nft_chat_open_constructor(account, dialog_id),
+            ),
+        ]
+        try:
+            self._show_action_menu("Откуда взять NFT?", actions, negative_text="Отмена")
+        except Exception as e:
+            _bootstrap_log(f"NFT-to-chat root menu failed: {e}")
+            if BulletinHelper:
+                BulletinHelper.show_error(f"Не удалось открыть меню: {e}")
+
+    def _nft_chat_pick_from_library(self, account, dialog_id):
+        try:
+            from ui.bulletin import BulletinHelper
+        except Exception:
+            BulletinHelper = None
+        entries = list(getattr(self, "gift_library", None) or [])
+        try:
+            entries.sort(key=lambda e: int(e.get("created_at", 0) or 0), reverse=True)
+        except Exception:
+            pass
+        if not entries:
+            if BulletinHelper:
+                BulletinHelper.show_info(
+                    "Библиотека пуста. Используй «Конструктор» здесь же, чтобы собрать первый NFT."
+                )
+            return
+        actions = []
+        for e in entries:
+            key = e.get("key")
+            if not key:
+                continue
+            title = str(e.get("title") or e.get("slug") or "NFT")
+            num = e.get("num", 1)
+            label = f"{title} #{num}"
+            actions.append(
+                (label, lambda k=key: self._choose_nft_chat_sender(account, dialog_id, k))
+            )
+        if not actions:
+            if BulletinHelper:
+                BulletinHelper.show_error("Библиотека NFT пуста")
+            return
+        try:
+            self._show_action_menu(
+                "Какой NFT отправить?", actions, negative_text="Отмена"
+            )
+        except Exception as e:
+            _bootstrap_log(f"NFT-to-chat library picker failed: {e}")
+            if BulletinHelper:
+                BulletinHelper.show_error(f"Не удалось открыть пикер: {e}")
+
+    def _nft_chat_open_constructor(self, account, dialog_id):
+        """Open the same NFT catalog sheet that the in-profile constructor
+        uses (ResaleGridController via _open_catalog_nft_sheet), then let
+        the existing CatalogGrid click handler do the heavy lifting:
+            click → finishFragment() → AttrLoader.start() → NftBuilderSheet
+        After the user saves the result, the _library_upsert_wrapper hook
+        reads _eblannft_chat_send_pending and fires the sender chooser.
+
+        This replaces the v1.0.9 ad-hoc action-menu picker that was priming
+        stolen_gift_inner with a TL_starGift base without finishing the
+        host fragment first — the source of the 'ContentView contains null
+        child' frame crash."""
+        try:
+            from ui.bulletin import BulletinHelper
+        except Exception:
+            BulletinHelper = None
+
+        self._eblannft_chat_send_pending = {
+            "account": int(account or 0),
+            "dialog_id": int(dialog_id or 0),
+            "ts": time.time(),
+        }
+        if BulletinHelper:
+            BulletinHelper.show_info(
+                "Выбери NFT в каталоге и собери в конструкторе — после сохранения спрошу, от кого отправить."
+            )
+        try:
+            self._open_catalog_nft_sheet()
+        except Exception as e:
+            self._eblannft_chat_send_pending = None
+            _bootstrap_log(f"NFT-to-chat catalog open failed: {e}")
+            if BulletinHelper:
+                BulletinHelper.show_error(f"Не удалось открыть каталог: {e}")
+
+    def _choose_nft_chat_sender(self, account, dialog_id, key):
+        actions = [
+            (
+                "От собеседника (входящее)",
+                lambda: self._send_nft_to_chat_with_assignment(account, dialog_id, key, is_out=False),
+            ),
+            (
+                "От меня (исходящее)",
+                lambda: self._send_nft_to_chat_with_assignment(account, dialog_id, key, is_out=True),
+            ),
+        ]
+        try:
+            self._show_action_menu("От кого пришёл NFT?", actions, negative_text="Отмена")
+        except Exception as e:
+            _bootstrap_log(f"sender chooser failed: {e}")
+
+    def _send_nft_to_chat_with_assignment(self, account, dialog_id, key, is_out):
+        # Inject the local TL_messageService bubble first.
+        try:
+            self._inject_unique_gift_into_chat(account, dialog_id, key, is_out=bool(is_out))
+        except Exception as e:
+            _bootstrap_log(f"chat inject failed: {e}")
+
+        # Assign profile ownership: outgoing → peer's profile, incoming → my profile.
+        try:
+            if int(dialog_id or 0) > 0 and bool(is_out):
+                target_user_id = int(dialog_id)
+            else:
+                try:
+                    target_user_id = int(self._get_my_user_id() or 0)
+                except Exception:
+                    target_user_id = 0
+        except Exception:
+            target_user_id = 0
+
+        if target_user_id <= 0:
+            return
+
+        try:
+            self._reassign_library_entry_owner(key, target_user_id)
+        except Exception as e:
+            _bootstrap_log(f"profile assignment failed: {e}")
+
+    def _reassign_library_entry_owner(self, key, target_user_id):
+        """Patch a library entry's identity_config.owner_user_id AND rewrite
+        the underlying TL_savedStarGift wrapper so its owner_id / from_id /
+        to_id fields actually point at the target user. Without this second
+        step the UI still treats the gift as 'mine' (showing Transfer / Wear
+        / Sell on the bottom sheet), even though the entry sits in the
+        target's profile. Re-serializes the wrapper to b64 so the assignment
+        persists across restarts."""
+        try:
+            from ui.bulletin import BulletinHelper
+        except Exception:
+            BulletinHelper = None
+        target_user_id = int(target_user_id or 0)
+        if target_user_id <= 0:
+            return False
+        entry = None
+        try:
+            entry = self._library_find_entry(key)
+        except Exception as e:
+            _bootstrap_log(f"library_find_entry failed: {e}")
+        if entry is None:
+            return False
+        try:
+            cfg = entry.get("identity_config") or {}
+        except Exception:
+            cfg = {}
+        try:
+            cfg = self._sanitize_identity_config(cfg)
+        except Exception:
+            if not isinstance(cfg, dict):
+                cfg = {}
+        # owner / from / to all need to point at the target so Telegram's gift
+        # bottom-sheet, the small "Owner" row, and the "You bought / received"
+        # caption all flip away from the local user.
+        for key_name in ("owner_user_id", "from_user_id", "to_user_id"):
+            try:
+                cfg[key_name] = int(target_user_id)
+            except Exception:
+                cfg[key_name] = target_user_id
+        entry["identity_config"] = cfg
+
+        # Step 2: actually mutate the wrapper's Java fields and persist b64.
+        try:
+            wrapper = self._library_get_wrapper(key)
+        except Exception as e:
+            wrapper = None
+            _bootstrap_log(f"reassign: wrapper load failed: {e}")
+        gift = None
+        try:
+            gift = self._extract_wrapper_gift(wrapper) if wrapper is not None else None
+        except Exception:
+            gift = None
+
+        if wrapper is not None:
+            try:
+                self._apply_identity_config_to_objects(gift=gift, wrapper=wrapper, identity_config=cfg)
+            except Exception as e:
+                _bootstrap_log(f"reassign: apply_identity_config failed: {e}")
+
+            # When the owner is no longer me, strip purchase-context fields so
+            # Telegram doesn't render the 'You bought this gift on ...' caption
+            # at the top of the StarGiftSheet.
+            try:
+                my_id_now = int(self._get_my_user_id() or 0)
+            except Exception:
+                my_id_now = 0
+            if my_id_now > 0 and int(target_user_id) != my_id_now:
+                for fld, zero in (
+                    ("msg_id", 0),
+                    ("msgId", 0),
+                    ("saved_id", 0),
+                    ("savedId", 0),
+                    ("savedID", 0),
+                    ("saved_gift_id", 0),
+                    ("savedGiftId", 0),
+                    ("unsaved", False),
+                    ("name_hidden", False),
+                    ("nameHidden", False),
+                    ("pinned_to_top", False),
+                    ("pinnedToTop", False),
+                ):
+                    try:
+                        self._set_field(wrapper, fld, zero)
+                    except Exception:
+                        pass
+
+            # Re-serialize so the persisted b64 carries the new owner. Use the
+            # module-level serializer that lives in the runtime namespace.
+            try:
+                runtime_mod = sys.modules.get(f"{_RUNTIME_PACKAGE_ALIAS}.plugin") or sys.modules.get(
+                    f"{_RUNTIME_PACKAGE_NAME}.plugin"
+                )
+                serializer = getattr(runtime_mod, "serialize_tl_object", None) if runtime_mod else None
+                if callable(serializer):
+                    new_b64 = serializer(wrapper)
+                    if new_b64:
+                        entry["b64"] = str(new_b64)
+            except Exception as e:
+                _bootstrap_log(f"reassign: serialize failed: {e}")
+
+        try:
+            self._library_dirty = True
+        except Exception:
+            pass
+        try:
+            self._save_cache()
+        except Exception:
+            pass
+        try:
+            self._rebuild_injection_payloads()
+        except Exception:
+            pass
+        try:
+            self._post_local_profile_notifications(reason="nft_chat_assignment", cooldown=0.2)
+        except Exception:
+            pass
+        if BulletinHelper:
+            try:
+                if int(target_user_id) == int(self._get_my_user_id() or 0):
+                    BulletinHelper.show_success("NFT прикреплён к твоему профилю")
+                else:
+                    BulletinHelper.show_success("NFT прикреплён к профилю собеседника")
+            except Exception:
+                pass
+        return True
+
+    def _inject_unique_gift_into_chat(self, account, dialog_id, key, is_out=False):
+        try:
+            from java import jclass
+            from java.util import ArrayList
+            from org.telegram.messenger import (
+                MessageObject,
+                MessagesController,
+                MessagesStorage,
+                UserConfig,
+                NotificationCenter,
+            )
+            from org.telegram.tgnet import TLRPC
+            from ui.bulletin import BulletinHelper
+            from android_utils import run_on_ui_thread
+        except Exception as e:
+            _bootstrap_log(f"NFT-chat inject imports failed: {e}")
+            return
+
+        wrapper = None
+        try:
+            wrapper = self._library_get_wrapper(key)
+        except Exception as e:
+            _bootstrap_log(f"library wrapper load failed: {e}")
+        gift = None
+        try:
+            gift = self._extract_wrapper_gift(wrapper) if wrapper is not None else None
+        except Exception:
+            gift = None
+        if gift is None:
+            try:
+                BulletinHelper.show_error("Не удалось загрузить выбранный NFT")
+            except Exception:
+                pass
+            return
+
+        # Pull availability_total / limited_count from the catalog onto the
+        # injected gift so the Quantity row in StarGiftSheet renders 'X / Y
+        # issued' instead of a blank rectangle. Same call the in-profile
+        # injection path makes inside process_response.
+        try:
+            self._ensure_unique_gift_availability(gift, base_gift_id=0)
+        except Exception as e:
+            _bootstrap_log(f"availability fill failed: {e}")
+
+        ActionClass = None
+        for cn in (
+            "org.telegram.tgnet.TLRPC$TL_messageActionStarGiftUnique",
+            "org.telegram.tgnet.TLRPC$TL_messageActionStarGift",
+        ):
+            try:
+                ActionClass = jclass(cn)
+                break
+            except Exception:
+                continue
+        if ActionClass is None:
+            try:
+                BulletinHelper.show_error("Нет класса TL_messageActionStarGiftUnique в этой сборке")
+            except Exception:
+                pass
+            return
+
+        try:
+            action = ActionClass()
+            try:
+                action.gift = gift
+            except Exception:
+                try:
+                    field = action.getClass().getField("gift")
+                    field.set(action, gift)
+                except Exception as e:
+                    _bootstrap_log(f"gift field set failed: {e}")
+            for attr in ("upgrade", "saved", "refunded"):
+                try:
+                    setattr(action, attr, False)
+                except Exception:
+                    pass
+            try:
+                action.transferred = bool(not is_out)
+            except Exception:
+                pass
+
+            peer_dialog = self._build_peer_for_entity(int(dialog_id))
+            if peer_dialog is None:
+                BulletinHelper.show_error("Этот тип диалога пока не поддерживается")
+                return
+
+            msg = TLRPC.TL_messageService()
+            try:
+                msg.id = int(self._allocate_fake_incoming_message_id())
+            except Exception:
+                msg.id = int(UserConfig.getInstance(account).getNewMessageId())
+            msg.peer_id = peer_dialog
+            msg.dialog_id = int(dialog_id)
+            msg.date = int(time.time())
+            msg.action = action
+            msg.unread = True
+            msg.out = bool(is_out)
+            msg.flags = 256 | (2 if is_out else 0)
+
+            if is_out:
+                me = TLRPC.TL_peerUser()
+                me.user_id = int(UserConfig.getInstance(account).getClientUserId())
+                msg.from_id = me
+            else:
+                msg.from_id = peer_dialog
+
+            obj = MessageObject(account, msg, False, True)
+            obj_list = ArrayList()
+            obj_list.add(obj)
+
+            try:
+                ml = ArrayList()
+                ml.add(msg)
+                MessagesStorage.getInstance(account).putMessages(ml, True, True, False, 0, 0, 0)
+            except Exception as e:
+                _bootstrap_log(f"MessagesStorage.putMessages failed (non-fatal): {e}")
+
+            MessagesController.getInstance(account).updateInterfaceWithMessages(
+                int(dialog_id), obj_list, 0
+            )
+            try:
+                NotificationCenter.getInstance(account).postNotificationName(
+                    NotificationCenter.dialogsNeedReload
+                )
+            except Exception:
+                pass
+
+            try:
+                BulletinHelper.show_success("NFT добавлен в чат локально")
+            except Exception:
+                pass
+
+            def _fireworks():
+                try:
+                    LaunchActivity = jclass("org.telegram.ui.LaunchActivity")
+                    inst = getattr(LaunchActivity, "instance", None)
+                    if inst is not None and inst.getFireworksOverlay() is not None:
+                        inst.getFireworksOverlay().start(True)
+                except Exception:
+                    pass
+            try:
+                run_on_ui_thread(_fireworks)
+            except Exception:
+                _fireworks()
+        except Exception as e:
+            try:
+                BulletinHelper.show_error(f"NFT в чат: {e}")
+            except Exception:
+                pass
+            _bootstrap_log(f"NFT inject error: {e}")
+
+    # Hook _library_upsert_wrapper to detect saves from the constructor flow
+    # that originated in the chat-action menu. The flag is set in
+    # _nft_chat_open_constructor and cleared on first hit so we don't fire the
+    # sender chooser for unrelated saves later in the session.
+    try:
+        original_upsert = _EblanNftImpl.__dict__.get("_library_upsert_wrapper")
+    except Exception:
+        original_upsert = None
+    if original_upsert is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("_library_upsert_wrapper") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original_upsert = cand
+                break
+    if original_upsert is not None and not getattr(original_upsert, "_eblannft_chat_save_hook", False):
+        def patched_upsert(self, *a, **kw):
+            try:
+                k = original_upsert(self, *a, **kw)
+            except Exception:
+                raise
+            try:
+                pending = getattr(self, "_eblannft_chat_send_pending", None)
+            except Exception:
+                pending = None
+            if pending and k:
+                try:
+                    self._eblannft_chat_send_pending = None
+                    account = int(pending.get("account") or 0)
+                    dialog_id = int(pending.get("dialog_id") or 0)
+                except Exception:
+                    account, dialog_id = 0, 0
+                if dialog_id:
+                    try:
+                        from android_utils import run_on_ui_thread
+                        # Defer slightly so the constructor sheet has time to dismiss.
+                        run_on_ui_thread(lambda k=k, a=account, d=dialog_id: self._choose_nft_chat_sender(a, d, k))
+                    except Exception:
+                        try:
+                            self._choose_nft_chat_sender(account, dialog_id, k)
+                        except Exception as e:
+                            _bootstrap_log(f"post-constructor chooser launch failed: {e}")
+            return k
+
+        patched_upsert._eblannft_chat_save_hook = True
+        try:
+            _EblanNftImpl._library_upsert_wrapper = patched_upsert
+            _bootstrap_log("library upsert hook installed (chat-flow handoff)")
+        except Exception as e:
+            _bootstrap_log(f"library upsert hook install failed: {e}")
+
+    try:
+        _EblanNftImpl._open_nft_to_chat_menu = _open_nft_to_chat_menu
+        _EblanNftImpl._nft_chat_pick_from_library = _nft_chat_pick_from_library
+        _EblanNftImpl._nft_chat_open_constructor = _nft_chat_open_constructor
+        _EblanNftImpl._choose_nft_chat_sender = _choose_nft_chat_sender
+        _EblanNftImpl._send_nft_to_chat_with_assignment = _send_nft_to_chat_with_assignment
+        _EblanNftImpl._reassign_library_entry_owner = _reassign_library_entry_owner
+        _EblanNftImpl._inject_unique_gift_into_chat = _inject_unique_gift_into_chat
+        _EblanNftImpl.on_plugin_load = patched_load
+        _bootstrap_log("NFT-to-chat methods + chat menu patch installed")
+    except Exception as e:
+        _bootstrap_log(f"NFT-to-chat install failed: {e}")
+
+
+_patch_runtime_nft_to_chat()
+
+
+def _patch_runtime_foreign_profile_gates():
+    """Suppress eblannft's owner-only sheet rows when the gift's library
+    entry is assigned to another user. Also strip saved_id / msg_id /
+    unsaved on wrappers reassigned to a foreign owner so Telegram drops
+    the 'You bought this gift' caption."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+
+    def _entry_owner_uid(plugin_self, entry):
+        try:
+            cfg = entry.get("identity_config") or {}
+        except Exception:
+            cfg = {}
+        try:
+            return int(cfg.get("owner_user_id", 0) or 0)
+        except Exception:
+            return 0
+
+    def _gate_methods():
+        gated = ("_inject_local_gift_value_row", "_inject_local_gift_release_badge",
+                 "_inject_local_gift_ton_owner_row", "_apply_local_ton_blockchain_line")
+        for name in gated:
+            try:
+                original = _EblanNftImpl.__dict__.get(name)
+            except Exception:
+                original = None
+            if original is None:
+                for base in getattr(_EblanNftImpl, "__mro__", ()):
+                    cand = base.__dict__.get(name) if hasattr(base, "__dict__") else None
+                    if cand is not None:
+                        original = cand
+                        break
+            if original is None:
+                continue
+            if getattr(original, "_eblannft_owner_gated", False):
+                continue
+
+            def _make(orig, mname):
+                def patched(self, sheet, gift=None, *a, **kw):
+                    key = None
+                    try:
+                        key = self._resolve_library_key_from_gift_sheet(sheet) if sheet is not None else None
+                    except Exception:
+                        key = None
+                    if not key and gift is not None:
+                        try:
+                            key = self._resolve_library_key_for_gift(gift)
+                        except Exception:
+                            key = None
+                    if key:
+                        try:
+                            entry = self._library_find_entry(key)
+                        except Exception:
+                            entry = None
+                        if entry is not None:
+                            owner = _entry_owner_uid(self, entry)
+                            try:
+                                my_id = int(self._get_my_user_id() or 0)
+                            except Exception:
+                                my_id = 0
+                            if owner > 0 and my_id > 0 and owner != my_id:
+                                return False
+                    return orig(self, sheet, gift, *a, **kw)
+                patched._eblannft_owner_gated = True
+                patched.__name__ = mname
+                return patched
+
+            try:
+                setattr(_EblanNftImpl, name, _make(original, name))
+                _bootstrap_log(f"foreign-profile gate installed on {name}")
+            except Exception as e:
+                _bootstrap_log(f"foreign-profile gate install failed for {name}: {e}")
+
+    _gate_methods()
+
+
+_patch_runtime_foreign_profile_gates()
+
+
+def _patch_runtime_resume_update_check():
+    """Wire the wrapper's update-check into the runtime's existing
+    AppResumeRefreshHook so that returning to the app from the recents
+    panel re-polls the manifest (subject to the 2-min resume throttle).
+    Without this, _maybe_check_for_update only fires inside on_plugin_load
+    and the user has to force-stop / cold-start to see a new release."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+    runtime_mod = sys.modules.get(f"{_RUNTIME_PACKAGE_ALIAS}.plugin") or sys.modules.get(
+        f"{_RUNTIME_PACKAGE_NAME}.plugin"
+    )
+    if runtime_mod is None:
+        _bootstrap_log("resume hook patch skipped: runtime module not found")
+        return
+    AppResumeRefreshHook = getattr(runtime_mod, "AppResumeRefreshHook", None)
+    if AppResumeRefreshHook is None:
+        _bootstrap_log("resume hook patch skipped: AppResumeRefreshHook missing")
+        return
+
+    try:
+        original = AppResumeRefreshHook.__dict__.get("after_hooked_method")
+    except Exception:
+        original = None
+    if original is None:
+        for base in getattr(AppResumeRefreshHook, "__mro__", ()):
+            cand = base.__dict__.get("after_hooked_method") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original = cand
+                break
+    if original is None:
+        _bootstrap_log("resume hook patch: no after_hooked_method to wrap")
+        return
+    if getattr(original, "_eblannft_resume_update_patched", False):
+        return
+
+    def patched(self, param):
+        try:
+            original(self, param)
+        except Exception as e:
+            _bootstrap_log(f"AppResumeRefreshHook original error: {e}")
+        try:
+            _maybe_check_for_update(reason="resume")
+        except Exception as e:
+            _bootstrap_log(f"resume update trigger failed: {e}")
+
+    patched._eblannft_resume_update_patched = True
+    try:
+        AppResumeRefreshHook.after_hooked_method = patched
+        _bootstrap_log("AppResumeRefreshHook patched for resume-time update polling")
+    except Exception as e:
+        _bootstrap_log(f"resume hook patch install failed: {e}")
+
+
+_patch_runtime_resume_update_check()
+
+
+def _patch_runtime_library_label_for_sent():
+    """Re-label library entries that were sent to other users via the
+    chat-action menu. Without this, _format_library_entry_label still
+    appends '• активен' to gifts whose identity_config.owner_user_id has
+    been reassigned to a peer — making it look like the gift is still in
+    your profile when it actually lives in someone else's now."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+    try:
+        original = _EblanNftImpl.__dict__.get("_format_library_entry_label")
+    except Exception:
+        original = None
+    if original is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("_format_library_entry_label") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original = cand
+                break
+    if original is None:
+        _bootstrap_log("library label patch: no base method found")
+        return
+    if getattr(original, "_eblannft_sent_label", False):
+        return
+
+    def _resolve_recipient_name(self, owner_user_id):
+        """Best-effort 'first name' lookup for the recipient. Falls back to
+        '@username' or just 'другой' if MessagesController doesn't have the
+        user cached."""
+        try:
+            from java import jclass
+            from client_utils import get_user_config
+            uid = int(owner_user_id or 0)
+            if uid <= 0:
+                return ""
+            account = int(get_user_config().selectedAccount)
+            MC = jclass("org.telegram.messenger.MessagesController")
+            ctrl = MC.getInstance(account)
+            user = ctrl.getUser(uid)
+            if user is None:
+                return ""
+            for fld in ("first_name", "firstName"):
+                try:
+                    name = str(getattr(user, fld, "") or "").strip()
+                except Exception:
+                    name = ""
+                if name:
+                    return name
+            for fld in ("username",):
+                try:
+                    uname = str(getattr(user, fld, "") or "").strip()
+                except Exception:
+                    uname = ""
+                if uname:
+                    return f"@{uname}"
+        except Exception:
+            pass
+        return ""
+
+    def patched(self, entry):
+        try:
+            base_label = original(self, entry)
+        except Exception as e:
+            _bootstrap_log(f"library label original failed: {e}")
+            return "NFT"
+        if not isinstance(entry, dict):
+            return base_label
+
+        # Resolve owner from identity_config; fall back to my_id.
+        try:
+            cfg = entry.get("identity_config") or {}
+            owner = int(cfg.get("owner_user_id", 0) or 0)
+        except Exception:
+            owner = 0
+        try:
+            my_id = int(self._get_my_user_id() or 0)
+        except Exception:
+            my_id = 0
+        if owner <= 0 or my_id <= 0 or owner == my_id:
+            return base_label
+
+        # Strip the misleading '• активен' tag (and any other tags that
+        # follow it on the right side of the bullet) and replace with a
+        # 'отправлено: <name>' marker.
+        try:
+            label = str(base_label or "")
+        except Exception:
+            label = "NFT"
+        try:
+            sep = " • "  # ' • '
+            head = label.split(sep, 1)[0] if sep in label else label
+        except Exception:
+            head = label
+
+        recipient = _resolve_recipient_name(self, owner)
+        if recipient:
+            return f"{head} • отправлено: {recipient}"
+        return f"{head} • отправлено другому"
+
+    patched._eblannft_sent_label = True
+    try:
+        _EblanNftImpl._format_library_entry_label = patched
+        _bootstrap_log("library label patched (sent-to-others detector)")
+    except Exception as e:
+        _bootstrap_log(f"library label patch install failed: {e}")
+
+
+_patch_runtime_library_label_for_sent()
+
+
+# Map of dev-y / placeholder strings the runtime hands to TextView.setText
+# via _ui_text — replaced here with friendlier copy. Keys MUST match the
+# runtime's literals exactly (Cyrillic + punctuation).
+_EBLANNFT_TEXT_REWRITES = {
+    # Welcome sheet description on first install — drop the 'fast, smooth,
+    # signature green eblannft vibe' tail per user request, keep only the
+    # first sentence that actually tells the user what the plugin does.
+    "Локально настраивай NFT-подарки, NFT Username, NFT Number и визуал профиля. Быстро, плавно и с фирменным зелёным eblannft вайбом.":
+        "Локально настраивай NFT-подарки, NFT Username, NFT Number и визуал профиля.",
+}
+
+
+def _patch_runtime_ui_text_rewrites():
+    """Wrap NftClonerPlugin._ui_text so a small dictionary of dev-y strings
+    can be swapped for friendlier copy without touching the runtime file."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+    try:
+        original = _EblanNftImpl.__dict__.get("_ui_text")
+    except Exception:
+        original = None
+    if original is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("_ui_text") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original = cand
+                break
+    if original is None:
+        _bootstrap_log("ui_text rewrite: no _ui_text method on runtime")
+        return
+    if getattr(original, "_eblannft_text_rewritten", False):
+        return
+
+    def patched(self, value, *a, **kw):
+        try:
+            key = str(value or "")
+        except Exception:
+            key = ""
+        if key and key in _EBLANNFT_TEXT_REWRITES:
+            try:
+                value = _EBLANNFT_TEXT_REWRITES[key]
+            except Exception:
+                pass
+        try:
+            return original(self, value, *a, **kw)
+        except Exception:
+            return value
+
+    patched._eblannft_text_rewritten = True
+    try:
+        _EblanNftImpl._ui_text = patched
+        _bootstrap_log(
+            f"ui_text rewrite map installed ({len(_EBLANNFT_TEXT_REWRITES)} entries)"
+        )
+    except Exception as e:
+        _bootstrap_log(f"ui_text rewrite install failed: {e}")
+
+
+_patch_runtime_ui_text_rewrites()
+
+
+def _walk_view_tree_rewrite_texts(view, mapping):
+    """Depth-first walk a Java View tree; whenever a TextView's current
+    text matches a key in `mapping`, swap it for the mapped value. Used
+    to retarget hard-coded setText('...') strings that the runtime built
+    in via literal — bypasses the _ui_text patch route entirely."""
+    if view is None or not mapping:
+        return
+    try:
+        getter = getattr(view, "getText", None)
+        if callable(getter):
+            try:
+                cur = str(getter() or "")
+            except Exception:
+                cur = ""
+            if cur and cur in mapping:
+                try:
+                    view.setText(str(mapping[cur]))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        n = view.getChildCount() if hasattr(view, "getChildCount") else 0
+    except Exception:
+        n = 0
+    for i in range(int(n or 0)):
+        try:
+            child = view.getChildAt(i)
+        except Exception:
+            child = None
+        if child is not None:
+            _walk_view_tree_rewrite_texts(child, mapping)
+
+
+def _patch_runtime_welcome_text_walker():
+    """Wrap _show_install_welcome_sheet so that — once the sheet is
+    attached — we walk LaunchActivity.instance.getWindow().getDecorView()
+    looking for any TextView whose .getText() matches a key in
+    _EBLANNFT_TEXT_REWRITES, and call setText() with the rewrite. Three
+    delayed walks (50/250/700/1500 ms) cover the case where the sheet
+    animates in after our first attempt."""
+    if _LOAD_ERROR is not None or _EblanNftImpl is BasePlugin:
+        return
+    try:
+        original = _EblanNftImpl.__dict__.get("_show_install_welcome_sheet")
+    except Exception:
+        original = None
+    if original is None:
+        for base in getattr(_EblanNftImpl, "__mro__", ()):
+            cand = base.__dict__.get("_show_install_welcome_sheet") if hasattr(base, "__dict__") else None
+            if cand is not None:
+                original = cand
+                break
+    if original is None:
+        _bootstrap_log("welcome walker: no _show_install_welcome_sheet found")
+        return
+    if getattr(original, "_eblannft_welcome_walked", False):
+        return
+
+    def patched(self, ctx_override=None, *a, **kw):
+        try:
+            result = original(self, ctx_override, *a, **kw)
+        except Exception as e:
+            _bootstrap_log(f"welcome original failed: {e}")
+            raise
+
+        def _do_walk():
+            try:
+                from java import jclass
+                LaunchActivity = jclass("org.telegram.ui.LaunchActivity")
+                act = getattr(LaunchActivity, "instance", None)
+                if act is None:
+                    return
+                window = act.getWindow() if hasattr(act, "getWindow") else None
+                root = window.getDecorView() if window is not None else None
+                if root is not None:
+                    _walk_view_tree_rewrite_texts(root, _EBLANNFT_TEXT_REWRITES)
+            except Exception as e:
+                _bootstrap_log(f"welcome text walk failed: {e}")
+
+        try:
+            from java import dynamic_proxy, jclass as _jclass
+            from org.telegram.messenger import AndroidUtilities
+            Runnable = _jclass("java.lang.Runnable")
+
+            def _make():
+                class _Tick(dynamic_proxy(Runnable)):
+                    def run(self_obj):
+                        try:
+                            _do_walk()
+                        except Exception:
+                            pass
+                        return None
+                return _Tick()
+
+            for delay_ms in (50, 250, 700, 1500):
+                try:
+                    AndroidUtilities.runOnUIThread(_make(), int(delay_ms))
+                except Exception:
+                    pass
+        except Exception as e:
+            _bootstrap_log(f"welcome walker scheduling failed: {e}")
+        return result
+
+    patched._eblannft_welcome_walked = True
+    try:
+        _EblanNftImpl._show_install_welcome_sheet = patched
+        _bootstrap_log("welcome sheet text walker installed")
+    except Exception as e:
+        _bootstrap_log(f"welcome walker install failed: {e}")
+
+
+_patch_runtime_welcome_text_walker()
+
+
+# ---------------------------------------------------------------------------
+# Auto-update section: poll the GitHub manifest, present an MD3 BottomSheet
+# with change notes + a real progress bar, then restart the app.
+# ---------------------------------------------------------------------------
+
+
+def _version_tuple(version_str):
+    parts = re.findall(r"\d+", str(version_str or ""))
+    if not parts:
+        return (0,)
+    nums = tuple(int(p) for p in parts[:4])
+    while len(nums) < 4:
+        nums = nums + (0,)
+    return nums
+
+
+def _is_remote_different(remote_version):
+    """Treat any non-empty manifest version that doesn't match local as an
+    actionable update — including rollbacks. Lets the maintainer ship a
+    lower version (e.g. yank v1.0.19 back to v1.0.18) and have every
+    install pick it up automatically."""
+    try:
+        rv = str(remote_version or "").strip()
+    except Exception:
+        rv = ""
+    if not rv:
+        return False
+    return _version_tuple(rv) != _version_tuple(__version__)
+
+
+def _is_remote_upgrade(remote_version):
+    return _version_tuple(remote_version) > _version_tuple(__version__)
+
+
+def _wrapper_file_path():
+    try:
+        return os.path.abspath(__file__)
+    except Exception:
+        return ""
+
+
+def _resolve_dest_for_manifest_entry(rel_path):
+    """Map a manifest path to an absolute on-disk destination."""
+    rel = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
+    if not rel:
+        return None
+    if rel == "eblannft.plugin":
+        wrapper = _wrapper_file_path()
+        if wrapper:
+            return wrapper
+        return None
+    if rel.startswith(f"{_RUNTIME_PACKAGE_NAME}/"):
+        root = _RUNTIME_INSTALL_ROOT or _existing_runtime_root() or _pick_writable_install_root()
+        return os.path.abspath(os.path.join(root, rel.replace("/", os.sep)))
+    # Anything else lands next to the runtime, in a sibling path mirroring repo layout.
+    root = _RUNTIME_INSTALL_ROOT or _existing_runtime_root()
+    if root:
+        return os.path.abspath(os.path.join(root, rel.replace("/", os.sep)))
+    return None
+
+
+def _fetch_manifest():
+    # Bust raw.githubusercontent.com's CDN cache (~5-10 min TTL otherwise) by
+    # appending a unique query string. The CDN keys on the full URL, so each
+    # fetch returns whatever is currently committed instead of a stale copy.
+    bust = int(time.time())
+    url = (
+        f"https://raw.githubusercontent.com/{_RUNTIME_REPO}/{_RUNTIME_BRANCH}/"
+        f"{_UPDATE_MANIFEST_PATH}?_={bust}"
+    )
+    raw, _total = _http_get(url, timeout=12)
+    text = raw.decode("utf-8", errors="replace")
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise RuntimeError("Manifest is not a JSON object")
+    version = str(data.get("version") or "").strip()
+    if not version:
+        raise RuntimeError("Manifest is missing 'version'")
+    files = data.get("files") or list(_RUNTIME_FILES) + ["eblannft.plugin"]
+    if not isinstance(files, list) or not files:
+        files = list(_RUNTIME_FILES) + ["eblannft.plugin"]
+    return {
+        "version": version,
+        "notes": str(data.get("notes") or "").strip(),
+        "files": [str(x).strip() for x in files if str(x).strip()],
+    }
+
+
+def _last_check_marker_path():
+    base = _RUNTIME_INSTALL_ROOT or _existing_runtime_root()
+    if not base:
+        return ""
+    try:
+        return os.path.join(base, _UPDATE_TIMESTAMP_FILE)
+    except Exception:
+        return ""
+
+
+def _read_last_check_ts():
+    path = _last_check_marker_path()
+    if not path or not os.path.isfile(path):
+        return 0.0
+    try:
+        with open(path, "r") as f:
+            return float((f.read() or "0").strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _write_last_check_ts(ts=None):
+    path = _last_check_marker_path()
+    if not path:
+        return
+    try:
+        with open(path, "w") as f:
+            f.write(str(float(ts if ts is not None else time.time())))
+    except Exception:
+        pass
+
+
+def _get_update_interval_idx():
+    """Read the user-chosen interval index from plugin settings (defaults to
+    the constant default if the runtime instance isn't ready yet)."""
+    if _plugin_instance is None:
+        return _UPDATE_INTERVAL_DEFAULT_IDX
+    try:
+        idx = int(
+            _plugin_instance.get_setting(
+                "eblannft_update_interval_idx", _UPDATE_INTERVAL_DEFAULT_IDX
+            )
+            or 0
+        )
+    except Exception:
+        idx = _UPDATE_INTERVAL_DEFAULT_IDX
+    if 0 <= idx < len(_UPDATE_INTERVAL_OPTIONS):
+        return idx
+    return _UPDATE_INTERVAL_DEFAULT_IDX
+
+
+def _set_update_interval_idx(idx):
+    if _plugin_instance is None:
+        return
+    try:
+        _plugin_instance.set_setting("eblannft_update_interval_idx", int(idx))
+    except Exception:
+        pass
+
+
+def _get_update_interval_sec():
+    return int(_UPDATE_INTERVAL_OPTIONS[_get_update_interval_idx()][0])
+
+
+def _get_update_interval_label():
+    return str(_UPDATE_INTERVAL_OPTIONS[_get_update_interval_idx()][1])
+
+
+def _show_update_interval_picker():
+    """BottomSheet with a SlideChooseView letting the user pick how often
+    the plugin polls GitHub for updates (5 часов / День / Неделя / Месяц).
+    The choice persists into plugin settings and is read on every poll."""
+    try:
+        from android_utils import run_on_ui_thread
+    except Exception:
+        return False
+    try:
+        from java import jclass, dynamic_proxy
+        from client_utils import get_last_fragment
+        from org.telegram.ui.ActionBar import BottomSheet, Theme
+        from org.telegram.ui.Components import SlideChooseView
+        from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+        from android.view import Gravity
+        from android.widget import LinearLayout, TextView
+        from android.graphics.drawable import GradientDrawable
+        from android.util import TypedValue
+    except Exception as e:
+        _bootstrap_log(f"interval picker imports failed: {e}")
+        return False
+
+    frag = None
+    try:
+        frag = get_last_fragment()
+    except Exception:
+        frag = None
+    ctx = None
+    try:
+        ctx = frag.getParentActivity() if frag and frag.getParentActivity() else None
+    except Exception:
+        ctx = None
+    if ctx is None:
+        try:
+            ctx = ApplicationLoader.applicationContext
+        except Exception:
+            ctx = None
+    if ctx is None:
+        return False
+
+    def _build():
+        try:
+            try:
+                accent = int(Theme.getColor(Theme.key_featuredStickers_addButton))
+            except Exception:
+                accent = 0xFF5B8CFF
+            try:
+                text_color = int(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            except Exception:
+                text_color = 0xFFFFFFFF
+            try:
+                muted_color = int(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            except Exception:
+                muted_color = 0xFF9AA3AE
+            try:
+                bg_color = int(Theme.getColor(Theme.key_dialogBackground))
+            except Exception:
+                bg_color = 0xFF14161B
+
+            def _blend(over_argb, base_argb, alpha_over):
+                a = max(0.0, min(1.0, float(alpha_over)))
+                inv = 1.0 - a
+                ro = (over_argb >> 16) & 0xFF
+                go = (over_argb >> 8) & 0xFF
+                bo = over_argb & 0xFF
+                rb = (base_argb >> 16) & 0xFF
+                gb = (base_argb >> 8) & 0xFF
+                bb = base_argb & 0xFF
+                r = int(round(ro * a + rb * inv))
+                g = int(round(go * a + gb * inv))
+                b = int(round(bo * a + bb * inv))
+                return (0xFF << 24) | (r << 16) | (g << 8) | b
+
+            sheet = BottomSheet(ctx, True)
+
+            outer = LinearLayout(ctx)
+            outer.setOrientation(LinearLayout.VERTICAL)
+            outer.setPadding(
+                AndroidUtilities.dp(20),
+                AndroidUtilities.dp(22),
+                AndroidUtilities.dp(20),
+                AndroidUtilities.dp(20),
+            )
+
+            title = TextView(ctx)
+            title.setText("Интервал проверки обновлений")
+            try:
+                title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 19)
+                title.setTextColor(text_color)
+                title.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            except Exception:
+                pass
+            outer.addView(title, LinearLayout.LayoutParams(-1, -2))
+
+            subtitle = TextView(ctx)
+            subtitle.setText(
+                "Как часто плагин сам проверяет, есть ли новая версия. "
+                "Когда возвращаешься в приложение — проверка идёт быстрее в "
+                "любом случае."
+            )
+            try:
+                subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                subtitle.setTextColor(muted_color)
+                subtitle.setLineSpacing(0.0, 1.15)
+            except Exception:
+                pass
+            lp_sub = LinearLayout.LayoutParams(-1, -2)
+            try:
+                lp_sub.topMargin = AndroidUtilities.dp(8)
+            except Exception:
+                pass
+            outer.addView(subtitle, lp_sub)
+
+            # Card containing the SlideChooseView.
+            card = LinearLayout(ctx)
+            card.setOrientation(LinearLayout.VERTICAL)
+            try:
+                cb = GradientDrawable()
+                cb.setCornerRadius(AndroidUtilities.dp(20))
+                cb.setColor(_blend(accent, bg_color, 0.10))
+                card.setBackground(cb)
+                card.setPadding(
+                    AndroidUtilities.dp(14),
+                    AndroidUtilities.dp(18),
+                    AndroidUtilities.dp(14),
+                    AndroidUtilities.dp(14),
+                )
+            except Exception:
+                pass
+            lp_card = LinearLayout.LayoutParams(-1, -2)
+            try:
+                lp_card.topMargin = AndroidUtilities.dp(20)
+            except Exception:
+                pass
+            outer.addView(card, lp_card)
+
+            try:
+                selector = SlideChooseView(ctx)
+            except Exception:
+                # Some builds expect (context, resourcesProvider). Pass null.
+                selector = SlideChooseView(ctx, None)
+            current_idx = _get_update_interval_idx()
+            try:
+                selector.setOptions(
+                    int(current_idx),
+                    "5 часов",
+                    "День",
+                    "Неделя",
+                    "Месяц",
+                )
+            except Exception as e:
+                _bootstrap_log(f"setOptions failed: {e}")
+
+            cb_cls = jclass("org.telegram.ui.Components.SlideChooseView$Callback")
+
+            class _Cb(dynamic_proxy(cb_cls)):
+                def onOptionSelected(self_obj, index):
+                    try:
+                        _set_update_interval_idx(int(index))
+                        _bootstrap_log(
+                            f"update interval set to idx={int(index)} ({_UPDATE_INTERVAL_OPTIONS[int(index)][1]})"
+                        )
+                    except Exception as e:
+                        _bootstrap_log(f"interval onOptionSelected failed: {e}")
+
+                def onTouchEnd(self_obj):
+                    return None
+
+            try:
+                selector.setCallback(_Cb())
+            except Exception as e:
+                _bootstrap_log(f"setCallback failed: {e}")
+
+            card.addView(selector, LinearLayout.LayoutParams(-1, -2))
+
+            # OK button.
+            ok_btn = TextView(ctx)
+            ok_btn.setText("Готово")
+            try:
+                ok_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                ok_btn.setGravity(Gravity.CENTER)
+                ab = GradientDrawable()
+                ab.setCornerRadius(AndroidUtilities.dp(24))
+                ab.setColor(accent)
+                ok_btn.setBackground(ab)
+                try:
+                    ok_btn.setTextColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
+                except Exception:
+                    ok_btn.setTextColor(0xFFFFFFFF)
+                try:
+                    ok_btn.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                except Exception:
+                    pass
+                ok_btn.setPadding(
+                    AndroidUtilities.dp(20),
+                    AndroidUtilities.dp(14),
+                    AndroidUtilities.dp(20),
+                    AndroidUtilities.dp(14),
+                )
+            except Exception:
+                pass
+            lp_ok = LinearLayout.LayoutParams(-1, -2)
+            try:
+                lp_ok.topMargin = AndroidUtilities.dp(18)
+            except Exception:
+                pass
+            outer.addView(ok_btn, lp_ok)
+
+            try:
+                from android_utils import OnClickListener
+                ok_btn.setOnClickListener(OnClickListener(lambda _v=None: sheet.dismiss()))
+            except Exception:
+                pass
+
+            sheet.setCustomView(outer)
+            try:
+                sheet.show()
+            except Exception:
+                pass
+        except Exception as e:
+            _bootstrap_log(f"interval picker build failed: {e}")
+
+    run_on_ui_thread(_build)
+    return True
+
+
+def _format_bytes(n):
+    try:
+        n = float(n or 0)
+    except Exception:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB"]
+    i = 0
+    while n >= 1024.0 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(n)} B"
+    return f"{n:.1f} {units[i]}"
+
+
+def _format_progress_status(short_path, current_bytes, total_bytes, applying=False):
+    if applying:
+        return f"{short_path} • {_format_bytes(current_bytes)}"
+    if total_bytes > 0:
+        loaded = _format_bytes(current_bytes)
+        total = _format_bytes(total_bytes)
+        return f"{short_path} • {loaded} / {total}"
+    return f"{short_path} • {_format_bytes(current_bytes)}"
+
+
+def _restart_application():
+    """Force the Telegram process to die so the user can relaunch it cleanly."""
+    try:
+        from java import jclass
+        Process = jclass("android.os.Process")
+        myPid = int(Process.myPid())
+        Process.killProcess(myPid)
+        return True
+    except Exception as e:
+        _bootstrap_log(f"restart failed: {e}")
+        try:
+            os._exit(0)
+        except Exception:
+            pass
+        return False
+
+
+def _download_and_apply_update(manifest, progress_cb=None):
+    """Download every file from the manifest, then atomically replace on disk."""
+    files = list(manifest.get("files") or [])
+    if not files:
+        raise RuntimeError("Manifest has no files")
+
+    plan = []
+    sizes = {}
+    for rel in files:
+        dest = _resolve_dest_for_manifest_entry(rel)
+        if not dest:
+            _bootstrap_log(f"skip update entry, unresolved dest: {rel}")
+            continue
+        plan.append((rel, dest))
+        # HEAD-style size hint via streaming; we'll get the real total when
+        # we actually start the body fetch.
+        sizes[rel] = 0
+
+    if not plan:
+        raise RuntimeError("Update plan is empty after resolving destinations")
+
+    payloads = []
+    completed_bytes = 0
+
+    def _known_total():
+        return sum(int(v or 0) for v in sizes.values())
+
+    for idx, (rel, dest) in enumerate(plan, 1):
+        url = _raw_url(rel)
+        short = rel.split("/")[-1]
+
+        def _on_bytes(loaded, total, _rel=rel, _short=short, _idx=idx):
+            if total and total > sizes.get(_rel, 0):
+                sizes[_rel] = total
+            overall_total = _known_total()
+            overall_loaded = completed_bytes + loaded
+            if callable(progress_cb):
+                try:
+                    progress_cb(
+                        idx=_idx,
+                        total_steps=len(plan),
+                        current_path=_short,
+                        applying=False,
+                        current_bytes=loaded,
+                        current_total=total or 0,
+                        overall_bytes=overall_loaded,
+                        overall_total=overall_total,
+                    )
+                except Exception:
+                    pass
+
+        data, total = _http_get(url, progress_cb=_on_bytes)
+        if not data:
+            raise RuntimeError(f"Empty download for {rel}")
+        if total > sizes.get(rel, 0):
+            sizes[rel] = total
+        payloads.append((rel, dest, data))
+        completed_bytes += len(data)
+
+    # All downloads succeeded — now write atomically.
+    apply_total = max(1, sum(len(d) for _r, _de, d in payloads))
+    applied = 0
+    for idx, (rel, dest, data) in enumerate(payloads, 1):
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        applied += len(data)
+        if callable(progress_cb):
+            try:
+                progress_cb(
+                    idx=idx,
+                    total_steps=len(payloads),
+                    current_path=rel.split("/")[-1],
+                    applying=True,
+                    current_bytes=len(data),
+                    current_total=len(data),
+                    overall_bytes=applied,
+                    overall_total=apply_total,
+                )
+            except Exception:
+                pass
+
+
+_eblannft_popup_sticker_doc_cache = None
+
+
+def _enable_sticker_animation(sticker_view):
+    """Tell BackupImageView's ImageReceiver to start + loop the TGS animation
+    (same dance _bind_welcome_pepe_sticker does in the runtime)."""
+    try:
+        receiver = (
+            sticker_view.getImageReceiver()
+            if sticker_view is not None and hasattr(sticker_view, "getImageReceiver")
+            else None
+        )
+    except Exception:
+        receiver = None
+    if receiver is None:
+        return
+    for setter, args in (
+        ("setAllowStartAnimation", (True,)),
+        ("setAutoRepeat", (1,)),
+        ("setAutoRepeatCount", (0,)),
+        ("setAutoRepeatTimeout", (0,)),
+        ("setAllowStartLottieAnimation", (True,)),
+    ):
+        try:
+            fn = getattr(receiver, setter, None)
+            if callable(fn):
+                fn(*args)
+        except Exception:
+            pass
+    try:
+        if hasattr(receiver, "startAnimation"):
+            receiver.startAnimation()
+    except Exception:
+        pass
+
+
+def _apply_sticker_document_to_view(sticker_view, document, image_filter="120_120"):
+    if sticker_view is None or document is None:
+        return False
+    try:
+        if not hasattr(sticker_view, "setImage"):
+            return False
+        from org.telegram.messenger import ImageLocation
+        loc = ImageLocation.getForDocument(document)
+        if loc is None:
+            return False
+        sticker_view.setImage(loc, str(image_filter or "120_120"), None, 0, document)
+        _enable_sticker_animation(sticker_view)
+        global _eblannft_popup_sticker_doc_cache
+        _eblannft_popup_sticker_doc_cache = document
+        return True
+    except Exception as e:
+        _bootstrap_log(f"apply sticker doc failed: {e}")
+        return False
+
+
+def _bind_eblannft_popup_sticker(sticker_view, set_name="HappyHappyPepe", indexes=(31, 0), image_filter="120_120"):
+    """Look up the requested sticker (by set short_name + preferred index list,
+    falling back to subsequent indexes if the chosen one is out of range) and
+    apply it to a BackupImageView. If the sticker set isn't loaded yet,
+    asynchronously fetch it via MediaDataController.getStickerSet and apply
+    on the UI thread when it arrives."""
+    if sticker_view is None:
+        return False
+
+    # Reuse the cached document if one's already been resolved during this
+    # session — saves a MediaDataController round-trip on subsequent popups.
+    cached = _eblannft_popup_sticker_doc_cache
+    if cached is not None and _apply_sticker_document_to_view(sticker_view, cached, image_filter):
+        return True
+
+    try:
+        from java import jclass, dynamic_proxy
+        from android_utils import run_on_ui_thread
+        from org.telegram.messenger import MediaDataController, UserConfig
+        from org.telegram.tgnet import TLRPC
+    except Exception as e:
+        _bootstrap_log(f"sticker imports failed: {e}")
+        return False
+
+    try:
+        account = int(UserConfig.selectedAccount)
+    except Exception:
+        account = 0
+
+    try:
+        media_controller = MediaDataController.getInstance(account)
+    except Exception:
+        media_controller = None
+    if media_controller is None:
+        return False
+
+    def _try_set(sset):
+        try:
+            docs = getattr(sset, "documents", None) if sset is not None else None
+            if docs is None:
+                return False
+            n = int(docs.size())
+            for idx in indexes:
+                try:
+                    i = int(idx)
+                except Exception:
+                    continue
+                if 0 <= i < n:
+                    doc = docs.get(i)
+                    if _apply_sticker_document_to_view(sticker_view, doc, image_filter):
+                        return True
+            return False
+        except Exception as e:
+            _bootstrap_log(f"sticker set scan failed: {e}")
+            return False
+
+    # Fast path: set already cached locally.
+    try:
+        sset = media_controller.getStickerSetByName(str(set_name))
+    except Exception:
+        sset = None
+    if _try_set(sset):
+        return True
+
+    # Slow path: ask MediaDataController to fetch / cache it.
+    try:
+        input_set = TLRPC.TL_inputStickerSetShortName()
+        input_set.short_name = str(set_name)
+        target_view = sticker_view
+
+        class _CB(dynamic_proxy(jclass("org.telegram.messenger.Utilities$Callback"))):
+            def run(self_obj, result):
+                try:
+                    def _apply():
+                        _try_set(result)
+                    run_on_ui_thread(_apply)
+                except Exception as e:
+                    try:
+                        _bootstrap_log(f"sticker set callback fail: {e}")
+                    except Exception:
+                        pass
+
+        media_controller.getStickerSet(input_set, None, False, _CB())
+    except Exception as e:
+        _bootstrap_log(f"sticker fetch failed: {e}")
+
+    return False
+
+
+def _parse_notes_bullets(text):
+    """Split release notes into a list of bullet items.
+
+    Recognises three input styles, in order of preference:
+      1. "(1) ... (2) ... (3) ..." numbered groups (this repo's house style)
+      2. "• item / - item / * item" markdown-ish bullets
+      3. Plain prose — falls back to sentence-split on ". " before a capital
+
+    Returns a list of clean strings without the leading marker. Empty input
+    or no clear structure → returns a single-item list with the whole text.
+    """
+    import re
+    if not text:
+        return []
+    body = str(text).strip()
+    # Strip a "vX.Y.Z — " prefix so it doesn't show up as a bullet on its own.
+    body = re.sub(r"^[Bb]eta\s+v?\d+\.\d+\.\d+\s*[—–-]\s*", "", body)
+    body = re.sub(r"^v?\d+\.\d+\.\d+\s*[—–-]\s*", "", body)
+
+    # 1) Numbered "(N)" groups
+    parts = re.split(r"\s*\(\d+\)\s*", body)
+    if len(parts) >= 3:
+        items = []
+        # Optional intro before "(1)" — keep only if it looks like a real
+        # phrase, not just a category label.
+        intro = parts[0].strip().rstrip(":,.; ")
+        if intro and len(intro) > 16:
+            items.append(intro)
+        for p in parts[1:]:
+            s = p.strip().rstrip(" .;")
+            if s:
+                items.append(s)
+        if len(items) >= 2:
+            return items
+
+    # 2) Bullet markers
+    if re.search(r"(^|\n)\s*[•\-\*]\s+", body):
+        lines = re.split(r"(?:^|\n)\s*[•\-\*]\s+", body)
+        items = [l.strip().rstrip(" .;") for l in lines if l.strip()]
+        if len(items) >= 2:
+            return items
+
+    # 3) Sentence split — only if the text has at least two reasonable sentences.
+    sents = re.split(r"\.\s+(?=[А-ЯA-Z])", body)
+    if len(sents) >= 2:
+        return [s.strip().rstrip(".") for s in sents if s.strip()]
+
+    return [body]
+
+
+def _schedule_popup_retry(manifest, attempt, reason):
+    """Re-schedule _show_update_popup later if the first attempt couldn't
+    build (e.g. fired before LaunchActivity finished mounting). Bounded by
+    _UPDATE_POPUP_MAX_RETRIES so we never loop forever."""
+    next_attempt = int(attempt or 0) + 1
+    if next_attempt > _UPDATE_POPUP_MAX_RETRIES:
+        _bootstrap_log(
+            f"update popup: giving up after {next_attempt - 1} retries (last reason: {reason})"
+        )
+        return
+    _bootstrap_log(
+        f"update popup retry #{next_attempt} scheduled in {_UPDATE_POPUP_RETRY_DELAY_MS}ms (reason: {reason})"
+    )
+    try:
+        from java import jclass, dynamic_proxy
+        from org.telegram.messenger import AndroidUtilities
+        Runnable = jclass("java.lang.Runnable")
+
+        class _Retry(dynamic_proxy(Runnable)):
+            def run(self_obj):
+                try:
+                    _show_update_popup(manifest, _retry_attempt=next_attempt)
+                except Exception as e:
+                    _bootstrap_log(f"update popup retry #{next_attempt} crashed: {e}")
+                return None
+
+        AndroidUtilities.runOnUIThread(_Retry(), int(_UPDATE_POPUP_RETRY_DELAY_MS))
+        return
+    except Exception:
+        pass
+
+    def _delayed():
+        try:
+            time.sleep(_UPDATE_POPUP_RETRY_DELAY_MS / 1000.0)
+            _show_update_popup(manifest, _retry_attempt=next_attempt)
+        except Exception as e:
+            _bootstrap_log(f"update popup retry #{next_attempt} fallback crashed: {e}")
+    threading.Thread(target=_delayed, daemon=True).start()
+
+
+def _show_update_popup(manifest, _retry_attempt=0):
+    """Build and present an MD3 BottomSheet describing the available update.
+
+    Layout (top → bottom):
+      1. Hero header — ⬇ icon glyph + 'Обновление' title + 'eblanNFT' subtitle
+         + version chip 'v X.Y.Z  →  vA.B.C'
+      2. Optional 'Что нового' card with scrollable change notes
+      3. Progress card — label / percent / 12dp gradient track / status line
+      4. Two-line button stack — filled primary 'Скачать' + text 'Позже'
+
+    Returns True iff the BottomSheet was successfully scheduled for display.
+    On failure (no UI context yet, imports missing, etc.) reschedules itself
+    up to _UPDATE_POPUP_MAX_RETRIES times with _UPDATE_POPUP_RETRY_DELAY_MS
+    spacing — covers the cold-start case where the runtime fires the
+    update check before LaunchActivity has finished mounting.
+    """
+    try:
+        from android_utils import run_on_ui_thread, log as _log_ui
+    except Exception:
+        _schedule_popup_retry(manifest, _retry_attempt, "android_utils not ready")
+        return False
+    try:
+        from java import jclass
+        from client_utils import get_last_fragment
+        from org.telegram.ui.ActionBar import BottomSheet, Theme
+        from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+        from android.view import View, Gravity, ViewOutlineProvider
+        from android.widget import LinearLayout, FrameLayout, TextView, ScrollView, ImageView
+        from android.graphics.drawable import GradientDrawable
+        from android.util import TypedValue
+    except Exception as e:
+        _bootstrap_log(f"update popup imports failed: {e}")
+        _schedule_popup_retry(manifest, _retry_attempt, f"imports: {e}")
+        return False
+    try:
+        from org.telegram.ui.Components import BackupImageView
+    except Exception:
+        BackupImageView = None
+
+    try:
+        frag = get_last_fragment()
+        ctx = frag.getParentActivity() if frag and frag.getParentActivity() else None
+        if ctx is None:
+            try:
+                ctx = ApplicationLoader.applicationContext
+            except Exception:
+                ctx = None
+        if ctx is None:
+            _schedule_popup_retry(manifest, _retry_attempt, "no UI context")
+            return False
+    except Exception as e:
+        _schedule_popup_retry(manifest, _retry_attempt, f"context lookup: {e}")
+        return False
+
+    state = {"started": False, "done": False}
+
+    def _build_and_show():
+        try:
+            try:
+                accent = int(Theme.getColor(Theme.key_featuredStickers_addButton))
+            except Exception:
+                accent = 0xFF5B8CFF
+            try:
+                accent_text = int(Theme.getColor(Theme.key_featuredStickers_buttonText))
+            except Exception:
+                accent_text = 0xFFFFFFFF
+            try:
+                bg_color = int(Theme.getColor(Theme.key_dialogBackground))
+            except Exception:
+                bg_color = 0xFF14161B
+            try:
+                text_color = int(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+            except Exception:
+                text_color = 0xFFFFFFFF
+            try:
+                muted_color = int(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            except Exception:
+                muted_color = 0xFF9AA3AE
+
+            # ---- Material 3 surface tones, derived from accent + background ----
+            def _blend(over_argb, base_argb, alpha_over):
+                a = max(0.0, min(1.0, float(alpha_over)))
+                inv = 1.0 - a
+                ro = (over_argb >> 16) & 0xFF
+                go = (over_argb >> 8) & 0xFF
+                bo = over_argb & 0xFF
+                rb = (base_argb >> 16) & 0xFF
+                gb = (base_argb >> 8) & 0xFF
+                bb = base_argb & 0xFF
+                r = int(round(ro * a + rb * inv))
+                g = int(round(go * a + gb * inv))
+                b = int(round(bo * a + bb * inv))
+                return (0xFF << 24) | (r << 16) | (g << 8) | b
+
+            surface_color = _blend(accent, bg_color, 0.06)        # subtle tint
+            container_color = _blend(accent, bg_color, 0.12)       # cards
+            container_color_2 = _blend(accent, bg_color, 0.18)     # raised
+            track_bg_color = _blend(accent, bg_color, 0.22)        # progress track
+            chip_color = _blend(accent, bg_color, 0.20)            # version chip
+            divider_color = _blend(accent, bg_color, 0.10)
+
+            sheet = BottomSheet(ctx, True)
+
+            outer = LinearLayout(ctx)
+            outer.setOrientation(LinearLayout.VERTICAL)
+            outer.setPadding(
+                AndroidUtilities.dp(20),
+                AndroidUtilities.dp(22),
+                AndroidUtilities.dp(20),
+                AndroidUtilities.dp(20),
+            )
+
+            # ============================================================
+            # HERO — icon glyph in tinted square + title + subtitle + chip
+            # ============================================================
+            hero = LinearLayout(ctx)
+            hero.setOrientation(LinearLayout.HORIZONTAL)
+            hero.setGravity(Gravity.CENTER_VERTICAL)
+            outer.addView(hero, LinearLayout.LayoutParams(-1, -2))
+
+            icon_box = FrameLayout(ctx)
+            try:
+                ib = GradientDrawable()
+                ib.setCornerRadius(AndroidUtilities.dp(18))
+                ib.setColor(_blend(accent, bg_color, 0.20))
+                icon_box.setBackground(ib)
+                icon_box.setClipToOutline(True)
+                icon_box.setOutlineProvider(ViewOutlineProvider.BACKGROUND)
+            except Exception:
+                pass
+
+            sticker_bound = False
+            sticker_view_ref = None
+            if BackupImageView is not None:
+                try:
+                    sticker_view = BackupImageView(ctx)
+                    try:
+                        sticker_view.setRoundRadius(AndroidUtilities.dp(14))
+                    except Exception:
+                        pass
+                    icon_box.addView(
+                        sticker_view,
+                        FrameLayout.LayoutParams(
+                            AndroidUtilities.dp(48),
+                            AndroidUtilities.dp(48),
+                            Gravity.CENTER,
+                        ),
+                    )
+                    # __icon__ = HappyHappyPepe/31. Try 31 first, fall back to
+                    # earlier indexes if the set doesn't have it. Async fetch
+                    # via MediaDataController if not cached locally.
+                    try:
+                        _bind_eblannft_popup_sticker(
+                            sticker_view,
+                            set_name="HappyHappyPepe",
+                            indexes=(31, 30, 0),
+                            image_filter="120_120",
+                        )
+                        sticker_bound = True
+                        sticker_view_ref = sticker_view
+                    except Exception as e:
+                        _bootstrap_log(f"sticker bind failed: {e}")
+                except Exception as e:
+                    _bootstrap_log(f"BackupImageView setup failed: {e}")
+
+            if not sticker_bound:
+                icon_glyph = TextView(ctx)
+                try:
+                    icon_glyph.setText("⬇")  # safer fallback glyph
+                    icon_glyph.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 26)
+                    icon_glyph.setTextColor(accent)
+                    icon_glyph.setGravity(Gravity.CENTER)
+                    try:
+                        icon_glyph.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                icon_box.addView(
+                    icon_glyph,
+                    FrameLayout.LayoutParams(-1, -1, Gravity.CENTER),
+                )
+
+            hero.addView(
+                icon_box,
+                LinearLayout.LayoutParams(AndroidUtilities.dp(54), AndroidUtilities.dp(54)),
+            )
+
+            hero_text = LinearLayout(ctx)
+            hero_text.setOrientation(LinearLayout.VERTICAL)
+            try:
+                lp_ht = LinearLayout.LayoutParams(0, -2, 1.0)
+                lp_ht.leftMargin = AndroidUtilities.dp(14)
+                hero.addView(hero_text, lp_ht)
+            except Exception:
+                hero.addView(hero_text, LinearLayout.LayoutParams(-1, -2))
+
+            # Adapt the hero copy to whether we're upgrading or rolling back.
+            try:
+                _is_upgrade = _is_remote_upgrade(manifest.get("version"))
+            except Exception:
+                _is_upgrade = True
+            title = TextView(ctx)
+            title.setText(
+                "Обновление готово" if _is_upgrade else f"Откат на v{manifest.get('version', '?')}"
+            )
+            try:
+                title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+                title.setTextColor(text_color)
+                title.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            except Exception:
+                pass
+            hero_text.addView(title, LinearLayout.LayoutParams(-1, -2))
+
+            subtitle = TextView(ctx)
+            subtitle.setText("eblanNFT")
+            try:
+                subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                subtitle.setTextColor(muted_color)
+            except Exception:
+                pass
+            lp_sub = LinearLayout.LayoutParams(-1, -2)
+            try:
+                lp_sub.topMargin = AndroidUtilities.dp(2)
+            except Exception:
+                pass
+            hero_text.addView(subtitle, lp_sub)
+
+            # Version chip on its own line, slightly indented under hero.
+            chip_row = LinearLayout(ctx)
+            chip_row.setOrientation(LinearLayout.HORIZONTAL)
+            chip_row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL)
+            lp_chip_row = LinearLayout.LayoutParams(-1, -2)
+            try:
+                lp_chip_row.topMargin = AndroidUtilities.dp(14)
+            except Exception:
+                pass
+            outer.addView(chip_row, lp_chip_row)
+
+            chip = TextView(ctx)
+            try:
+                chip.setText(
+                    f"  v{__version__}   →   v{manifest.get('version', '?')}  "
+                )
+                chip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+                chip.setTextColor(accent)
+                chip.setGravity(Gravity.CENTER)
+                try:
+                    chip.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                except Exception:
+                    pass
+                chip.setPadding(
+                    AndroidUtilities.dp(10),
+                    AndroidUtilities.dp(6),
+                    AndroidUtilities.dp(10),
+                    AndroidUtilities.dp(6),
+                )
+                cb = GradientDrawable()
+                cb.setCornerRadius(AndroidUtilities.dp(999))
+                cb.setColor(chip_color)
+                chip.setBackground(cb)
+            except Exception:
+                pass
+            chip_row.addView(chip, LinearLayout.LayoutParams(-2, -2))
+
+            # ============================================================
+            # CHANGE NOTES card
+            # ============================================================
+            notes_text = manifest.get("notes") or ""
+            if notes_text:
+                notes_card = LinearLayout(ctx)
+                notes_card.setOrientation(LinearLayout.VERTICAL)
+                try:
+                    nc_bg = GradientDrawable()
+                    nc_bg.setCornerRadius(AndroidUtilities.dp(20))
+                    nc_bg.setColor(container_color)
+                    notes_card.setBackground(nc_bg)
+                    notes_card.setPadding(
+                        AndroidUtilities.dp(16),
+                        AndroidUtilities.dp(14),
+                        AndroidUtilities.dp(16),
+                        AndroidUtilities.dp(14),
+                    )
+                except Exception:
+                    pass
+                lp_nc = LinearLayout.LayoutParams(-1, -2)
+                try:
+                    lp_nc.topMargin = AndroidUtilities.dp(18)
+                except Exception:
+                    pass
+                outer.addView(notes_card, lp_nc)
+
+                notes_header = TextView(ctx)
+                try:
+                    notes_header.setText("Что нового")
+                    notes_header.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                    notes_header.setTextColor(accent)
+                    notes_header.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                    notes_header.setLetterSpacing(0.04)
+                    notes_header.setAllCaps(True)
+                except Exception:
+                    pass
+                notes_card.addView(notes_header, LinearLayout.LayoutParams(-1, -2))
+
+                notes_scroll = ScrollView(ctx)
+                try:
+                    notes_scroll.setVerticalScrollBarEnabled(False)
+                except Exception:
+                    pass
+
+                # Parse the notes into bullets and render each as a small
+                # accent dot + text row, so the user scans changes instead
+                # of reading a wall of prose.
+                bullets_container = LinearLayout(ctx)
+                bullets_container.setOrientation(LinearLayout.VERTICAL)
+
+                try:
+                    bullet_items = _parse_notes_bullets(notes_text)
+                except Exception:
+                    bullet_items = [notes_text]
+
+                if not bullet_items:
+                    bullet_items = [notes_text]
+
+                for idx, item_text in enumerate(bullet_items):
+                    if not item_text:
+                        continue
+                    row = LinearLayout(ctx)
+                    row.setOrientation(LinearLayout.HORIZONTAL)
+                    row.setGravity(Gravity.TOP)
+
+                    # The dot — 6dp accent disc, vertically nudged down to
+                    # sit on the cap-height of the first line.
+                    dot = View(ctx)
+                    try:
+                        d = GradientDrawable()
+                        d.setShape(GradientDrawable.OVAL)
+                        d.setColor(accent)
+                        dot.setBackground(d)
+                    except Exception:
+                        pass
+                    lp_dot = LinearLayout.LayoutParams(
+                        AndroidUtilities.dp(6),
+                        AndroidUtilities.dp(6),
+                    )
+                    try:
+                        lp_dot.topMargin = AndroidUtilities.dp(8)
+                        lp_dot.rightMargin = AndroidUtilities.dp(12)
+                    except Exception:
+                        pass
+                    row.addView(dot, lp_dot)
+
+                    item_tv = TextView(ctx)
+                    try:
+                        item_tv.setText(str(item_text))
+                        item_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                        item_tv.setTextColor(text_color)
+                        item_tv.setLineSpacing(0.0, 1.18)
+                    except Exception:
+                        pass
+                    try:
+                        row.addView(item_tv, LinearLayout.LayoutParams(0, -2, 1.0))
+                    except Exception:
+                        row.addView(item_tv, LinearLayout.LayoutParams(-1, -2))
+
+                    lp_row = LinearLayout.LayoutParams(-1, -2)
+                    if idx > 0:
+                        try:
+                            lp_row.topMargin = AndroidUtilities.dp(8)
+                        except Exception:
+                            pass
+                    bullets_container.addView(row, lp_row)
+
+                notes_scroll.addView(bullets_container, FrameLayout.LayoutParams(-1, -2))
+                lp_notes = LinearLayout.LayoutParams(-1, AndroidUtilities.dp(180))
+                lp_notes.topMargin = AndroidUtilities.dp(10)
+                notes_card.addView(notes_scroll, lp_notes)
+
+            # ============================================================
+            # PROGRESS card
+            # ============================================================
+            progress_card = LinearLayout(ctx)
+            progress_card.setOrientation(LinearLayout.VERTICAL)
+            try:
+                pc_bg = GradientDrawable()
+                pc_bg.setCornerRadius(AndroidUtilities.dp(20))
+                pc_bg.setColor(container_color)
+                progress_card.setBackground(pc_bg)
+                progress_card.setPadding(
+                    AndroidUtilities.dp(16),
+                    AndroidUtilities.dp(14),
+                    AndroidUtilities.dp(16),
+                    AndroidUtilities.dp(16),
+                )
+            except Exception:
+                pass
+            lp_pc = LinearLayout.LayoutParams(-1, -2)
+            try:
+                lp_pc.topMargin = AndroidUtilities.dp(14)
+            except Exception:
+                pass
+            outer.addView(progress_card, lp_pc)
+
+            head = LinearLayout(ctx)
+            head.setOrientation(LinearLayout.HORIZONTAL)
+            head.setGravity(Gravity.CENTER_VERTICAL)
+            progress_card.addView(head, LinearLayout.LayoutParams(-1, -2))
+
+            progress_label = TextView(ctx)
+            try:
+                progress_label.setText("Готово к загрузке")
+                progress_label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+                progress_label.setTextColor(text_color)
+                progress_label.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            except Exception:
+                pass
+            try:
+                head.addView(progress_label, LinearLayout.LayoutParams(0, -2, 1.0))
+            except Exception:
+                head.addView(progress_label, LinearLayout.LayoutParams(-1, -2))
+
+            percent = TextView(ctx)
+            try:
+                percent.setText("0%")
+                percent.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+                percent.setTextColor(accent)
+                percent.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+            except Exception:
+                pass
+            head.addView(percent, LinearLayout.LayoutParams(-2, -2))
+
+            track_wrap = FrameLayout(ctx)
+            track_bg = View(ctx)
+            track_fill = View(ctx)
+            try:
+                tb = GradientDrawable()
+                tb.setCornerRadius(AndroidUtilities.dp(999))
+                tb.setColor(track_bg_color)
+                track_bg.setBackground(tb)
+
+                # Gradient fill: accent → slightly lighter accent so it has
+                # depth instead of looking flat.
+                light_accent = _blend(0xFFFFFFFF, accent, 0.18)
+                tf = GradientDrawable(
+                    GradientDrawable.Orientation.LEFT_RIGHT,
+                    [accent, light_accent],
+                )
+                tf.setCornerRadius(AndroidUtilities.dp(999))
+                track_fill.setBackground(tf)
+                track_fill.setPivotX(0.0)
+                track_fill.setScaleX(0.0)
+            except Exception:
+                pass
+            track_wrap.addView(
+                track_bg,
+                FrameLayout.LayoutParams(-1, AndroidUtilities.dp(12), Gravity.CENTER_VERTICAL),
+            )
+            track_wrap.addView(
+                track_fill,
+                FrameLayout.LayoutParams(-1, AndroidUtilities.dp(12), Gravity.CENTER_VERTICAL),
+            )
+            lp_track = LinearLayout.LayoutParams(-1, AndroidUtilities.dp(14))
+            lp_track.topMargin = AndroidUtilities.dp(14)
+            progress_card.addView(track_wrap, lp_track)
+
+            status = TextView(ctx)
+            try:
+                status.setText("Скачивание не запущено")
+                status.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                status.setTextColor(muted_color)
+                status.setLineSpacing(0.0, 1.12)
+            except Exception:
+                pass
+            lp_status = LinearLayout.LayoutParams(-1, -2)
+            lp_status.topMargin = AndroidUtilities.dp(12)
+            progress_card.addView(status, lp_status)
+
+            # ============================================================
+            # ACTION BUTTONS — primary filled + secondary text
+            # ============================================================
+            action_btn = TextView(ctx)
+            action_btn.setText("Скачать обновление" if _is_upgrade else "Установить эту версию")
+            try:
+                action_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                action_btn.setGravity(Gravity.CENTER)
+                ab = GradientDrawable()
+                ab.setCornerRadius(AndroidUtilities.dp(24))
+                ab.setColor(accent)
+                action_btn.setBackground(ab)
+                action_btn.setTextColor(accent_text)
+                try:
+                    action_btn.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                except Exception:
+                    pass
+                action_btn.setPadding(
+                    AndroidUtilities.dp(20),
+                    AndroidUtilities.dp(14),
+                    AndroidUtilities.dp(20),
+                    AndroidUtilities.dp(14),
+                )
+            except Exception:
+                pass
+            lp_action = LinearLayout.LayoutParams(-1, -2)
+            lp_action.topMargin = AndroidUtilities.dp(20)
+            outer.addView(action_btn, lp_action)
+
+            close_btn = TextView(ctx)
+            close_btn.setText("Позже")
+            try:
+                close_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                close_btn.setGravity(Gravity.CENTER)
+                close_btn.setTextColor(muted_color)
+                close_btn.setPadding(
+                    AndroidUtilities.dp(16),
+                    AndroidUtilities.dp(12),
+                    AndroidUtilities.dp(16),
+                    AndroidUtilities.dp(12),
+                )
+            except Exception:
+                pass
+            lp_close = LinearLayout.LayoutParams(-1, -2)
+            lp_close.topMargin = AndroidUtilities.dp(4)
+            outer.addView(close_btn, lp_close)
+
+            # Track-fill state — we drive the bar both by setScaleX (cheap path)
+            # AND by direct LayoutParams.width fallback (some Android builds
+            # silently drop ViewPropertyAnimator scaleX from 0 → small_value
+            # so the bar stayed empty even at 50%+).
+            track_state = {"ratio": 0.0, "track_w": 0}
+
+            def _set_ratio(ratio):
+                try:
+                    r = max(0.0, min(1.0, float(ratio or 0.0)))
+                except Exception:
+                    r = 0.0
+                # Monotone fill: never visually retract (idle resets are rare;
+                # the Telegram download path occasionally emits a stale earlier
+                # ratio and we don't want the bar to bounce backwards).
+                if r < float(track_state.get("ratio", 0.0) or 0.0) - 0.02:
+                    return
+                track_state["ratio"] = r
+
+                def _apply():
+                    # Method A — pivoted scaleX. Works on most builds.
+                    try:
+                        track_fill.setPivotX(0.0)
+                        track_fill.setScaleX(float(r))
+                    except Exception:
+                        pass
+                    # Method B — also size the View via LayoutParams.width so
+                    # the fill is visible even on builds where scaleX glitches
+                    # (some MIUI / Honor / Huawei skins). Pick width from the
+                    # measured track_bg width once it's laid out.
+                    try:
+                        tw = int(track_state.get("track_w", 0) or 0)
+                        if tw <= 0:
+                            try:
+                                tw = int(track_bg.getWidth() or 0)
+                            except Exception:
+                                tw = 0
+                            if tw > 0:
+                                track_state["track_w"] = tw
+                        if tw > 0:
+                            new_w = max(0, int(round(tw * float(r))))
+                            try:
+                                lp = track_fill.getLayoutParams()
+                                if lp is not None and getattr(lp, "width", -1) != new_w:
+                                    lp.width = new_w
+                                    track_fill.setLayoutParams(lp)
+                                    # Method B uses width, reset scaleX to 1 so
+                                    # we don't double-shrink.
+                                    track_fill.setScaleX(1.0)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        track_fill.invalidate()
+                    except Exception:
+                        pass
+
+                try:
+                    run_on_ui_thread(_apply)
+                except Exception:
+                    try:
+                        _apply()
+                    except Exception:
+                        pass
+
+            def _set_status(text):
+                try:
+                    status.setText(str(text or ""))
+                except Exception:
+                    pass
+
+            def _set_label(text):
+                try:
+                    progress_label.setText(str(text or ""))
+                except Exception:
+                    pass
+
+            # Single persistent percent-tween thread. Eliminates the wobble
+            # bug where overlapping per-callback tweens raced each other on
+            # the UI queue (every progress chunk spawned a new 220ms tween,
+            # and queued setText lambdas arrived out of order producing the
+            # 19→21→20 flicker). Now: one daemon, always pulls the latest
+            # target, never decreases the displayed value.
+            percent_state = {
+                "current": 0.0,   # last value actually pushed to TextView
+                "target": 0.0,    # latest goal
+                "running": False,
+                "stop": False,
+                "last_text": "",
+            }
+
+            def _percent_loop():
+                try:
+                    idle_ticks = 0
+                    while not percent_state.get("stop"):
+                        cur = float(percent_state.get("current", 0.0) or 0.0)
+                        tgt = float(percent_state.get("target", 0.0) or 0.0)
+                        delta = tgt - cur
+                        if abs(delta) < 0.05:
+                            cur = tgt
+                            percent_state["current"] = cur
+                            idle_ticks += 1
+                            # Self-terminate after ~1s of no work.
+                            if idle_ticks > 30:
+                                percent_state["running"] = False
+                                return
+                            try:
+                                time.sleep(0.033)
+                            except Exception:
+                                return
+                            continue
+                        idle_ticks = 0
+                        # Move ~22% of the gap per frame → ~6 frames to converge.
+                        step = delta * 0.22
+                        if abs(step) < 0.25:
+                            step = 0.25 if step > 0 else -0.25
+                        new_cur = cur + step
+                        # Clamp so we don't overshoot or move backwards visually.
+                        if delta > 0 and new_cur > tgt:
+                            new_cur = tgt
+                        elif delta < 0 and new_cur < tgt:
+                            new_cur = tgt
+                        if new_cur < cur:
+                            new_cur = cur  # never retract — see _set_ratio note
+                        percent_state["current"] = new_cur
+                        txt = f"{int(round(new_cur))}%"
+                        if txt != percent_state.get("last_text"):
+                            percent_state["last_text"] = txt
+                            try:
+                                run_on_ui_thread(lambda t=txt: percent.setText(t))
+                            except Exception:
+                                pass
+                        try:
+                            time.sleep(0.033)  # ~30fps
+                        except Exception:
+                            return
+                finally:
+                    percent_state["running"] = False
+
+            def _set_percent(value):
+                try:
+                    target = float(value)
+                except Exception:
+                    target = 0.0
+                # Never push the target backwards — protects against stale
+                # progress ticks that would make the percent flicker down.
+                if target < float(percent_state.get("target", 0.0) or 0.0):
+                    return
+                percent_state["target"] = target
+                # Snap on tiny deltas — no animation needed.
+                cur = float(percent_state.get("current", 0.0) or 0.0)
+                if abs(target - cur) < 0.5:
+                    percent_state["current"] = target
+                    txt = f"{int(round(target))}%"
+                    if txt != percent_state.get("last_text"):
+                        percent_state["last_text"] = txt
+                        try:
+                            run_on_ui_thread(lambda t=txt: percent.setText(t))
+                        except Exception:
+                            try:
+                                percent.setText(txt)
+                            except Exception:
+                                pass
+                    return
+                # Spin up the persistent loop on first real motion.
+                if not percent_state.get("running"):
+                    percent_state["running"] = True
+                    try:
+                        threading.Thread(target=_percent_loop, daemon=True).start()
+                    except Exception:
+                        # Fallback: just snap.
+                        percent_state["current"] = target
+                        try:
+                            run_on_ui_thread(lambda t=target: percent.setText(f"{int(round(t))}%"))
+                        except Exception:
+                            try:
+                                percent.setText(f"{int(round(target))}%")
+                            except Exception:
+                                pass
+
+            def _ui_progress(idx, total_steps, current_path, applying, current_bytes,
+                              current_total, overall_bytes, overall_total):
+                if overall_total > 0:
+                    ratio = overall_bytes / float(overall_total)
+                elif current_total > 0:
+                    ratio = current_bytes / float(current_total)
+                else:
+                    ratio = max(0.0, (idx - 1) / float(max(1, total_steps)))
+                _set_ratio(ratio)
+                _set_percent(ratio * 100.0)
+                _set_label("Применение…" if applying else "Скачивание…")
+                _set_status(_format_progress_status(current_path, current_bytes,
+                                                    current_total, applying=applying))
+
+            def _on_progress(**kw):
+                def _do():
+                    _ui_progress(**kw)
+                run_on_ui_thread(_do)
+
+            # Auto-restart countdown — after a successful download we wait
+            # 5 seconds with a live ticker on the action button before
+            # restarting on our own. The user can tap it to restart now,
+            # or tap "Отмена" to stop the auto-restart.
+            countdown_state = {"active": False, "remaining": 0, "tok": 0}
+
+            def _start_restart_countdown(seconds=5):
+                countdown_state["active"] = True
+                countdown_state["remaining"] = int(seconds)
+                countdown_state["tok"] = countdown_state.get("tok", 0) + 1
+                my_tok = countdown_state["tok"]
+                try:
+                    run_on_ui_thread(lambda: close_btn.setText("Отмена"))
+                except Exception:
+                    pass
+
+                def _ticker():
+                    while True:
+                        if countdown_state.get("tok") != my_tok or not countdown_state.get("active"):
+                            return
+                        rem = int(countdown_state.get("remaining", 0))
+                        if rem <= 0:
+                            try:
+                                run_on_ui_thread(_restart_application)
+                            except Exception:
+                                try:
+                                    _restart_application()
+                                except Exception:
+                                    pass
+                            return
+                        try:
+                            run_on_ui_thread(lambda r=rem: action_btn.setText(f"Перезапустить ({r})"))
+                        except Exception:
+                            pass
+                        try:
+                            time.sleep(1.0)
+                        except Exception:
+                            return
+                        countdown_state["remaining"] = rem - 1
+
+                try:
+                    threading.Thread(target=_ticker, daemon=True).start()
+                except Exception:
+                    pass
+
+            def _cancel_restart_countdown():
+                countdown_state["active"] = False
+                try:
+                    run_on_ui_thread(lambda: action_btn.setText("Перезапустить"))
+                except Exception:
+                    pass
+                try:
+                    run_on_ui_thread(lambda: close_btn.setText("Позже"))
+                except Exception:
+                    pass
+
+            def _do_download():
+                try:
+                    _download_and_apply_update(manifest, progress_cb=_on_progress)
+                    def _done():
+                        state["done"] = True
+                        _set_ratio(1.0)
+                        _set_percent(100)
+                        _set_label("Готово")
+                        _set_status("Файлы установлены. Перезапуск через несколько секунд…")
+                        try:
+                            action_btn.setText("Перезапустить (5)")
+                            action_btn.setEnabled(True)
+                            action_btn.setAlpha(1.0)
+                        except Exception:
+                            pass
+                        try:
+                            _start_restart_countdown(seconds=5)
+                        except Exception:
+                            pass
+                    run_on_ui_thread(_done)
+                except Exception as e:
+                    err = e
+                    def _err():
+                        state["started"] = False
+                        _set_label("Ошибка")
+                        _set_status(f"Не удалось скачать: {err}")
+                        try:
+                            action_btn.setText("Повторить")
+                            action_btn.setEnabled(True)
+                            action_btn.setAlpha(1.0)
+                        except Exception:
+                            pass
+                    run_on_ui_thread(_err)
+
+            try:
+                from android_utils import OnClickListener
+            except Exception:
+                OnClickListener = None
+
+            def _on_action():
+                if state["done"]:
+                    _restart_application()
+                    return
+                if state["started"]:
+                    return
+                state["started"] = True
+                try:
+                    action_btn.setEnabled(False)
+                    action_btn.setAlpha(0.85)
+                    action_btn.setText("Скачивается…")
+                except Exception:
+                    pass
+                _set_label("Скачивание…")
+                _set_status("Получаю файлы из GitHub…")
+                threading.Thread(target=_do_download, daemon=True).start()
+
+            def _on_close():
+                # If the auto-restart ticker is running, the secondary button
+                # acts as "Отмена" and just stops the countdown — the user
+                # stays on the success screen with a manual «Перезапустить».
+                if countdown_state.get("active"):
+                    _cancel_restart_countdown()
+                    try:
+                        _set_status("Файлы установлены. Нажми «Перезапустить», чтобы применить.")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    sheet.dismiss()
+                except Exception:
+                    pass
+
+            if OnClickListener is not None:
+                try:
+                    action_btn.setOnClickListener(OnClickListener(lambda _v=None: _on_action()))
+                    close_btn.setOnClickListener(OnClickListener(lambda _v=None: _on_close()))
+                except Exception:
+                    pass
+
+            sheet.setCustomView(outer)
+
+            # Subtle entry animation: hero slides up, content fades in.
+            try:
+                outer.setAlpha(0.0)
+                outer.animate().alpha(1.0).setDuration(220).start()
+            except Exception:
+                pass
+            try:
+                hero.setTranslationY(float(AndroidUtilities.dp(8)))
+                hero.animate().translationY(0.0).setDuration(260).start()
+            except Exception:
+                pass
+            try:
+                if 'progress_card' in dir():
+                    progress_card.setAlpha(0.0)
+                    progress_card.setTranslationY(float(AndroidUtilities.dp(8)))
+                    progress_card.animate().alpha(1.0).translationY(0.0).setStartDelay(70).setDuration(260).start()
+            except Exception:
+                pass
+            try:
+                action_btn.setAlpha(0.0)
+                action_btn.setTranslationY(float(AndroidUtilities.dp(10)))
+                action_btn.animate().alpha(1.0).translationY(0.0).setStartDelay(120).setDuration(240).start()
+            except Exception:
+                pass
+
+            try:
+                sheet.show()
+            except Exception:
+                run_on_ui_thread(sheet.show)
+
+            # Some Telegram builds attach the receiver lazily — re-kick the
+            # animation after show() so the TGS plays even if the document
+            # arrived after our first startAnimation() call.
+            if sticker_view_ref is not None:
+                try:
+                    from java import dynamic_proxy
+                    Runnable = jclass("java.lang.Runnable")
+
+                    def _make_rekick():
+                        sv = sticker_view_ref
+
+                        class _Tick(dynamic_proxy(Runnable)):
+                            def run(self_obj):
+                                try:
+                                    _enable_sticker_animation(sv)
+                                except Exception:
+                                    pass
+                                return None
+                        return _Tick()
+
+                    for delay_ms in (180, 600, 1500):
+                        try:
+                            sticker_view_ref.postDelayed(_make_rekick(), int(delay_ms))
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _bootstrap_log(f"sticker re-kick scheduling failed: {e}")
+        except Exception as e:
+            _bootstrap_log(f"popup build failure: {e}")
+
+    run_on_ui_thread(_build_and_show)
+    return True
+
+
+def _check_for_update_interactive():
+    """Manual update check, triggered from the Service menu.
+
+    Always polls (ignores the 4-hour throttle), shows a bulletin while
+    checking, and either opens the popup (newer version) or surfaces a
+    success/error toast.
+    """
+    if _LOAD_ERROR is not None:
+        return
+    try:
+        from ui.bulletin import BulletinHelper
+    except Exception:
+        BulletinHelper = None
+    try:
+        from android_utils import run_on_ui_thread
+    except Exception:
+        run_on_ui_thread = None
+
+    def _toast(method_name, text):
+        if BulletinHelper is None:
+            return
+        method = getattr(BulletinHelper, method_name, None)
+        if not callable(method):
+            return
+        if run_on_ui_thread is not None:
+            run_on_ui_thread(lambda: method(text))
+        else:
+            try:
+                method(text)
+            except Exception:
+                pass
+
+    _toast("show_info", f"Проверяю обновления для v{__version__}…")
+
+    def _worker():
+        try:
+            manifest = _fetch_manifest()
+            _write_last_check_ts(time.time())
+            remote_v = str(manifest.get("version", "?"))
+            if not _is_remote_different(remote_v):
+                _toast("show_success", f"В репо та же версия: v{__version__}")
+                return
+            _bootstrap_log(f"manual update check: v{__version__} -> v{remote_v}")
+            _show_update_popup(manifest)
+        except Exception as e:
+            _toast("show_error", f"Не удалось проверить обновления: {e}")
+            _bootstrap_log(f"manual update check error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _maybe_check_for_update(force=False, reason="load"):
+    """Background-poll the manifest. Show popup if a newer version is published.
+
+    `reason` toggles the throttle: load-time uses the long 4-hour gate so we
+    don't hammer GitHub on every cold start; 'resume' uses a much shorter
+    gate so coming back from recent apps still picks up new releases without
+    a force-stop. Manual checks pass force=True to bypass both gates.
+    """
+    if _LOAD_ERROR is not None:
+        return
+    try:
+        last_ts = _read_last_check_ts()
+        now = time.time()
+        # Bypass the throttle for plugin-load checks — `on_plugin_load` fires
+        # once per app session (and once right after install), so doing one
+        # HTTP request each time is cheap and means a freshly installed/upgraded
+        # plugin instantly shows the update popup if a newer build was pushed.
+        # Resume polls keep their short 2-min throttle.
+        if str(reason or "") == "resume":
+            threshold = _UPDATE_CHECK_RESUME_THROTTLE_SEC
+            if not force and last_ts and (now - last_ts) < threshold:
+                return
+        # else: load — always check, no early return.
+    except Exception:
+        pass
+
+    def _worker():
+        try:
+            manifest = _fetch_manifest()
+            _write_last_check_ts(time.time())
+            remote_v = str(manifest.get("version", "?"))
+            if not _is_remote_different(remote_v):
+                _bootstrap_log(f"up to date: local v{__version__} == remote v{remote_v}")
+                return
+            kind = "upgrade" if _is_remote_upgrade(remote_v) else "rollback"
+            _bootstrap_log(f"manifest {kind} available: v{__version__} -> v{remote_v}")
+            _show_update_popup(manifest)
+        except Exception as e:
+            _bootstrap_log(f"update check error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _schedule_update_check():
+    """Defer the check so we don't race with plugin/UI initialization."""
+    try:
+        from java import jclass
+        from org.telegram.messenger import AndroidUtilities
+        Runnable = jclass("java.lang.Runnable")
+        from java import dynamic_proxy
+
+        class _Tick(dynamic_proxy(Runnable)):
+            def run(self_obj):
+                try:
+                    _maybe_check_for_update()
+                except Exception as e:
+                    _bootstrap_log(f"scheduled check error: {e}")
+                return None
+
+        AndroidUtilities.runOnUIThread(_Tick(), int(_UPDATE_CHECK_DELAY_MS))
+        return True
+    except Exception:
+        # Fallback: pure Python timer thread.
+        def _delayed():
+            try:
+                time.sleep(_UPDATE_CHECK_DELAY_MS / 1000.0)
+                _maybe_check_for_update()
+            except Exception:
+                pass
+        threading.Thread(target=_delayed, daemon=True).start()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Plugin class — subclasses the runtime impl and adds the update check on load.
+# ---------------------------------------------------------------------------
+
+
+if isinstance(_EblanNftImpl, type) and issubclass(_EblanNftImpl, BasePlugin):
+    class EblanNftPlugin(_EblanNftImpl):
+        def on_plugin_load(self):
+            if _LOAD_ERROR is not None:
+                _maybe_show_storage_permission_alert(_LOAD_ERROR)
+                raise RuntimeError(f"eblanNFT runtime unavailable: {_LOAD_ERROR}")
+            parent = getattr(super(), "on_plugin_load", None)
+            if callable(parent):
+                parent()
+            try:
+                _schedule_update_check()
+            except Exception as e:
+                _bootstrap_log(f"update bootstrap error: {e}")
+            return None
+
+        def _create_service_settings_subfragment(self, parent_view=None):
+            base_items = []
+            try:
+                base_items = list(super()._create_service_settings_subfragment(parent_view) or [])
+            except Exception as e:
+                _bootstrap_log(f"service base build failed: {e}")
+
+            try:
+                from ui.settings import Text
+            except Exception as e:
+                _bootstrap_log(f"ui.settings import failed in service patch: {e}")
+                return base_items
+
+            update_row = Text(
+                text="Версия и обновления",
+                subtext=f"v{__version__} • проверить на GitHub",
+                icon="msg_download",
+                on_click=lambda _: _check_for_update_interactive(),
+            )
+
+            insert_at = 0
+            for i, item in enumerate(base_items):
+                if type(item).__name__ == "Divider":
+                    insert_at = i + 1
+                    break
+            base_items.insert(insert_at, update_row)
+            return base_items
+else:
+    class EblanNftPlugin(BasePlugin):
+        def on_plugin_load(self):
+            _maybe_show_storage_permission_alert(_LOAD_ERROR)
+            # _LOAD_ERROR is None in the rare case where _load_eblannft_impl
+            # returned a class but the issubclass check failed silently —
+            # surface a useful message instead of literal "None".
+            err_text = (
+                str(_LOAD_ERROR) if _LOAD_ERROR is not None
+                else (
+                    "runtime impl resolved but is not a BasePlugin subclass "
+                    "(likely a stale module after disable/enable — try "
+                    "force-stop the app or reinstall the plugin)"
+                )
+            )
+            raise RuntimeError(f"eblanNFT runtime unavailable: {err_text}")
+
+
+NftClonerPlugin = EblanNftPlugin

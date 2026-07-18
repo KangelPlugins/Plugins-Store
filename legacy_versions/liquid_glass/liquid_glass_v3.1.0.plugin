@@ -1,0 +1,3003 @@
+__id__ = "liquid_glass"
+__name__ = "Liquid Glass [Fork]"
+__description__ = "Liquid Glass: стекло на панелях чата и шапках. Blur, Telegram 12.5.1+."
+__author__ = "@PluginProject · @w3b_0s1nt"
+__icon__ = "vkVSfmG_by_achestickbot/5"
+__version__ = "2.3.4"
+__min_version__ = "12.5.1"
+PROFILE_SCHEMA_VERSION = 2
+
+from base_plugin import BasePlugin, MethodHook, AppEvent
+from hook_utils import find_class, get_private_field, set_private_field
+from android_utils import run_on_ui_thread
+from ui.settings import Header, Switch, Divider, Input, Text
+from ui.bulletin import BulletinHelper
+from java import dynamic_proxy
+from android.os import Build
+from android.view import View
+from android.graphics import Color, Rect
+from org.telegram.messenger import SharedConfig, AndroidUtilities
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components.blur3.drawable.color import (
+    BlurredBackgroundColorProvider,
+    BlurredBackgroundColorProviderThemed,
+)
+import json
+import time
+from collections import OrderedDict
+from weakref import WeakSet
+
+_class_cache = {}
+
+DEFAULT_SETTINGS = {
+    "enabled": True,
+    "apply_action_bar": True,
+    "apply_top_panels": True,
+    "apply_search_bar": True,
+    "apply_story_bar": True,
+    "apply_dialogs_list": False,
+    "apply_settings_header": False,
+    "apply_topics_header": False,
+    "action_bar_alpha": "0.82",
+    "panel_alpha": "0.80",
+    "action_bar_thickness": "14",
+    "panel_thickness": "12",
+    "action_bar_intensity": "0.42",
+    "panel_intensity": "0.38",
+    "strong_glass": False,
+    "performance_mode": False,
+    "debug_logs": False,
+}
+
+NUMERIC_SETTING_LIMITS = {
+    "action_bar_alpha": (0.3, 1.0),
+    "panel_alpha": (0.3, 1.0),
+    "action_bar_thickness": (6.0, 32.0),
+    "panel_thickness": (6.0, 32.0),
+    "action_bar_intensity": (0.1, 1.0),
+    "panel_intensity": (0.1, 1.0),
+}
+
+class _ColorProviderProxy(dynamic_proxy(BlurredBackgroundColorProvider)):
+    def __init__(self, base, disable_top_stroke=False, disable_shadow=False, disable_bottom_stroke=False):
+        super().__init__()
+        self._base = base
+        self._disable_top_stroke = disable_top_stroke
+        self._disable_shadow = disable_shadow
+        self._disable_bottom_stroke = disable_bottom_stroke
+
+    def getShadowColor(self):
+        if self._disable_shadow:
+            return 0
+        try:
+            return self._base.getShadowColor()
+        except Exception:
+            return 0
+
+    def getBackgroundColor(self):
+        try:
+            return self._base.getBackgroundColor()
+        except Exception:
+            return 0
+
+    def getStrokeColorTop(self):
+        if self._disable_top_stroke:
+            return 0
+        try:
+            return self._base.getStrokeColorTop()
+        except Exception:
+            return 0
+
+    def getStrokeColorBottom(self):
+        if self._disable_bottom_stroke:
+            return 0
+        try:
+            return self._base.getStrokeColorBottom()
+        except Exception:
+            return 0
+
+
+def safe_find_class(class_name):
+    if class_name in _class_cache:
+        return _class_cache[class_name]
+    try:
+        cls = find_class(class_name)
+        _class_cache[class_name] = cls
+        return cls
+    except Exception:
+        _class_cache[class_name] = None
+        return None
+
+
+def _get_first_available_field(obj, *names):
+    if not obj or not names:
+        return None
+    for name in names:
+        try:
+            v = getattr(obj, name, None)
+        except Exception:
+            v = None
+        if v is not None:
+            return v
+        try:
+            v = get_private_field(obj, name)
+        except Exception:
+            v = None
+        if v is not None:
+            return v
+    return None
+
+
+def _truthy_fragment_flag(raw):
+    if raw is None:
+        return False
+    try:
+        if callable(raw):
+            raw = raw()
+    except Exception:
+        return False
+    try:
+        return bool(raw)
+    except Exception:
+        return False
+
+
+class LiquidGlassPlugin(BasePlugin):
+    _APPLY_DEBOUNCE_MS = 100
+    _PERFORMANCE_DEBOUNCE_MS = 200
+    _DRAWABLE_CACHE_MAX = 256
+    _MIN_TOP_PANEL_DP = 8
+    _MAX_STORY_TOPICS_STRIP_HEIGHT_DP = 200
+    _DIALOGS_EXTRA_FROM_CELL_MS = 520
+    _STARTUP_GRACE_MS = 2400
+    _STARTUP_DEBOUNCE_MIN_MS = 420
+    _STARTUP_EXTRA_DELAY_MIN_MS = 260
+    _STATE_STORE_MAX = 128
+    _FACTORY_RETRY_COOLDOWN_MS = 2500
+    _THEME_BURST_DEBOUNCE_MS = 320
+
+    def __init__(self):
+        super().__init__()
+        self._loaded = False
+        self._hooks = []
+        self._applied = {}
+        self._warned = False
+        self._apply_pending = set()
+        self._apply_requested = set()
+        self._drawable_cache = OrderedDict()
+        self._last_apply_time = {}
+        self._active_chats = WeakSet()
+        self._extras_applied = {}
+        self._active_extras = WeakSet()
+        self._last_dialogs_extra_from_cell = {}
+        self._startup_grace_until_ms = 0.0
+        self._extra_apply_gen = {}
+        self._settings_apply_gen = 0
+        self._factory_cooldown_chat = {}
+        self._factory_cooldown_extra = {}
+        self._diag = {
+            "factory_miss_chat": 0,
+            "factory_miss_extra": 0,
+            "factory_cooldown_skip_chat": 0,
+            "factory_cooldown_skip_extra": 0,
+            "theme_burst_chat": 0,
+            "theme_burst_extra": 0,
+            "state_prunes": 0,
+        }
+
+    def _arm_startup_grace(self):
+        self._startup_grace_until_ms = (time.time() * 1000.0) + float(self._STARTUP_GRACE_MS)
+
+    def _in_startup_grace(self):
+        return (time.time() * 1000.0) < self._startup_grace_until_ms
+
+    def _schedule_settings_reapply(self, delay_ms=120):
+        self._settings_apply_gen += 1
+        gen = int(self._settings_apply_gen)
+
+        def _run():
+            if int(self._settings_apply_gen) != gen:
+                return
+            self._restore_all()
+
+        run_on_ui_thread(_run, delay_ms)
+
+    def on_app_event(self, event_type):
+        if event_type == AppEvent.START:
+            self._arm_startup_grace()
+
+    def on_plugin_load(self):
+        if self._loaded:
+            self.on_plugin_unload()
+        self._warned = False
+        self._loaded = True
+        self._arm_startup_grace()
+        self._hook_chat_activity()
+        self._hook_dialog_cell_extras()
+        self._hook_chat_search_tabs()
+        self._hook_extra_fragments()
+
+    def on_plugin_unload(self):
+        self._loaded = False
+        try:
+            self._last_dialogs_extra_from_cell.clear()
+        except Exception:
+            self._last_dialogs_extra_from_cell = {}
+        for ref in self._hooks:
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hooks.clear()
+        self._drawable_cache.clear()
+        self._startup_grace_until_ms = 0.0
+        self._extra_apply_gen.clear()
+        self._apply_pending.clear()
+        self._apply_requested.clear()
+        self._factory_cooldown_chat.clear()
+        self._factory_cooldown_extra.clear()
+        _class_cache.clear()
+        run_on_ui_thread(lambda: self._restore_all(reapply_after=False))
+
+    def _register_hook(self, ref):
+        if ref and ref not in self._hooks:
+            self._hooks.append(ref)
+
+    def _log_hook_status(self, block_name, added):
+        # Keep diagnostics low-noise but useful on client updates.
+        try:
+            self.log("[LiquidGlass] hooks %s: %d" % (block_name, int(added)))
+        except Exception:
+            pass
+
+    def _debug_enabled(self):
+        try:
+            return bool(self.get_setting("debug_logs", False))
+        except Exception:
+            return False
+
+    def _debug_log(self, text):
+        if not self._debug_enabled():
+            return
+        try:
+            self.log("[LiquidGlass][debug] %s" % str(text))
+        except Exception:
+            pass
+
+    def _class_declared_method(self, cls, name, *arg_types):
+        if not cls:
+            return None
+        # Prefer direct Class API; keep legacy fallback for bridge variants.
+        try:
+            return cls.getDeclaredMethod(name, *arg_types)
+        except Exception:
+            pass
+        try:
+            return cls.getClass().getDeclaredMethod(name, *arg_types)
+        except Exception:
+            return None
+
+    def _class_declared_methods(self, cls):
+        if not cls:
+            return []
+        try:
+            return cls.getDeclaredMethods()
+        except Exception:
+            pass
+        try:
+            return cls.getClass().getDeclaredMethods()
+        except Exception:
+            return []
+
+    def _bump_diag(self, key, inc=1):
+        try:
+            self._diag[key] = int(self._diag.get(key, 0)) + int(inc)
+        except Exception:
+            pass
+
+    def _prune_runtime_state(self):
+        if (
+            len(self._applied) < self._STATE_STORE_MAX
+            and len(self._extras_applied) < self._STATE_STORE_MAX
+            and len(self._last_apply_time) < (self._STATE_STORE_MAX * 2)
+            and len(self._factory_cooldown_chat) < (self._STATE_STORE_MAX * 2)
+            and len(self._factory_cooldown_extra) < (self._STATE_STORE_MAX * 2)
+        ):
+            return
+        keep_chat_ids = set()
+        keep_extra_ids = set()
+        try:
+            keep_chat_ids.update(id(x) for x in list(self._active_chats))
+        except Exception:
+            pass
+        try:
+            keep_extra_ids.update(id(x) for x in list(self._active_extras))
+        except Exception:
+            pass
+        self._applied = {k: v for k, v in self._applied.items() if k in keep_chat_ids}
+        self._extras_applied = {k: v for k, v in self._extras_applied.items() if k in keep_extra_ids}
+        self._last_apply_time = {k: v for k, v in self._last_apply_time.items() if k in keep_chat_ids}
+        self._factory_cooldown_chat = {k: v for k, v in self._factory_cooldown_chat.items() if k in keep_chat_ids}
+        self._factory_cooldown_extra = {k: v for k, v in self._factory_cooldown_extra.items() if k in keep_extra_ids}
+        self._bump_diag("state_prunes")
+
+    def _open_tg(self, username):
+        u = str(username or "").strip().lstrip("@")
+        if not u:
+            return
+        try:
+            AppLoader = safe_find_class("org.telegram.messenger.ApplicationLoader")
+            if AppLoader is None:
+                AppLoader = safe_find_class("com.exteragram.messenger.ApplicationLoader")
+            Intent_cls = safe_find_class("android.content.Intent")
+            Uri_cls = safe_find_class("android.net.Uri")
+            if AppLoader is None or Intent_cls is None or Uri_cls is None:
+                return
+            ctx = AppLoader.applicationContext
+            if ctx is None:
+                return
+            it = Intent_cls(Intent_cls.ACTION_VIEW, Uri_cls.parse("tg://resolve?domain=%s" % u))
+            it.addFlags(Intent_cls.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(it)
+        except Exception:
+            pass
+
+    def _requirements_hint_widgets(self):
+        rows = []
+        try:
+            blur_on = SharedConfig.chatBlurEnabled()
+        except Exception:
+            blur_on = True
+        if not blur_on:
+            rows.append(
+                Text(
+                    text="Включите размытие чата",
+                    subtext="Настройки чата -> Размытие. Без этого стеклянный эффект не отображается.",
+                    icon="msg_warning",
+                )
+            )
+        return rows
+
+    def _get_application_context(self):
+        for pkg in (
+            "org.telegram.messenger.ApplicationLoader",
+            "com.exteragram.messenger.ApplicationLoader",
+        ):
+            AL = safe_find_class(pkg)
+            if not AL:
+                continue
+            try:
+                ctx = AL.applicationContext
+                if ctx is not None:
+                    return ctx
+            except Exception:
+                pass
+        return None
+
+    def _clipboard_copy_text(self, text):
+        ctx = self._get_application_context()
+        if not ctx or not text:
+            return False
+        try:
+            Context = safe_find_class("android.content.Context")
+            ClipData = safe_find_class("android.content.ClipData")
+            if not Context or not ClipData:
+                return False
+            cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            if not cm:
+                return False
+            clip = ClipData.newPlainText("Liquid Glass", text)
+            cm.setPrimaryClip(clip)
+            return True
+        except Exception:
+            return False
+
+    def _clipboard_get_text(self):
+        ctx = self._get_application_context()
+        if not ctx:
+            return None
+        try:
+            Context = safe_find_class("android.content.Context")
+            if not Context:
+                return None
+            cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            if not cm:
+                return None
+            clip = cm.getPrimaryClip()
+            if not clip or clip.getItemCount() < 1:
+                return None
+            t = clip.getItemAt(0).getText()
+            if t is None:
+                return None
+            return str(t)
+        except Exception:
+            return None
+
+    def _coerce_import_value(self, key, raw):
+        if key not in DEFAULT_SETTINGS:
+            return None
+        default = DEFAULT_SETTINGS[key]
+        if isinstance(default, bool):
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, (int, float)):
+                return raw != 0
+            s = str(raw).strip().lower()
+            return s in ("1", "true", "yes", "on", "да")
+        if key in NUMERIC_SETTING_LIMITS:
+            lo, hi = NUMERIC_SETTING_LIMITS[key]
+            try:
+                v = float(str(raw).replace(",", ".").strip())
+            except Exception:
+                return str(default)
+            v = max(float(lo), min(float(hi), v))
+            if float(v).is_integer():
+                return str(int(v))
+            return ("%.3f" % v).rstrip("0").rstrip(".")
+        return str(raw)
+
+    def _export_profile_json(self):
+        payload = {
+            "format": "liquid_glass",
+            "schema_version": PROFILE_SCHEMA_VERSION,
+            "version": __version__,
+            "settings": {k: self.get_setting(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS},
+        }
+        try:
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception:
+            try:
+                BulletinHelper.show_info("Ошибка экспорта")
+            except Exception:
+                pass
+            return
+        if self._clipboard_copy_text(text):
+            try:
+                BulletinHelper.show_info("Профиль скопирован в буфер")
+            except Exception:
+                pass
+        else:
+            try:
+                BulletinHelper.show_info("Не удалось записать буфер обмена")
+            except Exception:
+                pass
+
+    def _import_profile_from_clipboard(self):
+        raw = self._clipboard_get_text()
+        if not raw or not str(raw).strip():
+            try:
+                BulletinHelper.show_info("Буфер пуст")
+            except Exception:
+                pass
+            return
+        try:
+            obj = json.loads(str(raw).strip())
+        except Exception:
+            try:
+                BulletinHelper.show_info("Неверный JSON в буфере")
+            except Exception:
+                pass
+            return
+        if not isinstance(obj, dict):
+            try:
+                BulletinHelper.show_info("Ожидался объект JSON")
+            except Exception:
+                pass
+            return
+        fmt = obj.get("format")
+        if fmt is not None and fmt != "liquid_glass":
+            try:
+                BulletinHelper.show_info("Это не профиль Liquid Glass")
+            except Exception:
+                pass
+            return
+        schema_version = obj.get("schema_version", 1)
+        try:
+            schema_version = int(schema_version)
+        except Exception:
+            schema_version = 1
+        if schema_version > PROFILE_SCHEMA_VERSION:
+            try:
+                BulletinHelper.show_info("Профиль из более новой версии плагина")
+            except Exception:
+                pass
+            return
+        inner = obj.get("settings", obj)
+        if not isinstance(inner, dict):
+            try:
+                BulletinHelper.show_info("Нет блока settings")
+            except Exception:
+                pass
+            return
+        if "apply_profile_header" in inner and "apply_settings_header" not in inner:
+            inner = dict(inner)
+            inner["apply_settings_header"] = inner.get("apply_profile_header")
+        merged = {k: self.get_setting(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS}
+        n = 0
+        for k, v in inner.items():
+            if k not in DEFAULT_SETTINGS:
+                continue
+            c = self._coerce_import_value(k, v)
+            if c is None:
+                continue
+            merged[k] = c
+            n += 1
+        if n == 0:
+            try:
+                BulletinHelper.show_info("Нет распознанных полей")
+            except Exception:
+                pass
+            return
+        self._persist_settings_bulk(merged)
+        self._drawable_cache.clear()
+        self._last_apply_time.clear()
+        self._extra_apply_gen.clear()
+        self._apply_pending.clear()
+        self._apply_requested.clear()
+        run_on_ui_thread(self._restore_all)
+        try:
+            BulletinHelper.show_info("Импорт: %d полей" % n)
+        except Exception:
+            pass
+
+    def _export_debug_report(self):
+        try:
+            blur_on = bool(SharedConfig.chatBlurEnabled())
+        except Exception:
+            blur_on = True
+        is_supported_now = bool(int(getattr(Build.VERSION, "SDK_INT", 0)) >= 33 and blur_on)
+        try:
+            settings = {k: self.get_setting(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS}
+        except Exception:
+            settings = {}
+        try:
+            diag = dict(self._diag)
+        except Exception:
+            diag = {}
+        try:
+            report = {
+                "format": "liquid_glass_debug_report",
+                "schema_version": 1,
+                "plugin_id": __id__,
+                "plugin_name": __name__,
+                "plugin_version": __version__,
+                "app_min_version": __min_version__,
+                "android_sdk": int(getattr(Build.VERSION, "SDK_INT", 0)),
+                "is_supported_now": is_supported_now,
+                "chat_blur_enabled": bool(blur_on),
+                "runtime": {
+                    "hooks_registered": int(len(self._hooks)),
+                    "active_chats": int(len(list(self._active_chats))),
+                    "active_extras": int(len(list(self._active_extras))),
+                    "applied_chat_stores": int(len(self._applied)),
+                    "applied_extra_stores": int(len(self._extras_applied)),
+                    "drawable_cache_size": int(len(self._drawable_cache)),
+                    "apply_pending": int(len(self._apply_pending)),
+                    "apply_requested": int(len(self._apply_requested)),
+                    "factory_cooldown_chat": int(len(self._factory_cooldown_chat)),
+                    "factory_cooldown_extra": int(len(self._factory_cooldown_extra)),
+                },
+                "diagnostics": diag,
+                "settings": settings,
+            }
+            text = json.dumps(report, ensure_ascii=False, indent=2)
+        except Exception:
+            try:
+                BulletinHelper.show_info("Ошибка сборки debug-отчёта")
+            except Exception:
+                pass
+            return
+
+        if self._clipboard_copy_text(text):
+            try:
+                BulletinHelper.show_info("Debug-отчёт скопирован в буфер")
+            except Exception:
+                pass
+        else:
+            try:
+                BulletinHelper.show_info("Не удалось записать debug-отчёт в буфер")
+            except Exception:
+                pass
+
+    def _export_debug_summary(self):
+        try:
+            blur_on = bool(SharedConfig.chatBlurEnabled())
+        except Exception:
+            blur_on = True
+        sdk = int(getattr(Build.VERSION, "SDK_INT", 0))
+        supported = bool(sdk >= 33 and blur_on)
+        try:
+            summary = (
+                "Liquid Glass Debug Summary\n"
+                "version: %s\n"
+                "android_sdk: %d\n"
+                "supported_now: %s\n"
+                "chat_blur_enabled: %s\n"
+                "hooks_registered: %d\n"
+                "active_chats: %d\n"
+                "active_extras: %d\n"
+                "drawable_cache_size: %d\n"
+                "factory_miss_chat: %d\n"
+                "factory_miss_extra: %d\n"
+                "theme_burst_chat: %d\n"
+                "theme_burst_extra: %d\n"
+                "state_prunes: %d"
+            ) % (
+                __version__,
+                sdk,
+                "yes" if supported else "no",
+                "yes" if blur_on else "no",
+                int(len(self._hooks)),
+                int(len(list(self._active_chats))),
+                int(len(list(self._active_extras))),
+                int(len(self._drawable_cache)),
+                int(self._diag.get("factory_miss_chat", 0)),
+                int(self._diag.get("factory_miss_extra", 0)),
+                int(self._diag.get("theme_burst_chat", 0)),
+                int(self._diag.get("theme_burst_extra", 0)),
+                int(self._diag.get("state_prunes", 0)),
+            )
+        except Exception:
+            try:
+                BulletinHelper.show_info("Ошибка сборки краткого отчёта")
+            except Exception:
+                pass
+            return
+
+        if self._clipboard_copy_text(summary):
+            try:
+                BulletinHelper.show_info("Краткий отчёт скопирован в буфер")
+            except Exception:
+                pass
+        else:
+            try:
+                BulletinHelper.show_info("Не удалось записать краткий отчёт в буфер")
+            except Exception:
+                pass
+
+    def create_settings(self):
+        def on_change(_):
+            self._schedule_settings_reapply(90)
+
+        hints = self._requirements_hint_widgets()
+        head = [Header(text="Liquid Glass")]
+        head.extend(hints)
+        if hints:
+            head.append(Divider())
+        head.extend(
+            [
+            Switch(
+                key="enabled",
+                text="Включить эффект",
+                subtext="Главный переключатель плагина",
+                default=True,
+                on_change=on_change,
+            ),
+            Divider(),
+            Header(text="Настройка"),
+            Text(
+                text="Области применения",
+                subtext="Где отображать стеклянный эффект",
+                icon="msg_folders",
+                create_sub_fragment=self._create_areas_settings,
+            ),
+            Text(
+                text="Внешний вид",
+                subtext="Прозрачность и профиль эффекта",
+                icon="msg_theme",
+                create_sub_fragment=self._create_appearance_settings,
+            ),
+            Text(
+                text="Тонкая настройка",
+                subtext="Толщина и интенсивность",
+                icon="msg_photo_settings",
+                create_sub_fragment=self._create_position_settings,
+            ),
+            Divider(),
+            Header(text="Сервис"),
+            Text(
+                text="Инструменты",
+                subtext="Импорт, экспорт и обслуживание",
+                icon="msg_settings",
+                create_sub_fragment=self._create_tools_settings,
+            ),
+            Text(
+                text="Справка",
+                subtext="Кратко о работе и настройке",
+                icon="msg_info",
+                create_sub_fragment=self._create_help_settings,
+            ),
+            Divider(),
+            Header(text="О плагине"),
+            Text(
+                text="@PluginProject",
+                subtext="Канал",
+                icon="msg_channel",
+                accent=True,
+                on_click=lambda v: self._open_tg("PluginProject"),
+            ),
+            Text(
+                text="@w3b_0s1nt",
+                subtext="Автор",
+                icon="msg_contact",
+                accent=True,
+                on_click=lambda v: self._open_tg("w3b_0s1nt"),
+            ),
+            Divider(text="%s · v%s" % (__name__, __version__)),
+            ]
+        )
+        return head
+
+    def _create_areas_settings(self):
+        def on_change(_):
+            self._schedule_settings_reapply(90)
+
+        return [
+            Header(text="В чате"),
+            Switch(key="apply_action_bar", text="Шапка чата", subtext="Верхняя панель экрана чата", default=True, on_change=on_change),
+            Switch(key="apply_top_panels", text="Верхние панели", subtext="Плашки над сообщениями", default=True, on_change=on_change),
+            Divider(),
+            Switch(key="apply_search_bar", text="Поиск", subtext="Панель поиска внутри чата", default=True, on_change=on_change),
+            Switch(key="apply_story_bar", text="Сторис", subtext="Полоса сторис и табов", default=True, on_change=on_change),
+            Divider(),
+            Header(text="Вне чата"),
+            Switch(
+                key="apply_dialogs_list",
+                text="Диалоги",
+                subtext="Шапка списка",
+                default=False,
+                on_change=on_change,
+            ),
+            Switch(
+                key="apply_settings_header",
+                text="Настройки",
+                subtext="Шапка списка",
+                default=False,
+                on_change=on_change,
+            ),
+            Switch(
+                key="apply_topics_header",
+                text="Темы форума",
+                subtext="Шапка списка тем",
+                default=False,
+                on_change=on_change,
+            ),
+        ]
+
+    def _create_appearance_settings(self):
+        def on_change(_):
+            self._schedule_settings_reapply(110)
+
+        return [
+            Header(text="Прозрачность"),
+            Input(
+                key="action_bar_alpha",
+                text="Прозрачность шапки",
+                subtext="0.3–1.0",
+                default="0.82",
+                on_change=on_change,
+            ),
+            Input(
+                key="panel_alpha",
+                text="Прозрачность панелей",
+                subtext="0.3–1.0",
+                default="0.80",
+                on_change=on_change,
+            ),
+            Divider(),
+            Header(text="Профиль"),
+            Switch(
+                key="strong_glass",
+                text="Strong Glass",
+                subtext="Более выразительный стеклянный слой",
+                default=False,
+                on_change=on_change,
+            ),
+            Divider(),
+            Text(
+                text="Тонкая настройка",
+                subtext="Толщина и интенсивность по зонам",
+                icon="msg_photo_settings",
+                create_sub_fragment=self._create_position_settings,
+            ),
+        ]
+
+    def _create_position_settings(self):
+        def on_change(_):
+            self._schedule_settings_reapply(120)
+
+        return [
+            Header(text="Толщина слоя"),
+            Input(
+                key="action_bar_thickness",
+                text="Толщина шапки, dp",
+                subtext="6–32",
+                default="14",
+                on_change=on_change,
+            ),
+            Input(
+                key="panel_thickness",
+                text="Толщина панелей, dp",
+                subtext="6–32",
+                default="12",
+                on_change=on_change,
+            ),
+            Divider(),
+            Header(text="Интенсивность"),
+            Input(
+                key="action_bar_intensity",
+                text="Интенсивность шапки",
+                subtext="0.1–1.0",
+                default="0.42",
+                on_change=on_change,
+            ),
+            Input(
+                key="panel_intensity",
+                text="Интенсивность панелей",
+                subtext="0.1–1.0",
+                default="0.38",
+                on_change=on_change,
+            ),
+        ]
+
+    def _create_tools_settings(self):
+        def on_change(_):
+            self._schedule_settings_reapply(90)
+
+        return [
+            Header(text="Профиль настроек"),
+            Text(
+                text="Экспорт профиля",
+                subtext="Скопировать JSON в буфер обмена",
+                icon="msg_share",
+                on_click=lambda v: run_on_ui_thread(self._export_profile_json),
+            ),
+            Text(
+                text="Импорт профиля",
+                subtext="Прочитать JSON из буфера обмена",
+                icon="msg_download",
+                on_click=lambda v: run_on_ui_thread(self._import_profile_from_clipboard),
+            ),
+            Text(
+                text="Скопировать debug-отчёт",
+                subtext="Диагностика, статусы и настройки в JSON",
+                icon="msg_info",
+                on_click=lambda v: run_on_ui_thread(self._export_debug_report),
+            ),
+            Text(
+                text="Скопировать краткий отчёт",
+                subtext="Короткий текст для отправки в чат",
+                icon="msg_send",
+                on_click=lambda v: run_on_ui_thread(self._export_debug_summary),
+            ),
+            Divider(),
+            Header(text="Производительность"),
+            Switch(
+                key="performance_mode",
+                text="Экономия",
+                subtext="Меньше нагрузка, более редкое обновление",
+                default=False,
+                on_change=on_change,
+            ),
+            Switch(
+                key="debug_logs",
+                text="Debug-логи",
+                subtext="Логи установки хуков и ошибок в консоль",
+                default=False,
+                on_change=on_change,
+            ),
+            Divider(),
+            Header(text="Обслуживание"),
+            Text(
+                text="Переприменить сейчас",
+                subtext="Применить параметры без перезапуска",
+                icon="msg_retry",
+                on_click=lambda v: run_on_ui_thread(self._force_reapply),
+            ),
+            Text(
+                text="Сбросить всё",
+                subtext="Вернуть параметры по умолчанию",
+                icon="msg_delete",
+                on_click=lambda v: run_on_ui_thread(self._reset_to_defaults),
+            ),
+        ]
+
+    def _create_help_settings(self):
+        return [
+            Header(text="Как это работает"),
+            Text(text="Эффект", subtext="Применяет стеклянный слой к выбранным зонам интерфейса", icon="msg_info"),
+            Text(text="Темы", subtext="Работает в светлой и тёмной теме, включая переключение на лету", icon="msg_info"),
+            Divider(),
+            Header(text="Рекомендации"),
+            Text(text="Размытие чата", subtext="Включите в настройках чата, иначе слой не будет виден", icon="msg_info"),
+            Text(text="После изменений", subtext="Используйте Переприменить сейчас, если эффект обновился не сразу", icon="msg_info"),
+            Divider(),
+            Header(text="Зоны"),
+            Text(text="В чате", subtext="Шапка, верхние панели, поиск, сторис"),
+            Text(text="Вне чата", subtext="Диалоги, настройки, темы форума"),
+            Divider(),
+            Header(text="Безопасность настроек"),
+            Text(text="Экспорт профиля", subtext="Сохраните рабочую конфигурацию в JSON"),
+            Text(text="Сбросить всё", subtext="Быстрый возврат к стабильным параметрам"),
+        ]
+
+    def _force_reapply(self):
+        self._drawable_cache.clear()
+        self._last_apply_time.clear()
+        self._apply_pending.clear()
+        self._apply_requested.clear()
+        self._extra_apply_gen.clear()
+        for st in list(self._applied.values()):
+            self._restore_chat_store(st)
+        self._applied.clear()
+        for st in list(self._extras_applied.values()):
+            self._restore_extras_store(st)
+        self._extras_applied.clear()
+        if not self.get_setting("enabled", True) or not self._is_supported():
+            try:
+                BulletinHelper.show_info("Оформление снято (эффект выкл. или недоступен)")
+            except Exception:
+                pass
+            return
+        try:
+            BulletinHelper.show_info("Настройки переприменены")
+        except Exception:
+            pass
+        chats = [
+            ca for ca in list(self._active_chats)
+            if self._is_fragment_active(ca) and self._is_fragment_resumed(ca)
+        ]
+        for i, ca in enumerate(chats):
+            try:
+                self.apply_to_chat(ca, i * 75, urgent=True)
+            except Exception:
+                pass
+        extras = [
+            ex for ex in list(self._active_extras)
+            if self._is_fragment_active(ex) and self._is_fragment_resumed(ex)
+        ]
+        for i, ex in enumerate(extras):
+            try:
+                self.apply_to_extra_fragment(ex, i * 85, urgent=True)
+            except Exception:
+                pass
+
+    def _get_attr(self, obj, name):
+        if obj is None: return None
+        try: return getattr(obj, name)
+        except Exception:
+            try: return get_private_field(obj, name)
+            except Exception: return None
+
+    def _set_attr(self, obj, name, value):
+        if obj is None:
+            return False
+        try:
+            setattr(obj, name, value)
+            return True
+        except Exception:
+            try:
+                return bool(set_private_field(obj, name, value))
+            except Exception:
+                return False
+
+    def _is_fragment_active(self, fragment):
+        if not fragment:
+            return False
+        try:
+            if _truthy_fragment_flag(self._get_attr(fragment, "isFinished")):
+                return False
+            if _truthy_fragment_flag(self._get_attr(fragment, "finishing")):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _is_fragment_resumed(self, fragment):
+        if not fragment:
+            return False
+        try:
+            return bool(fragment.isResumed())
+        except Exception:
+            pass
+        try:
+            p = self._get_attr(fragment, "paused")
+            if p is not None:
+                return not _truthy_fragment_flag(p)
+        except Exception:
+            pass
+        return True
+
+    def _clamp_dp_setting(self, value, default, lo, hi):
+        try:
+            v = float(str(value).replace(",", ".").strip())
+            return max(lo, min(hi, v))
+        except:
+            return default
+
+    def _panel_has_real_height(self, panel, min_dp=8):
+        if panel is None or panel.getVisibility() != View.VISIBLE:
+            return False
+        try:
+            h = int(panel.getHeight())
+            if h <= 0:
+                h = int(panel.getMeasuredHeight())
+            return h >= AndroidUtilities.dp(min_dp)
+        except Exception:
+            return False
+
+    def _detach_settings_glass_alpha_sync(self, store):
+        if not store:
+            return
+        try:
+            store.pop("_lg_hdr_alpha_i", None)
+        except Exception:
+            pass
+        t = store.pop("_settings_ab_predraw", None)
+        if not t:
+            return
+        try:
+            bg, listener = t
+            obs = bg.getViewTreeObserver()
+            if obs.isAlive():
+                obs.removeOnPreDrawListener(listener)
+        except Exception:
+            pass
+
+    def _sync_settings_header_glass_alpha(self, fragment, store):
+        try:
+            if not fragment or not store:
+                return
+            if not self._is_fragment_active(fragment):
+                self._detach_settings_glass_alpha_sync(store)
+                return
+            try:
+                name = fragment.getClass().getName()
+            except Exception:
+                return
+            if not name.startswith("org.telegram.ui.SettingsActivity"):
+                return
+            scrim = _get_first_available_field(fragment, "actionBarBackground")
+            entry = store.get("action_bar")
+            if not scrim or not entry:
+                return
+            dr = entry.get("applied")
+            if dr is None:
+                return
+            a = max(0, min(255, int(float(scrim.getAlpha()) * 255.0 + 0.5)))
+            try:
+                if store.get("_lg_hdr_alpha_i") == a:
+                    return
+            except Exception:
+                pass
+            store["_lg_hdr_alpha_i"] = a
+            dr.setAlpha(a)
+        except Exception:
+            pass
+
+    def _attach_settings_glass_alpha_sync(self, fragment, store):
+        if not fragment or not store:
+            return
+        self._detach_settings_glass_alpha_sync(store)
+        try:
+            name = fragment.getClass().getName()
+        except Exception:
+            return
+        if not name.startswith("org.telegram.ui.SettingsActivity"):
+            return
+        bg = _get_first_available_field(fragment, "actionBarBackground")
+        if not bg:
+            return
+        Lcls = safe_find_class("android.view.ViewTreeObserver$OnPreDrawListener")
+        if not Lcls:
+            return
+        plug = self
+        frag = fragment
+        st = store
+
+        class _SettingsHeaderPreDraw(dynamic_proxy(Lcls)):
+            def onPreDraw(self):
+                plug._sync_settings_header_glass_alpha(frag, st)
+                return True
+
+        listener = _SettingsHeaderPreDraw()
+        try:
+            bg.getViewTreeObserver().addOnPreDrawListener(listener)
+            store["_settings_ab_predraw"] = (bg, listener)
+        except Exception:
+            pass
+
+    def _resolve_action_bar(self, chat_activity):
+        if not chat_activity:
+            return None
+        ab = getattr(chat_activity, "actionBar", None)
+        if ab is None:
+            try:
+                ab = get_private_field(chat_activity, "actionBar")
+            except:
+                ab = None
+        if ab is None:
+            try:
+                getter = getattr(chat_activity, "getActionBar", None)
+                if callable(getter):
+                    ab = getter()
+            except:
+                ab = None
+        return ab
+
+    def _persist_settings_bulk(self, mapping):
+        items = list(mapping.items())
+        for i, (k, v) in enumerate(items):
+            last = i == len(items) - 1
+            try:
+                self.set_setting(k, v, reload_settings=last)
+            except TypeError:
+                self.set_setting(k, v)
+
+    def _is_likely_dark_theme(self, theme_delegate):
+        try:
+            m = getattr(Theme, "isCurrentThemeDark", None)
+            if callable(m):
+                try:
+                    return bool(m(theme_delegate))
+                except TypeError:
+                    return bool(m())
+        except Exception:
+            pass
+        try:
+            if theme_delegate is not None:
+                fn = getattr(theme_delegate, "isDark", None)
+                if callable(fn):
+                    try:
+                        return bool(fn())
+                    except Exception:
+                        pass
+                v = self._get_attr(theme_delegate, "isDark")
+                if v is not None:
+                    return bool(v)
+        except Exception:
+            pass
+        return None
+
+    def _action_bar_luminance_0_1(self, theme_delegate):
+        try:
+            if theme_delegate is not None:
+                c = int(Theme.getColor(Theme.key_actionBarDefault, theme_delegate))
+            else:
+                c = int(Theme.getColor(Theme.key_actionBarDefault))
+            r = (c >> 16) & 0xFF
+            g = (c >> 8) & 0xFF
+            b = c & 0xFF
+            return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        except Exception:
+            return None
+
+    def _theme_is_light(self, theme_delegate):
+        dark = self._is_likely_dark_theme(theme_delegate)
+        if dark is True:
+            return False
+        if dark is False:
+            return True
+        lum = self._action_bar_luminance_0_1(theme_delegate)
+        if lum is not None:
+            return lum >= 0.48
+        return False
+
+    def _adapt_glass_to_theme(self, theme_delegate, action_alpha, panel_alpha, action_intensity, panel_intensity, strong_glass=False):
+        lum = self._action_bar_luminance_0_1(theme_delegate)
+        dark = self._is_likely_dark_theme(theme_delegate)
+        aa = float(action_alpha)
+        pa = float(panel_alpha)
+        ai = float(action_intensity)
+        pi = float(panel_intensity)
+        if lum is not None:
+            if lum >= 0.6:
+                ai = min(0.74, ai * 0.94)
+                pi = min(0.72, pi * 0.93)
+                aa = min(0.91, aa * 1.025)
+                pa = min(0.89, pa * 1.02)
+            elif lum <= 0.2:
+                ai = min(0.82, ai * 0.98)
+                pi = min(0.78, pi * 0.97)
+        if strong_glass:
+            if lum is not None and lum >= 0.48:
+                ai = min(0.7, ai * 0.89)
+                pi = min(0.68, pi * 0.88)
+                aa = min(0.93, aa * 1.035)
+                pa = min(0.91, pa * 1.03)
+            if dark is True or (lum is not None and lum < 0.34):
+                ai = min(0.78, ai * 0.95)
+                pi = min(0.74, pi * 0.94)
+        return aa, pa, ai, pi
+
+    def _strong_glass_tune_action_bar(self, alpha, thickness_dp, intensity):
+        a = float(alpha)
+        a = max(0.73, min(0.93, a * 0.92))
+        th = min(max(float(thickness_dp) * 1.34, 15.0), 22.0)
+        inten = min(0.86, max(float(intensity) * 1.42, 0.62))
+        return a, th, inten
+
+    def _strong_glass_tune_panels(self, alpha, thickness_dp, intensity):
+        a = float(alpha)
+        a = max(0.68, min(0.92, a * 0.90))
+        th = min(max(float(thickness_dp) * 1.32, 12.0), 24.0)
+        inten = min(0.90, max(float(intensity) * 1.38, 0.58))
+        return a, th, inten
+
+    def _apply_action_bar_bottom_corners(self, drawable, bottom_radius_px):
+        if not drawable or bottom_radius_px is None:
+            return
+        r = max(0, int(bottom_radius_px))
+        if r == 0:
+            return
+        attempts = (
+            lambda: drawable.setRadius(0, 0, r, r, False),
+            lambda: drawable.setRadius(0, 0, r, r, True),
+            lambda: drawable.setRadius(0, 0, r, r),
+        )
+        for fn in attempts:
+            try:
+                fn()
+                return
+            except:
+                pass
+
+    def _configure_action_bar_drawable(self, drawable, bottom_radius_px, thickness, intensity, allow_liquid_glass=True):
+        if not drawable:
+            return
+        try:
+            if thickness is not None:
+                drawable.setThickness(thickness)
+            if intensity is not None:
+                drawable.setIntensity(float(intensity))
+        except:
+            pass
+        self._apply_action_bar_bottom_corners(drawable, bottom_radius_px)
+
+    def _clip_action_bar_outline(self, action_bar, bottom_radius_px):
+        if not action_bar or Build.VERSION.SDK_INT < 21:
+            return
+        try:
+            try:
+                action_bar.setOutlineProvider(None)
+            except Exception:
+                pass
+            action_bar.setClipToOutline(False)
+            fn = getattr(action_bar, "invalidateOutline", None)
+            if callable(fn):
+                fn()
+            self._clear_outline_ancestors(action_bar, 7)
+            action_bar.invalidate()
+        except Exception:
+            pass
+
+    def _reclip_chat_action_bar(self, chat_activity, bottom_radius_px):
+        try:
+            if (
+                not chat_activity
+                or not self._is_fragment_active(chat_activity)
+                or not self._is_fragment_resumed(chat_activity)
+            ):
+                return
+            ab = self._resolve_action_bar(chat_activity)
+            if ab:
+                self._clip_action_bar_outline(ab, bottom_radius_px)
+        except Exception:
+            pass
+
+    def _clear_view_outline_clip(self, view):
+        if not view or Build.VERSION.SDK_INT < 21:
+            return
+        try:
+            view.setClipToOutline(False)
+            view.setOutlineProvider(None)
+            fn = getattr(view, "invalidateOutline", None)
+            if callable(fn):
+                fn()
+            view.invalidate()
+        except Exception:
+            pass
+
+    def _clear_outline_ancestors(self, view, max_depth=6):
+        if not view or Build.VERSION.SDK_INT < 21:
+            return
+        parent = view
+        for _ in range(max(0, int(max_depth))):
+            try:
+                parent = parent.getParent()
+            except Exception:
+                break
+            if parent is None:
+                break
+            self._clear_view_outline_clip(parent)
+
+    def _view_needs_reapply_background(self, store, key, view):
+        if view is None:
+            return False
+        entry = store.get(key)
+        if not entry or entry.get("view") is not view:
+            return True
+        applied = entry.get("applied")
+        if applied is None:
+            return True
+        try:
+            if view.getBackground() != applied:
+                return True
+        except Exception:
+            return True
+        return False
+
+    def _action_bar_needs_reapply(self, store, action_bar):
+        return self._view_needs_reapply_background(store, "action_bar", action_bar)
+
+    def _panel_needs_reapply(self, store, key, view):
+        return self._view_needs_reapply_background(store, key, view)
+
+    def _store_needs_cleanup(self, store):
+        if not store:
+            return False
+        apply_action_bar = self.get_setting("apply_action_bar", True)
+        apply_top_panels = self.get_setting("apply_top_panels", True)
+        apply_search_bar = self.get_setting("apply_search_bar", True)
+        apply_story_bar = self.get_setting("apply_story_bar", True)
+        ab_keys = ("action_bar", "action_bar_blurred", "action_bar_cast_shadows")
+        if not apply_action_bar and any(store.get(k) for k in ab_keys):
+            return True
+        if not apply_top_panels and any(store.get(k) for k in ("top_panel", "top_panel2")):
+            return True
+        if not apply_search_bar and (store.get("search_bar") or store.get("search_results")):
+            return True
+        if not apply_story_bar and store.get("story_bar"):
+            return True
+        return False
+
+    def _restore_panel_if_view_replaced(self, store, key, new_view):
+        prev = store.get(key)
+        if prev and new_view is not None and prev.get("view") is not None and prev.get("view") is not new_view:
+            self._restore_panel_entry(store, key)
+
+    def _parse_float(self, value):
+        try:
+            return float(str(value).replace(",", ".").strip())
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    def _parse_float_safe(self, value, default=0.8, clamp_0_1=False):
+        try:
+            v = float(str(value).replace(",", ".").strip())
+            if clamp_0_1:
+                return max(0.0, min(1.0, v))
+            return v
+        except (TypeError, ValueError, AttributeError):
+            return default
+
+    def _is_supported(self):
+        if Build.VERSION.SDK_INT < 33:
+            self._warn_once("Эффект жидкого стекла не поддерживается на этом устройстве.")
+            return False
+        try:
+            blur_on = SharedConfig.chatBlurEnabled()
+        except Exception:
+            blur_on = True
+        if not blur_on:
+            self._warn_once("Размытие чата отключено. Включите в настройках Telegram.")
+            return False
+        return True
+
+    def _warn_once(self, text):
+        if self._warned: return
+        self._warned = True
+        try: BulletinHelper.show_info(text)
+        except Exception:
+            # Allow retry if bulletin display failed.
+            self._warned = False
+
+    def apply_to_chat(self, chat_activity, delay_ms=120, urgent=False):
+        if not chat_activity or not self._is_fragment_active(chat_activity):
+            return
+        self._prune_runtime_state()
+        if not self.get_setting("enabled", True):
+            key = id(chat_activity)
+            st = self._applied.get(key)
+            if st:
+                self._restore_chat_store(st)
+                self._applied.pop(key, None)
+                self._last_apply_time.pop(key, None)
+            self._apply_pending.discard(key)
+            self._apply_requested.discard(key)
+            try:
+                self._active_chats.discard(chat_activity)
+            except Exception:
+                pass
+            return
+        if not self._is_supported():
+            key = id(chat_activity)
+            st = self._applied.get(key)
+            if st:
+                self._restore_chat_store(st)
+                self._applied.pop(key, None)
+                self._last_apply_time.pop(key, None)
+            self._apply_pending.discard(key)
+            self._apply_requested.discard(key)
+            try:
+                self._active_chats.discard(chat_activity)
+            except Exception:
+                pass
+            return
+
+        try:
+            self._active_chats.add(chat_activity)
+        except Exception:
+            pass
+
+        key = id(chat_activity)
+        store = self._applied.get(key, {})
+        if not urgent and store:
+            try:
+                current_sig = self._chat_apply_signature(chat_activity)
+                if store.get("_lg_apply_sig") != current_sig:
+                    delay_ms = max(delay_ms, 180)
+                    debounce_ms_hint = self._THEME_BURST_DEBOUNCE_MS
+                    self._bump_diag("theme_burst_chat")
+                else:
+                    debounce_ms_hint = 0
+            except Exception:
+                debounce_ms_hint = 0
+        else:
+            debounce_ms_hint = 0
+        if len(self._last_apply_time) > 128:
+            valid_keys = set(self._applied.keys())
+            self._last_apply_time = {k: v for k, v in self._last_apply_time.items() if k in valid_keys}
+        current_time = time.time() * 1000
+        last_time = self._last_apply_time.get(key, 0)
+        debounce_ms = self._PERFORMANCE_DEBOUNCE_MS if self.get_setting("performance_mode", False) else self._APPLY_DEBOUNCE_MS
+        if debounce_ms_hint:
+            debounce_ms = max(debounce_ms, debounce_ms_hint)
+        if not urgent and self._in_startup_grace():
+            debounce_ms = max(debounce_ms, self._STARTUP_DEBOUNCE_MIN_MS)
+            delay_ms = max(delay_ms, self._STARTUP_EXTRA_DELAY_MIN_MS)
+
+        if current_time - last_time < debounce_ms:
+            self._apply_requested.add(key)
+            return
+        if key in self._apply_pending:
+            self._apply_requested.add(key)
+            return
+        if not self._needs_apply(chat_activity):
+            return
+
+        self._apply_pending.add(key)
+        self._last_apply_time[key] = current_time
+
+        run_on_ui_thread(lambda: self._apply_chat_impl(chat_activity), delay_ms)
+
+    def _needs_apply(self, chat_activity):
+        store = self._applied.get(id(chat_activity), {})
+        apply_action_bar = self.get_setting("apply_action_bar", True)
+        apply_top_panels = self.get_setting("apply_top_panels", True)
+        apply_search_bar = self.get_setting("apply_search_bar", True)
+        apply_story_bar = self.get_setting("apply_story_bar", True)
+        if not (apply_action_bar or apply_top_panels or apply_search_bar or apply_story_bar):
+            # Nothing is enabled for chat scopes: only run if cleanup is needed.
+            return bool(store)
+        if self._store_needs_cleanup(store):
+            return True
+        try:
+            if store.get("_lg_apply_sig") != self._chat_apply_signature(chat_activity):
+                return True
+        except Exception:
+            pass
+        if not store:
+            return True
+        if apply_action_bar:
+            ab = self._resolve_action_bar(chat_activity)
+            if ab and self._action_bar_needs_reapply(store, ab):
+                return True
+        if apply_top_panels:
+            p = _get_first_available_field(chat_activity, "topChatPanelView")
+            if p is not None and self._panel_has_real_height(p, self._MIN_TOP_PANEL_DP):
+                if self._panel_needs_reapply(store, "top_panel", p):
+                    return True
+            else:
+                if "top_panel" in store:
+                    return True
+            p2 = self._resolve_second_top_panel_view(chat_activity)
+            if p2 is not None and self._panel_has_real_height(p2, self._MIN_TOP_PANEL_DP):
+                if self._panel_needs_reapply(store, "top_panel2", p2):
+                    return True
+            else:
+                if "top_panel2" in store:
+                    return True
+        if apply_search_bar:
+            sp = self._resolve_search_primary_view(chat_activity)
+            if sp is not None and self._chat_search_ui_visible(sp):
+                if self._panel_needs_reapply(store, "search_bar", sp):
+                    return True
+            elif "search_bar" in store:
+                return True
+            msc = _get_first_available_field(chat_activity, "messagesSearchListContainer")
+            if msc is not None and msc.getVisibility() == View.VISIBLE:
+                if self._panel_needs_reapply(store, "search_results", msc):
+                    return True
+            elif "search_results" in store:
+                return True
+        elif "search_bar" in store or "search_results" in store:
+            return True
+        if apply_story_bar:
+            sv = self._resolve_story_bar_view(chat_activity)
+            if sv is not None and sv.getVisibility() == View.VISIBLE:
+                if self._panel_needs_reapply(store, "story_bar", sv):
+                    return True
+            elif "story_bar" in store:
+                return True
+        elif "story_bar" in store:
+            return True
+        return False
+
+    def _apply_chat_impl(self, chat_activity):
+        try:
+            if not self._is_fragment_active(chat_activity):
+                return
+            if not self._is_fragment_resumed(chat_activity):
+                return
+            if not self.get_setting("enabled", True):
+                ek = id(chat_activity)
+                st_off = self._applied.pop(ek, None)
+                if st_off:
+                    self._evict_drawable_cache_for_view_ids(self._collect_drawable_cache_view_ids(st_off))
+                    self._restore_chat_store(st_off)
+                self._apply_pending.discard(ek)
+                self._apply_requested.discard(ek)
+                self._last_apply_time.pop(ek, None)
+                try:
+                    self._active_chats.discard(chat_activity)
+                except Exception:
+                    pass
+                return
+            if not self._is_supported():
+                key_cleanup = id(chat_activity)
+                st_cleanup = self._applied.pop(key_cleanup, None)
+                if st_cleanup:
+                    self._evict_drawable_cache_for_view_ids(self._collect_drawable_cache_view_ids(st_cleanup))
+                    self._restore_chat_store(st_cleanup)
+                self._apply_pending.discard(key_cleanup)
+                self._apply_requested.discard(key_cleanup)
+                self._last_apply_time.pop(key_cleanup, None)
+                try:
+                    self._active_chats.discard(chat_activity)
+                except Exception:
+                    pass
+                return
+
+            key = id(chat_activity)
+            store = self._applied.setdefault(key, {})
+            apply_action_bar = self.get_setting("apply_action_bar", True)
+            apply_top_panels = self.get_setting("apply_top_panels", True)
+            apply_search_bar = self.get_setting("apply_search_bar", True)
+            apply_story_bar = self.get_setting("apply_story_bar", True)
+            performance_mode = self.get_setting("performance_mode", False)
+            self._sync_disabled_regions(store, chat_activity)
+            if not (apply_action_bar or apply_top_panels or apply_search_bar or apply_story_bar):
+                store.pop("_lg_apply_sig", None)
+                self._factory_cooldown_chat.pop(key, None)
+                return
+            theme_delegate = get_private_field(chat_activity, "themeDelegate")
+            if apply_action_bar:
+                if self._blur_needs_preserved_background_clip(chat_activity):
+                    if store.get("background_clip"):
+                        self._restore_background_clip_for_chat(chat_activity)
+                else:
+                    self._unclip_chat_background(chat_activity)
+
+            factory = get_private_field(chat_activity, "glassBackgroundDrawableFactory")
+            frosted_factory = get_private_field(chat_activity, "glassBackgroundDrawableFactoryFrosted")
+            if not factory and frosted_factory:
+                factory, frosted_factory = frosted_factory, None
+            if not factory:
+                now_ms = time.time() * 1000
+                next_retry = float(self._factory_cooldown_chat.get(key, 0))
+                if now_ms < next_retry:
+                    self._bump_diag("factory_cooldown_skip_chat")
+                    return
+                self._factory_cooldown_chat[key] = now_ms + float(self._FACTORY_RETRY_COOLDOWN_MS)
+                self._bump_diag("factory_miss_chat")
+                store.pop("_lg_apply_sig", None)
+                return
+            self._factory_cooldown_chat.pop(key, None)
+
+            self._reset_factories_liquid_glass(factory, frosted_factory)
+
+            strong_glass = self.get_setting("strong_glass", False)
+            offset_x, offset_y = 0, 0
+            action_alpha = self._parse_float_safe(self.get_setting("action_bar_alpha", "0.82"), clamp_0_1=True)
+            panel_alpha = self._parse_float_safe(self.get_setting("panel_alpha", "0.80"), clamp_0_1=True)
+            action_thickness_dp = self._clamp_dp_setting(self.get_setting("action_bar_thickness", "14"), 14, 6, 32)
+            panel_thickness_dp = self._clamp_dp_setting(self.get_setting("panel_thickness", "12"), 12, 6, 32)
+            action_intensity = self._parse_float_safe(self.get_setting("action_bar_intensity", "0.42"), clamp_0_1=True)
+            panel_intensity = self._parse_float_safe(self.get_setting("panel_intensity", "0.38"), clamp_0_1=True)
+            panel_radius = 0
+
+            if strong_glass:
+                action_alpha, action_thickness_dp, action_intensity = self._strong_glass_tune_action_bar(action_alpha, action_thickness_dp, action_intensity)
+                panel_alpha, panel_thickness_dp, panel_intensity = self._strong_glass_tune_panels(panel_alpha, panel_thickness_dp, panel_intensity)
+
+            action_alpha, panel_alpha, action_intensity, panel_intensity = self._adapt_glass_to_theme(
+                theme_delegate, action_alpha, panel_alpha, action_intensity, panel_intensity, strong_glass
+            )
+
+            action_thickness = AndroidUtilities.dp(action_thickness_dp)
+            panel_thickness = AndroidUtilities.dp(panel_thickness_dp)
+            liquid_ok = True
+
+            action_bar = self._resolve_action_bar(chat_activity)
+
+            if action_bar and apply_action_bar:
+                prev_ab = store.get("action_bar")
+                if prev_ab and prev_ab.get("view") is not None and prev_ab.get("view") is not action_bar:
+                    self._restore_action_bar_parts(store)
+                provider, psig = self._build_color_provider(
+                    theme_delegate,
+                    Theme.key_actionBarDefault,
+                    action_alpha,
+                    disable_top_stroke=False,
+                    disable_shadow=True,
+                    disable_bottom_stroke=True,
+                )
+                if provider is not None:
+                    bg = None
+                    for fac in self._action_bar_drawable_factories_order(factory, frosted_factory):
+                        bg = self._create_drawable(fac, action_bar, provider, offset_x, offset_y, store, psig, liquid_ok)
+                        if bg:
+                            break
+                    if bg:
+                        self._configure_action_bar_drawable(
+                            bg, panel_radius, action_thickness, action_intensity,
+                            allow_liquid_glass=liquid_ok,
+                        )
+                        self._disable_actionbar_blur(store, action_bar)
+                        self._disable_actionbar_shadows(store, action_bar)
+                        self._apply_background(store, "action_bar", action_bar, bg)
+                        self._clip_action_bar_outline(action_bar, panel_radius)
+                        pr = panel_radius
+                        if performance_mode:
+                            run_on_ui_thread(lambda: self._reclip_chat_action_bar(chat_activity, pr), 280)
+                        else:
+                            run_on_ui_thread(lambda: self._reclip_chat_action_bar(chat_activity, pr), 140)
+                            run_on_ui_thread(lambda: self._reclip_chat_action_bar(chat_activity, pr), 420)
+                    else:
+                        store["_lg_sig_dirty"] = True
+                else:
+                    store["_lg_sig_dirty"] = True
+
+            if apply_top_panels:
+                top1 = _get_first_available_field(chat_activity, "topChatPanelView")
+                self._apply_or_restore_top_row(
+                    store, "top_panel", top1, factory, theme_delegate,
+                    panel_alpha, panel_radius, panel_thickness, panel_intensity, offset_x, offset_y,
+                    allow_liquid_glass=liquid_ok,
+                )
+                top2 = self._resolve_second_top_panel_view(chat_activity)
+                self._apply_or_restore_top_row(
+                    store, "top_panel2", top2, factory, theme_delegate,
+                    panel_alpha, panel_radius, panel_thickness, panel_intensity, offset_x, offset_y,
+                    allow_liquid_glass=liquid_ok,
+                )
+
+            if apply_search_bar:
+                search_panel = self._resolve_search_primary_view(chat_activity)
+                if search_panel and self._chat_search_ui_visible(search_panel):
+                    self._restore_panel_if_view_replaced(store, "search_bar", search_panel)
+                    self._apply_search_bar(
+                        store, search_panel, factory, theme_delegate, panel_alpha, panel_radius, panel_thickness, panel_intensity,
+                        offset_x, offset_y, strong_glass=strong_glass, allow_liquid_glass=liquid_ok,
+                    )
+                elif "search_bar" in store:
+                    self._restore_panel_entry(store, "search_bar")
+                msc = _get_first_available_field(chat_activity, "messagesSearchListContainer")
+                if msc and msc.getVisibility() == View.VISIBLE:
+                    self._restore_panel_if_view_replaced(store, "search_results", msc)
+                    self._apply_search_bar(
+                        store, msc, factory, theme_delegate, panel_alpha, panel_radius, panel_thickness, panel_intensity,
+                        offset_x, offset_y, store_key="search_results", strong_glass=strong_glass, allow_liquid_glass=liquid_ok,
+                    )
+                elif "search_results" in store:
+                    self._restore_panel_entry(store, "search_results")
+
+            if apply_story_bar:
+                story_bar = self._resolve_story_bar_view(chat_activity)
+                if story_bar and story_bar.getVisibility() == View.VISIBLE:
+                    self._restore_panel_if_view_replaced(store, "story_bar", story_bar)
+                    provider, psig = self._build_color_provider(theme_delegate, Theme.key_chat_topPanelBackground, panel_alpha, True, True)
+                    bg = None
+                    if provider is not None:
+                        bg = self._create_drawable(factory, story_bar, provider, offset_x, offset_y, store, psig, liquid_ok)
+                    if provider is not None and bg:
+                        if strong_glass:
+                            st_th = max(AndroidUtilities.dp(8), int(panel_thickness * 0.92))
+                            st_in = max(0.12, min(1.0, float(panel_intensity) * 0.96))
+                        else:
+                            st_th, st_in = panel_thickness, panel_intensity
+                        self._configure_drawable(bg, panel_radius, st_th, st_in, allow_liquid_glass=liquid_ok)
+                        self._apply_panel_background(store, "story_bar", story_bar, bg)
+                    else:
+                        store["_lg_sig_dirty"] = True
+                elif "story_bar" in store:
+                    self._restore_panel_entry(store, "story_bar")
+
+            if store.pop("_lg_sig_dirty", None):
+                store.pop("_lg_apply_sig", None)
+            else:
+                store["_lg_apply_sig"] = self._chat_apply_signature(chat_activity)
+
+        except Exception:
+            try:
+                k = id(chat_activity)
+                d = self._applied.get(k)
+                if d:
+                    d.pop("_lg_apply_sig", None)
+            except Exception:
+                pass
+        finally:
+            try:
+                key = id(chat_activity)
+                self._apply_pending.discard(key)
+                if key in self._apply_requested:
+                    self._apply_requested.discard(key)
+                    if (
+                        self.get_setting("enabled", True)
+                        and self._is_supported()
+                        and self._is_fragment_active(chat_activity)
+                        and self._is_fragment_resumed(chat_activity)
+                        and self._needs_apply(chat_activity)
+                    ):
+                        follow = 120 if self.get_setting("performance_mode", False) else 80
+                        self.apply_to_chat(chat_activity, follow, urgent=False)
+            except Exception:
+                pass
+
+    def _apply_search_bar(self, store, search_panel, factory, theme_delegate, alpha, radius, thickness, intensity, offset_x, offset_y, store_key="search_bar", strong_glass=False, allow_liquid_glass=True):
+        if not search_panel:
+            return
+        try:
+            if store_key == "search_bar" and not self._chat_search_ui_visible(search_panel):
+                return
+            if store_key == "search_results" and search_panel.getVisibility() != View.VISIBLE:
+                return
+            provider, psig = self._build_color_provider(theme_delegate, Theme.key_chat_topPanelBackground, alpha, True, True, True)
+            if provider is None:
+                store["_lg_sig_dirty"] = True
+                return
+            bg = self._create_drawable(factory, search_panel, provider, offset_x, offset_y, store, psig, allow_liquid_glass)
+            if bg:
+                search_radius = max(AndroidUtilities.dp(8), radius - AndroidUtilities.dp(1))
+                if strong_glass:
+                    search_thickness = max(AndroidUtilities.dp(8), int(thickness * 0.91))
+                    search_intensity = max(0.12, min(1.0, float(intensity) * 0.95))
+                else:
+                    search_thickness = max(AndroidUtilities.dp(7), int(thickness * 0.78))
+                    search_intensity = max(0.1, min(1.0, float(intensity) * 0.88))
+                self._configure_drawable(bg, search_radius, search_thickness, search_intensity, allow_liquid_glass=allow_liquid_glass)
+                self._apply_panel_background(store, store_key, search_panel, bg)
+            else:
+                store["_lg_sig_dirty"] = True
+        except Exception:
+            pass
+
+    def _sync_disabled_regions(self, store, chat_activity):
+        apply_action_bar = self.get_setting("apply_action_bar", True)
+        apply_top_panels = self.get_setting("apply_top_panels", True)
+        apply_search_bar = self.get_setting("apply_search_bar", True)
+        apply_story_bar = self.get_setting("apply_story_bar", True)
+        if not apply_action_bar:
+            if "action_bar" in store or "action_bar_blurred" in store or "action_bar_cast_shadows" in store:
+                self._restore_action_bar_parts(store)
+        if not apply_top_panels:
+            for k in ("top_panel", "top_panel2"):
+                if k in store:
+                    self._restore_panel_entry(store, k)
+        if not apply_search_bar:
+            if "search_bar" in store:
+                self._restore_panel_entry(store, "search_bar")
+            if "search_results" in store:
+                self._restore_panel_entry(store, "search_results")
+        if not apply_story_bar:
+            if "story_bar" in store:
+                self._restore_panel_entry(store, "story_bar")
+
+    def _restore_action_bar_parts(self, store):
+        self._detach_settings_glass_alpha_sync(store)
+        e = store.get("action_bar")
+        if e and e.get("view"):
+            try:
+                v = e["view"]
+                v.setBackground(e.get("background"))
+                if e.get("backgroundColor") is not None:
+                    self._set_attr(v, "backgroundColor", e.get("backgroundColor"))
+                if e.get("layer_type") is not None:
+                    try:
+                        v.setLayerType(int(e["layer_type"]), None)
+                    except Exception:
+                        pass
+                if Build.VERSION.SDK_INT >= 21:
+                    try:
+                        if "saved_clip_to_outline" in e:
+                            v.setOutlineProvider(e.get("saved_outline_provider"))
+                            v.setClipToOutline(bool(e.get("saved_clip_to_outline")))
+                        else:
+                            v.setOutlineProvider(None)
+                            v.setClipToOutline(False)
+                    except Exception:
+                        pass
+                v.invalidate()
+            except:
+                pass
+        eb = store.get("action_bar_blurred")
+        if eb and eb.get("view") is not None:
+            try:
+                self._set_attr(eb["view"], "blurredBackground", eb.get("blurredBackground"))
+                eb["view"].invalidate()
+            except:
+                pass
+        es = store.get("action_bar_cast_shadows")
+        if es and es.get("view") is not None:
+            try:
+                if es.get("castShadows") is not None:
+                    try:
+                        es["view"].setCastShadows(es.get("castShadows"))
+                    except:
+                        self._set_attr(es["view"], "castShadows", es.get("castShadows"))
+                es["view"].invalidate()
+            except:
+                pass
+        for k in ("action_bar", "action_bar_blurred", "action_bar_cast_shadows"):
+            store.pop(k, None)
+
+    def _restore_chat_store(self, store):
+        if not store:
+            return
+        self._restore_action_bar_parts(store)
+        for key in ("top_panel", "top_panel2", "search_bar", "search_results", "story_bar"):
+            self._restore_panel_entry(store, key)
+        e = store.get("background_clip")
+        if e and e.get("view"):
+            try:
+                e["view"].setClipBounds(e.get("clip"))
+                e["view"].invalidate()
+            except:
+                pass
+        store.pop("background_clip", None)
+        store.pop("_lg_apply_sig", None)
+        store.pop("_lg_sig_dirty", None)
+
+    def _restore_panel_entry(self, store, key):
+        entry = store.get(key)
+        if not entry: return
+        view = entry.get("view")
+        try:
+            if view:
+                view.setBackground(entry.get("background"))
+                if entry.get("drawBlur") is not None:
+                    self._set_attr(view, "drawBlur", entry.get("drawBlur"))
+                if entry.get("backgroundColor") is not None:
+                    self._set_attr(view, "backgroundColor", entry.get("backgroundColor"))
+                if entry.get("layer_type") is not None:
+                    try:
+                        view.setLayerType(int(entry["layer_type"]), None)
+                    except Exception:
+                        pass
+                if Build.VERSION.SDK_INT >= 21:
+                    try:
+                        if "saved_clip_to_outline" in entry:
+                            view.setOutlineProvider(entry.get("saved_outline_provider"))
+                            view.setClipToOutline(bool(entry.get("saved_clip_to_outline")))
+                        else:
+                            self._clear_view_outline_clip(view)
+                    except Exception:
+                        pass
+                view.invalidate()
+        except Exception:
+            if view:
+                try:
+                    view.invalidate()
+                except Exception:
+                    pass
+        store.pop(key, None)
+
+    def _theme_color_fingerprint(self, resources_provider):
+        try:
+            if resources_provider is not None:
+                return int(Theme.getColor(Theme.key_actionBarDefault, resources_provider))
+            return int(Theme.getColor(Theme.key_actionBarDefault))
+        except Exception:
+            try:
+                return int(Theme.getColor(Theme.key_actionBarDefault))
+            except Exception:
+                return 0
+
+    def _glass_state_signature(self, resources_provider):
+        try:
+            tup = tuple(self.get_setting(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS)
+        except Exception:
+            tup = ()
+        return (tup, self._theme_color_fingerprint(resources_provider))
+
+    def _chat_apply_signature(self, chat_activity):
+        td = None
+        try:
+            td = get_private_field(chat_activity, "themeDelegate")
+        except Exception:
+            pass
+        return self._glass_state_signature(td)
+
+    def _fragment_apply_signature(self, fragment):
+        return self._glass_state_signature(self._resolve_resources_provider(fragment))
+
+    def _color_provider_cache_sig(self, resources_provider, color_key, alpha, disable_top_stroke=False, disable_shadow=False, disable_bottom_stroke=False):
+        rid = 0
+        try:
+            if resources_provider is not None:
+                rid = id(resources_provider)
+        except Exception:
+            rid = 0
+        ck = 0
+        if color_key is not None:
+            try:
+                ck = int(color_key)
+            except Exception:
+                try:
+                    ck = hash(str(color_key))
+                except Exception:
+                    ck = 0
+        return (
+            ck,
+            round(float(alpha), 5),
+            bool(disable_top_stroke),
+            bool(disable_shadow),
+            bool(disable_bottom_stroke),
+            rid,
+            self._theme_color_fingerprint(resources_provider),
+        )
+
+    def _build_color_provider(self, resources_provider, color_key, alpha, disable_top_stroke=False, disable_shadow=False, disable_bottom_stroke=False):
+        sig = self._color_provider_cache_sig(
+            resources_provider, color_key, alpha, disable_top_stroke, disable_shadow, disable_bottom_stroke
+        )
+        try:
+            provider = BlurredBackgroundColorProviderThemed(resources_provider, color_key, float(alpha))
+            if disable_top_stroke or disable_shadow or disable_bottom_stroke:
+                return _ColorProviderProxy(provider, disable_top_stroke, disable_shadow, disable_bottom_stroke), sig
+            return provider, sig
+        except Exception:
+            return None, sig
+
+    def _drawable_cache_get(self, cache_key):
+        d = self._drawable_cache
+        if cache_key not in d:
+            return None
+        drawable = d.pop(cache_key)
+        d[cache_key] = drawable
+        return drawable
+
+    def _drawable_cache_put(self, cache_key, drawable):
+        d = self._drawable_cache
+        if cache_key in d:
+            d.pop(cache_key)
+        d[cache_key] = drawable
+        max_n = self._DRAWABLE_CACHE_MAX
+        while len(d) > max_n:
+            d.popitem(last=False)
+
+    def _create_drawable(self, factory, view, provider, offset_x, offset_y, store, cache_sig=None, allow_liquid_glass=True):
+        if not factory or not view:
+            return None
+        prov_part = cache_sig if cache_sig is not None else (id(provider) if provider is not None else 0)
+        cache_key = (id(factory), id(view), offset_x, offset_y, prov_part, bool(allow_liquid_glass))
+        cached = self._drawable_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        prev_liquid = self._factory_get_liquid_allowed(factory)
+        try:
+            self._factory_set_liquid_allowed(factory, bool(allow_liquid_glass))
+            drawable = factory.create(view, provider) if provider else factory.create(view)
+            if drawable is not None:
+                self._drawable_cache_put(cache_key, drawable)
+            return drawable
+        except Exception:
+            return None
+        finally:
+            if prev_liquid is not None:
+                self._factory_set_liquid_allowed(factory, prev_liquid)
+            else:
+                self._factory_set_liquid_allowed(factory, False)
+
+    def _factory_get_liquid_allowed(self, factory):
+        if not factory or Build.VERSION.SDK_INT < 33:
+            return None
+        for name in ("isLiquidGlassEffectAllowed", "getLiquidGlassEffectAllowed"):
+            fn = getattr(factory, name, None)
+            if callable(fn):
+                try:
+                    return bool(fn())
+                except Exception:
+                    pass
+        return None
+
+    def _factory_set_liquid_allowed(self, factory, allowed):
+        if not factory or Build.VERSION.SDK_INT < 33:
+            return
+        fn = getattr(factory, "setLiquidGlassEffectAllowed", None)
+        if not callable(fn):
+            return
+        try:
+            fn(bool(allowed))
+        except TypeError:
+            if allowed:
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _reset_factories_liquid_glass(self, factory, frosted_factory):
+        for f in (factory, frosted_factory):
+            if f:
+                self._factory_set_liquid_allowed(f, False)
+
+    def _collect_drawable_cache_view_ids(self, store):
+        ids = set()
+        if not store:
+            return ids
+        for key in (
+            "action_bar",
+            "action_bar_blurred",
+            "action_bar_cast_shadows",
+            "top_panel",
+            "top_panel2",
+            "search_bar",
+            "search_results",
+            "story_bar",
+        ):
+            e = store.get(key)
+            v = e.get("view") if e else None
+            if v is not None:
+                try:
+                    ids.add(id(v))
+                except Exception:
+                    pass
+        e = store.get("background_clip")
+        if e and e.get("view"):
+            try:
+                ids.add(id(e["view"]))
+            except Exception:
+                pass
+        return ids
+
+    def _evict_drawable_cache_for_view_ids(self, view_ids):
+        if not view_ids or not self._drawable_cache:
+            return
+        drop = [k for k in self._drawable_cache if k and len(k) > 1 and k[1] in view_ids]
+        for k in drop:
+            self._drawable_cache.pop(k, None)
+
+    def _apply_or_restore_top_row(
+        self, store, store_key, row_view, factory, theme_delegate,
+        panel_alpha, panel_radius, panel_thickness, panel_intensity, offset_x, offset_y,
+        allow_liquid_glass=True,
+    ):
+        if row_view and self._panel_has_real_height(row_view, self._MIN_TOP_PANEL_DP):
+            self._restore_panel_if_view_replaced(store, store_key, row_view)
+            provider, psig = self._build_color_provider(
+                theme_delegate, Theme.key_chat_topPanelBackground, panel_alpha, True, True
+            )
+            if provider is None:
+                store["_lg_sig_dirty"] = True
+                return
+            bg = self._create_drawable(factory, row_view, provider, offset_x, offset_y, store, psig, allow_liquid_glass)
+            if bg:
+                self._configure_drawable(bg, panel_radius, panel_thickness, panel_intensity, allow_liquid_glass=allow_liquid_glass)
+                self._apply_panel_background(store, store_key, row_view, bg)
+            else:
+                store["_lg_sig_dirty"] = True
+        elif store_key in store:
+            self._restore_panel_entry(store, store_key)
+
+    def _configure_drawable(self, drawable, radius, thickness, intensity, allow_liquid_glass=True):
+        if not drawable:
+            return
+        try:
+            if radius is not None:
+                drawable.setRadius(radius)
+            if thickness is not None:
+                drawable.setThickness(thickness)
+            if intensity is not None:
+                drawable.setIntensity(float(intensity))
+        except Exception:
+            pass
+
+    def _apply_background(self, store, key, view, drawable):
+        if not view or not drawable: return
+        if key not in store or store[key].get("view") is not view:
+            ne = {"view": view, "background": view.getBackground()}
+            try:
+                ne["backgroundColor"] = self._get_attr(view, "backgroundColor")
+            except Exception:
+                pass
+            if Build.VERSION.SDK_INT >= 21:
+                try:
+                    ne["saved_clip_to_outline"] = bool(view.getClipToOutline())
+                    ne["saved_outline_provider"] = view.getOutlineProvider()
+                except Exception:
+                    pass
+            try:
+                ne["layer_type"] = int(view.getLayerType())
+            except Exception:
+                ne["layer_type"] = None
+            store[key] = ne
+        store[key]["applied"] = drawable
+        try:
+            view.setBackground(drawable)
+            self._set_attr(view, "backgroundColor", Color.TRANSPARENT)
+            view.invalidate()
+        except Exception:
+            store["_lg_sig_dirty"] = True
+
+    def _apply_panel_background(self, store, key, panel, drawable, clear_solid_underlay=True):
+        if not panel or not drawable:
+            return
+        if key not in store or store[key].get("view") is not panel:
+            clip_sv = None
+            prov_sv = None
+            if Build.VERSION.SDK_INT >= 21:
+                try:
+                    clip_sv = bool(panel.getClipToOutline())
+                    prov_sv = panel.getOutlineProvider()
+                except Exception:
+                    pass
+            try:
+                lt = int(panel.getLayerType())
+            except Exception:
+                lt = None
+            store[key] = {
+                "view": panel,
+                "background": panel.getBackground(),
+                "drawBlur": self._get_attr(panel, "drawBlur"),
+                "backgroundColor": self._get_attr(panel, "backgroundColor"),
+                "saved_clip_to_outline": clip_sv,
+                "saved_outline_provider": prov_sv,
+                "layer_type": lt,
+            }
+        store[key]["applied"] = drawable
+        try:
+            if Build.VERSION.SDK_INT >= 21:
+                self._clear_view_outline_clip(panel)
+            panel.setBackground(drawable)
+            self._set_attr(panel, "drawBlur", False)
+            if clear_solid_underlay:
+                self._set_attr(panel, "backgroundColor", Color.TRANSPARENT)
+            self._clear_outline_ancestors(panel, 6)
+            panel.invalidate()
+        except Exception:
+            store["_lg_sig_dirty"] = True
+
+    def _disable_actionbar_blur(self, store, action_bar):
+        try:
+            blurred = self._get_attr(action_bar, "blurredBackground")
+            if "action_bar_blurred" not in store or store["action_bar_blurred"].get("view") is not action_bar:
+                store["action_bar_blurred"] = {"view": action_bar, "blurredBackground": blurred}
+            if blurred:
+                self._set_attr(action_bar, "blurredBackground", False)
+            action_bar.invalidate()
+        except Exception:
+            store.pop("action_bar_blurred", None)
+
+    def _disable_actionbar_shadows(self, store, action_bar):
+        try:
+            prev = self._get_attr(action_bar, "castShadows")
+            if "action_bar_cast_shadows" not in store or store["action_bar_cast_shadows"].get("view") is not action_bar:
+                store["action_bar_cast_shadows"] = {"view": action_bar, "castShadows": prev}
+            try: action_bar.setCastShadows(False)
+            except: self._set_attr(action_bar, "castShadows", False)
+        except Exception:
+            store.pop("action_bar_cast_shadows", None)
+
+    def _blur_needs_preserved_background_clip(self, chat_activity):
+        if not chat_activity:
+            return False
+        for attr in ("topicId", "openedTopicId", "forumTopicId", "selectedTopicId"):
+            try:
+                v = _get_first_available_field(chat_activity, attr)
+                if v is None:
+                    continue
+                if int(v) != 0:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _unclip_chat_background(self, chat_activity):
+        try:
+            content_view = get_private_field(chat_activity, "contentView") or getattr(chat_activity, "contentView", None)
+            if not content_view: return
+            bg_view = getattr(content_view, "backgroundView", None) or get_private_field(content_view, "backgroundView")
+            if not bg_view: return
+            store = self._applied.setdefault(id(chat_activity), {})
+            if "background_clip" not in store or store["background_clip"].get("view") is not bg_view:
+                prev = None
+                try:
+                    current = bg_view.getClipBounds()
+                    if current: prev = Rect(current.left, current.top, current.right, current.bottom)
+                except Exception:
+                    prev = None
+                store["background_clip"] = {"view": bg_view, "clip": prev}
+            bg_view.setClipBounds(None)
+            bg_view.invalidate()
+        except Exception:
+            st = self._applied.get(id(chat_activity))
+            if st:
+                st.pop("background_clip", None)
+
+    def _restore_background_clip_for_chat(self, chat_activity):
+        try:
+            store = self._applied.get(id(chat_activity))
+            if not store:
+                return
+            e = store.get("background_clip")
+            if e and e.get("view"):
+                try:
+                    e["view"].setClipBounds(e.get("clip"))
+                    e["view"].invalidate()
+                except Exception:
+                    pass
+                store.pop("background_clip", None)
+        except Exception:
+            pass
+
+    def _view_is_short_horizontal_strip(self, view, max_height_dp):
+        if view is None:
+            return False
+        try:
+            if view.getVisibility() != View.VISIBLE:
+                return False
+            h = int(view.getHeight())
+            if h <= 0:
+                h = int(view.getMeasuredHeight())
+            if h <= 0:
+                return False
+            if h > AndroidUtilities.dp(max_height_dp):
+                return False
+            w = int(view.getWidth())
+            if w <= 0:
+                w = int(view.getMeasuredWidth())
+            if w < AndroidUtilities.dp(48):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _resolve_story_bar_view(self, chat_activity):
+        if not chat_activity:
+            return None
+        for name in ("storiesView", "storiesContainer", "storyView", "storyContainer"):
+            v = _get_first_available_field(chat_activity, name)
+            if v is not None:
+                return v
+        topics = _get_first_available_field(chat_activity, "topicsTabs")
+        if topics is not None and self._view_is_short_horizontal_strip(
+            topics, self._MAX_STORY_TOPICS_STRIP_HEIGHT_DP
+        ):
+            return topics
+        return None
+
+    def _cleanup_chat(self, chat_activity):
+        if not chat_activity: return
+        key = id(chat_activity)
+        st = self._applied.pop(key, None)
+        if st:
+            self._evict_drawable_cache_for_view_ids(self._collect_drawable_cache_view_ids(st))
+            self._restore_chat_store(st)
+        self._apply_pending.discard(key)
+        self._apply_requested.discard(key)
+        self._last_apply_time.pop(key, None)
+        self._factory_cooldown_chat.pop(key, None)
+        try:
+            self._active_chats.discard(chat_activity)
+        except Exception:
+            pass
+
+    def _restore_all(self, reapply_after=True):
+        for st in list(self._applied.values()):
+            self._restore_chat_store(st)
+        self._applied.clear()
+        self._drawable_cache.clear()
+        self._last_apply_time.clear()
+        self._apply_pending.clear()
+        self._apply_requested.clear()
+        self._extra_apply_gen.clear()
+        self._factory_cooldown_chat.clear()
+        self._factory_cooldown_extra.clear()
+        self._restore_all_extras(reapply_after=False)
+        if reapply_after and self.get_setting("enabled", True) and self._is_supported():
+            chats = [
+                ca for ca in list(self._active_chats)
+                if self._is_fragment_active(ca) and self._is_fragment_resumed(ca)
+            ]
+            for i, ca in enumerate(chats):
+                try:
+                    self.apply_to_chat(ca, 30 + i * 90, urgent=True)
+                except Exception:
+                    pass
+            extras = [
+                ex for ex in list(self._active_extras)
+                if self._is_fragment_active(ex) and self._is_fragment_resumed(ex)
+            ]
+            for i, ex in enumerate(extras):
+                try:
+                    self.apply_to_extra_fragment(ex, 40 + i * 100, urgent=True)
+                except Exception:
+                    pass
+
+    def _extra_fragment_setting(self, fragment):
+        if not fragment:
+            return None
+        try:
+            name = fragment.getClass().getName()
+        except Exception:
+            return None
+        if "DialogsActivity" in name:
+            return "apply_dialogs_list"
+        if name.startswith("org.telegram.ui.SettingsActivity"):
+            return "apply_settings_header"
+        if name.endswith("TopicsFragment"):
+            return "apply_topics_header"
+        return None
+
+    def _resolve_resources_provider(self, fragment):
+        return _get_first_available_field(fragment, "themeDelegate", "resourceProvider")
+
+    def _resolve_blur_factory_pair(self, fragment, store=None):
+        main = _get_first_available_field(
+            fragment, "glassBackgroundDrawableFactory", "iBlur3FactoryLiquidGlass"
+        )
+        frost = _get_first_available_field(
+            fragment, "glassBackgroundDrawableFactoryFrosted", "iBlur3FactoryFrostedLiquidGlass"
+        )
+        if main or frost:
+            return main, frost
+        if store is not None:
+            cached = store.get("_lg_synth_factory_pair")
+            if cached:
+                return cached
+        src_main = _get_first_available_field(fragment, "iBlur3SourceGlass")
+        src_frost = _get_first_available_field(fragment, "iBlur3SourceGlassFrosted")
+        if not src_main:
+            gs = getattr(fragment, "getGlassSource", None)
+            if callable(gs):
+                try:
+                    src_main = gs()
+                except Exception:
+                    pass
+        fac_cls = safe_find_class("org.telegram.ui.Components.blur3.BlurredBackgroundDrawableViewFactory")
+        if not fac_cls or not src_main:
+            return None, None
+        try:
+            main = fac_cls(src_main)
+        except Exception:
+            main = None
+        frost = None
+        if src_frost is not None and src_frost is not src_main:
+            try:
+                frost = fac_cls(src_frost)
+            except Exception:
+                frost = None
+        pair = (main, frost)
+        if store is not None and (main or frost):
+            store["_lg_synth_factory_pair"] = pair
+        return pair
+
+    def _action_bar_drawable_factories_order(self, factory, frosted):
+        order = []
+        if factory is not None:
+            order.append(factory)
+        if frosted is not None:
+            fid = id(frosted)
+            if not any(id(f) == fid for f in order if f is not None):
+                order.append(frosted)
+        seen = set()
+        out = []
+        for fac in order:
+            if fac is None:
+                continue
+            k = id(fac)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(fac)
+        return out
+
+    def _restore_extras_store(self, store):
+        if not store:
+            return
+        self._restore_action_bar_parts(store)
+
+    def _restore_all_extras(self, reapply_after=True):
+        for st in list(self._extras_applied.values()):
+            self._restore_extras_store(st)
+        self._extras_applied.clear()
+        if reapply_after and self.get_setting("enabled", True) and self._is_supported():
+            extras = [
+                ex for ex in list(self._active_extras)
+                if self._is_fragment_active(ex) and self._is_fragment_resumed(ex)
+            ]
+            for i, ex in enumerate(extras):
+                try:
+                    self.apply_to_extra_fragment(ex, 40 + i * 100, urgent=True)
+                except Exception:
+                    pass
+
+    def apply_to_extra_fragment(self, fragment, delay_ms=100, urgent=False):
+        if not fragment or not self._is_fragment_active(fragment):
+            return
+        self._prune_runtime_state()
+        sk = self._extra_fragment_setting(fragment)
+        if not sk or not self.get_setting(sk, False):
+            key = id(fragment)
+            self._extra_apply_gen.pop(key, None)
+            st = self._extras_applied.pop(key, None)
+            if st:
+                self._restore_extras_store(st)
+            try:
+                self._active_extras.discard(fragment)
+            except Exception:
+                pass
+            return
+        if not self.get_setting("enabled", True):
+            key = id(fragment)
+            self._extra_apply_gen.pop(key, None)
+            st = self._extras_applied.pop(key, None)
+            if st:
+                self._evict_drawable_cache_for_view_ids(self._collect_drawable_cache_view_ids(st))
+                self._restore_extras_store(st)
+            try:
+                self._active_extras.discard(fragment)
+            except Exception:
+                pass
+            return
+        if not self._is_supported():
+            key = id(fragment)
+            self._extra_apply_gen.pop(key, None)
+            st = self._extras_applied.pop(key, None)
+            if st:
+                self._evict_drawable_cache_for_view_ids(self._collect_drawable_cache_view_ids(st))
+                self._restore_extras_store(st)
+            try:
+                self._active_extras.discard(fragment)
+            except Exception:
+                pass
+            return
+        try:
+            self._active_extras.add(fragment)
+        except Exception:
+            pass
+        if not urgent and self._in_startup_grace():
+            delay_ms = max(delay_ms, self._STARTUP_EXTRA_DELAY_MIN_MS + 80)
+        key = id(fragment)
+        if not urgent:
+            store = self._extras_applied.get(key, {})
+            if store:
+                try:
+                    if store.get("_lg_apply_sig") != self._fragment_apply_signature(fragment):
+                        delay_ms = max(delay_ms, 220)
+                        self._bump_diag("theme_burst_extra")
+                except Exception:
+                    pass
+        if len(self._extra_apply_gen) > 96:
+            alive = set(self._extras_applied.keys())
+            try:
+                alive.update(id(x) for x in list(self._active_extras))
+            except Exception:
+                pass
+            self._extra_apply_gen = {k: v for k, v in self._extra_apply_gen.items() if k in alive}
+        self._extra_apply_gen[key] = int(self._extra_apply_gen.get(key, 0)) + 1
+        gen = int(self._extra_apply_gen[key])
+        plug, fr = self, fragment
+
+        def _run():
+            if int(plug._extra_apply_gen.get(key, 0)) != gen:
+                return
+            plug._apply_extra_fragment_impl(fr)
+
+        run_on_ui_thread(_run, delay_ms)
+
+    def _apply_extra_fragment_impl(self, fragment):
+        try:
+            if not self._is_fragment_active(fragment):
+                return
+            if not self.get_setting("enabled", True) or not self._is_supported():
+                self._cleanup_extra(fragment)
+                return
+            sk = self._extra_fragment_setting(fragment)
+            if not sk or not self.get_setting(sk, False):
+                self._cleanup_extra(fragment)
+                return
+            store = self._extras_applied.setdefault(id(fragment), {})
+            rp = self._resolve_resources_provider(fragment)
+            liquid_ok = True
+            action_bar = None
+            if sk == "apply_dialogs_list":
+                action_bar = self._resolve_action_bar(fragment)
+                if not action_bar:
+                    store.pop("_lg_apply_sig", None)
+                    return
+                prev_d = store.get("action_bar")
+                if prev_d and prev_d.get("view") is not None and prev_d.get("view") is not action_bar:
+                    self._restore_action_bar_parts(store)
+                if (
+                    store.get("_lg_apply_sig") == self._fragment_apply_signature(fragment)
+                    and not self._action_bar_needs_reapply(store, action_bar)
+                ):
+                    return
+            factory, frosted = self._resolve_blur_factory_pair(fragment, store)
+            if not factory and frosted:
+                factory, frosted = frosted, None
+            if not factory:
+                key = id(fragment)
+                now_ms = time.time() * 1000
+                next_retry = float(self._factory_cooldown_extra.get(key, 0))
+                if now_ms < next_retry:
+                    self._bump_diag("factory_cooldown_skip_extra")
+                    return
+                self._factory_cooldown_extra[key] = now_ms + float(self._FACTORY_RETRY_COOLDOWN_MS)
+                self._bump_diag("factory_miss_extra")
+                store.pop("_lg_apply_sig", None)
+                return
+            self._factory_cooldown_extra.pop(id(fragment), None)
+            self._reset_factories_liquid_glass(factory, frosted)
+            strong_glass = self.get_setting("strong_glass", False)
+            offset_x, offset_y = 0, 0
+            action_alpha = self._parse_float_safe(self.get_setting("action_bar_alpha", "0.82"), clamp_0_1=True)
+            action_thickness_dp = self._clamp_dp_setting(self.get_setting("action_bar_thickness", "14"), 14, 6, 32)
+            action_intensity = self._parse_float_safe(self.get_setting("action_bar_intensity", "0.42"), clamp_0_1=True)
+            panel_alpha = self._parse_float_safe(self.get_setting("panel_alpha", "0.80"), clamp_0_1=True)
+            panel_intensity = self._parse_float_safe(self.get_setting("panel_intensity", "0.38"), clamp_0_1=True)
+            panel_radius = 0
+            if strong_glass:
+                action_alpha, action_thickness_dp, action_intensity = self._strong_glass_tune_action_bar(
+                    action_alpha, action_thickness_dp, action_intensity
+                )
+            action_alpha, _, action_intensity, _ = self._adapt_glass_to_theme(
+                rp, action_alpha, panel_alpha, action_intensity, panel_intensity, strong_glass
+            )
+            action_thickness = AndroidUtilities.dp(action_thickness_dp)
+            if action_bar is None:
+                action_bar = self._resolve_action_bar(fragment)
+            if not action_bar:
+                store.pop("_lg_apply_sig", None)
+                return
+            prev_ab = store.get("action_bar")
+            if prev_ab and prev_ab.get("view") is not None and prev_ab.get("view") is not action_bar:
+                self._restore_action_bar_parts(store)
+            provider, psig = self._build_color_provider(
+                rp,
+                Theme.key_actionBarDefault,
+                action_alpha,
+                disable_top_stroke=False,
+                disable_shadow=True,
+                disable_bottom_stroke=True,
+            )
+            if provider is None:
+                store.pop("_lg_apply_sig", None)
+                return
+            bg = None
+            for fac in self._action_bar_drawable_factories_order(factory, frosted):
+                bg = self._create_drawable(fac, action_bar, provider, offset_x, offset_y, store, psig, liquid_ok)
+                if bg:
+                    break
+            if bg:
+                self._configure_action_bar_drawable(
+                    bg, panel_radius, action_thickness, action_intensity,
+                    allow_liquid_glass=liquid_ok,
+                )
+                self._disable_actionbar_blur(store, action_bar)
+                self._disable_actionbar_shadows(store, action_bar)
+                self._apply_background(store, "action_bar", action_bar, bg)
+                self._clip_action_bar_outline(action_bar, panel_radius)
+                if sk == "apply_settings_header":
+                    self._attach_settings_glass_alpha_sync(fragment, store)
+                    self._sync_settings_header_glass_alpha(fragment, store)
+                    ab = action_bar
+                    pr = panel_radius
+                    if self.get_setting("performance_mode", False):
+                        run_on_ui_thread(lambda: self._clip_action_bar_outline(ab, pr), 320)
+                    else:
+                        run_on_ui_thread(lambda: self._clip_action_bar_outline(ab, pr), 160)
+                        run_on_ui_thread(lambda: self._clip_action_bar_outline(ab, pr), 480)
+                store["_lg_apply_sig"] = self._fragment_apply_signature(fragment)
+            else:
+                store.pop("_lg_apply_sig", None)
+        except Exception:
+            try:
+                k = id(fragment)
+                st = self._extras_applied.get(k)
+                if st:
+                    st.pop("_lg_apply_sig", None)
+            except Exception:
+                pass
+
+    def _cleanup_extra(self, fragment):
+        if not fragment:
+            return
+        key = id(fragment)
+        self._extra_apply_gen.pop(key, None)
+        self._factory_cooldown_extra.pop(key, None)
+        st = self._extras_applied.pop(key, None)
+        if st:
+            self._evict_drawable_cache_for_view_ids(self._collect_drawable_cache_view_ids(st))
+            self._restore_extras_store(st)
+        try:
+            self._active_extras.discard(fragment)
+        except Exception:
+            pass
+
+    def _chat_search_ui_visible(self, view):
+        if not view:
+            return False
+        try:
+            if view.getVisibility() == View.VISIBLE:
+                return True
+        except Exception:
+            pass
+        shown = getattr(view, "shown", None)
+        if callable(shown):
+            try:
+                return bool(shown())
+            except Exception:
+                return False
+        return False
+
+    def _resolve_search_primary_view(self, chat_activity):
+        tabs = _get_first_available_field(chat_activity, "hashtagSearchTabs")
+        if tabs is not None:
+            return tabs
+        return _get_first_available_field(chat_activity, "chatSearchPanel")
+
+    def _resolve_second_top_panel_view(self, chat_activity):
+        return _get_first_available_field(chat_activity, "topChatPanelView2")
+
+    def _reset_to_defaults(self):
+        self._persist_settings_bulk(DEFAULT_SETTINGS)
+        self._drawable_cache.clear()
+        self._last_apply_time.clear()
+        self._extra_apply_gen.clear()
+        self._apply_pending.clear()
+        self._apply_requested.clear()
+        run_on_ui_thread(self._restore_all)
+        try:
+            BulletinHelper.show_info("Настройки сброшены к значениям по умолчанию")
+        except Exception:
+            pass
+
+    def _hook_chat_activity(self):
+        ChatActivityClass = safe_find_class("org.telegram.ui.ChatActivity")
+        if not ChatActivityClass:
+            return
+        ctx_cls = safe_find_class("android.content.Context")
+        added = 0
+
+        try:
+            if ctx_cls:
+                create_view = self._class_declared_method(ChatActivityClass, "createView", ctx_cls)
+                if create_view:
+                    create_view.setAccessible(True)
+                    self._register_hook(self.hook_method(create_view, _ChatCreateViewHook(self)))
+                    added += 1
+        except Exception as e:
+            self._debug_log("chat_activity.createView hook failed: %s" % e)
+
+        try:
+            on_resume = self._class_declared_method(ChatActivityClass, "onResume")
+            if on_resume:
+                on_resume.setAccessible(True)
+                self._register_hook(self.hook_method(on_resume, _ChatResumeHook(self)))
+                added += 1
+        except Exception as e:
+            self._debug_log("chat_activity.onResume hook failed: %s" % e)
+
+        try:
+            seen = set()
+            for m in self._class_declared_methods(ChatActivityClass):
+                if m.getName() != "updateColors":
+                    continue
+                sig = str(m.toString())
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                m.setAccessible(True)
+                self._register_hook(self.hook_method(m, _ChatResumeHook(self)))
+                added += 1
+        except Exception as e:
+            self._debug_log("chat_activity.updateColors hook failed: %s" % e)
+
+        try:
+            BoolT = safe_find_class("java.lang.Boolean")
+            if BoolT:
+                update_top = self._class_declared_method(ChatActivityClass, "updateTopPanel", BoolT.TYPE)
+                if update_top:
+                    update_top.setAccessible(True)
+                    self._register_hook(self.hook_method(update_top, _ChatResumeHook(self)))
+                    added += 1
+        except Exception as e:
+            self._debug_log("chat_activity.updateTopPanel hook failed: %s" % e)
+
+        try:
+            invalidate_clip = self._class_declared_method(ChatActivityClass, "invalidateClipRectForBackgroundAndChatList")
+            if invalidate_clip:
+                invalidate_clip.setAccessible(True)
+                self._register_hook(self.hook_method(invalidate_clip, _ChatClipHook(self)))
+                added += 1
+        except Exception as e:
+            self._debug_log("chat_activity.invalidateClipRect hook failed: %s" % e)
+
+        try:
+            on_destroy = self._class_declared_method(ChatActivityClass, "onFragmentDestroy")
+            if on_destroy:
+                on_destroy.setAccessible(True)
+                self._register_hook(self.hook_method(on_destroy, _ChatDestroyHook(self)))
+                added += 1
+        except Exception as e:
+            self._debug_log("chat_activity.onFragmentDestroy hook failed: %s" % e)
+        self._log_hook_status("chat_activity", added)
+
+    def _hook_chat_search_tabs(self):
+        added = 0
+        for cname in ("org.telegram.ui.Components.ChatSearchTabs", "org.telegram.ui.Components.ChatSearchPanel"):
+            cls = safe_find_class(cname)
+            if not cls:
+                continue
+            try:
+                seen = set()
+                for m in self._class_declared_methods(cls):
+                    if m.getName() not in ("show", "setVisibility"):
+                        continue
+                    sig = str(m.toString())
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    m.setAccessible(True)
+                    self._register_hook(self.hook_method(m, _AllOpenChatsRepaintHook(self)))
+                    added += 1
+            except Exception as e:
+                self._debug_log("%s search-tabs hook failed: %s" % (cname, e))
+        self._log_hook_status("chat_search_tabs", added)
+
+    def _hook_dialog_cell_extras(self):
+        Cls = safe_find_class("org.telegram.ui.Cells.DialogCell")
+        if not Cls:
+            return
+        added = 0
+        try:
+            seen = set()
+            for m in self._class_declared_methods(Cls):
+                if m.getName() != "setDialog":
+                    continue
+                sig = str(m.toString())
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                m.setAccessible(True)
+                self._register_hook(self.hook_method(m, _DialogCellSetDialogHook(self)))
+                added += 1
+        except Exception as e:
+            self._debug_log("dialog_cell_extras.setDialog hook failed: %s" % e)
+        self._log_hook_status("dialog_cell_extras", added)
+
+    def _maybe_apply_dialogs_extra_from_cell(self, dialogs_activity):
+        if not dialogs_activity:
+            return
+        if not self.get_setting("enabled", True) or not self.get_setting("apply_dialogs_list", False):
+            return
+        if not self._is_fragment_active(dialogs_activity):
+            return
+        try:
+            if "DialogsActivity" not in dialogs_activity.getClass().getName():
+                return
+        except Exception:
+            return
+        key = id(dialogs_activity)
+        if len(self._last_dialogs_extra_from_cell) > 96:
+            self._last_dialogs_extra_from_cell.clear()
+        now = time.time() * 1000
+        last = self._last_dialogs_extra_from_cell.get(key, 0)
+        if now - last < self._DIALOGS_EXTRA_FROM_CELL_MS:
+            return
+        self._last_dialogs_extra_from_cell[key] = now
+        self.apply_to_extra_fragment(dialogs_activity, 40)
+
+    def _hook_extra_fragments(self):
+        ctx_cls = safe_find_class("android.content.Context")
+        added = 0
+        for cname in (
+            "org.telegram.ui.DialogsActivity",
+            "org.telegram.ui.SettingsActivity",
+            "org.telegram.ui.TopicsFragment",
+        ):
+            Cls = safe_find_class(cname)
+            if not Cls or not ctx_cls:
+                continue
+            try:
+                cv = self._class_declared_method(Cls, "createView", ctx_cls)
+                if cv:
+                    cv.setAccessible(True)
+                    self._register_hook(self.hook_method(cv, _ExtraFragmentResumeHook(self)))
+                    added += 1
+            except Exception as e:
+                self._debug_log("%s createView hook failed: %s" % (cname, e))
+            try:
+                ore = self._class_declared_method(Cls, "onResume")
+                if ore:
+                    ore.setAccessible(True)
+                    self._register_hook(self.hook_method(ore, _ExtraFragmentResumeHook(self)))
+                    added += 1
+            except Exception as e:
+                self._debug_log("%s onResume hook failed: %s" % (cname, e))
+            try:
+                seen = set()
+                for m in self._class_declared_methods(Cls):
+                    if m.getName() != "updateColors":
+                        continue
+                    sig = str(m.toString())
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    m.setAccessible(True)
+                    self._register_hook(self.hook_method(m, _ExtraFragmentResumeHook(self)))
+                    added += 1
+            except Exception as e:
+                self._debug_log("%s updateColors hook failed: %s" % (cname, e))
+            try:
+                dest = self._class_declared_method(Cls, "onFragmentDestroy")
+                if dest:
+                    dest.setAccessible(True)
+                    self._register_hook(self.hook_method(dest, _ExtraFragmentDestroyHook(self)))
+                    added += 1
+            except Exception as e:
+                self._debug_log("%s onFragmentDestroy hook failed: %s" % (cname, e))
+        self._log_hook_status("extra_fragments", added)
+
+
+class _ChatCreateViewHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param):
+        try:
+            ca = param.thisObject
+            plug = self.plugin
+            if plug._in_startup_grace():
+                run_on_ui_thread(lambda: plug.apply_to_chat(ca, 0), 520)
+                run_on_ui_thread(lambda: plug.apply_to_chat(ca, 0), 1050)
+            else:
+                plug.apply_to_chat(ca, 110)
+                run_on_ui_thread(lambda: plug.apply_to_chat(ca, 0), 450)
+        except Exception:
+            ca = getattr(param, "thisObject", None)
+            if ca:
+                try:
+                    self.plugin.apply_to_chat(ca, 120)
+                except Exception:
+                    pass
+
+class _ChatResumeHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param):
+        try:
+            ca = param.thisObject
+            plug = self.plugin
+            if plug._in_startup_grace():
+                run_on_ui_thread(lambda: plug.apply_to_chat(ca, 0), 440)
+                run_on_ui_thread(lambda: plug.apply_to_chat(ca, 0), 980)
+            else:
+                plug.apply_to_chat(ca, 70)
+                run_on_ui_thread(lambda: plug.apply_to_chat(ca, 0), 300)
+        except Exception:
+            ca = getattr(param, "thisObject", None)
+            if ca:
+                try:
+                    self.plugin.apply_to_chat(ca, 100)
+                except Exception:
+                    pass
+
+class _ChatDestroyHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def before_hooked_method(self, param):
+        try:
+            self.plugin._cleanup_chat(param.thisObject)
+        except Exception:
+            obj = getattr(param, "thisObject", None)
+            if obj is not None:
+                try:
+                    self.plugin._cleanup_chat(obj)
+                except Exception:
+                    pass
+
+class _AllOpenChatsRepaintHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param):
+        try:
+            plug = self.plugin
+            if plug._in_startup_grace():
+                base, step = 95, 100
+            elif plug.get_setting("performance_mode", False):
+                base, step = 70, 65
+            else:
+                base, step = 45, 55
+            chats = [
+                ca for ca in list(plug._active_chats)
+                if plug._is_fragment_active(ca) and plug._is_fragment_resumed(ca)
+            ]
+            for i, ca in enumerate(chats):
+                plug.apply_to_chat(ca, base + i * step)
+        except Exception:
+            pass
+
+
+class _DialogCellSetDialogHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            da = get_private_field(cell, "parentFragment")
+            plug = self.plugin
+            run_on_ui_thread(lambda p=plug, d=da: p._maybe_apply_dialogs_extra_from_cell(d), 0)
+        except Exception:
+            pass
+
+
+class _ExtraFragmentResumeHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param):
+        try:
+            fr = param.thisObject
+            plug = self.plugin
+            perf = plug.get_setting("performance_mode", False)
+            if plug._in_startup_grace():
+                run_on_ui_thread(lambda: plug.apply_to_extra_fragment(fr, 0), 460)
+                if not perf:
+                    run_on_ui_thread(lambda: plug.apply_to_extra_fragment(fr, 0), 960)
+            else:
+                plug.apply_to_extra_fragment(fr, 90)
+                run_on_ui_thread(lambda: plug.apply_to_extra_fragment(fr, 0), 380)
+                if not perf:
+                    run_on_ui_thread(lambda: plug.apply_to_extra_fragment(fr, 0), 780)
+        except Exception:
+            pass
+
+class _ExtraFragmentDestroyHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def before_hooked_method(self, param):
+        try:
+            self.plugin._cleanup_extra(param.thisObject)
+        except Exception:
+            pass
+
+class _ChatClipHook(MethodHook):
+    def __init__(self, plugin): self.plugin = plugin
+    def after_hooked_method(self, param):
+        try:
+            if not self.plugin.get_setting("enabled", True) or not self.plugin.get_setting("apply_action_bar", True):
+                return
+            ca = param.thisObject
+            if not self.plugin._is_fragment_resumed(ca):
+                return
+            try:
+                td = get_private_field(ca, "themeDelegate")
+            except Exception:
+                td = None
+            if self.plugin._theme_is_light(td):
+                self.plugin._restore_background_clip_for_chat(ca)
+            elif self.plugin._blur_needs_preserved_background_clip(ca):
+                return
+            else:
+                self.plugin._unclip_chat_background(ca)
+        except Exception:
+            pass

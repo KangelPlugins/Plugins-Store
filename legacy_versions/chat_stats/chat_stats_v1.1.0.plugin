@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+__id__ = "chat_stats"
+__name__ = "Chat Stats"
+__description__ = "Статистика сообщений в чате с человеком или канале"
+__author__ = "@MKC_KOCMOC"
+__version__ = "1.0.0"
+__icon__ = "msg_stats"
+__min_version__ = "12.2.10"
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import send_request
+from android_utils import log, run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import UserConfig, MessagesController, AndroidUtilities
+from org.telegram.ui import LaunchActivity
+from android.app import ProgressDialog
+from android.widget import ScrollView, TextView, LinearLayout
+from android.view import Gravity
+from android.graphics import Typeface
+
+import re
+from datetime import datetime
+
+# Слова короче этой длины игнорируются в топе
+MIN_WORD_LEN = 3
+
+# Стоп-слова (предлоги, союзы, частицы)
+STOP_WORDS = {
+    "это", "как", "что", "но", "или", "для", "все", "так", "уже", "его",
+    "она", "они", "мне", "тебе", "нас", "вас", "был", "была", "были",
+    "есть", "нет", "да", "ну", "вот", "ещё", "еще", "тут", "там",
+    "при", "без", "под", "над", "про", "бы", "же", "ли", "бы",
+    "the", "and", "for", "that", "this", "with", "are", "was", "have",
+    "not", "you", "from", "they", "will", "been", "can", "its",
+}
+
+
+def fmt_date(ts):
+    try:
+        return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
+    except Exception:
+        return "—"
+
+
+def count_words(text, counter):
+    if not text:
+        return
+    words = re.findall(r"[а-яёa-z]{%d,}" % MIN_WORD_LEN, text.lower())
+    for w in words:
+        if w not in STOP_WORDS:
+            counter[w] = counter.get(w, 0) + 1
+
+
+class ChatStatsPlugin(BasePlugin):
+
+    def __init__(self):
+        self.is_processing = False
+        self.progress_dialog = None
+
+    def on_plugin_load(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="📊 Статистика чата",
+            icon="msg_stats",
+            on_click=self.on_menu_click,
+        ))
+
+    # ------------------------------------------------------------------
+    # Точка входа
+    # ------------------------------------------------------------------
+    def on_menu_click(self, param):
+        if self.is_processing:
+            BulletinHelper.show_error("Уже идёт сбор статистики, подождите...")
+            return
+
+        dialog_id = param.get("dialog_id")
+        account = UserConfig.selectedAccount
+        self_id = UserConfig.getInstance(account).getClientUserId()
+
+        # Определяем тип диалога
+        # Каналы и супергруппы имеют отрицательный dialog_id < -1000000000
+        # Обычные группы: отрицательный но > -1000000000
+        # Личные диалоги: положительный
+        if dialog_id < 0:
+            peer_id = -dialog_id
+            if peer_id > 1000000000:
+                # Канал / супергруппа
+                mode = "channel"
+            else:
+                # Обычная группа
+                mode = "group"
+        else:
+            mode = "dialog"
+
+        self.is_processing = True
+        self._show_progress("Сбор статистики…\nПросмотрено: 0 сообщений")
+
+        state = {
+            "dialog_id": dialog_id,
+            "self_id": self_id,
+            "mode": mode,
+            "account": account,
+            # счётчики для диалога/группы
+            "my_count": 0,
+            "their_count": 0,
+            "word_counter": {},
+            # для канала
+            "total_posts": 0,
+            "first_date": None,
+            "last_date": None,
+            # пагинация
+            "offset_id": 0,
+            "total_scanned": 0,
+        }
+
+        self._fetch_chunk(state)
+
+    # ------------------------------------------------------------------
+    # Прогресс
+    # ------------------------------------------------------------------
+    def _show_progress(self, text):
+        def _run():
+            try:
+                act = LaunchActivity.instance
+                if not act:
+                    return
+                self.progress_dialog = ProgressDialog(act)
+                self.progress_dialog.setMessage(text)
+                self.progress_dialog.setCancelable(False)
+                self.progress_dialog.show()
+            except Exception:
+                pass
+        run_on_ui_thread(_run)
+
+    def _update_progress(self, scanned):
+        def _run():
+            if self.progress_dialog and self.progress_dialog.isShowing():
+                self.progress_dialog.setMessage(
+                    f"Сбор статистики…\nПросмотрено: {scanned} сообщений"
+                )
+        run_on_ui_thread(_run)
+
+    def _hide_progress(self):
+        def _run():
+            if self.progress_dialog:
+                self.progress_dialog.dismiss()
+                self.progress_dialog = None
+        run_on_ui_thread(_run)
+
+    # ------------------------------------------------------------------
+    # Пагинация истории
+    # ------------------------------------------------------------------
+    def _fetch_chunk(self, state):
+        account = state["account"]
+        controller = MessagesController.getInstance(account)
+
+        req = TLRPC.TL_messages_getHistory()
+        req.peer = controller.getInputPeer(state["dialog_id"])
+        req.offset_id = state["offset_id"]
+        req.limit = 100
+        req.add_offset = 0
+        req.min_id = 0
+        req.max_id = 0
+        req.hash = 0
+
+        def on_response(response, error):
+            if error:
+                self.is_processing = False
+                self._hide_progress()
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {error.text}"))
+                return
+
+            messages = response.messages
+            if messages.isEmpty():
+                self._finish(state)
+                return
+
+            mode = state["mode"]
+
+            for i in range(messages.size()):
+                msg = messages.get(i)
+                state["offset_id"] = msg.id
+
+                # Пропускаем служебные
+                if isinstance(msg.action, TLRPC.TL_messageActionHistoryClear):
+                    continue
+                # Пропускаем пустые
+                if not hasattr(msg, "message"):
+                    continue
+
+                if mode == "channel":
+                    # Для канала считаем посты и даты
+                    state["total_posts"] += 1
+                    if msg.date:
+                        if state["last_date"] is None:
+                            state["last_date"] = msg.date
+                        state["first_date"] = msg.date
+                    count_words(msg.message, state["word_counter"])
+
+                elif mode == "dialog":
+                    # Личный диалог: my vs their
+                    from_id = None
+                    if hasattr(msg, "from_id") and msg.from_id:
+                        if isinstance(msg.from_id, TLRPC.TL_peerUser):
+                            from_id = msg.from_id.user_id
+
+                    if from_id == state["self_id"]:
+                        state["my_count"] += 1
+                    else:
+                        state["their_count"] += 1
+                    count_words(msg.message, state["word_counter"])
+
+                else:
+                    # Группа: my vs остальные
+                    from_id = None
+                    if hasattr(msg, "from_id") and msg.from_id:
+                        if isinstance(msg.from_id, TLRPC.TL_peerUser):
+                            from_id = msg.from_id.user_id
+
+                    if from_id == state["self_id"]:
+                        state["my_count"] += 1
+                    else:
+                        state["their_count"] += 1
+                    count_words(msg.message, state["word_counter"])
+
+            state["total_scanned"] += messages.size()
+            self._update_progress(state["total_scanned"])
+
+            if messages.size() < 100:
+                self._finish(state)
+            else:
+                self._fetch_chunk(state)
+
+        send_request(req, on_response)
+
+    # ------------------------------------------------------------------
+    # Завершение — показываем результат
+    # ------------------------------------------------------------------
+    def _finish(self, state):
+        self.is_processing = False
+        self._hide_progress()
+        run_on_ui_thread(lambda: self._show_result(state))
+
+    def _show_result(self, state):
+        act = LaunchActivity.instance
+        if not act:
+            return
+
+        mode = state["mode"]
+
+        # Топ-10 слов (общий для всех режимов)
+        word_counter = state["word_counter"]
+        top_words = sorted(word_counter.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        # Строим текст статистики
+        lines = []
+
+        if mode == "channel":
+            total = state["total_posts"]
+            first = fmt_date(state["first_date"]) if state["first_date"] else "—"
+            last = fmt_date(state["last_date"]) if state["last_date"] else "—"
+
+            lines.append(("📌 Всего постов", str(total), False))
+            lines.append(("📅 Первый пост", first, False))
+            lines.append(("📅 Последний пост", last, False))
+
+        else:
+            my = state["my_count"]
+            their = state["their_count"]
+            total = my + their
+
+            if total > 0:
+                my_pct = round(my / total * 100, 1)
+                their_pct = round(their / total * 100, 1)
+            else:
+                my_pct = their_pct = 0.0
+
+            label_their = "Собеседник" if mode == "dialog" else "Остальные"
+
+            lines.append(("💬 Всего сообщений", str(total), False))
+            lines.append(("", "", True))  # разделитель
+            lines.append(("✉️ Я написал", f"{my} ({my_pct}%)", False))
+            lines.append((f"✉️ {label_their}", f"{their} ({their_pct}%)", False))
+            lines.append(("", "", True))
+
+            # Кто больше пишет
+            if my > their:
+                leader = f"Вы пишете больше ({my_pct}% vs {their_pct}%)"
+            elif their > my:
+                leader = f"{label_their} пишет больше ({their_pct}% vs {my_pct}%)"
+            else:
+                leader = "Вы пишете одинаково"
+            lines.append(("📈 Активность", leader, False))
+
+        # Топ слов
+        if top_words:
+            lines.append(("", "", True))
+            lines.append(("🔤 Топ-10 слов", "", False))
+            for rank, (word, cnt) in enumerate(top_words, 1):
+                lines.append((f"  {rank}. {word}", str(cnt), False))
+
+        # --- Строим UI ---
+        main = LinearLayout(act)
+        main.setOrientation(LinearLayout.VERTICAL)
+
+        scroll = ScrollView(act)
+        scroll.setPadding(
+            AndroidUtilities.dp(20),
+            AndroidUtilities.dp(8),
+            AndroidUtilities.dp(20),
+            AndroidUtilities.dp(8),
+        )
+
+        inner = LinearLayout(act)
+        inner.setOrientation(LinearLayout.VERTICAL)
+
+        def to_color(hex_val):
+            return int(hex_val - 0x100000000) if hex_val > 0x7FFFFFFF else hex_val
+
+        COLOR_LABEL = to_color(0xFFAAAAAA)
+        COLOR_VALUE = to_color(0xFFE0E0E0)
+        COLOR_DIVIDER = to_color(0x33888888)
+
+        for label, value, is_divider in lines:
+            if is_divider:
+                div = TextView(act)
+                div.setHeight(AndroidUtilities.dp(1))
+                div.setBackgroundColor(COLOR_DIVIDER)
+                lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    AndroidUtilities.dp(1),
+                )
+                lp.topMargin = AndroidUtilities.dp(6)
+                lp.bottomMargin = AndroidUtilities.dp(6)
+                div.setLayoutParams(lp)
+                inner.addView(div)
+                continue
+
+            row = LinearLayout(act)
+            row.setOrientation(LinearLayout.HORIZONTAL)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            lp_row = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            lp_row.topMargin = AndroidUtilities.dp(4)
+            lp_row.bottomMargin = AndroidUtilities.dp(4)
+            row.setLayoutParams(lp_row)
+
+            lbl = TextView(act)
+            lbl.setText(label)
+            lbl.setTextSize(14.0)
+            lbl.setTextColor(COLOR_LABEL)
+            lbl_lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+            lbl.setLayoutParams(lbl_lp)
+            row.addView(lbl)
+
+            if value:
+                val = TextView(act)
+                val.setText(value)
+                val.setTextSize(14.0)
+                val.setTextColor(COLOR_VALUE)
+                val.setTypeface(None, Typeface.BOLD)
+                val.setGravity(Gravity.END)
+                row.addView(val)
+
+            inner.addView(row)
+
+        scroll.addView(inner)
+        main.addView(scroll)
+
+        title = "📊 Статистика канала" if mode == "channel" else "📊 Статистика чата"
+
+        builder = AlertDialogBuilder(act)
+        builder.set_title(title)
+        builder.set_view(main)
+        builder.set_positive_button("Закрыть", lambda b, w: b.dismiss())
+        builder.show()

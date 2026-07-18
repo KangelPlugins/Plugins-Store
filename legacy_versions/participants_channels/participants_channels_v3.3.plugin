@@ -1,0 +1,920 @@
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, set_private_field
+from android_utils import log, run_on_ui_thread
+from client_utils import send_request
+from java.lang import Class as JClass
+from java.util import ArrayList
+from java import jclass
+import time
+import weakref
+
+__id__ = "participants_channels"
+__name__ = "Каналы участников чата"
+__description__ = "Добавляет вкладку **Каналы** в профиль группы, показывающую личные каналы участников.\n\nНажать на канал = открыть канал.\nНажать и держать = открыть профиль админа."
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "3.2"
+__icon__ = "MaxExteraPluginsStickers/19"
+__min_version__ = "12.5.1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+TAB_ID = 10
+TAB_LABEL = "Каналы"
+CACHE_TTL = 300
+DEFAULT_HISTORY_LIMIT = 100
+MAX_HISTORY_LIMIT = 100000
+MAX_CACHED_CHATS = 3
+MAX_USERS_CACHE = 300
+BATCH_SIZE = 10
+
+
+class GroupChannelsTabPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._user_channels = {}
+        self._no_channel = set()
+        self._loading = set()
+        self._channels_cache = {}
+        self._channels_cache_time = {}
+        self._history_loaded = {}
+        self._history_running = set()
+        self._cache_order = []
+        self._active_sml = {}
+        self._active_acc = {}
+        self._update_pending = set()
+        self._mc_cache = {}
+        self._last_count = {}
+        self._channel_to_users = {}
+        self._long_click_hooked_pages = set()
+
+    def on_plugin_load(self):
+        try:
+            self._setup()
+        except Exception as e:
+            log(f"[GCT] load: {e}")
+
+    def on_plugin_unload(self):
+        self._user_channels.clear()
+        self._no_channel.clear()
+        self._loading.clear()
+        self._channels_cache.clear()
+        self._channels_cache_time.clear()
+        self._history_loaded.clear()
+        self._history_running.clear()
+        self._cache_order.clear()
+        self._active_sml.clear()
+        self._active_acc.clear()
+        self._update_pending.clear()
+        self._mc_cache.clear()
+        self._last_count.clear()
+        self._channel_to_users.clear()
+        self._long_click_hooked_pages.clear()
+
+    def _open_url_internal(self, url):
+        def handler(view):
+            try:
+                Browser = jclass("org.telegram.messenger.browser.Browser")
+                ctx = view.getContext()
+                uri = jclass("android.net.Uri").parse(url)
+                Browser.openUrl(ctx, uri, True, False, None)
+            except Exception:
+                try:
+                    Browser = jclass("org.telegram.messenger.browser.Browser")
+                    ctx = view.getContext()
+                    Browser.openInTelegramBrowser(ctx, url, None)
+                except Exception as e:
+                    log(f"[GCT] open url: {e}")
+        return handler
+
+    def create_settings(self):
+        from ui.settings import Switch, Header, Text, Divider, Input
+        return [
+            Header(text="Информация"),
+            Text(
+                text="Канал автора",
+                icon="msg_channel",
+                on_click=self._open_url_internal("https://t.me/MaxExteraPlugins"),
+            ),
+            Text(
+                text="Документация",
+                icon="msg_link",
+                on_click=self._open_url_internal("https://telegra.ph/Dokumentaciya-k-plaginu-Kanaly-uchastnikov-chata-07-01"),
+            ),
+            Divider(),
+            Header(text="Настройки"),
+            Switch(
+                key="load_from_history",
+                text="Искать каналы в истории чата",
+                subtext="Загружает авторов сообщений из истории (полезно, если список участников скрыт администраторами)",
+                default=False
+            ),
+            Switch(
+                key="only_if_hidden",
+                text="Только если скрыт список участников",
+                subtext="Поиск в истории будет работать только в чатах, где администраторы скрыли список участников",
+                default=False
+            ),
+            Input(
+                key="history_limit",
+                text="Количество сообщений",
+                subtext=f"Сколько последних сообщений будут проверятся, на наличие каналов в профиле у их отправителей.\n\nОт 1 до {MAX_HISTORY_LIMIT} (большое значение может вызвать лаги; рекомендуется: 5000).",
+                default=str(DEFAULT_HISTORY_LIMIT),
+                icon="msg_edit",
+            )
+        ]
+
+    def _get_history_limit(self):
+        raw = self.get_setting("history_limit", str(DEFAULT_HISTORY_LIMIT))
+        try:
+            val = int(str(raw).strip())
+        except (ValueError, TypeError):
+            return DEFAULT_HISTORY_LIMIT
+        if val < 1:
+            return DEFAULT_HISTORY_LIMIT
+        if val > MAX_HISTORY_LIMIT:
+            return MAX_HISTORY_LIMIT
+        return val
+
+    def _setup(self):
+        plugin = self
+        sml_cls = JClass.forName("org.telegram.ui.Components.SharedMediaLayout")
+
+        for m in sml_cls.getDeclaredMethods():
+            if m.getName() == "updateTabs":
+                m.setAccessible(True)
+
+                class H1(MethodHook):
+                    def after_hooked_method(self, param):
+                        try:
+                            sml_obj = param.thisObject
+                            run_on_ui_thread(lambda: plugin._on_tabs_safe(sml_obj), 50)
+                        except Exception as e:
+                            log(f"[GCT] tabs err: {e}")
+
+                self.hook_method(m, H1())
+                break
+
+        try:
+            pa_cls = find_class("org.telegram.ui.ProfileActivity")
+            if pa_cls:
+                self.hook_all_methods(pa_cls, "updateSelectedMediaTabText", _CounterHook(plugin))
+        except Exception:
+            pass
+
+        try:
+            pa2_cls = find_class("org.telegram.ui.ProfileActivity2")
+            if pa2_cls:
+                self.hook_all_methods(pa2_cls, "updateSelectedMediaTabText", _CounterHook(plugin))
+        except Exception:
+            pass
+
+    def _get_mc(self, acc):
+        if acc not in self._mc_cache:
+            from org.telegram.messenger import MessagesController
+            self._mc_cache[acc] = MessagesController.getInstance(acc)
+        return self._mc_cache[acc]
+
+    def _trim_caches(self):
+        if len(self._user_channels) > MAX_USERS_CACHE:
+            keys = list(self._user_channels.keys())[:MAX_USERS_CACHE // 2]
+            for k in keys:
+                self._user_channels.pop(k, None)
+        if len(self._no_channel) > MAX_USERS_CACHE:
+            to_remove = list(self._no_channel)[:MAX_USERS_CACHE // 2]
+            for k in to_remove:
+                self._no_channel.discard(k)
+        while len(self._cache_order) > MAX_CACHED_CHATS:
+            old_did = self._cache_order.pop(0)
+            self._channels_cache.pop(old_did, None)
+            self._channels_cache_time.pop(old_did, None)
+            self._active_sml.pop(old_did, None)
+            self._active_acc.pop(old_did, None)
+            self._last_count.pop(old_did, None)
+
+    def _on_tabs_safe(self, sml):
+        try:
+            self._on_tabs(sml)
+        except Exception as e:
+            log(f"[GCT] on_tabs: {e}")
+
+    def _on_tabs(self, sml):
+        try:
+            did = get_private_field(sml, "dialog_id")
+            if did is None or int(did) >= 0:
+                return
+            did = int(did)
+        except Exception:
+            return
+
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            acc = int(pa.getCurrentAccount())
+        except Exception:
+            return
+
+        if not self._is_group(did, acc):
+            return
+
+        self._trim_caches()
+        self._active_sml[did] = weakref.ref(sml)
+        self._active_acc[did] = acc
+
+        self._hook_long_click(sml)
+
+        cached_ids = self._get_cached_channel_ids(did)
+        if cached_ids:
+            self._show_channels(did, cached_ids)
+
+        run_on_ui_thread(lambda: self._load_members_async(did, acc), 100)
+
+    def _hook_long_click(self, sml):
+        try:
+            mp = get_private_field(sml, "mediaPages")
+            if not mp:
+                return
+            plugin = self
+            for page in mp:
+                if page is None:
+                    continue
+                page_id = id(page)
+                if page_id in self._long_click_hooked_pages:
+                    continue
+                self._long_click_hooked_pages.add(page_id)
+                lv = get_private_field(page, "listView")
+                if lv is None:
+                    continue
+                self._wrap_long_click(lv, sml, page)
+        except Exception as e:
+            log(f"[GCT] hook_lc: {e}")
+
+    def _wrap_long_click(self, listView, sml, page):
+        plugin = self
+        try:
+            original_listener = get_private_field(listView, "onItemLongClickListenerExtended")
+        except Exception:
+            original_listener = None
+
+        try:
+            original_simple = get_private_field(listView, "onItemLongClickListener")
+        except Exception:
+            original_simple = None
+
+        from java import dynamic_proxy
+
+        class LongClickProxy(dynamic_proxy(jclass("org.telegram.ui.Components.RecyclerListView$OnItemLongClickListenerExtended"))):
+            def onItemClick(self, view, position, x, y):
+                try:
+                    sel_type = plugin._get_selected_type_page(page)
+                    if sel_type == TAB_ID:
+                        handled = plugin._handle_long_click(view, position, sml)
+                        if handled:
+                            return True
+                except Exception as e:
+                    log(f"[GCT] lc proxy: {e}")
+                if original_listener is not None:
+                    try:
+                        return original_listener.onItemClick(view, position, x, y)
+                    except Exception:
+                        pass
+                if original_simple is not None:
+                    try:
+                        return original_simple.onItemClick(view, position)
+                    except Exception:
+                        pass
+                return False
+
+            def onMove(self, dx, dy):
+                if original_listener is not None:
+                    try:
+                        original_listener.onMove(dx, dy)
+                    except Exception:
+                        pass
+
+        proxy = LongClickProxy()
+        listView.setOnItemLongClickListener(proxy)
+
+    def _get_selected_type_page(self, page):
+        try:
+            return int(get_private_field(page, "selectedType"))
+        except Exception:
+            return -1
+
+    def _handle_long_click(self, view, position, sml):
+        try:
+            did = int(get_private_field(sml, "dialog_id"))
+            acc = self._active_acc.get(did)
+            if acc is None:
+                return False
+
+            adapter = get_private_field(sml, "channelRecommendationsAdapter")
+            if adapter is None:
+                return False
+
+            chat = None
+            try:
+                adapter_cls = adapter.getClass()
+                chats_field = None
+                for f in adapter_cls.getDeclaredFields():
+                    f.setAccessible(True)
+                    if f.getName() == "chats":
+                        chats_field = f
+                        break
+                if chats_field is not None:
+                    chats_list = chats_field.get(adapter)
+                    if chats_list is not None and position < chats_list.size():
+                        chat = chats_list.get(position)
+            except Exception:
+                pass
+
+            if chat is None:
+                return False
+
+            channel_id = int(chat.id)
+            owners = self._channel_to_users.get(channel_id, [])
+
+            if len(owners) == 1:
+                self._open_user_profile(owners[0], sml, acc)
+                return True
+            elif len(owners) > 1:
+                self._show_owners_dialog(owners, sml, acc, channel_id)
+                return True
+            else:
+                self._open_channel_profile(channel_id, sml, acc)
+                return True
+
+        except Exception as e:
+            log(f"[GCT] handle_lc: {e}")
+        return False
+
+    def _open_user_profile(self, uid, sml, acc):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            from android.os import Bundle as AndroidBundle
+            args = AndroidBundle()
+            args.putLong("user_id", int(uid))
+            ProfileActivity = jclass("org.telegram.ui.ProfileActivity")
+            fragment = ProfileActivity(args)
+            pa.presentFragment(fragment)
+        except Exception as e:
+            log(f"[GCT] open_user: {e}")
+
+    def _open_channel_profile(self, channel_id, sml, acc):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            from android.os import Bundle as AndroidBundle
+            args = AndroidBundle()
+            args.putLong("chat_id", int(channel_id))
+            ProfileActivity = jclass("org.telegram.ui.ProfileActivity")
+            fragment = ProfileActivity(args)
+            pa.presentFragment(fragment)
+        except Exception as e:
+            log(f"[GCT] open_ch: {e}")
+
+    def _show_owners_dialog(self, owner_uids, sml, acc, channel_id):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            ctx = pa.getParentActivity()
+            if ctx is None:
+                return
+
+            from java.lang import Long as JLong
+            mc = self._get_mc(acc)
+
+            AlertDialog = jclass("org.telegram.ui.ActionBar.AlertDialog$Builder")
+            builder = AlertDialog(ctx)
+            builder.setTitle("Владельцы канала")
+
+            names = []
+            uids_ordered = []
+            for uid in owner_uids:
+                user = mc.getUser(JLong(uid))
+                if user is not None:
+                    try:
+                        UserObject = jclass("org.telegram.messenger.UserObject")
+                        name = str(UserObject.getUserName(user))
+                    except Exception:
+                        name = str(uid)
+                    names.append(name)
+                    uids_ordered.append(uid)
+
+            if not names:
+                return
+
+            items = [jclass("java.lang.String")(n) for n in names]
+            items_arr = jclass("java.lang.reflect.Array").newInstance(jclass("java.lang.CharSequence"), len(items))
+            for i, item in enumerate(items):
+                items_arr[i] = item
+
+            plugin = self
+
+            from java.lang import Object as JObject
+
+            class DialogClickListener(dynamic_proxy(jclass("android.content.DialogInterface$OnClickListener"))):
+                def onClick(self, dialog, which):
+                    try:
+                        if which < len(uids_ordered):
+                            plugin._open_user_profile(uids_ordered[which], sml, acc)
+                    except Exception as e:
+                        log(f"[GCT] dlg_click: {e}")
+
+            builder.setItems(items_arr, DialogClickListener())
+            builder.setNegativeButton("Закрыть", None)
+            builder.show()
+        except Exception as e:
+            log(f"[GCT] show_owners: {e}")
+
+    def _load_members_async(self, did, acc):
+        try:
+            uids = self._get_member_uids(did, acc)
+            if uids:
+                known_ids = []
+                to_load = []
+                for uid in uids:
+                    if uid in self._no_channel:
+                        continue
+                    pcid = self._user_channels.get(uid)
+                    if pcid:
+                        if pcid not in known_ids:
+                            known_ids.append(pcid)
+                    elif uid not in self._loading:
+                        to_load.append(uid)
+
+                if known_ids:
+                    self._update_cache_and_show(did, known_ids)
+
+                if to_load:
+                    self._load_users_batch(to_load[:BATCH_SIZE], did, acc, to_load[BATCH_SIZE:])
+
+            if self.get_setting("load_from_history", False):
+                should_load = True
+                if self.get_setting("only_if_hidden", False):
+                    should_load = self._is_members_hidden(did, acc)
+                if should_load and did not in self._history_running:
+                    last_hist = self._history_loaded.get(did, 0)
+                    if time.time() - last_hist > CACHE_TTL:
+                        self._history_loaded[did] = time.time()
+                        self._load_from_history(did, acc)
+        except Exception as e:
+            log(f"[GCT] load_members: {e}")
+
+    def _get_cached_channel_ids(self, did):
+        cache_time = self._channels_cache_time.get(did, 0)
+        if time.time() - cache_time > CACHE_TTL:
+            return None
+        return self._channels_cache.get(did)
+
+    def _update_cache_and_show(self, did, new_ids):
+        existing = self._channels_cache.get(did, [])
+        merged = list(existing)
+        changed = False
+        for cid in new_ids:
+            if cid not in merged:
+                merged.append(cid)
+                changed = True
+        if changed or not existing:
+            self._channels_cache[did] = merged
+            self._channels_cache_time[did] = time.time()
+            if did in self._cache_order:
+                self._cache_order.remove(did)
+            self._cache_order.append(did)
+        self._schedule_show(did)
+
+    def _schedule_show(self, did):
+        if did in self._update_pending:
+            return
+        self._update_pending.add(did)
+
+        def do_show():
+            self._update_pending.discard(did)
+            cached = self._channels_cache.get(did, [])
+            if cached:
+                self._show_channels(did, cached)
+
+        run_on_ui_thread(do_show, 200)
+
+    def _show_channels(self, did, channel_ids):
+        sml_ref = self._active_sml.get(did)
+        if not sml_ref:
+            return
+        sml = sml_ref()
+        if sml is None:
+            self._active_sml.pop(did, None)
+            return
+        acc = self._active_acc.get(did)
+        if acc is None:
+            return
+        channels = self._get_chats_by_ids(channel_ids, acc)
+        if channels:
+            self._last_count[did] = len(channels)
+            self._show_tab(sml, channels)
+
+    def _get_chats_by_ids(self, channel_ids, acc):
+        from java.lang import Long as JLong
+        mc = self._get_mc(acc)
+        result = []
+        for cid in channel_ids:
+            try:
+                ch = mc.getChat(JLong(cid))
+                if ch is not None:
+                    result.append(ch)
+            except Exception:
+                pass
+        result.sort(key=lambda c: self._get_subs(c), reverse=True)
+        return result
+
+    def _get_subs(self, chat):
+        try:
+            return int(chat.participants_count)
+        except Exception:
+            return 0
+
+    def _load_users_batch(self, batch, did, acc, remaining):
+        from org.telegram.tgnet import TLRPC
+        from java.lang import Long as JLong
+        mc = self._get_mc(acc)
+        plugin = self
+
+        for uid in batch:
+            if uid in self._loading:
+                continue
+            self._loading.add(uid)
+
+            try:
+                user = mc.getUser(JLong(uid))
+                if user is None:
+                    self._loading.discard(uid)
+                    self._no_channel.add(uid)
+                    continue
+
+                req = TLRPC.TL_users_getFullUser()
+                inp = TLRPC.TL_inputUser()
+                inp.user_id = user.id
+                try:
+                    inp.access_hash = user.access_hash
+                except Exception:
+                    inp.access_hash = 0
+                req.id = inp
+
+                def make_cb(u, d, a, rem):
+                    def cb(response, error):
+                        plugin._loading.discard(u)
+                        if response is not None:
+                            plugin._process_user_response(response, u, d, a)
+                        else:
+                            plugin._no_channel.add(u)
+                        if rem:
+                            run_on_ui_thread(lambda: plugin._load_users_batch(rem[:BATCH_SIZE], d, a, rem[BATCH_SIZE:]), 50)
+                    return cb
+
+                send_request(req, make_cb(uid, did, acc, remaining if uid == batch[-1] else None))
+            except Exception:
+                self._loading.discard(uid)
+
+    def _process_user_response(self, response, uid, did, acc):
+        mc = self._get_mc(acc)
+        try:
+            users = response.users
+            if users:
+                for i in range(users.size()):
+                    mc.putUser(users.get(i), False)
+            chats = response.chats
+            if chats:
+                for i in range(chats.size()):
+                    mc.putChat(chats.get(i), False)
+        except Exception:
+            pass
+
+        try:
+            full_user = response.full_user
+            if full_user:
+                pcid = 0
+                try:
+                    pcid = int(full_user.personal_channel_id)
+                except Exception:
+                    pass
+                if pcid != 0:
+                    self._user_channels[uid] = pcid
+                    self._no_channel.discard(uid)
+                    if pcid not in self._channel_to_users:
+                        self._channel_to_users[pcid] = []
+                    if uid not in self._channel_to_users[pcid]:
+                        self._channel_to_users[pcid].append(uid)
+                    self._update_cache_and_show(did, [pcid])
+                else:
+                    self._no_channel.add(uid)
+        except Exception:
+            pass
+
+    def _load_from_history(self, did, acc):
+        self._history_running.add(did)
+        total_limit = self._get_history_limit()
+        self._load_history_page(did, acc, 0, total_limit)
+
+    def _load_history_page(self, did, acc, offset_id, remaining):
+        from org.telegram.tgnet import TLRPC
+        from java.lang import Long as JLong
+
+        if remaining <= 0:
+            self._history_running.discard(did)
+            return
+
+        mc = self._get_mc(acc)
+        chat_id = int(-did)
+        chat = mc.getChat(JLong(chat_id))
+        if chat is None:
+            self._history_running.discard(did)
+            return
+
+        req = TLRPC.TL_messages_getHistory()
+        try:
+            from org.telegram.messenger import ChatObject
+            if ChatObject.isChannel(chat):
+                inp = TLRPC.TL_inputPeerChannel()
+                inp.channel_id = chat_id
+                try:
+                    inp.access_hash = chat.access_hash
+                except Exception:
+                    inp.access_hash = 0
+            else:
+                inp = TLRPC.TL_inputPeerChat()
+                inp.chat_id = chat_id
+            req.peer = inp
+        except Exception:
+            self._history_running.discard(did)
+            return
+
+        batch = min(100, remaining)
+        req.limit = batch
+        req.offset_id = offset_id
+        req.offset_date = 0
+        req.add_offset = 0
+        req.max_id = 0
+        req.min_id = 0
+        req.hash = 0
+        plugin = self
+
+        def on_resp(response, error):
+            if error or response is None:
+                plugin._history_running.discard(did)
+                return
+            try:
+                users = getattr(response, 'users', None)
+                if users:
+                    for i in range(users.size()):
+                        mc.putUser(users.get(i), False)
+                chats = getattr(response, 'chats', None)
+                if chats:
+                    for i in range(chats.size()):
+                        mc.putChat(chats.get(i), False)
+
+                messages = getattr(response, 'messages', None)
+                last_id = 0
+                count = 0
+                page_uids = set()
+                if messages:
+                    count = messages.size()
+                    for i in range(count):
+                        msg = messages.get(i)
+                        last_id = int(msg.id)
+                        from_id = getattr(msg, 'from_id', None)
+                        if from_id:
+                            uid = getattr(from_id, 'user_id', None)
+                            if uid:
+                                page_uids.add(int(uid))
+
+                if page_uids:
+                    run_on_ui_thread(lambda: plugin._process_history_uids(list(page_uids), did, acc))
+
+                if count < batch or last_id == 0:
+                    plugin._history_running.discard(did)
+                else:
+                    plugin._load_history_page(did, acc, last_id, remaining - batch)
+            except Exception as e:
+                log(f"[GCT] hist: {e}")
+                plugin._history_running.discard(did)
+
+        send_request(req, on_resp)
+
+    def _process_history_uids(self, uids, did, acc):
+        known_ids = []
+        to_load = []
+        for uid in uids:
+            if uid in self._no_channel:
+                continue
+            pcid = self._user_channels.get(uid)
+            if pcid:
+                if pcid not in known_ids:
+                    known_ids.append(pcid)
+            elif uid not in self._loading:
+                to_load.append(uid)
+
+        if known_ids:
+            self._update_cache_and_show(did, known_ids)
+
+        if to_load:
+            self._load_users_batch(to_load[:BATCH_SIZE], did, acc, to_load[BATCH_SIZE:])
+
+    def _is_members_hidden(self, did, acc):
+        try:
+            mc = self._get_mc(acc)
+            cid = int(-did)
+            ci = mc.getChatFull(cid)
+            if ci is None:
+                return False
+            return bool(getattr(ci, "participants_hidden", False))
+        except Exception:
+            return False
+
+    def _is_group(self, dialog_id, account):
+        if dialog_id >= 0:
+            return False
+        try:
+            from org.telegram.messenger import ChatObject
+            from java.lang import Long as JLong
+            mc = self._get_mc(account)
+            chat = mc.getChat(JLong(int(-dialog_id)))
+            if chat is None:
+                return False
+            is_ch = bool(ChatObject.isChannel(chat))
+            return (not is_ch) or bool(chat.megagroup)
+        except Exception:
+            return False
+
+    def _get_member_uids(self, did, acc):
+        try:
+            mc = self._get_mc(acc)
+            cid = int(-did)
+            ci = mc.getChatFull(cid)
+            if ci is None:
+                return []
+            parts = None
+            try:
+                p = ci.participants
+                if p:
+                    parts = p.participants
+            except Exception:
+                pass
+            if parts is None:
+                return []
+            uids = []
+            size = parts.size()
+            for i in range(size):
+                try:
+                    uids.append(int(parts.get(i).user_id))
+                except Exception:
+                    pass
+            return uids
+        except Exception:
+            return []
+
+    def _show_tab(self, sml, channels):
+        try:
+            ss = get_private_field(sml, "scrollSlidingTextTabStrip")
+            if ss is None:
+                return
+            self._fill_adapter(sml, channels)
+            tab_exists = False
+            try:
+                ids = ss.getTabIds()
+                if ids:
+                    for i in range(ids.size()):
+                        if int(ids.get(i)) == TAB_ID:
+                            tab_exists = True
+                            break
+            except Exception:
+                pass
+            if not tab_exists:
+                try:
+                    ss.addTextTab(TAB_ID, TAB_LABEL, None)
+                except Exception:
+                    try:
+                        ss.addTextTab(TAB_ID, TAB_LABEL)
+                    except Exception:
+                        return
+                try:
+                    ss.updateTabStyles()
+                except Exception:
+                    pass
+            else:
+                self._rename_tab(sml, ss)
+            self._try_update_counter(sml)
+        except Exception:
+            pass
+
+    def _rename_tab(self, sml, ss):
+        try:
+            id_to_pos = get_private_field(ss, "idToPosition")
+            if id_to_pos is None:
+                return
+            pos = id_to_pos.get(TAB_ID, -1)
+            if pos == -1:
+                return
+            tabs_container = get_private_field(ss, "tabsContainer")
+            if tabs_container is None:
+                return
+            tab_view = tabs_container.getChildAt(pos)
+            if tab_view is None:
+                return
+            current_text = str(tab_view.getText())
+            if current_text != TAB_LABEL:
+                tab_view.setText(TAB_LABEL)
+        except Exception:
+            pass
+
+    def _try_update_counter(self, sml):
+        try:
+            selected = self._get_selected_type(sml)
+            if selected != TAB_ID:
+                return
+            did = int(get_private_field(sml, "dialog_id"))
+            count = self._last_count.get(did, 0)
+            self._set_counter_text(sml, count)
+        except Exception:
+            pass
+
+    def _set_counter_text(self, sml, count):
+        try:
+            pa = get_private_field(sml, "profileActivity")
+            if pa is None:
+                return
+            counter_view = get_private_field(pa, "mediaCounterTextView")
+            if counter_view is None:
+                return
+            if count > 0:
+                LocaleController = jclass("org.telegram.messenger.LocaleController")
+                text = LocaleController.formatPluralString("Channels", count)
+                counter_view.setText(text)
+            else:
+                counter_view.setText(TAB_LABEL)
+        except Exception:
+            pass
+
+    def _on_counter_update(self, pa):
+        try:
+            sml = get_private_field(pa, "sharedMediaLayout")
+            if sml is None:
+                return
+            selected = self._get_selected_type(sml)
+            if selected != TAB_ID:
+                return
+            did = None
+            try:
+                did = int(get_private_field(sml, "dialog_id"))
+            except Exception:
+                return
+            if did is None:
+                return
+            count = self._last_count.get(did, 0)
+            self._set_counter_text(sml, count)
+        except Exception:
+            pass
+
+    def _get_selected_type(self, sml):
+        try:
+            mp = get_private_field(sml, "mediaPages")
+            if mp and mp[0]:
+                return int(get_private_field(mp[0], "selectedType"))
+        except Exception:
+            pass
+        return -1
+
+    def _fill_adapter(self, sml, channels):
+        try:
+            adapter = get_private_field(sml, "channelRecommendationsAdapter")
+            if adapter is None:
+                return
+            chat_list = ArrayList()
+            for ch in channels:
+                chat_list.add(ch)
+            adapter_cls = adapter.getClass()
+            for f in adapter_cls.getDeclaredFields():
+                f.setAccessible(True)
+                name = f.getName()
+                if name == "chats":
+                    f.set(adapter, chat_list)
+                elif name == "more":
+                    f.setInt(adapter, 0)
+            adapter.notifyDataSetChanged()
+        except Exception:
+            pass
+
+
+class _CounterHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self._plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self._plugin._on_counter_update(param.thisObject)
+        except Exception:
+            pass

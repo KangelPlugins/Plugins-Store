@@ -1,0 +1,901 @@
+from base_plugin import BasePlugin, MethodHook
+import threading
+import time
+import re
+import collections
+import unicodedata
+from java import jclass, dynamic_proxy, jarray
+from java.lang import Integer, Boolean, Runnable, Long, Object
+from client_utils import (
+    get_media_data_controller,
+    get_notification_center,
+)
+from hook_utils import find_class, get_private_field
+from android_utils import run_on_ui_thread
+from org.telegram.messenger import NotificationCenter, MessageObject
+from org.telegram.tgnet import TLRPC
+from ui.settings import Header
+
+__id__ = "voice_search_pro_v3"
+__name__ = "Voice Search Pro v3"
+__version__ = "1.0.7.8"
+__description__ = "Voice messages search by their text content"
+__icon__ = "msg_search_voice"
+__min_version__ = "12.51.0"
+__author__ = "@chestertech"
+
+MAX_RESULTS_DISPLAY = 50
+
+try:
+    UserConfig = jclass("org.telegram.messenger.UserConfig")
+    MessagesStorage = jclass("org.telegram.messenger.MessagesStorage")
+except Exception:
+    UserConfig = None
+    MessagesStorage = None
+
+
+_UI_QUEUE = collections.deque()
+
+
+class _UiTask(dynamic_proxy(Runnable)):
+    def run(self):
+        try:
+            fn = _UI_QUEUE.popleft()
+        except IndexError:
+            return
+        try:
+            fn()
+        except Exception as e:
+            pass
+
+
+try:
+    _AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+except Exception:
+    _AndroidUtilities = None
+
+
+_UI_TASK = None
+
+
+def _get_ui_task():
+    global _UI_TASK
+    if _UI_TASK is None:
+        _UI_TASK = _UiTask()
+    return _UI_TASK
+
+
+def _post_ui(fn):
+    try:
+        run_on_ui_thread(fn)
+        return
+    except Exception as e:
+        pass
+    try:
+        if _AndroidUtilities is not None:
+            _UI_QUEUE.append(fn)
+            _AndroidUtilities.runOnUIThread(_get_ui_task())
+        else:
+            fn()
+    except Exception as e:
+        pass
+
+
+def safe_execute(log_message="Operation failed", return_value=None):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                return return_value
+        return wrapper
+    return decorator
+
+
+class SearchInChatHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._on_search_in_chat(param.args)
+        except Exception as e:
+            pass
+
+
+class SearchResultsDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def didReceivedNotification(self, id, account, args):
+        try:
+            plugin = VoiceSearchPlugin.instance
+            if plugin is None:
+                return
+            if id == NotificationCenter.chatSearchResultsAvailable:
+                plugin._on_native_results(id, account, args)
+        except Exception:
+            pass
+
+
+class DialogsSearchInternalHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._on_global_search(param.thisObject, param.args)
+        except Exception as e:
+            pass
+
+
+class DialogsItemCountHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            self.plugin._inject_global_results(param.thisObject)
+        except Exception as e:
+            pass
+
+
+class VoiceSearchPlugin(BasePlugin):
+    instance = None
+
+    def __init__(self):
+        super().__init__()
+        VoiceSearchPlugin.instance = self
+        self.current_account = 0
+        self._scan_lock = threading.Lock()
+
+        self._delegate = None
+        self._search_unhooks = []
+        self._merging = False
+        self._active_dialog = None
+        self._active_guid = None
+        self._active_query = ""
+        self._native_results = []
+        self._native_results_query = None
+        self._native_results_dialog = None
+        self._pending_query = None
+        self._pending_dialog = None
+        self._injected_native = []
+        self._injected_native_query = None
+        self._injected_global = []
+
+        self._dlg_unhooks = []
+        self._dlg_adapter = None
+        self._global_results = []
+        self._global_query = None
+        self._global_pending = None
+        self._global_field_cache = {}
+
+    def on_plugin_load(self):
+        try:
+            self.current_account = UserConfig.selectedAccount
+        except Exception as e:
+            pass
+
+        self._install_native_search_integration()
+
+    def on_plugin_unload(self):
+        self._remove_native_search_integration()
+
+    @safe_execute("Failed to install native search integration")
+    def _install_native_search_integration(self):
+        try:
+            self._delegate = SearchResultsDelegate()
+        except Exception as e:
+            self._delegate = None
+
+        nc = get_notification_center()
+        if nc and self._delegate is not None:
+            deleg = self._delegate
+
+            def _register_observer():
+                try:
+                    evt = NotificationCenter.chatSearchResultsAvailable
+                    nc.addObserver(deleg, evt)
+                except Exception as e:
+                    pass
+
+            _post_ui(_register_observer)
+
+        mdc_class = find_class("org.telegram.messenger.MediaDataController")
+        if not mdc_class:
+            return
+        try:
+            unhooks = self.hook_all_methods(mdc_class, "searchMessagesInChat", SearchInChatHook(self))
+            if unhooks:
+                self._search_unhooks = unhooks if isinstance(unhooks, list) else [unhooks]
+            else:
+                pass
+        except Exception as e:
+            pass
+
+        self._dlg_unhooks = []
+        dsa_class = find_class("org.telegram.ui.Adapters.DialogsSearchAdapter")
+        if dsa_class:
+            try:
+                u_search = self.hook_all_methods(dsa_class, "searchMessagesInternal", DialogsSearchInternalHook(self))
+                if u_search:
+                    self._dlg_unhooks += (u_search if isinstance(u_search, list) else [u_search])
+            except Exception as e:
+                pass
+            try:
+                u_count = self.hook_all_methods(dsa_class, "getItemCount", DialogsItemCountHook(self))
+                if u_count:
+                    self._dlg_unhooks += (u_count if isinstance(u_count, list) else [u_count])
+            except Exception as e:
+                pass
+        else:
+            pass
+
+    @safe_execute("Failed to remove native search integration")
+    def _remove_native_search_integration(self):
+        try:
+            nc = get_notification_center()
+            deleg = self._delegate
+            if nc and deleg:
+                _post_ui(lambda: nc.removeObserver(deleg, NotificationCenter.chatSearchResultsAvailable))
+        except Exception as e:
+            pass
+        self._delegate = None
+        for unhook in self._search_unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception as e:
+                pass
+        self._search_unhooks = []
+        self._native_results = []
+        self._native_results_query = None
+        self._native_results_dialog = None
+        for unhook in self._dlg_unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception as e:
+                pass
+        self._dlg_unhooks = []
+        try:
+            self._cleanup_injected_native()
+        except Exception:
+            pass
+        try:
+            inj = self._injected_global
+            self._injected_global = []
+            if inj and self._dlg_adapter is not None:
+                self._cleanup_injected_global(self._dlg_adapter, inj)
+        except Exception:
+            pass
+        self._dlg_adapter = None
+        self._global_results = []
+        self._global_query = None
+        self._global_pending = None
+        self._global_field_cache = {}
+
+    def _on_search_in_chat(self, args):
+        if args is None or len(args) < 4:
+            return
+        try:
+            raw_query = args[0]
+            query = str(raw_query).strip() if raw_query is not None else ""
+            dialog_id = int(args[1])
+            guid = int(args[3])
+        except Exception as e:
+            return
+        try:
+            direction = int(args[4]) if len(args) > 4 and args[4] is not None else None
+        except Exception:
+            direction = None
+
+        self._active_dialog = dialog_id
+        self._active_guid = guid
+        self._active_query = query
+
+        if len(query) < 2:
+            return
+
+        if query == self._native_results_query and dialog_id == self._native_results_dialog:
+            return
+
+        if query == self._pending_query and dialog_id == self._pending_dialog:
+            return
+        self._pending_query = query
+        self._pending_dialog = dialog_id
+
+        threading.Thread(
+            target=self._scan_and_cache,
+            args=(query, dialog_id, guid),
+            daemon=True,
+        ).start()
+
+    def _decode_utf8_blob(self, blob_bytes):
+        if not blob_bytes or len(blob_bytes) < 12:
+            return None
+        constructor = int.from_bytes(blob_bytes[0:4], 'little')
+        flags = int.from_bytes(blob_bytes[4:8], 'little')
+        if constructor != 1 or flags not in (1, 3):
+            return None
+
+        start_pos = 8
+        blob = bytes([b & 0xFF for b in blob_bytes])
+        if blob[start_pos] == 254:
+            start_pos += 3
+        else:
+            start_pos += 1
+
+        end_pos = next((i for i in range(8, len(blob) - 1) if (blob[i:i+2] == b'\x00\x00') or (i + 3 < len(blob) and blob[i:i+4] == b'Kurg')), len(blob))
+
+        text_bytes = blob[start_pos:end_pos]
+        if not text_bytes:
+            return None
+
+        cleaned_bytes = bytes(b for b in text_bytes if 32 <= b <= 126 or b >= 128)
+        if not cleaned_bytes:
+            return None
+
+        for errors in ['strict', 'ignore']:
+            try:
+                text = cleaned_bytes.decode('utf-8', errors=errors).strip()
+                if len(text) >= 3 and any(c.isalpha() for c in text):
+                    text = unicodedata.normalize('NFC', re.sub(r'\s+', ' ', text))
+                    cleaned = re.sub(r'urur7y.*$', '', text)
+                    return {'transcription': cleaned, 'constructor': constructor, 'flags': flags}
+            except:
+                continue
+        return None
+
+    @safe_execute("Transcription scan failed")
+    def _scan_and_cache(self, query, dialog_id, guid):
+        matches = []
+        messages_checked = 0
+        storage = MessagesStorage.getInstance(self.current_account)
+        if not storage:
+            self._pending_query = None
+            return
+        db = storage.getDatabase()
+        if not db:
+            self._pending_query = None
+            return
+
+        with self._scan_lock:
+            scan_start = time.time()
+            sql = """SELECT mid, date, custom_params FROM messages_v2
+                     WHERE uid = ? AND custom_params NOT NULL AND LENGTH(custom_params) > 8 AND media = -1
+                     ORDER BY date DESC LIMIT 1000"""
+            cursor = db.queryFinalized(sql, [str(dialog_id)])
+
+            try:
+                pattern = re.compile(query, re.IGNORECASE | re.UNICODE)
+            except Exception as e:
+                pattern = re.compile(re.escape(query), re.IGNORECASE | re.UNICODE)
+
+            while cursor and cursor.next():
+                messages_checked += 1
+                mid = cursor.intValue(0)
+                date = cursor.intValue(1)
+                blob_data = cursor.byteArrayValue(2)
+                if not blob_data:
+                    continue
+                result = self._decode_utf8_blob(blob_data)
+                if result and (transcription := result.get('transcription')):
+                    m = pattern.search(transcription)
+                    if m:
+                        snippet = transcription[max(0, m.start() - 20):m.end() + 20].replace(chr(10), ' ')
+                        matches.append((mid, date))
+
+            if cursor:
+                cursor.dispose()
+
+        matches.sort(key=lambda x: x[1], reverse=True)
+        mids = [m[0] for m in matches[:MAX_RESULTS_DISPLAY]]
+        message_objects = self._load_message_objects(dialog_id, mids)
+
+        self._native_results = message_objects
+        self._native_results_query = query
+        self._native_results_dialog = dialog_id
+        self._pending_query = None
+        _post_ui(lambda: self._refresh_native_results(guid))
+
+    @safe_execute("Failed to load message objects", return_value=[])
+    def _load_message_objects(self, dialog_id, mids):
+        objs = []
+        if not mids:
+            return objs
+        storage = MessagesStorage.getInstance(self.current_account)
+        db = storage.getDatabase()
+        if not db:
+            return objs
+        for mid in mids:
+            cursor = None
+            try:
+                cursor = db.queryFinalized(
+                    "SELECT data FROM messages_v2 WHERE mid = ? AND uid = ?",
+                    [str(mid), str(dialog_id)],
+                )
+                if cursor and cursor.next():
+                    data = cursor.byteBufferValue(0)
+                    if data is not None:
+                        try:
+                            message = TLRPC.Message.TLdeserialize(data, data.readInt32(False), False)
+                        finally:
+                            data.reuse()
+                        if message is not None:
+                            mobj = MessageObject(self.current_account, message, False, False)
+                            objs.append(mobj)
+            except Exception as e:
+                pass
+            finally:
+                if cursor:
+                    cursor.dispose()
+        return objs
+
+    def _refresh_native_results(self, guid):
+        if not self._native_results:
+            return
+        if self._active_guid is not None and guid != self._active_guid:
+            return
+        if (self._native_results_query != self._active_query
+                or self._native_results_dialog != self._active_dialog):
+            return
+        added = self._merge_results(None)
+        self._post_native_available(guid)
+
+    def _post_native_available(self, guid):
+        try:
+            mdc = get_media_data_controller()
+            results = list(self._native_results)
+            count = len(results)
+            if count <= 0:
+                return
+            try:
+                if mdc is not None:
+                    mdc.setSearchedPosition(0)
+            except Exception as e:
+                pass
+            did = int(self._active_dialog) if self._active_dialog is not None else 0
+            first_mid = int(results[0].getId())
+            mask = 1 if count > 1 else 0
+            try:
+                reqid = get_private_field(mdc, "lastReqId")
+                loading_more = get_private_field(mdc, "loadingMoreSearchMessages")
+            except Exception:
+                pass
+            arr = jarray(Object)([
+                Integer(guid),
+                Integer(first_mid),
+                Integer(mask),
+                Long(did),
+                Integer(0),
+                Integer(count),
+                Boolean(True),
+            ])
+            self._merging = True
+            try:
+                nc = get_notification_center()
+                if nc:
+                    nc.postNotificationName(NotificationCenter.chatSearchResultsAvailable, arr)
+                else:
+                    pass
+            finally:
+                self._merging = False
+        except Exception as e:
+            pass
+
+    def _on_native_results(self, id, account, args):
+        if self._merging:
+            return
+        if args is None or len(args) < 2:
+            return
+
+        try:
+            guid = int(args[0])
+        except Exception:
+            guid = None
+        _jid = args[1] if len(args) > 1 else None
+        _cnt = args[5] if len(args) > 5 else None
+        if self._active_guid is not None and guid is not None and guid != self._active_guid:
+            return
+
+        if not self._native_results:
+            return
+        if self._native_results_dialog != self._active_dialog:
+            return
+        if self._native_results_query != self._active_query:
+            return
+
+        added = self._merge_results(args)
+        if added < 0:
+            return
+
+        try:
+            base_count = int(args[5]) if len(args) > 5 else 0
+        except Exception:
+            base_count = 0
+        try:
+            native_jump_id = int(args[1]) if len(args) > 1 else 0
+        except Exception:
+            native_jump_id = 0
+        mdc = get_media_data_controller()
+        try:
+            sr = get_private_field(mdc, "searchResultMessages")
+            merged_total = int(sr.size()) if sr is not None else (base_count + added)
+        except Exception:
+            merged_total = base_count + added
+        new_count = merged_total if merged_total > 0 else (base_count + added)
+
+        jump_desc = "native"
+        if native_jump_id == 0 and self._native_results:
+            try:
+                first_mid = int(self._native_results[0].getId())
+                args[1] = Integer(first_mid)
+                if len(args) > 6:
+                    args[6] = Boolean(False)
+                try:
+                    if mdc is not None:
+                        mdc.setSearchedPosition(0)
+                except Exception as e2:
+                    pass
+                jump_desc = f"first-transcription mid={first_mid} (count-only, no re-jump)"
+            except Exception as e:
+                pass
+
+        try:
+            pos = int(mdc.getSearchPosition()) if mdc is not None else 0
+        except Exception:
+            pos = 0
+        mask = (1 if pos < new_count - 1 else 0) | (2 if pos > 0 else 0)
+
+        if len(args) > 5:
+            try:
+                args[5] = Integer(new_count)
+            except Exception as e:
+                pass
+        if len(args) > 4:
+            try:
+                args[4] = Integer(pos)
+            except Exception as e:
+                pass
+        if len(args) > 2:
+            try:
+                args[2] = Integer(mask)
+            except Exception as e:
+                pass
+
+        self._merging = True
+        try:
+            nc = get_notification_center()
+            if nc:
+                nc.postNotificationName(NotificationCenter.chatSearchResultsAvailable, args)
+        except Exception as e:
+            pass
+        finally:
+            self._merging = False
+
+    @safe_execute("Merge failed", return_value=0)
+    def _merge_results(self, args):
+        mdc = get_media_data_controller()
+        if not mdc:
+            return 0
+        search_messages = get_private_field(mdc, "searchResultMessages")
+        search_map = get_private_field(mdc, "searchServerResultMessagesMap")
+        if search_map is None:
+            search_map = get_private_field(mdc, "searchResultMessagesMap")
+        search_server = get_private_field(mdc, "searchServerResultMessages")
+        counts = get_private_field(mdc, "messagesSearchCount")
+        if search_messages is None:
+            return 0
+
+        if self._injected_native and self._injected_native_query != self._native_results_query:
+            self._cleanup_injected_native()
+
+        added = 0
+        newly = []
+        for mobj in self._native_results:
+            try:
+                mid = mobj.getId()
+            except Exception as e:
+                continue
+            already = False
+            if search_map is not None:
+                try:
+                    already = search_map[0].get(mid) is not None
+                except Exception:
+                    already = False
+            if already:
+                continue
+            try:
+                search_messages.add(mobj)
+                if search_server is not None:
+                    search_server.add(mobj)
+                if search_map is not None:
+                    search_map[0].put(mid, mobj)
+                added += 1
+                newly.append((mobj, mid))
+            except Exception as e:
+                pass
+
+        if newly:
+            if self._injected_native_query == self._native_results_query:
+                self._injected_native.extend(newly)
+            else:
+                self._injected_native = newly
+            self._injected_native_query = self._native_results_query
+
+        if added > 0 and counts is not None:
+            try:
+                counts[0] = int(counts[0]) + added
+            except Exception as e:
+                pass
+        if added > 0:
+            try:
+                end_reached = get_private_field(mdc, "messagesSearchEndReached")
+                if end_reached is not None:
+                    end_reached[0] = True
+                    try:
+                        end_reached[1] = True
+                    except Exception:
+                        pass
+                else:
+                    pass
+            except Exception as e:
+                pass
+        return added
+
+    def _cleanup_injected_native(self):
+        injected = self._injected_native
+        self._injected_native = []
+        self._injected_native_query = None
+        if not injected:
+            return
+        try:
+            mdc = get_media_data_controller()
+            if mdc is None:
+                return
+            search_messages = get_private_field(mdc, "searchResultMessages")
+            search_map = get_private_field(mdc, "searchServerResultMessagesMap")
+            if search_map is None:
+                search_map = get_private_field(mdc, "searchResultMessagesMap")
+            search_server = get_private_field(mdc, "searchServerResultMessages")
+            counts = get_private_field(mdc, "messagesSearchCount")
+            removed = 0
+            for mobj, mid in injected:
+                was_removed = False
+                try:
+                    if search_messages is not None:
+                        was_removed = bool(search_messages.remove(mobj))
+                except Exception:
+                    was_removed = False
+                if not was_removed:
+                    continue
+                removed += 1
+                try:
+                    if search_server is not None:
+                        search_server.remove(mobj)
+                except Exception:
+                    pass
+                try:
+                    if search_map is not None:
+                        search_map[0].remove(mid)
+                except Exception:
+                    pass
+            if removed > 0 and counts is not None:
+                try:
+                    counts[0] = max(0, int(counts[0]) - removed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _schedule_global_cleanup(self):
+        injected = self._injected_global
+        adapter = self._dlg_adapter
+        self._injected_global = []
+        if not injected or adapter is None:
+            return
+        _post_ui(lambda: self._cleanup_injected_global(adapter, injected))
+
+    def _cleanup_injected_global(self, adapter, injected):
+        try:
+            srm = self._dsa_field(adapter, "searchResultMessages")
+            if srm is None:
+                return
+            for mobj in injected:
+                try:
+                    srm.remove(mobj)
+                except Exception:
+                    pass
+            try:
+                adapter.notifyDataSetChanged()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _dsa_field(self, adapter, name):
+        try:
+            f = self._global_field_cache.get(name, "MISS")
+            if f == "MISS":
+                f = None
+                cls = adapter.getClass()
+                while cls is not None:
+                    try:
+                        f = cls.getDeclaredField(name)
+                        break
+                    except Exception:
+                        f = None
+                        cls = cls.getSuperclass()
+                if f is None:
+                    self._global_field_cache[name] = None
+                    return None
+                f.setAccessible(True)
+                self._global_field_cache[name] = f
+            if f is None:
+                return None
+            return f.get(adapter)
+        except Exception:
+            return None
+
+    def _on_global_search(self, adapter, args):
+        try:
+            dtype = self._dsa_field(adapter, "dialogsType")
+            if dtype is not None and int(dtype) != 0:
+                return
+        except Exception:
+            pass
+        self._dlg_adapter = adapter
+        try:
+            raw_q = args[0] if (args is not None and len(args) > 0) else None
+        except Exception:
+            raw_q = None
+        query = str(raw_q).strip() if raw_q is not None else ""
+        if len(query) < 2:
+            self._schedule_global_cleanup()
+            self._global_results = []
+            self._global_query = None
+            self._global_pending = None
+            return
+        if query == self._global_query:
+            return
+        if query == self._global_pending:
+            return
+        self._schedule_global_cleanup()
+        self._global_pending = query
+        threading.Thread(
+            target=self._scan_and_cache_global,
+            args=(query, adapter),
+            daemon=True,
+        ).start()
+
+    @safe_execute("Global transcription scan failed")
+    def _scan_and_cache_global(self, query, adapter):
+        matches = []
+        messages_checked = 0
+        storage = MessagesStorage.getInstance(self.current_account)
+        if not storage:
+            self._global_pending = None
+            return
+        db = storage.getDatabase()
+        if not db:
+            self._global_pending = None
+            return
+        with self._scan_lock:
+            scan_start = time.time()
+            sql = """SELECT mid, uid, date, custom_params FROM messages_v2
+                     WHERE custom_params NOT NULL AND LENGTH(custom_params) > 8 AND media = -1
+                     ORDER BY date DESC LIMIT 1000"""
+            cursor = db.queryFinalized(sql, [])
+            try:
+                pattern = re.compile(query, re.IGNORECASE | re.UNICODE)
+            except Exception as e:
+                pattern = re.compile(re.escape(query), re.IGNORECASE | re.UNICODE)
+            while cursor and cursor.next():
+                messages_checked += 1
+                mid = cursor.intValue(0)
+                uid = cursor.longValue(1)
+                date = cursor.intValue(2)
+                blob_data = cursor.byteArrayValue(3)
+                if not blob_data:
+                    continue
+                result = self._decode_utf8_blob(blob_data)
+                if result and (transcription := result.get('transcription')):
+                    if pattern.search(transcription):
+                        matches.append((uid, mid, date))
+            if cursor:
+                cursor.dispose()
+
+        matches.sort(key=lambda x: x[2], reverse=True)
+        matches = matches[:MAX_RESULTS_DISPLAY]
+
+        by_dialog = {}
+        order = []
+        for uid, mid, date in matches:
+            if uid not in by_dialog:
+                by_dialog[uid] = []
+                order.append(uid)
+            by_dialog[uid].append((mid, date))
+
+        built = []
+        for uid in order:
+            pairs = by_dialog[uid]
+            mids = [p[0] for p in pairs]
+            date_by_mid = {p[0]: p[1] for p in pairs}
+            objs = self._load_message_objects(uid, mids)
+            for mobj in objs:
+                try:
+                    d = date_by_mid.get(int(mobj.getId()), 0)
+                except Exception:
+                    d = 0
+                try:
+                    mobj.setQuery(query)
+                except Exception:
+                    pass
+                built.append((d, mobj))
+
+        built.sort(key=lambda x: x[0], reverse=True)
+        message_objects = [m for _, m in built]
+
+        if self._global_pending is not None and self._global_pending != query:
+            return
+
+        self._global_results = message_objects
+        self._global_query = query
+        self._global_pending = None
+
+        adp = adapter or self._dlg_adapter
+        if adp is not None:
+            _post_ui(lambda: self._global_notify(adp))
+
+    def _global_notify(self, adapter):
+        try:
+            adapter.notifyDataSetChanged()
+        except Exception as e:
+            pass
+
+    def _inject_global_results(self, adapter):
+        if not self._global_results or not self._global_query:
+            return
+        dtype = self._dsa_field(adapter, "dialogsType")
+        if dtype is not None and int(dtype) != 0:
+            return
+        cur_q = self._dsa_field(adapter, "lastMessagesSearchString")
+        if cur_q is None or str(cur_q).strip() != self._global_query:
+            return
+        srm = self._dsa_field(adapter, "searchResultMessages")
+        if srm is None:
+            return
+        try:
+            n = int(srm.size())
+        except Exception:
+            return
+        existing = set()
+        for i in range(n):
+            try:
+                o = srm.get(i)
+                existing.add((int(o.getId()), int(o.getDialogId())))
+            except Exception:
+                pass
+        insert_at = 0
+        added = 0
+        for mobj in self._global_results:
+            try:
+                key = (int(mobj.getId()), int(mobj.getDialogId()))
+            except Exception:
+                continue
+            if key in existing:
+                continue
+            try:
+                srm.add(insert_at, mobj)
+                existing.add(key)
+                insert_at += 1
+                added += 1
+            except Exception:
+                pass
+        if added:
+            pass
+        self._injected_global = self._global_results
+
+
+def create_plugin():
+    return VoiceSearchPlugin()

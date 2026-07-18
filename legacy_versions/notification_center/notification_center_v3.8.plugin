@@ -1,0 +1,1119 @@
+from typing import Any, Dict, List
+import json
+import os
+import time
+import threading
+
+from base_plugin import BasePlugin, HookResult, MenuItemData, MenuItemType, MethodHook
+from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread, OnClickListener
+from client_utils import get_last_fragment, run_on_queue, GLOBAL_QUEUE
+from file_utils import get_plugins_dir, ensure_dir_exists
+from java import jclass, jint, dynamic_proxy
+from hook_utils import find_class, get_private_field
+import weakref
+
+from android.graphics import Typeface
+from android.os import Bundle
+from android.text import TextUtils
+from android.util import TypedValue
+from android.view import Gravity, View
+from android.widget import LinearLayout, ScrollView, TextView
+
+from org.telegram.messenger import AndroidUtilities, MessagesController, UserConfig
+from org.telegram.messenger import R as R_tg
+from org.telegram.ui import ChatActivity
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import AvatarDrawable, BackupImageView, LayoutHelper
+
+__id__ = "notification_center"
+__name__ = "Notification Center"
+__description__ = "Discord-style notification inbox: replies to your messages and mentions.\n\n*Ссылка на документацию в настройках плагина!*"
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "3.6"
+__icon__ = "MaxExteraPluginsStickers/10"
+
+_lock = threading.Lock()
+
+MATCH_PARENT = -1
+WRAP_CONTENT = -2
+
+NC_PILL_ID = 23000001
+NC_PILL_TAG = "nc_pill"
+
+THREE_DAYS = 3 * 86400
+SEVEN_DAYS = 7 * 86400
+
+
+def _data_dir():
+    d = os.path.join(get_plugins_dir(), "notification_center_data")
+    ensure_dir_exists(d)
+    return d
+
+
+def _data_path(account):
+    return os.path.join(_data_dir(), f"notifications_{account}.json")
+
+
+def _archive_path(account):
+    return os.path.join(_data_dir(), f"archive_{account}.json")
+
+
+def _load_json(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def _save_json(path, items):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+    except:
+        pass
+
+
+def _load_notifications(account):
+    return _load_json(_data_path(account))
+
+
+def _save_notifications(account, items):
+    _save_json(_data_path(account), items)
+
+
+def _load_archive(account):
+    return _load_json(_archive_path(account))
+
+
+def _save_archive(account, items):
+    _save_json(_archive_path(account), items)
+
+
+def _get_user_name(user):
+    if user is None:
+        return "Неизвестно"
+    first = getattr(user, "first_name", "") or ""
+    last = getattr(user, "last_name", "") or ""
+    name = f"{first} {last}".strip()
+    return name if name else "Неизвестно"
+
+
+def _get_chat_title(chat):
+    if chat is None:
+        return "Неизвестный чат"
+    return getattr(chat, "title", "") or "Неизвестный чат"
+
+
+def _timestamp_text(ts):
+    diff = time.time() - ts
+    if diff < 60:
+        return "только что"
+    elif diff < 3600:
+        return f"{int(diff // 60)} мин. назад"
+    elif diff < 86400:
+        return f"{int(diff // 3600)} ч. назад"
+    else:
+        return f"{int(diff // 86400)} дн. назад"
+
+
+def _navigate_to_message(dialog_id, msg_id):
+    fragment = get_last_fragment()
+    if not fragment:
+        return
+    args = Bundle()
+    if dialog_id > 0:
+        args.putLong("user_id", int(dialog_id))
+    else:
+        args.putLong("chat_id", int(-dialog_id))
+    args.putInt("message_id", int(msg_id))
+    chat_activity = ChatActivity(args)
+    fragment.presentFragment(chat_activity)
+
+
+def _run_archiving(account, auto_archive_enabled):
+    now = time.time()
+    with _lock:
+        notifs = _load_notifications(account)
+        if not notifs:
+            return
+
+        if auto_archive_enabled:
+            archive = _load_archive(account)
+            keep = []
+            for n in notifs:
+                if now - n.get("timestamp", 0) > THREE_DAYS:
+                    archive.insert(0, n)
+                else:
+                    keep.append(n)
+            if len(keep) != len(notifs):
+                _save_notifications(account, keep)
+                archive = [a for a in archive if now - a.get("timestamp", 0) <= SEVEN_DAYS]
+                if len(archive) > 500:
+                    archive = archive[:500]
+                _save_archive(account, archive)
+        else:
+            archive = _load_archive(account)
+
+        if archive:
+            cleaned = [a for a in archive if now - a.get("timestamp", 0) <= SEVEN_DAYS]
+            if len(cleaned) != len(archive):
+                _save_archive(account, cleaned)
+
+
+class ProcessNewMessagesHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            messages = param.args[0]
+            if messages is None:
+                return
+            account = param.thisObject.currentAccount
+            for i in range(messages.size()):
+                msg_obj = messages.get(i)
+                if msg_obj is None:
+                    continue
+                msg = msg_obj.messageOwner
+                if msg is None:
+                    continue
+                self.plugin._process_message(msg, account)
+        except:
+            pass
+
+
+class NotificationCenterActionBarHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._add_icon_to_fragment(param.thisObject)
+        except:
+            pass
+
+
+class NotificationCenterPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._pill_registered = False
+        self._pill_hooks_installed = False
+        self._active_pills = weakref.WeakSet()
+        self._pill_tag_key = jint(0x4E43)
+        self.PillRegistry = find_class("com.exteragram.messenger.pillstack.core.PillRegistry")
+        self.PillInfo = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillInfo")
+        self.PillCreator = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator")
+        self.PillStackConfig = find_class("com.exteragram.messenger.pillstack.core.PillStackConfig")
+        self.WeatherPill = find_class("com.exteragram.messenger.pillstack.ui.pills.weather.WeatherPill")
+
+    def on_plugin_load(self):
+        if self.get_setting("show_in_drawer", True):
+            self._add_drawer_item()
+        try:
+            clazz = jclass("org.telegram.ui.DialogsActivity")
+            self.hook_method(clazz.getClass().getDeclaredMethod("onResume"), NotificationCenterActionBarHook(self))
+        except:
+            pass
+        self._hook_process_new_messages()
+        self._inject_icon_now()
+        if self._pill_supported():
+            if self.get_setting("pill_enabled", False):
+                self._register_nc_pill()
+
+    def _hook_process_new_messages(self):
+        try:
+            nc_cls = find_class("org.telegram.messenger.NotificationsController")
+            if nc_cls is None:
+                return
+            hook = ProcessNewMessagesHook(self)
+            for m in nc_cls.getClass().getDeclaredMethods():
+                if m.getName() == "processNewMessages":
+                    m.setAccessible(True)
+                    self.hook_method(m, hook)
+                    break
+        except:
+            pass
+        try:
+            nc_cls = find_class("org.telegram.messenger.NotificationsController")
+            if nc_cls is None:
+                return
+            hook = ProcessNewMessagesHook(self)
+            for m in nc_cls.getClass().getMethods():
+                if m.getName() == "processNewMessages":
+                    m.setAccessible(True)
+                    self.hook_method(m, hook)
+                    break
+        except:
+            pass
+
+    def on_plugin_unload(self):
+        pass
+
+    def _pill_supported(self):
+        try:
+            return self.PillRegistry is not None and self.PillInfo is not None and self.WeatherPill is not None
+        except:
+            return False
+
+    def _register_nc_pill(self):
+        if not self._pill_supported():
+            return
+        if self._pill_registered:
+            return
+
+        plugin = self
+
+        class NCPillCreator(dynamic_proxy(plugin.PillCreator)):
+            def __init__(self):
+                super().__init__()
+
+            def create(self, context, resourcesProvider):
+                try:
+                    pill = plugin.WeatherPill(context, resourcesProvider)
+                    pill.setTag(NC_PILL_TAG)
+                    plugin._active_pills.add(pill)
+                    plugin._apply_nc_pill_ui(pill)
+                    return pill
+                except Exception as e:
+                    return None
+
+        try:
+            info = self.PillInfo(
+                jint(NC_PILL_ID),
+                "Notification Center",
+                jint(R_tg.drawable.msg_notifications),
+                jint(-11565578),
+                jint(-13276952),
+                NCPillCreator()
+            )
+            self.PillRegistry.register(info)
+            self._install_nc_pill_hooks()
+            self._ensure_nc_pill_visible()
+            self._pill_registered = True
+        except Exception as e:
+            self._pill_registered = False
+
+    def _install_nc_pill_hooks(self):
+        if self._pill_hooks_installed or not self.WeatherPill:
+            return
+        plugin = self
+
+        class NCGetIdHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    tag = param.thisObject.getTag()
+                    if tag == NC_PILL_TAG:
+                        plugin._active_pills.add(param.thisObject)
+                        param.setResult(jint(NC_PILL_ID))
+                except:
+                    pass
+
+        class NCInteractionHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    tag = param.thisObject.getTag()
+                    if tag != NC_PILL_TAG:
+                        return
+                    plugin._active_pills.add(param.thisObject)
+                    method_name = param.method.getName()
+                    if method_name == "onPillClicked":
+                        plugin._show_center()
+                        param.setResult(None)
+                    elif method_name == "onPillLongClicked":
+                        plugin._show_center()
+                        param.setResult(True)
+                    elif method_name in ["onUpdateData", "setData"]:
+                        plugin._apply_nc_pill_ui(param.thisObject)
+                        param.setResult(None)
+                except:
+                    pass
+
+        methods_to_hook = {
+            "getPillId": NCGetIdHook(),
+            "onPillClicked": NCInteractionHook(),
+            "onPillLongClicked": NCInteractionHook(),
+            "onUpdateData": NCInteractionHook(),
+            "setData": NCInteractionHook(),
+        }
+
+        hooked = set()
+        try:
+            for m in self.WeatherPill.getClass().getDeclaredMethods():
+                name = m.getName()
+                if name in methods_to_hook and name not in hooked:
+                    m.setAccessible(True)
+                    self.hook_method(m, methods_to_hook[name])
+                    hooked.add(name)
+        except:
+            pass
+        try:
+            for m in self.WeatherPill.getClass().getMethods():
+                name = m.getName()
+                if name in methods_to_hook and name not in hooked:
+                    m.setAccessible(True)
+                    self.hook_method(m, methods_to_hook[name])
+                    hooked.add(name)
+        except:
+            pass
+
+        self._pill_hooks_installed = True
+
+    def _ensure_nc_pill_visible(self):
+        try:
+            active = self.PillStackConfig.activePills
+            for i in range(active.size()):
+                if int(active.get(i)) == NC_PILL_ID:
+                    return
+            active.add(jint(NC_PILL_ID))
+            self.PillStackConfig.savePillsLayout()
+            run_on_ui_thread(self.PillStackConfig.notifySettingsChanged)
+        except:
+            pass
+
+    def _apply_nc_pill_ui(self, pill):
+        try:
+            account = UserConfig.selectedAccount
+            with _lock:
+                notifs = _load_notifications(account)
+            count = len(notifs)
+            text_view = get_private_field(pill, "textView")
+            if text_view:
+                label = "ping" if count == 1 else "pings"
+                text_view.setText(f"{count} {label}")
+            icon_view = get_private_field(pill, "iconView")
+            if icon_view:
+                try:
+                    icon_view.setImageResource(R_tg.drawable.msg_notifications)
+                except:
+                    pass
+        except:
+            pass
+
+    def _is_main_dialogs_screen(self, fragment):
+        try:
+            class_name = fragment.getClass().getSimpleName()
+            if class_name != "DialogsActivity":
+                return False
+            folder_id = get_private_field(fragment, "folderId")
+            if folder_id is not None and int(folder_id) != 0:
+                return False
+            return True
+        except:
+            return True
+
+    def _has_nc_button(self, menu):
+        for i in range(menu.getChildCount()):
+            child = menu.getChildAt(i)
+            try:
+                tag = child.getTag()
+                if tag is not None and int(tag) == 230:
+                    return True
+            except:
+                continue
+        return False
+
+    def _add_icon_to_fragment(self, fragment):
+        if not self.get_setting("show_in_actionbar", False):
+            return
+        if not self._is_main_dialogs_screen(fragment):
+            return
+        actionBar = fragment.getActionBar()
+        if not actionBar:
+            return
+        menu = actionBar.createMenu()
+        if self._has_nc_button(menu):
+            return
+        R_drawable = jclass("org.telegram.messenger.R$drawable")
+        icon_res = getattr(R_drawable, "msg_notifications", getattr(R_drawable, "msg_markread", 0))
+        item = menu.addItem(230, icon_res)
+        menu.removeView(item)
+        menu.addView(item, menu.getChildCount() - 1)
+        item.setOnClickListener(OnClickListener(lambda v: self._show_center()))
+
+    def _inject_icon_now(self):
+        def do_inject():
+            try:
+                fragment = get_last_fragment()
+                if fragment is None:
+                    return
+                if "DialogsActivity" not in fragment.getClass().getName():
+                    return
+                self._add_icon_to_fragment(fragment)
+            except:
+                pass
+        run_on_ui_thread(do_inject, 500)
+
+    def _add_drawer_item(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text="Notification Center",
+            on_click=self._on_nc_drawer_click,
+            icon="msg_notifications",
+            item_id="nc_drawer_btn"
+        ))
+
+    def _remove_drawer_item(self):
+        self.remove_menu_item("nc_drawer_btn")
+
+    def _on_drawer_toggle(self, enabled):
+        if enabled:
+            self._add_drawer_item()
+        else:
+            self._remove_drawer_item()
+
+    def _on_nc_drawer_click(self, context):
+        self._show_center()
+
+    def _on_settings_open_click(self, view):
+        self._show_center()
+
+    def _on_add_to_pill_stack(self, view):
+        if not self._pill_supported():
+            missing = []
+            if not self.PillRegistry:
+                missing.append("PillRegistry")
+            if not self.PillInfo:
+                missing.append("PillInfo")
+            if not self.PillCreator:
+                missing.append("PillCreator")
+            if not self.WeatherPill:
+                missing.append("WeatherPill")
+            BulletinHelper.show_error(f"Pill Stack недоступен: отсутствует {', '.join(missing)}")
+            return
+        if self._pill_registered:
+            BulletinHelper.show_info("Уже добавлено в Pill Stack")
+            return
+        self.set_setting("pill_enabled", True)
+        self._register_nc_pill()
+
+    def _open_url(self, url):
+        def handler(view):
+            try:
+                from android.content import Intent
+                from android.net import Uri
+                intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                ctx = view.getContext()
+                ctx.startActivity(intent)
+            except:
+                BulletinHelper.show_error("Не удалось открыть ссылку")
+        return handler
+
+    def _build_notification_view(self, context, notifications, dialog_ref, scroll_ref, is_archive=False):
+        account = UserConfig.selectedAccount
+        mc = MessagesController.getInstance(account)
+
+        root = LinearLayout(context)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(0, AndroidUtilities.dp(4), 0, AndroidUtilities.dp(8))
+
+        if not notifications:
+            empty = TextView(context)
+            if is_archive:
+                empty.setText("Архив пуст\n\nУведомления старше 3 дней будут перемещены сюда автоматически")
+            else:
+                empty.setText("Уведомлений пока нет\n\nОтветы на ваши сообщения и @упоминания появятся здесь")
+            empty.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            empty.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+            empty.setGravity(Gravity.CENTER)
+            empty.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(48), AndroidUtilities.dp(16), AndroidUtilities.dp(48))
+            root.addView(empty, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+            return root
+
+        grouped = {}
+        order = []
+        for n in notifications:
+            did = n.get("dialog_id", 0)
+            if did not in grouped:
+                grouped[did] = []
+                order.append(did)
+            grouped[did].append(n)
+
+        for dialog_id in order:
+            self._add_dialog_group(context, root, dialog_id, grouped[dialog_id], mc, account, dialog_ref, scroll_ref)
+
+        return root
+
+    def _add_dialog_group(self, context, parent, dialog_id, items, mc, account, dialog_ref, scroll_ref):
+        container = LinearLayout(context)
+        container.setOrientation(LinearLayout.VERTICAL)
+        container.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(6), AndroidUtilities.dp(16), AndroidUtilities.dp(6))
+
+        header_row = LinearLayout(context)
+        header_row.setOrientation(LinearLayout.HORIZONTAL)
+        header_row.setGravity(Gravity.CENTER_VERTICAL)
+        header_row.setPadding(0, AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4))
+
+        avatar_view = BackupImageView(context)
+        avatar_view.setRoundRadius(AndroidUtilities.dp(20))
+        avatar_drawable = AvatarDrawable()
+
+        is_user = dialog_id > 0
+        title_text = ""
+        if is_user:
+            user = mc.getUser(dialog_id)
+            if user is not None:
+                title_text = _get_user_name(user)
+                avatar_drawable.setInfo(account, user)
+                avatar_view.setForUserOrChat(user, avatar_drawable)
+            else:
+                title_text = f"Пользователь {dialog_id}"
+                avatar_drawable.setInfo(0, "", "")
+                avatar_view.setImageDrawable(avatar_drawable)
+        else:
+            chat = mc.getChat(-dialog_id)
+            if chat is not None:
+                title_text = _get_chat_title(chat)
+                avatar_drawable.setInfo(account, chat)
+                avatar_view.setForUserOrChat(chat, avatar_drawable)
+            else:
+                title_text = f"Чат {dialog_id}"
+                avatar_drawable.setInfo(0, "", "")
+                avatar_view.setImageDrawable(avatar_drawable)
+
+        header_row.addView(avatar_view, LayoutHelper.createLinear(40, 40, Gravity.CENTER_VERTICAL, 0, 0, 10, 0))
+
+        title_container = LinearLayout(context)
+        title_container.setOrientation(LinearLayout.VERTICAL)
+        title_container.setGravity(Gravity.CENTER_VERTICAL)
+
+        title_tv = TextView(context)
+        title_tv.setText(title_text)
+        title_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        title_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15)
+        title_tv.setTypeface(Typeface.DEFAULT_BOLD)
+        title_tv.setSingleLine(True)
+        title_tv.setEllipsize(TextUtils.TruncateAt.END)
+        title_container.addView(title_tv, LayoutHelper.createLinear(WRAP_CONTENT, WRAP_CONTENT))
+
+        count_label = "уведомление" if len(items) == 1 else "уведомлений"
+        if 2 <= len(items) <= 4:
+            count_label = "уведомления"
+        count_tv = TextView(context)
+        count_tv.setText(f"{len(items)} {count_label}")
+        count_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        count_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+        title_container.addView(count_tv, LayoutHelper.createLinear(WRAP_CONTENT, WRAP_CONTENT))
+
+        header_row.addView(title_container, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT, 1.0))
+
+        arrow = TextView(context)
+        arrow.setText("▼")
+        arrow.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayIcon))
+        arrow.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+        arrow.setGravity(Gravity.CENTER)
+        header_row.addView(arrow, LayoutHelper.createLinear(24, 24, Gravity.CENTER_VERTICAL, 8, 0, 0, 0))
+
+        container.addView(header_row, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+
+        messages_container = LinearLayout(context)
+        messages_container.setOrientation(LinearLayout.VERTICAL)
+        messages_container.setVisibility(View.GONE)
+        messages_container.setPadding(AndroidUtilities.dp(50), 0, 0, 0)
+
+        for item in items:
+            msg_row = self._build_message_row(context, item, dialog_ref, scroll_ref)
+            messages_container.addView(msg_row, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+
+        container.addView(messages_container, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+
+        def toggle_click(v):
+            if messages_container.getVisibility() == View.GONE:
+                messages_container.setVisibility(View.VISIBLE)
+                arrow.setText("▲")
+            else:
+                messages_container.setVisibility(View.GONE)
+                arrow.setText("▼")
+
+        header_row.setOnClickListener(OnClickListener(toggle_click))
+
+        div = View(context)
+        div.setBackgroundColor(Theme.getColor(Theme.key_divider))
+
+        parent.addView(container, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+        parent.addView(div, LayoutHelper.createLinear(MATCH_PARENT, 1))
+
+    def _build_message_row(self, context, item, dialog_ref, scroll_ref):
+        outer = LinearLayout(context)
+        outer.setOrientation(LinearLayout.HORIZONTAL)
+        outer.setGravity(Gravity.CENTER_VERTICAL)
+        outer.setPadding(0, AndroidUtilities.dp(6), 0, AndroidUtilities.dp(6))
+
+        text_col = LinearLayout(context)
+        text_col.setOrientation(LinearLayout.VERTICAL)
+
+        top_row = LinearLayout(context)
+        top_row.setOrientation(LinearLayout.HORIZONTAL)
+        top_row.setGravity(Gravity.CENTER_VERTICAL)
+
+        sender_tv = TextView(context)
+        sender_tv.setText(item.get("sender_name", "Неизвестно"))
+        sender_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+        sender_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        sender_tv.setTypeface(Typeface.DEFAULT_BOLD)
+        sender_tv.setSingleLine(True)
+        top_row.addView(sender_tv, LayoutHelper.createLinear(WRAP_CONTENT, WRAP_CONTENT, 1.0))
+
+        notif_type = item.get("type", "")
+        if notif_type:
+            type_tv = TextView(context)
+            type_tv.setText("ответ" if notif_type == "reply" else "@упоминание")
+            type_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10)
+            type_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+            type_tv.setPadding(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0)
+            top_row.addView(type_tv, LayoutHelper.createLinear(WRAP_CONTENT, WRAP_CONTENT, 0, 0, 4, 0))
+
+        time_tv = TextView(context)
+        time_tv.setText(_timestamp_text(item.get("timestamp", 0)))
+        time_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        time_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11)
+        top_row.addView(time_tv, LayoutHelper.createLinear(WRAP_CONTENT, WRAP_CONTENT))
+
+        text_col.addView(top_row, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+
+        msg_tv = TextView(context)
+        text = item.get("text", "")
+        msg_tv.setText(text if text else "[медиа]")
+        msg_tv.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        msg_tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+        msg_tv.setMaxLines(3)
+        msg_tv.setEllipsize(TextUtils.TruncateAt.END)
+        text_col.addView(msg_tv, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+
+        outer.addView(text_col, LayoutHelper.createLinear(0, WRAP_CONTENT, 1.0))
+
+        goto_btn = TextView(context)
+        goto_btn.setText("→")
+        goto_btn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        goto_btn.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+        goto_btn.setGravity(Gravity.CENTER)
+        goto_btn.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(8), AndroidUtilities.dp(8), AndroidUtilities.dp(8))
+
+        goto_bg = jclass("android.graphics.drawable.GradientDrawable")()
+        goto_bg.setCornerRadius(AndroidUtilities.dp(8))
+        goto_bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText) & 0x1AFFFFFF)
+        goto_btn.setBackground(goto_bg)
+
+        did = item.get("dialog_id", 0)
+        mid = item.get("msg_id", 0)
+
+        def on_goto(v):
+            if dialog_ref[0] is not None:
+                dialog_ref[0].dismiss()
+            run_on_ui_thread(lambda: _navigate_to_message(did, mid), 200)
+
+        goto_btn.setOnClickListener(OnClickListener(on_goto))
+        outer.addView(goto_btn, LayoutHelper.createLinear(36, 36, Gravity.CENTER_VERTICAL, 4, 0, 0, 0))
+
+        return outer
+
+    def _refresh_center_content(self, scroll_ref, dialog_ref, is_archive=False):
+        if scroll_ref[0] is None:
+            return
+        scroll = scroll_ref[0]
+        context = scroll.getContext()
+        account = UserConfig.selectedAccount
+        with _lock:
+            if is_archive:
+                data = _load_archive(account)
+            else:
+                data = _load_notifications(account)
+        scroll.removeAllViews()
+        content = self._build_notification_view(context, data, dialog_ref, scroll_ref, is_archive=is_archive)
+        scroll.addView(content)
+
+    def _show_center(self):
+        plugin = self
+
+        def do_show():
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                return
+
+            account = UserConfig.selectedAccount
+
+            auto_archive = plugin.get_setting("auto_archive", True)
+            if auto_archive:
+                _run_archiving(account, True)
+
+            with _lock:
+                notifs = _load_notifications(account)
+
+            dialog_ref = [None]
+            scroll_ref = [None]
+            tab_state = [False]
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Notification Center")
+
+            outer_layout = LinearLayout(activity)
+            outer_layout.setOrientation(LinearLayout.VERTICAL)
+
+            scroll = ScrollView(activity)
+            scroll_ref[0] = scroll
+            content = plugin._build_notification_view(activity, notifs, dialog_ref, scroll_ref, is_archive=False)
+            scroll.addView(content)
+            scroll.setMinimumHeight(AndroidUtilities.dp(300))
+
+            if auto_archive:
+                tab_bar = LinearLayout(activity)
+                tab_bar.setOrientation(LinearLayout.HORIZONTAL)
+                tab_bar.setGravity(Gravity.CENTER)
+                tab_bar.setPadding(AndroidUtilities.dp(8), AndroidUtilities.dp(4), AndroidUtilities.dp(8), AndroidUtilities.dp(4))
+
+                tab_notifs = TextView(activity)
+                tab_notifs.setText("Уведомления")
+                tab_notifs.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                tab_notifs.setTypeface(Typeface.DEFAULT_BOLD)
+                tab_notifs.setGravity(Gravity.CENTER)
+                tab_notifs.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8))
+
+                tab_archive = TextView(activity)
+                tab_archive.setText("Архив")
+                tab_archive.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                tab_archive.setGravity(Gravity.CENTER)
+                tab_archive.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(8))
+
+                def _apply_tab_style():
+                    if not tab_state[0]:
+                        tab_notifs.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+                        tab_notifs.setTypeface(Typeface.DEFAULT_BOLD)
+                        tab_archive.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                        tab_archive.setTypeface(Typeface.DEFAULT)
+                    else:
+                        tab_archive.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+                        tab_archive.setTypeface(Typeface.DEFAULT_BOLD)
+                        tab_notifs.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                        tab_notifs.setTypeface(Typeface.DEFAULT)
+
+                _apply_tab_style()
+
+                def on_tab_notifs(v):
+                    if not tab_state[0]:
+                        return
+                    tab_state[0] = False
+                    _apply_tab_style()
+                    plugin._refresh_center_content(scroll_ref, dialog_ref, is_archive=False)
+
+                def on_tab_archive(v):
+                    if tab_state[0]:
+                        return
+                    tab_state[0] = True
+                    _apply_tab_style()
+                    plugin._refresh_center_content(scroll_ref, dialog_ref, is_archive=True)
+
+                tab_notifs.setOnClickListener(OnClickListener(on_tab_notifs))
+                tab_archive.setOnClickListener(OnClickListener(on_tab_archive))
+
+                tab_bar.addView(tab_notifs, LayoutHelper.createLinear(0, WRAP_CONTENT, 1.0))
+                tab_bar.addView(tab_archive, LayoutHelper.createLinear(0, WRAP_CONTENT, 1.0))
+
+                tab_div = View(activity)
+                tab_div.setBackgroundColor(Theme.getColor(Theme.key_divider))
+
+                outer_layout.addView(tab_bar, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+                outer_layout.addView(tab_div, LayoutHelper.createLinear(MATCH_PARENT, 1))
+
+            outer_layout.addView(scroll, LayoutHelper.createLinear(MATCH_PARENT, WRAP_CONTENT))
+
+            builder.set_view(outer_layout)
+
+            def do_clear():
+                with _lock:
+                    if auto_archive and tab_state[0]:
+                        _save_archive(account, [])
+                    else:
+                        _save_notifications(account, [])
+                if auto_archive and tab_state[0]:
+                    BulletinHelper.show_success("Архив очищен")
+                else:
+                    BulletinHelper.show_success("Все уведомления очищены")
+                if plugin.get_setting("close_after_clear", False):
+                    if dialog_ref[0] is not None:
+                        dialog_ref[0].dismiss()
+                else:
+                    plugin._refresh_center_content(scroll_ref, dialog_ref, is_archive=(auto_archive and tab_state[0]))
+
+            def on_clear(bld, which):
+                if plugin.get_setting("confirm_clear", True):
+                    confirm = AlertDialogBuilder(activity)
+                    confirm.set_title("Очистить все")
+                    confirm.set_message("Вы уверены, что хотите удалить все уведомления?")
+
+                    def on_yes(cbld, cwhich):
+                        cbld.dismiss()
+                        do_clear()
+
+                    confirm.set_positive_button("Удалить", on_yes)
+                    confirm.set_negative_button("Отмена", lambda cbld, cw: cbld.dismiss())
+                    confirm.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+                    confirm.show()
+                else:
+                    do_clear()
+
+            builder.set_negative_button("Очистить все", on_clear)
+            builder.set_positive_button("Закрыть", lambda bld, w: bld.dismiss())
+            builder.make_button_red(AlertDialogBuilder.BUTTON_NEGATIVE)
+            builder.create()
+
+            try:
+                dialog = builder.get_dialog()
+                if dialog is None:
+                    dialog = builder._dialog
+                if dialog is not None:
+                    neg_button = dialog.getButton(AlertDialogBuilder.BUTTON_NEGATIVE)
+                    if neg_button is not None:
+                        def on_clear_click(v):
+                            on_clear(builder, AlertDialogBuilder.BUTTON_NEGATIVE)
+                        neg_button.setOnClickListener(OnClickListener(on_clear_click))
+            except:
+                pass
+
+            dialog_ref[0] = builder
+            builder.show()
+
+            try:
+                dialog = builder.get_dialog() if hasattr(builder, 'get_dialog') else getattr(builder, '_dialog', None)
+                if dialog is not None:
+                    neg_button = dialog.getButton(AlertDialogBuilder.BUTTON_NEGATIVE)
+                    if neg_button is not None:
+                        def on_clear_click2(v):
+                            on_clear(builder, AlertDialogBuilder.BUTTON_NEGATIVE)
+                        neg_button.setOnClickListener(OnClickListener(on_clear_click2))
+            except:
+                pass
+
+        run_on_ui_thread(do_show, 300)
+
+    def _get_from_id(self, msg):
+        from_id_peer = getattr(msg, "from_id", None)
+        if from_id_peer is not None:
+            uid = getattr(from_id_peer, "user_id", 0)
+            if uid:
+                return int(uid)
+        return 0
+
+    def _get_dialog_id(self, msg):
+        peer = getattr(msg, "peer_id", None)
+        if peer is None:
+            return 0
+        user_id = getattr(peer, "user_id", 0)
+        chat_id = getattr(peer, "chat_id", 0)
+        channel_id = getattr(peer, "channel_id", 0)
+        if user_id:
+            return int(user_id)
+        if chat_id:
+            return int(-chat_id)
+        if channel_id:
+            return int(-channel_id)
+        return 0
+
+    def _is_mention(self, msg, current_user_id, mc):
+        if getattr(msg, "mentioned", False):
+            return True
+        entities = getattr(msg, "entities", None)
+        if entities is not None:
+            for ent in entities:
+                ent_class = ent.getClass().getSimpleName()
+                if ent_class == "TL_messageEntityMentionName":
+                    if getattr(ent, "user_id", 0) == current_user_id:
+                        return True
+                elif ent_class == "TL_messageEntityMention":
+                    text = getattr(msg, "message", "") or ""
+                    offset = getattr(ent, "offset", 0)
+                    length = getattr(ent, "length", 0)
+                    mention_text = text[offset:offset + length].lstrip("@").lower()
+                    user = mc.getUser(current_user_id)
+                    if user is not None:
+                        username = (getattr(user, "username", "") or "").lower()
+                        if username and mention_text == username:
+                            return True
+        return False
+
+    def _is_reply_to_me(self, msg, current_user_id, account):
+        reply_to = getattr(msg, "reply_to", None)
+        if reply_to is None:
+            return False
+        reply_to_msg_id = getattr(reply_to, "reply_to_msg_id", 0)
+        if not reply_to_msg_id:
+            return False
+        reply_to_peer_id = getattr(reply_to, "reply_to_peer_id", None)
+        if reply_to_peer_id is not None:
+            return False
+        try:
+            reply_from = getattr(reply_to, "reply_from", None)
+            if reply_from is not None:
+                from_id = getattr(reply_from, "from_id", None)
+                if from_id is not None:
+                    uid = getattr(from_id, "user_id", 0)
+                    if uid == current_user_id:
+                        return True
+        except:
+            pass
+        try:
+            reply_header = getattr(msg, "replyMessage", None)
+            if reply_header is not None:
+                reply_msg = getattr(reply_header, "messageOwner", reply_header)
+                reply_from_id = self._get_from_id(reply_msg)
+                if reply_from_id == current_user_id:
+                    return True
+        except:
+            pass
+        dialog_id = self._get_dialog_id(msg)
+        try:
+            mc = MessagesController.getInstance(account)
+            dialog_messages = mc.dialogMessage
+            if dialog_messages is not None:
+                arr = dialog_messages.get(dialog_id)
+                if arr is not None:
+                    for i in range(arr.size()):
+                        m = arr.get(i)
+                        if m is not None and m.getId() == reply_to_msg_id:
+                            sender = self._get_from_id(m.messageOwner)
+                            return sender == current_user_id
+        except:
+            pass
+        return False
+
+    def _process_message(self, msg, account):
+        current_user_id = UserConfig.getInstance(account).getClientUserId()
+        from_id = self._get_from_id(msg)
+
+        if from_id == current_user_id:
+            return
+
+        dialog_id = self._get_dialog_id(msg)
+        if dialog_id == 0:
+            return
+
+        if dialog_id > 0:
+            return
+
+        mc = MessagesController.getInstance(account)
+
+        is_mention = self._is_mention(msg, current_user_id, mc)
+        is_reply = self._is_reply_to_me(msg, current_user_id, account)
+
+        if not is_mention and not is_reply:
+            return
+
+        user = mc.getUser(from_id) if from_id > 0 else None
+        sender_name = _get_user_name(user) if user is not None else f"Пользователь {from_id}"
+
+        text = getattr(msg, "message", "") or ""
+        msg_id = getattr(msg, "id", 0)
+
+        notif = {
+            "msg_id": int(msg_id),
+            "dialog_id": int(dialog_id),
+            "from_id": int(from_id),
+            "sender_name": sender_name,
+            "text": text[:500],
+            "type": "mention" if is_mention else "reply",
+            "timestamp": time.time(),
+        }
+
+        with _lock:
+            notifs = _load_notifications(account)
+            existing_ids = {n.get("msg_id") for n in notifs}
+            if msg_id not in existing_ids:
+                notifs.insert(0, notif)
+                if len(notifs) > 500:
+                    notifs = notifs[:500]
+                _save_notifications(account, notifs)
+
+    def create_settings(self):
+        settings = [
+            Header(text="Информация"),
+            Text(
+                text="Документация",
+                icon="msg_link",
+                on_click=self._open_url("https://telegra.ph/Dokumentaciya-k-plaginu-Notification-Center-06-27"),
+            ),
+            Text(
+                text="Канал автора",
+                icon="msg_channel",
+                on_click=self._open_url("https://t.me/MaxExteraPlugins"),
+            ),
+            Divider(),
+            Header(text="Центр уведомлений"),
+            Text(
+                text="Открыть центр уведомлений",
+                icon="msg_notifications",
+                on_click=self._on_settings_open_click,
+            ),
+            Divider(),
+            Header(text="Расположение кнопки"),
+            Switch(
+                key="show_in_drawer",
+                text="Боковое меню",
+                default=True,
+                subtext="Добавить кнопку в боковое меню",
+                icon="msg_menu",
+                on_change=self._on_drawer_toggle,
+            ),
+            Switch(
+                key="show_in_actionbar",
+                text="Главный экран",
+                default=False,
+                subtext="Добавить иконку на главный экран",
+                icon="msg_header",
+            ),
+            Divider(),
+            Header(text="Архивирование"),
+            Switch(
+                key="auto_archive",
+                text="Автоматическое архивирование",
+                default=True,
+                subtext="Перемещать уведомления старше 3 дней в архив. Из архива удаляются через 7 дней",
+                icon="msg_archive",
+            ),
+            Divider(),
+            Header(text="Очистка уведомлений"),
+            Switch(
+                key="confirm_clear",
+                text="Подтверждение очистки",
+                default=True,
+                subtext="Запрашивать подтверждение при очистке всех уведомлений",
+                icon="msg_delete",
+            ),
+            Switch(
+                key="close_after_clear",
+                text="Закрыть после очистки",
+                default=False,
+                subtext="Закрыть центр уведомлений после очистки всех",
+                icon="msg_close",
+            ),
+            Divider(),
+        ]
+
+        if self._pill_supported():
+            settings.extend([
+                Divider(),
+                Header(text="Pill Stack"),
+                Switch(
+                    key="pill_enabled",
+                    text="Показать в Pill Stack",
+                    default=False,
+                    subtext="Показывать количество уведомлений в строке поиска",
+                    icon="msg_search",
+                    on_change=self._on_pill_toggle,
+                ),
+            ])
+
+        return settings
+
+    def _on_pill_toggle(self, enabled):
+        if enabled:
+            self._register_nc_pill()
+        else:
+            self._pill_registered = False

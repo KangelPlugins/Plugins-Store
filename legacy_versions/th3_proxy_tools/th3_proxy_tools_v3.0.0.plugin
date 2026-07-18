@@ -1,0 +1,689 @@
+import json
+import re
+import socket
+import threading
+import time
+import os
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List
+
+import java
+from android.os import SystemClock
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, get_user_config, run_on_queue, send_document, send_message
+from file_utils import get_plugins_dir, write_file
+from hook_utils import find_class, get_private_field, set_private_field
+from java import jclass
+from java.lang import Boolean as JBoolean
+from java.lang import Integer as JInteger
+from org.telegram.messenger import (
+    AndroidUtilities,
+    ApplicationLoader,
+    LocaleController,
+    NotificationCenter,
+    R as R_tg,
+    SharedConfig,
+    UserConfig,
+)
+from org.telegram.tgnet import ConnectionsManager, RequestTimeDelegate, TLRPC
+from ui.bulletin import BulletinHelper
+
+__id__ = "th3_proxy_tools"
+__name__ = "Th3ProxyTools"
+__description__ = (
+    "Расширенный менеджер прокси.\n\n"
+    "**Возможности:**\n"
+    "• Массовый пинг всех прокси с live-обновлением;\n"
+    "• Флаги стран и провайдеры;\n"
+    "• Импорт/Экспорт списков прокси;\n"
+    "• Сортировка по пингу;\n"
+    "• Удаление дубликатов и нерабочих."
+)
+__author__ = "@th3_nek1t"
+__version__ = "2.1.0"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.12.0"
+
+MENU_PING_ALL_ID = 999_001
+MENU_SORT_ID = 999_002
+MENU_IMPORT_ID = 999_003
+MENU_EXPORT_ID = 999_004
+
+
+def _jlist_to_py(jl) -> list:
+    return [jl.get(i) for i in range(jl.size())]
+
+
+def _post_proxy_check_done(info):
+    try:
+        NotificationCenter.getGlobalInstance().postNotificationName(
+            NotificationCenter.proxyCheckDone, info
+        )
+    except Exception:
+        pass
+
+
+class _NativeTimeDelegate(java.dynamic_proxy(RequestTimeDelegate)):
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self, time_val):
+        try:
+            self._fn(time_val)
+        except Exception as e:
+            log(f"th3pt: delegate cb {e}")
+
+
+class Th3ProxyTools(BasePlugin):
+
+    def on_plugin_load(self) -> None:
+        self._ping_busy = False
+        self._did_initial_reset = False
+        self._ip_cache = {}
+        self._pending_ips = set()
+        self._batch_lock = threading.Lock()
+        self._load_ip_cache()
+        self._hook_proxy_list()
+        self._hook_proxy_cells()
+
+    # ── settings persistence ──
+
+    def _load_ip_cache(self):
+        try:
+            self._ip_cache = json.loads(self.get_setting("ip_cache", "{}"))
+        except Exception:
+            self._ip_cache = {}
+
+    def _save_ip_cache(self):
+        self.set_setting("ip_cache", json.dumps(self._ip_cache))
+
+    # ── settings UI ──
+
+    def create_settings(self) -> list:
+        from ui.settings import Divider, Header, Input, Selector, Switch
+
+        return [
+            Header(text="Пинг"),
+            Selector(
+                key="ping_mode", text="Режим", default=0,
+                items=["Нативный", "TCP", "HTTP (SOCKS)"],
+                icon="msg_settings",
+            ),
+            Input(
+                key="ping_url", text="URL (HTTP)",
+                default="https://www.google.com/generate_204",
+                subtext="Для SOCKS; MTProto → TCP.", icon="msg_link",
+            ),
+            Divider(),
+            Header(text="Отображение"),
+            Switch(
+                key="show_geo", text="Флаги стран и провайдер",
+                default=True, icon="msg_location",
+            ),
+            Divider(),
+            Header(text="Кнопки в шапке"),
+            Switch(key="btn_ping", text="Пинг все", default=True, icon="msg_recent"),
+            Switch(key="btn_sort", text="Сортировка", default=True, icon="msg_list"),
+            Switch(key="btn_import", text="Импорт", default=True, icon="msg_download"),
+            Switch(key="btn_export", text="Экспорт", default=True, icon="msg_share"),
+            Divider(),
+            Header(text="Нативный режим"),
+            Switch(
+                key="reset_cache_on_open", text="Сбрасывать кэш при открытии",
+                default=True, subtext="Только нативный.", icon="msg_settings",
+            ),
+        ]
+
+    # ── hooks ──
+
+    def _hook_proxy_list(self):
+        try:
+            act_cls = find_class("org.telegram.ui.ProxyListActivity")
+            if act_cls is None:
+                return
+            jc = act_cls.getClass()
+            ctx_cls = find_class("android.content.Context")
+
+            m_rows = jc.getDeclaredMethod("updateRows", JBoolean.TYPE)
+            m_rows.setAccessible(True)
+            self.hook_method(m_rows, _UpdateRowsHook(self))
+
+            m_check = jc.getDeclaredMethod("checkProxyList")
+            m_check.setAccessible(True)
+            self.hook_method(m_check, _CheckProxyListHook(self))
+
+            m_cv = jc.getDeclaredMethod("createView", ctx_cls)
+            m_cv.setAccessible(True)
+            self.hook_method(m_cv, _CreateViewHook(self))
+        except Exception as e:
+            log(f"th3pt: hook list {e}")
+
+    def _hook_proxy_cells(self):
+        try:
+            cell_cls = find_class("org.telegram.ui.ProxyListActivity$TextDetailProxyCell")
+            if cell_cls is None:
+                return
+            cc = cell_cls.getClass()
+
+            m_us = cc.getDeclaredMethod("updateStatus")
+            m_us.setAccessible(True)
+            self.hook_method(m_us, _CellUpdateStatusHook(self))
+
+            pi_cls = find_class("org.telegram.messenger.SharedConfig$ProxyInfo")
+            if pi_cls is not None:
+                m_sp = cc.getDeclaredMethod("setProxy", pi_cls)
+                m_sp.setAccessible(True)
+                self.hook_method(m_sp, _CellSetProxyHook(self))
+        except Exception as e:
+            log(f"th3pt: hook cells {e}")
+
+    # ── action bar buttons ──
+
+    def _add_action_buttons(self, fragment):
+        try:
+            ab = get_private_field(fragment, "actionBar")
+            if ab is None:
+                return
+            menu = ab.createMenu()
+            iw = AndroidUtilities.dp(40)
+            plg = self
+            if plg.get_setting("btn_export", True) and menu.getItem(MENU_EXPORT_ID) is None:
+                it = menu.addItemWithWidth(MENU_EXPORT_ID, R_tg.drawable.msg_share, iw, "Экспорт")
+                it.setOnClickListener(OnClickListener(lambda _v: plg._export_proxies()))
+            if plg.get_setting("btn_import", True) and menu.getItem(MENU_IMPORT_ID) is None:
+                it = menu.addItemWithWidth(MENU_IMPORT_ID, R_tg.drawable.msg_download, iw, "Импорт")
+                it.setOnClickListener(OnClickListener(lambda _v: plg._import_from_clipboard()))
+            if plg.get_setting("btn_sort", True) and menu.getItem(MENU_SORT_ID) is None:
+                it = menu.addItemWithWidth(MENU_SORT_ID, R_tg.drawable.msg_list, iw, "По пингу")
+                it.setOnClickListener(OnClickListener(lambda _v, f=fragment: plg._sort_by_ping(f)))
+            if plg.get_setting("btn_ping", True) and menu.getItem(MENU_PING_ALL_ID) is None:
+                it = menu.addItemWithWidth(MENU_PING_ALL_ID, R_tg.drawable.msg_recent, iw, "Пинг все")
+                it.setOnClickListener(OnClickListener(lambda _v, f=fragment: plg._on_ping_all(f)))
+        except Exception as e:
+            log(f"th3pt: buttons {e}")
+
+    # ── refresh helpers ──
+
+    def _start_status_refresh_loop(self):
+        def loop():
+            while self._ping_busy:
+                time.sleep(1.0)
+                run_on_ui_thread(self._force_refresh_cells)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _force_refresh_cells(self):
+        try:
+            fr = get_last_fragment()
+            if fr is None:
+                return
+            if "ProxyListActivity" not in fr.getClass().getName():
+                return
+            ad = get_private_field(fr, "listAdapter")
+            if ad is not None:
+                ad.notifyDataSetChanged()
+        except Exception:
+            pass
+
+    def _notify_proxy_settings_changed(self):
+        try:
+            NotificationCenter.getGlobalInstance().postNotificationName(
+                NotificationCenter.proxySettingsChanged
+            )
+        except Exception:
+            pass
+
+    # ── ping all (NATIVE — uses ConnectionsManager.checkProxy per-proxy) ──
+
+    def _on_ping_all(self, fragment):
+        if self._ping_busy:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Проверка уже идёт"))
+            return
+        self._ping_busy = True
+        mode = self.get_setting("ping_mode", 0)
+
+        def start():
+            SharedConfig.loadProxyList()
+            al = SharedConfig.proxyList
+            proxies = _jlist_to_py(al)
+            total = len(proxies)
+            if total == 0:
+                BulletinHelper.show_info("Список прокси пуст")
+                self._ping_busy = False
+                return
+
+            BulletinHelper.show_info(f"Проверка {total} прокси…")
+
+            for p in proxies:
+                p.checking = True
+            self._notify_proxy_settings_changed()
+            self._start_status_refresh_loop()
+
+            if mode == 0:
+                self._run_native_ping_all(proxies, total)
+            else:
+                run_on_queue(lambda: self._run_custom_ping_all(proxies, total, mode))
+
+        run_on_ui_thread(start)
+
+    def _run_native_ping_all(self, proxies, total):
+        account = UserConfig.selectedAccount
+        cm = ConnectionsManager.getInstance(account)
+        remaining = {"n": total}
+
+        def on_one_done():
+            remaining["n"] -= 1
+            if remaining["n"] <= 0:
+                def finish():
+                    self._ping_busy = False
+                    SharedConfig.saveProxyList()
+                    self._notify_proxy_settings_changed()
+                    ok = sum(1 for p in proxies if p.available)
+                    BulletinHelper.show_success(f"Готово: {ok} работают, {total - ok} нет")
+                run_on_ui_thread(finish)
+
+        for px in proxies:
+            addr = str(getattr(px, "address", "") or "").strip()
+            if not addr:
+                def mark_empty(p=px):
+                    p.checking = False
+                    p.available = False
+                    p.ping = 0
+                    p.availableCheckTime = SystemClock.elapsedRealtime()
+                    _post_proxy_check_done(p)
+                    on_one_done()
+                run_on_ui_thread(mark_empty)
+                continue
+
+            def make_cb(p):
+                def on_time(t):
+                    def ui_upd():
+                        p.checking = False
+                        p.availableCheckTime = SystemClock.elapsedRealtime()
+                        if t == -1:
+                            p.available = False
+                            p.ping = 0
+                        else:
+                            p.available = True
+                            p.ping = int(t)
+                        _post_proxy_check_done(p)
+                        on_one_done()
+                    run_on_ui_thread(ui_upd)
+                return on_time
+
+            try:
+                cm.checkProxy(
+                    px.address, px.port,
+                    px.username, px.password, px.secret,
+                    _NativeTimeDelegate(make_cb(px)),
+                )
+            except Exception as e:
+                log(f"th3pt: checkProxy {addr}: {e}")
+                def mark_fail(p=px):
+                    p.checking = False
+                    p.available = False
+                    p.ping = 0
+                    p.availableCheckTime = SystemClock.elapsedRealtime()
+                    _post_proxy_check_done(p)
+                    on_one_done()
+                run_on_ui_thread(mark_fail)
+
+    def _run_custom_ping_all(self, proxies, total, mode):
+        url = (self.get_setting("ping_url", "") or "").strip() or "https://www.google.com/generate_204"
+
+        def check_one(px):
+            ms = -1
+            try:
+                if mode == 1:
+                    ms = self._tcp_ms(px)
+                elif mode == 2:
+                    ms = self._http_ms(px, url)
+            except Exception:
+                ms = -1
+
+            def ui_upd(p=px, m=ms):
+                p.checking = False
+                p.availableCheckTime = SystemClock.elapsedRealtime()
+                if m < 0:
+                    p.available = False
+                    p.ping = 0
+                else:
+                    p.available = True
+                    p.ping = m
+                _post_proxy_check_done(p)
+            run_on_ui_thread(ui_upd)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(check_one, proxies))
+
+        def done():
+            self._ping_busy = False
+            SharedConfig.saveProxyList()
+            self._notify_proxy_settings_changed()
+            ok = sum(1 for p in proxies if p.available)
+            BulletinHelper.show_success(f"Готово: {ok} работают, {total - ok} нет")
+        run_on_ui_thread(done)
+
+    def _tcp_ms(self, info) -> int:
+        h = str(getattr(info, "address", "") or "")
+        p = int(getattr(info, "port", 0) or 0)
+        if not h or not p:
+            return -1
+        t0 = time.time()
+        try:
+            with socket.create_connection((h, p), timeout=5.0):
+                return int((time.time() - t0) * 1000)
+        except OSError:
+            return -1
+
+    def _http_ms(self, info, url) -> int:
+        import requests
+        secret = str(getattr(info, "secret", "") or "").strip()
+        if secret:
+            return self._tcp_ms(info)
+        u = str(getattr(info, "username", "") or "")
+        pw = str(getattr(info, "password", "") or "")
+        h = str(getattr(info, "address", "") or "")
+        p = int(getattr(info, "port", 0) or 0)
+        if not h or not p:
+            return -1
+        auth = f"{u}:{pw}@" if u or pw else ""
+        px = f"socks5h://{auth}{h}:{p}"
+        t0 = time.time()
+        try:
+            r = requests.get(url, proxies={"http": px, "https": px}, timeout=12)
+            return int((time.time() - t0) * 1000) if r.status_code < 400 else -1
+        except Exception:
+            return self._tcp_ms(info)
+
+    # ── sort ──
+
+    def _sort_by_ping(self, fragment):
+        def ui():
+            SharedConfig.loadProxyList()
+            al = SharedConfig.proxyList
+            items = _jlist_to_py(al)
+            if len(items) <= 1:
+                return
+            def sk(i):
+                av = bool(getattr(i, "available", False))
+                p = int(getattr(i, "ping", 0) or 0)
+                if not av or p <= 0:
+                    return (1, 10**9)
+                return (0, p)
+            items.sort(key=sk)
+            al.clear()
+            for it in items:
+                al.add(it)
+            SharedConfig.saveProxyList()
+            self._notify_proxy_settings_changed()
+            BulletinHelper.show_success("Отсортировано по пингу")
+        run_on_ui_thread(ui)
+
+    # ── import ──
+
+    def _import_from_clipboard(self):
+        def ui():
+            try:
+                clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+                if not clip or not clip.hasPrimaryClip():
+                    BulletinHelper.show_error("Буфер пуст")
+                    return
+                raw = str(clip.getPrimaryClip().getItemAt(0).getText() or "")
+                text = raw.replace("tg://", " tg://").replace("https://t.me/", " https://t.me/")
+                links = re.findall(r"(tg://[^\s\"'<>]+|https?://t\.me/[^\s\"'<>]+)", text)
+                if not links:
+                    BulletinHelper.show_error("Прокси-ссылок не найдено")
+                    return
+                ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+                added = 0
+                for lnk in links:
+                    if "proxy?" not in lnk and "socks?" not in lnk:
+                        continue
+                    lnk = lnk.replace("https://t.me/", "tg://")
+                    parsed = urllib.parse.urlsplit(lnk.replace("tg://", "http://"))
+                    q = urllib.parse.parse_qs(parsed.query)
+                    srv = q.get("server", [""])[0]
+                    port = q.get("port", ["0"])[0]
+                    if srv and port.isdigit():
+                        info = ProxyInfo(
+                            srv, int(port),
+                            urllib.parse.unquote(q.get("user", [""])[0]),
+                            urllib.parse.unquote(q.get("pass", [""])[0]),
+                            q.get("secret", [""])[0],
+                        )
+                        SharedConfig.addProxy(info)
+                        added += 1
+                if added:
+                    SharedConfig.saveProxyList()
+                    self._notify_proxy_settings_changed()
+                    BulletinHelper.show_success(f"Импортировано: {added}")
+                else:
+                    BulletinHelper.show_error("Не удалось распознать прокси")
+            except Exception as e:
+                log(f"th3pt: import {e}")
+                BulletinHelper.show_error(f"Ошибка импорта: {e}")
+        run_on_ui_thread(ui)
+
+    # ── export ──
+
+    def _export_proxies(self):
+        def task():
+            try:
+                SharedConfig.loadProxyList()
+                proxies = _jlist_to_py(SharedConfig.proxyList)
+                if not proxies:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Список пуст"))
+                    return
+                mt, sk = [], []
+                for p in proxies:
+                    secret = str(getattr(p, "secret", "") or "").strip()
+                    if secret:
+                        mt.append(f"tg://proxy?server={p.address}&port={p.port}&secret={secret}")
+                    else:
+                        sk.append(f"tg://socks?server={p.address}&port={p.port}&user={p.username}&pass={p.password}")
+                total = len(proxies)
+                txt = f"Прокси ({total}):\n\n"
+                if sk:
+                    txt += "SOCKS5:\n" + "\n".join(sk) + "\n\n"
+                if mt:
+                    txt += "MTProto:\n" + "\n".join(mt)
+                uid = get_user_config().getClientUserId()
+                if len(txt) > 4000:
+                    fp = os.path.join(get_plugins_dir(), "proxies_export.txt")
+                    write_file(fp, txt)
+                    send_document(uid, fp, caption="Экспорт прокси")
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Экспорт → Избранное (файл)"))
+                else:
+                    q = TLRPC.TL_messageEntityBlockquote()
+                    q.collapsed = True
+                    q.offset = 0
+                    q.length = len(txt.encode("utf-16-le")) // 2
+                    send_message({"peer": uid, "message": txt, "entities": [q]})
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Экспорт → Избранное"))
+            except Exception as e:
+                log(f"th3pt: export {e}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {e}"))
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── geo lookup (ip-api batch) ──
+
+    def _fetch_geo_batch(self, addr: str):
+        with self._batch_lock:
+            if addr in self._ip_cache or addr in self._pending_ips:
+                return
+            self._pending_ips.add(addr)
+            should_fire = len(self._pending_ips) == 1 or len(self._pending_ips) % 15 == 0
+
+        if should_fire:
+            def batch():
+                import requests as req
+                time.sleep(0.8)
+                with self._batch_lock:
+                    ips = list(self._pending_ips)[:100]
+                    for ip in ips:
+                        self._pending_ips.discard(ip)
+                if not ips:
+                    return
+                try:
+                    resolved = []
+                    ip_map = {}
+                    for host in ips:
+                        try:
+                            ip = socket.gethostbyname(host) if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host) else host
+                        except Exception:
+                            ip = host
+                        resolved.append({"query": ip})
+                        ip_map[ip] = host
+                    resp = req.post(
+                        "http://ip-api.com/batch?fields=query,countryCode,isp",
+                        json=resolved, timeout=8,
+                    ).json()
+                    changed = False
+                    for item in resp:
+                        cc = item.get("countryCode")
+                        qip = item.get("query")
+                        isp = item.get("isp", "")
+                        isp = re.sub(r"(?i)\s+(LLC|Inc\.|Ltd\.|Corporation|Corp\.|Hosting|Network|Communications|GmbH)", "", isp).strip(" ,.")
+                        if len(isp) > 18:
+                            isp = isp[:16] + ".."
+                        if cc and qip:
+                            flag = chr(ord(cc[0]) + 127397) + chr(ord(cc[1]) + 127397)
+                            orig = ip_map.get(qip, qip)
+                            self._ip_cache[orig] = {"flag": flag, "isp": isp, "cc": cc}
+                            changed = True
+                    if changed:
+                        self._save_ip_cache()
+                        run_on_ui_thread(lambda: self._notify_proxy_settings_changed())
+                except Exception as e:
+                    log(f"th3pt: geo batch {e}")
+            threading.Thread(target=batch, daemon=True).start()
+
+    def _geo_text(self, addr: str) -> str:
+        d = self._ip_cache.get(addr)
+        if not d:
+            return ""
+        flag = d.get("flag", "")
+        isp = d.get("isp", "")
+        if flag and isp:
+            return f"{flag} {isp}"
+        return flag or isp
+
+
+# ═══════════════════════════════════════════
+#   Hooks
+# ═══════════════════════════════════════════
+
+class _UpdateRowsHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def before_hooked_method(self, param):
+        try:
+            if not param.args[0]:
+                return
+            if self._p._ping_busy:
+                return
+            if self._p.get_setting("ping_mode", 0) != 0:
+                return
+            if not self._p.get_setting("reset_cache_on_open", True):
+                return
+            if self._p._did_initial_reset:
+                return
+            self._p._did_initial_reset = True
+            SharedConfig.loadProxyList()
+            al = SharedConfig.proxyList
+            for i in range(al.size()):
+                o = al.get(i)
+                o.availableCheckTime = 0
+                o.checking = False
+            set_private_field(param.thisObject, "wasCheckedAllList", False)
+        except Exception as e:
+            log(f"th3pt: updateRows {e}")
+
+
+class _CheckProxyListHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def before_hooked_method(self, param):
+        try:
+            if self._p.get_setting("ping_mode", 0) == 0:
+                return
+            param.setResult(None)
+        except Exception as e:
+            log(f"th3pt: checkProxy hook {e}")
+
+
+class _CreateViewHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        self._p._did_initial_reset = False
+        self._p._add_action_buttons(param.thisObject)
+
+
+class _CellSetProxyHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            info = param.args[0]
+            if not info:
+                return
+            addr = str(getattr(info, "address", "") or "")
+            show_geo = self._p.get_setting("show_geo", True)
+
+            tv = get_private_field(cell, "textView")
+            if tv is None:
+                return
+
+            flag = ""
+            if show_geo:
+                d = self._p._ip_cache.get(addr)
+                if d:
+                    flag = d.get("flag", "")
+                else:
+                    self._p._fetch_geo_batch(addr)
+
+            base = f"{addr}:{info.port}"
+            if flag:
+                tv.setText(f"{flag} {base}")
+            else:
+                tv.setText(base)
+        except Exception as e:
+            log(f"th3pt: setProxy cell {e}")
+
+
+class _CellUpdateStatusHook(MethodHook):
+    def __init__(self, plg):
+        self._p = plg
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            info = get_private_field(cell, "currentInfo")
+            if not info:
+                return
+            if not self._p.get_setting("show_geo", True):
+                return
+            addr = str(getattr(info, "address", "") or "")
+            d = self._p._ip_cache.get(addr)
+            if not d:
+                return
+            isp = d.get("isp", "")
+            if not isp:
+                return
+            vv = get_private_field(cell, "valueTextView")
+            if vv is None:
+                return
+            cur = str(vv.getText() or "")
+            if isp not in cur:
+                vv.setText(f"{cur} · {isp}")
+        except Exception as e:
+            log(f"th3pt: updateStatus {e}")
