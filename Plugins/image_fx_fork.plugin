@@ -1,0 +1,1250 @@
+__id__ = "image_fx_fork"
+__name__ = "ImageFX Ultimate"
+__description__ = "Полноценный графический редактор фотографий с каруселью фильтров"
+__author__ = "@anivdev (fork of @aprux)"
+__version__ = "2.0"
+__min_version__ = "12.5.1"
+__icon__ = "SpottyEmojiAnim/22"
+
+
+import os
+import uuid
+import time
+import io
+import threading
+import traceback
+from typing import Any, Optional
+
+try:
+    from PIL import Image, ImageOps, ImageFilter, ImageDraw, ImageEnhance
+except ImportError:
+    raise ImportError("Pillow library is not installed. This plugin requires it.")
+
+from java import jclass, jint, jarray, jbyte, dynamic_proxy
+from java.io import File
+from org.telegram.messenger import ApplicationLoader, MessageObject, FileLoader, UserConfig, ImageLocation
+from org.telegram.tgnet import TLRPC
+from com.exteragram.messenger.plugins import PluginsController
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook, HookResult, HookStrategy
+from client_utils import send_message, get_send_messages_helper
+from android_utils import R, run_on_ui_thread, log, OnLongClickListener, OnClickListener
+from ui.bulletin import BulletinHelper
+from hook_utils import find_class, get_private_field
+from android.util import Log
+
+# Cache classes for performance
+PhotoViewerClass = find_class("org.telegram.ui.PhotoViewer")
+LocaleControllerClass = find_class("org.telegram.messenger.LocaleController")
+DialogObjectClass = find_class("org.telegram.messenger.DialogObject")
+MessagesControllerClass = find_class("org.telegram.messenger.MessagesController")
+UserConfigClass = find_class("org.telegram.messenger.UserConfig")
+R_drawable = find_class("org.telegram.messenger.R$drawable")
+
+def _to_class(value):
+    if value is None: return None
+    try:
+        if hasattr(value, "getDeclaredMethod"):
+            return value
+    except Exception:
+        pass
+    try:
+        return value.getClass()
+    except Exception:
+        return None
+
+def dlog(msg):
+    try:
+        Log.d("image_fx", str(msg))
+    except Exception:
+        pass
+    try:
+        log(str(msg))
+    except Exception:
+        pass
+
+def pil_to_android_bitmap(pil_img, format="JPEG"):
+    try:
+        buf = io.BytesIO()
+        if format == "JPEG":
+            pil_img.convert("RGB").save(buf, format="JPEG", quality=85)
+        else:
+            pil_img.save(buf, format="PNG")
+        byte_data = buf.getvalue()
+        
+        j_byte_array = jarray(jbyte)(byte_data)
+        
+        BitmapFactory = jclass("android.graphics.BitmapFactory")
+        Options = jclass("android.graphics.BitmapFactory$Options")
+        options = Options()
+        if format == "JPEG":
+            options.inPreferredConfig = jclass("android.graphics.Bitmap$Config").RGB_565
+        else:
+            options.inPreferredConfig = jclass("android.graphics.Bitmap$Config").ARGB_8888
+            
+        return BitmapFactory.decodeByteArray(j_byte_array, 0, len(j_byte_array), options)
+    except Exception as e:
+        dlog(f"[ImageFX+ JNI] pil_to_android_bitmap error: {e}")
+        return None
+
+class ImageFXEditor:
+    def __init__(self, activity, photo_path, preview_path, peer_id, is_from_viewer, plugin):
+        self.activity = activity
+        self.photo_path = photo_path
+        self.preview_path = preview_path
+        self.peer_id = peer_id
+        self.is_from_viewer = is_from_viewer
+        self.plugin = plugin
+        
+        self.original_bitmap = None
+        self.filtered_bitmap = None
+        self.thumb_rounded = None
+        self.filter_thumb_bitmaps = []
+        self.selected_filter = "original"
+        self.current_preview_path = preview_path
+        self.filter_items = []
+        
+        # Load classes
+        self.Dialog = jclass("android.app.Dialog")
+        self.FrameLayout = jclass("android.widget.FrameLayout")
+        self.LinearLayout = jclass("android.widget.LinearLayout")
+        self.TextView = jclass("android.widget.TextView")
+        self.ImageView = jclass("android.widget.ImageView")
+        self.HorizontalScrollView = jclass("android.widget.HorizontalScrollView")
+        self.ViewGroup = jclass("android.view.ViewGroup")
+        self.Color = jclass("android.graphics.Color")
+        self.Gravity = jclass("android.view.Gravity")
+        self.TypedValue = jclass("android.util.TypedValue")
+        self.MotionEvent = jclass("android.view.MotionEvent")
+        self.Typeface = jclass("android.graphics.Typeface")
+        
+        # Resolve status bar height
+        AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
+        self.status_bar_height = 0
+        if AndroidUtilities:
+            try:
+                self.status_bar_height = int(getattr(AndroidUtilities, "statusBarHeight", 0))
+            except Exception:
+                pass
+        if self.status_bar_height == 0:
+            self.status_bar_height = self.dp(24)
+
+    def dp(self, val):
+        return int(self.TypedValue.applyDimension(
+            self.TypedValue.COMPLEX_UNIT_DIP, 
+            float(val), 
+            self.activity.getResources().getDisplayMetrics()
+        ))
+
+    def create_card_background(self, fill_color, stroke_color, corner_radius):
+        try:
+            GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+            gd = GradientDrawable()
+            gd.setShape(GradientDrawable.RECTANGLE)
+            gd.setColor(fill_color)
+            gd.setCornerRadius(float(corner_radius))
+            if stroke_color != 0:
+                gd.setStroke(self.dp(2), stroke_color)
+            return gd
+        except Exception as e:
+            dlog(f"[ImageFX+ JNI] create_card_background error: {e}")
+            return None
+
+    def load_optimized_bitmap(self, path, max_dim):
+        try:
+            FileObj = jclass("java.io.File")
+            if not FileObj(path).exists():
+                return None
+            BitmapFactory = jclass("android.graphics.BitmapFactory")
+            Options = jclass("android.graphics.BitmapFactory$Options")
+            options = Options()
+            options.inJustDecodeBounds = True
+            BitmapFactory.decodeFile(path, options)
+            
+            src_width = options.outWidth
+            src_height = options.outHeight
+            in_sample_size = 1
+            
+            if src_width > max_dim or src_height > max_dim:
+                half_width = src_width // 2
+                half_height = src_height // 2
+                while (half_width // in_sample_size) >= max_dim and (half_height // in_sample_size) >= max_dim:
+                    in_sample_size *= 2
+                    
+            options.inJustDecodeBounds = False
+            options.inSampleSize = in_sample_size
+            options.inPreferredConfig = jclass("android.graphics.Bitmap$Config").RGB_565
+            
+            return BitmapFactory.decodeFile(path, options)
+        except Exception as e:
+            dlog(f"[ImageFX+ JNI] load_optimized_bitmap error: {e}")
+            return None
+
+    def show(self):
+        R_style = jclass("android.R$style")
+        self.dialog = self.Dialog(self.activity, R_style.Theme_Black_NoTitleBar)
+        self.dialog.requestWindowFeature(jclass("android.view.Window").FEATURE_NO_TITLE)
+        
+        # Build views
+        root = self.FrameLayout(self.activity)
+        root.setLayoutParams(self.ViewGroup.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+        root.setBackgroundColor(self.Color.BLACK)
+        
+        # Header
+        header = self.LinearLayout(self.activity)
+        header.setOrientation(self.LinearLayout.HORIZONTAL)
+        header.setGravity(self.Gravity.CENTER_VERTICAL)
+        header.setBackgroundColor(self.Color.parseColor("#121212"))
+        
+        headerParams = self.FrameLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.dp(56))
+        headerParams.gravity = self.Gravity.TOP
+        headerParams.topMargin = self.status_bar_height
+        root.addView(header, headerParams)
+        
+        # Close Button
+        closeBtn = self.TextView(self.activity)
+        closeBtn.setText("✕")
+        closeBtn.setTextColor(self.Color.WHITE)
+        closeBtn.setTextSize(self.TypedValue.COMPLEX_UNIT_SP, 20)
+        closeBtn.setGravity(self.Gravity.CENTER)
+        closeBtn.setPadding(self.dp(16), 0, self.dp(16), 0)
+        closeBtn.setOnClickListener(OnClickListener(lambda v: self.dialog.dismiss()))
+        header.addView(closeBtn)
+        
+        # Title
+        titleText = self.TextView(self.activity)
+        titleText.setText("ImageFX Редактор")
+        titleText.setTextColor(self.Color.WHITE)
+        titleText.setTextSize(self.TypedValue.COMPLEX_UNIT_SP, 18)
+        titleText.setTypeface(self.Typeface.DEFAULT_BOLD)
+        titleParams = self.LinearLayout.LayoutParams(0, self.ViewGroup.LayoutParams.WRAP_CONTENT, 1.0)
+        titleParams.leftMargin = self.dp(8)
+        titleText.setLayoutParams(titleParams)
+        header.addView(titleText)
+        
+        # Send Button
+        sendBtn = self.TextView(self.activity)
+        sendBtn.setText("Отправить")
+        sendBtn.setTextColor(self.Color.WHITE)
+        sendBtn.setTextSize(self.TypedValue.COMPLEX_UNIT_SP, 14)
+        sendBtn.setTypeface(self.Typeface.DEFAULT_BOLD)
+        sendBtn.setGravity(self.Gravity.CENTER)
+        sendBtn.setPadding(self.dp(16), self.dp(8), self.dp(16), self.dp(8))
+        
+        bg = self.create_card_background(self.Color.parseColor("#3390EC"), 0, self.dp(16))
+        if bg:
+            sendBtn.setBackground(bg)
+        
+        sendParams = self.LinearLayout.LayoutParams(self.ViewGroup.LayoutParams.WRAP_CONTENT, self.ViewGroup.LayoutParams.WRAP_CONTENT)
+        sendParams.rightMargin = self.dp(12)
+        sendBtn.setLayoutParams(sendParams)
+        sendBtn.setOnClickListener(OnClickListener(lambda v: self.on_send_clicked()))
+        header.addView(sendBtn)
+        
+        # Preview Container
+        previewContainer = self.FrameLayout(self.activity)
+        previewContainerParams = self.FrameLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT)
+        previewContainerParams.topMargin = self.dp(56) + self.status_bar_height
+        previewContainerParams.bottomMargin = self.dp(130)
+        root.addView(previewContainer, previewContainerParams)
+        
+        self.previewImageView = self.ImageView(self.activity)
+        self.previewImageView.setScaleType(self.ImageView.ScaleType.FIT_CENTER)
+        previewContainer.addView(self.previewImageView, self.FrameLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+        
+        # Original Indicator
+        self.originalIndicator = self.TextView(self.activity)
+        self.originalIndicator.setText("Оригинал")
+        self.originalIndicator.setTextColor(self.Color.WHITE)
+        self.originalIndicator.setTextSize(self.TypedValue.COMPLEX_UNIT_SP, 12)
+        self.originalIndicator.setPadding(self.dp(12), self.dp(6), self.dp(12), self.dp(6))
+        
+        ind_bg = self.create_card_background(self.Color.parseColor("#80000000"), 0, self.dp(12))
+        if ind_bg:
+            self.originalIndicator.setBackground(ind_bg)
+            
+        indicatorParams = self.FrameLayout.LayoutParams(self.ViewGroup.LayoutParams.WRAP_CONTENT, self.ViewGroup.LayoutParams.WRAP_CONTENT)
+        indicatorParams.gravity = self.Gravity.TOP | self.Gravity.CENTER_HORIZONTAL
+        indicatorParams.topMargin = self.dp(16)
+        self.originalIndicator.setLayoutParams(indicatorParams)
+        self.originalIndicator.setVisibility(jclass("android.view.View").GONE)
+        previewContainer.addView(self.originalIndicator)
+        
+        # Touch to Compare
+        class TouchCompareListener(dynamic_proxy(jclass("android.view.View$OnTouchListener"))):
+            def __init__(self, editor_inst):
+                super().__init__()
+                self.editor = editor_inst
+            def onTouch(self, v, event):
+                return self.editor.on_touch_compare(v, event)
+                
+        self.previewImageView.setOnTouchListener(TouchCompareListener(self))
+        
+        # Horizontal Scroll for Carousel
+        scroll = self.HorizontalScrollView(self.activity)
+        scroll.setHorizontalScrollBarEnabled(False)
+        scrollParams = self.FrameLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.dp(120))
+        scrollParams.gravity = self.Gravity.BOTTOM
+        scrollParams.bottomMargin = self.dp(10)
+        root.addView(scroll, scrollParams)
+        
+        self.carouselContainer = self.LinearLayout(self.activity)
+        self.carouselContainer.setOrientation(self.LinearLayout.HORIZONTAL)
+        self.carouselContainer.setPadding(self.dp(12), self.dp(8), self.dp(12), self.dp(8))
+        scroll.addView(self.carouselContainer, self.ViewGroup.LayoutParams(self.ViewGroup.LayoutParams.WRAP_CONTENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+        
+        # Load initial bitmap
+        self.original_bitmap = self.load_optimized_bitmap(self.preview_path, 1024)
+        if self.original_bitmap:
+            self.previewImageView.setImageBitmap(self.original_bitmap)
+            
+        # Setup Carousel
+        self.setup_carousel()
+        
+        # Set content view and show
+        self.dialog.setContentView(root)
+        
+        class DialogDismissListener(dynamic_proxy(jclass("android.content.DialogInterface$OnDismissListener"))):
+            def __init__(self, editor_inst):
+                super().__init__()
+                self.editor = editor_inst
+            def onDismiss(self, dialog):
+                self.editor.cleanup()
+                
+        self.dialog.setOnDismissListener(DialogDismissListener(self))
+        self.dialog.show()
+
+    def on_touch_compare(self, v, event):
+        action = event.getAction()
+        if action == self.MotionEvent.ACTION_DOWN:
+            if self.original_bitmap:
+                self.previewImageView.setImageBitmap(self.original_bitmap)
+            self.originalIndicator.setVisibility(jclass("android.view.View").VISIBLE)
+            return True
+        elif action == self.MotionEvent.ACTION_UP or action == self.MotionEvent.ACTION_CANCEL:
+            active_bmp = self.filtered_bitmap if self.filtered_bitmap else self.original_bitmap
+            if active_bmp:
+                self.previewImageView.setImageBitmap(active_bmp)
+            self.originalIndicator.setVisibility(jclass("android.view.View").GONE)
+            return True
+        return False
+
+    def setup_carousel(self):
+        try:
+            thumb_pil = Image.open(self.preview_path)
+            thumb_pil = ImageOps.exif_transpose(thumb_pil)
+            w, h = thumb_pil.size
+            scale = min(128.0 / w, 128.0 / h)
+            thumb_pil = thumb_pil.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+        except Exception as e:
+            dlog(f"[ImageFX+ JNI] Thumb loading error: {e}")
+            thumb_pil = None
+            
+        FILTERS = [
+            ("original", "Оригинал"),
+            ("sepia", "Сепия"),
+            ("blur", "Размытие"),
+            ("grayscale", "Ч/Б"),
+            ("invert", "Инверсия"),
+            ("contour", "Контур"),
+            ("emboss", "Тиснение"),
+            ("sharpen", "Резкость"),
+            ("detail", "Детали"),
+            ("smooth", "Сгладить"),
+            ("edge_enhance", "Края"),
+            # Aesthetic filters
+            ("retro", "Ретро"),
+            ("cool", "Полароид"),
+            ("neon", "Неон"),
+            ("hdr", "HDR"),
+            ("posterize", "Комикс"),
+            ("solarize", "Соляризация"),
+            ("sunshine", "Лето"),
+            ("gold", "Р. золото"),
+            # TikTok / Meme filters
+            ("glitch", "Глитч"),
+            ("deep_fried", "Жаренный мем"),
+            ("pixel", "8бит"),
+            ("thermal", "Тепловизор"),
+            ("gigachad", "Гигачад")
+        ]
+        
+        self.filter_items = []
+        for filter_key, filter_name in FILTERS:
+            item = self.LinearLayout(self.activity)
+            item.setOrientation(self.LinearLayout.VERTICAL)
+            item.setGravity(self.Gravity.CENTER_HORIZONTAL)
+            item_params = self.LinearLayout.LayoutParams(self.dp(76), self.ViewGroup.LayoutParams.MATCH_PARENT)
+            item_params.leftMargin = self.dp(4)
+            item_params.rightMargin = self.dp(4)
+            item.setLayoutParams(item_params)
+            
+            # Frame
+            frame = self.FrameLayout(self.activity)
+            frame_params = self.LinearLayout.LayoutParams(self.dp(54), self.dp(54))
+            frame.setLayoutParams(frame_params)
+            
+            border_col = self.Color.parseColor("#3390EC") if filter_key == self.selected_filter else self.Color.TRANSPARENT
+            bg = self.create_card_background(self.Color.TRANSPARENT, border_col, self.dp(8))
+            if bg:
+                frame.setBackground(bg)
+            frame.setPadding(self.dp(3), self.dp(3), self.dp(3), self.dp(3))
+            
+            filter_thumb_bitmap = None
+            if thumb_pil:
+                try:
+                    if filter_key == "original":
+                        processed_thumb_pil = thumb_pil
+                    else:
+                        processed_thumb_pil = self.plugin.apply_filter_to_file(thumb_pil, filter_key)
+                    
+                    if processed_thumb_pil:
+                        mask = Image.new("L", processed_thumb_pil.size, 0)
+                        draw = ImageDraw.Draw(mask)
+                        draw.rounded_rectangle((0, 0, processed_thumb_pil.size[0], processed_thumb_pil.size[1]), self.dp(6), fill=255)
+                        rounded_pil = Image.new("RGBA", processed_thumb_pil.size, (0, 0, 0, 0))
+                        rounded_pil.paste(processed_thumb_pil, (0, 0), mask=mask)
+                        filter_thumb_bitmap = pil_to_android_bitmap(rounded_pil, format="PNG")
+                        if filter_thumb_bitmap:
+                            self.filter_thumb_bitmaps.append(filter_thumb_bitmap)
+                except Exception as e:
+                    dlog(f"[ImageFX+ JNI] Error generating thumbnail for {filter_key}: {e}")
+
+            thumbView = self.ImageView(self.activity)
+            thumbView.setScaleType(self.ImageView.ScaleType.FIT_CENTER)
+            if filter_thumb_bitmap:
+                thumbView.setImageBitmap(filter_thumb_bitmap)
+            else:
+                thumbView.setBackgroundColor(self.Color.DKGRAY)
+            frame.addView(thumbView, self.FrameLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.MATCH_PARENT))
+            item.addView(frame)
+            
+            # Label
+            label = self.TextView(self.activity)
+            label.setText(filter_name)
+            label.setTextColor(self.Color.parseColor("#3390EC") if filter_key == self.selected_filter else self.Color.LTGRAY)
+            label.setTextSize(self.TypedValue.COMPLEX_UNIT_SP, 11)
+            label.setGravity(self.Gravity.CENTER)
+            label_params = self.LinearLayout.LayoutParams(self.ViewGroup.LayoutParams.MATCH_PARENT, self.ViewGroup.LayoutParams.WRAP_CONTENT)
+            label_params.topMargin = self.dp(4)
+            label.setLayoutParams(label_params)
+            item.addView(label)
+            
+            # Click
+            item.setOnClickListener(OnClickListener(lambda v, k=filter_key: self.select_filter(k)))
+            
+            self.carouselContainer.addView(item)
+            self.filter_items.append((filter_key, frame, label))
+
+    def select_filter(self, filter_key):
+        if self.selected_filter == filter_key:
+            return
+        self.selected_filter = filter_key
+        dlog(f"[ImageFX+ JNI] select_filter: {filter_key}")
+        
+        # Update carousel borders
+        for k, frame, label in self.filter_items:
+            border_col = self.Color.parseColor("#3390EC") if k == self.selected_filter else self.Color.TRANSPARENT
+            bg = self.create_card_background(self.Color.TRANSPARENT, border_col, self.dp(8))
+            if bg:
+                frame.setBackground(bg)
+            label.setTextColor(self.Color.parseColor("#3390EC") if k == self.selected_filter else self.Color.LTGRAY)
+            
+        # Fast path for original
+        if filter_key == "original":
+            if self.original_bitmap:
+                self.previewImageView.setImageBitmap(self.original_bitmap)
+            old = self.filtered_bitmap
+            self.filtered_bitmap = None
+            if old and old != self.original_bitmap:
+                old.recycle()
+            return
+            
+        # Apply filter in Pillow and convert in memory directly
+        try:
+            processed_pil = self.plugin.apply_filter_to_file(self.preview_path, filter_key)
+            if processed_pil:
+                bmp = pil_to_android_bitmap(processed_pil)
+                if bmp:
+                    old = self.filtered_bitmap
+                    self.filtered_bitmap = bmp
+                    self.previewImageView.setImageBitmap(self.filtered_bitmap)
+                    if old and old != self.original_bitmap:
+                        old.recycle()
+                else:
+                    dlog("[ImageFX+ JNI] Failed to convert PIL to Android Bitmap.")
+        except Exception as e:
+            dlog(f"[ImageFX+ JNI] Filter application error: {e}")
+
+    def on_send_clicked(self):
+        dlog(f"[ImageFX+ JNI] on_send_clicked filter: {self.selected_filter}")
+        self.dialog.dismiss()
+        
+        # Close viewer and pickers
+        if self.is_from_viewer:
+            try:
+                pv = PhotoViewerClass.getInstance()
+                if pv:
+                    pv.closePhoto(True, False)
+                from client_utils import get_last_fragment
+                last_fragment = get_last_fragment()
+                if last_fragment:
+                    last_fragment.dismissCurrentDialog()
+                    f_class = last_fragment.getClass().getSimpleName()
+                    if "PhotoPicker" in f_class or "Media" in f_class or "Gallery" in f_class:
+                        last_fragment.finishFragment()
+            except Exception as e:
+                dlog(f"[ImageFX+ JNI] Error closing viewer: {e}")
+                
+        # Send processed high-res photo in background
+        BulletinHelper.show_info("Применение фильтра и отправка...")
+        
+        def bg_save():
+            try:
+                final_path = self.photo_path
+                if self.selected_filter != "original":
+                    dlog(f"[ImageFX+ JNI] Applying filter {self.selected_filter} to high-res image: {self.photo_path}")
+                    processed = self.plugin.apply_filter_to_file(self.photo_path, self.selected_filter)
+                    if processed:
+                        out_name = f"final_fx_{uuid.uuid4()}.png"
+                        final_path = os.path.join(self.plugin.temp_dir.getAbsolutePath(), out_name)
+                        processed.save(final_path, "PNG")
+                        self.plugin.temp_files.append(final_path)
+                
+                dlog(f"[ImageFX+ JNI] Dispatching photo to peer {self.peer_id} at: {final_path}")
+                self.plugin.send_processed_image(self.peer_id, final_path)
+            except Exception as ex:
+                dlog(f"[ImageFX+ JNI] bg_save error: {ex}\n{traceback.format_exc()}")
+                run_on_ui_thread(R(lambda: BulletinHelper.show_error("Ошибка применения фильтра высокого разрешения.")))
+                
+        threading.Thread(target=bg_save, daemon=True).start()
+
+    def cleanup(self):
+        dlog("[ImageFX+ JNI] Cleaning up dialog resources...")
+        if self.original_bitmap:
+            self.original_bitmap.recycle()
+            self.original_bitmap = None
+        if self.filtered_bitmap:
+            self.filtered_bitmap.recycle()
+            self.filtered_bitmap = None
+        if self.thumb_rounded:
+            self.thumb_rounded.recycle()
+            self.thumb_rounded = None
+        for bmp in self.filter_thumb_bitmaps:
+            if bmp:
+                try:
+                    bmp.recycle()
+                except Exception:
+                    pass
+        self.filter_thumb_bitmaps.clear()
+
+class OpenPhotoHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        
+    def after_hooked_method(self, param):
+        try:
+            dlog("[ImageFX+] PhotoViewer.openPhoto method intercepted. Setup send button long click...")
+            def setup():
+                pv = PhotoViewerClass.getInstance()
+                if pv:
+                    send_btn = get_private_field(pv, "pickerViewSendButton")
+                    if send_btn:
+                        self.plugin.setup_send_button_long_click(send_btn)
+            run_on_ui_thread(R(setup))
+        except Exception as e:
+            dlog(f"[ImageFX+] OpenPhotoHook error: {e}\n{traceback.format_exc()}")
+
+class ImageFXPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.menu_id = None
+        self.hooks_list = []
+        self.hooked_buttons = set()
+        self.hooked_buttons_listeners = {}
+        self.temp_files = []
+        self.temp_dir = None
+
+    def on_plugin_load(self):
+        dlog("[ImageFX+] Plugin load initiated.")
+        self.hooks_list = []
+        self.hooked_buttons = set()
+        self.hooked_buttons_listeners = {}
+        self.temp_files = []
+        self.temp_dir = self._get_temp_dir()
+        
+        # 1. Message context menu hook using exact working layout
+        try:
+            self.menu_id = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Редактор ImageFX",
+                icon="msg_edit",
+                on_click=self.on_message_click,
+                priority=100
+            ))
+            dlog("[ImageFX+] Message context menu item registered.")
+        except Exception as e:
+            dlog(f"[ImageFX+] Context menu registration failed: {e}\n{traceback.format_exc()}")
+
+        # 2. PhotoViewer hooks using exact signature iteration loop from working plugin
+        try:
+            photo_viewer_class = _to_class(PhotoViewerClass)
+            hooked_open = False
+            for m in photo_viewer_class.getDeclaredMethods():
+                if m.getName() == "openPhoto" and len(m.getParameterTypes()) >= 10:
+                    m.setAccessible(True)
+                    self.hooks_list.append(self.hook_method(m, OpenPhotoHook(self)))
+                    hooked_open = True
+            if hooked_open:
+                dlog("[ImageFX+] PhotoViewer.openPhoto hook injected.")
+            else:
+                dlog("[ImageFX+] Failed to find PhotoViewer.openPhoto method signature.")
+        except Exception as e:
+            dlog(f"[ImageFX+] Hooking PhotoViewer failed: {e}\n{traceback.format_exc()}")
+
+        # Pre-hook setup if PhotoViewer is already open
+        try:
+            pv = PhotoViewerClass.getInstance()
+            if pv:
+                send_btn = get_private_field(pv, "pickerViewSendButton")
+                if send_btn:
+                    self.setup_send_button_long_click(send_btn)
+        except Exception as e:
+            dlog(f"[ImageFX+] Pre-hook view check failed: {e}")
+
+    def on_plugin_unload(self):
+        dlog("[ImageFX+] Unloading plugin hooks...")
+        if self.menu_id:
+            try:
+                self.remove_menu_item(self.menu_id)
+            except Exception as e:
+                dlog(f"[ImageFX+] Failed to remove menu item: {e}")
+            self.menu_id = None
+            
+        for h in self.hooks_list:
+            try:
+                self.unhook_method(h)
+            except Exception as e:
+                dlog(f"[ImageFX+] Failed to unhook Xposed hook: {e}")
+        self.hooks_list = []
+
+        # Restore original listener on any hooked buttons
+        for btn, orig_listener in self.hooked_buttons_listeners.items():
+            try:
+                btn.setOnLongClickListener(orig_listener)
+            except Exception as e:
+                dlog(f"[ImageFX+] Error restoring original long click listener: {e}")
+
+        self.hooked_buttons.clear()
+        self.hooked_buttons_listeners.clear()
+        self._cleanup_temp_files()
+        dlog("[ImageFX+] Plugin unloaded successfully.")
+
+    def setup_send_button_long_click(self, send_btn):
+        try:
+            btn_hash = hash(send_btn)
+            if btn_hash in self.hooked_buttons:
+                return
+                
+            dlog("[ImageFX+] Overriding send button long click listener...")
+            orig_listener = None
+            listener_info = get_private_field(send_btn, "mListenerInfo")
+            if listener_info:
+                try:
+                    orig_listener = get_private_field(listener_info, "mOnLongClickListener")
+                except Exception:
+                    pass
+
+            def custom_long_click(view):
+                dlog("[ImageFX+] Send button long-pressed in PhotoViewer.")
+                try:
+                    pv = PhotoViewerClass.getInstance()
+                    if not pv:
+                        dlog("[ImageFX+] PhotoViewer instance is null.")
+                        return False
+                        
+                    is_video = get_private_field(pv, "isCurrentVideo") or False
+                    if is_video:
+                        dlog("[ImageFX+] Selected media is video, forwarding to original send menu.")
+                        if orig_listener:
+                            return orig_listener.onLongClick(view)
+                        return False
+
+                    # Extract path with old working logic
+                    imagesArrLocals = get_private_field(pv, "imagesArrLocals")
+                    currentIndex = get_private_field(pv, "currentIndex") or 0
+                    dlog(f"[ImageFX+] Image collection size: {imagesArrLocals.size() if imagesArrLocals else 'None'}, current index: {currentIndex}")
+                    
+                    path = None
+                    if imagesArrLocals and 0 <= currentIndex < imagesArrLocals.size():
+                        entry = imagesArrLocals.get(currentIndex)
+                        if entry:
+                            path = getattr(entry, "path", None) or getattr(entry, "imagePath", None)
+                    
+                    if not path:
+                        path = get_private_field(pv, "currentPathObject")
+
+                    dlog(f"[ImageFX+] Path extracted from PhotoViewer: {path}")
+                    if not path:
+                        BulletinHelper.show_error("Не удалось найти путь к изображению.")
+                        return True
+
+                    # Copy content:// to cache
+                    if path.startswith("content://"):
+                        path = self._copy_uri_to_cache(path)
+                        dlog(f"[ImageFX+] Copied content URI to cache path: {path}")
+
+                    if path and os.path.exists(path):
+                        parentChatActivity = get_private_field(pv, "parentChatActivity")
+                        peer_id = 0
+                        if parentChatActivity:
+                            peer_id = parentChatActivity.getDialogId()
+                        
+                        dlog(f"[ImageFX+] Showing drop-down action menu next to send button...")
+                        self.show_custom_menu(view, path, peer_id, pv)
+                        return True
+                    else:
+                        dlog(f"[ImageFX+] Path does not exist locally: {path}")
+                        BulletinHelper.show_error("Изображение недоступно на диске.")
+                        return True
+                except Exception as ex:
+                    dlog(f"[ImageFX+] custom_long_click error: {ex}\n{traceback.format_exc()}")
+                    return False
+
+            send_btn.setOnLongClickListener(OnLongClickListener(custom_long_click))
+            self.hooked_buttons.add(btn_hash)
+            self.hooked_buttons_listeners[send_btn] = orig_listener
+            dlog("[ImageFX+] Hooked send button successfully.")
+        except Exception as e:
+            dlog(f"[ImageFX+] Overriding long click listener failed: {e}\n{traceback.format_exc()}")
+
+    def show_custom_menu(self, view, path, peer_id, pv):
+        try:
+            ItemOptionsClass = find_class("org.telegram.ui.Components.ItemOptions")
+            DarkThemeResourceProvider = find_class("org.telegram.ui.Stories.DarkThemeResourceProvider")
+            dtrp = DarkThemeResourceProvider()
+            containerView = get_private_field(pv, "containerView")
+
+            options = ItemOptionsClass.makeOptions(containerView, dtrp, view)
+            
+            # 1. Edit option using R$drawable msg_edit
+            msg_edit_res = int(getattr(R_drawable, "msg_edit", 0))
+            
+            class Runnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def __init__(self, run_fn):
+                    super().__init__()
+                    self.run_fn = run_fn
+                def run(self):
+                    self.run_fn()
+
+            options.add(msg_edit_res, "Редактировать в ImageFX", Runnable(lambda: self.on_menu_edit_clicked(options, path, peer_id, pv)))
+            
+            # 2. Add Telegram native options (Schedule, No Sound)
+            parentChatActivity = get_private_field(pv, "parentChatActivity")
+            user = None
+            canScheduleMessage = False
+            if parentChatActivity:
+                try:
+                    user = parentChatActivity.getCurrentUser()
+                    canScheduleMessage = parentChatActivity.canScheduleMessage()
+                except Exception:
+                    pass
+
+            userIsSelf = False
+            if user:
+                try:
+                    UserObject = find_class("org.telegram.messenger.UserObject")
+                    userIsSelf = UserObject.isUserSelf(user)
+                except Exception:
+                    pass
+
+            showSchedule = canScheduleMessage
+            showWithoutSound = not userIsSelf
+
+            if showWithoutSound:
+                input_notify_off_res = int(getattr(R_drawable, "input_notify_off", 0))
+                options.add(input_notify_off_res, self.get_locale_string("SendWithoutSound"), Runnable(lambda: self.on_send_without_sound_clicked(options)))
+
+            if showSchedule:
+                msg_calendar2_res = int(getattr(R_drawable, "msg_calendar2", 0))
+                key_schedule = "SetReminder" if userIsSelf else "ScheduleMessage"
+                options.add(msg_calendar2_res, self.get_locale_string(key_schedule), Runnable(lambda: self.on_schedule_clicked(options)))
+
+            Gravity = find_class("android.view.Gravity")
+            gravity_right = int(getattr(Gravity, "RIGHT", 5))
+            options.setGravity(gravity_right).show()
+            dlog("[ImageFX+] Menu displayed successfully next to send button.")
+        except Exception as e:
+            dlog(f"[ImageFX+] show_custom_menu error: {e}\n{traceback.format_exc()}")
+
+    def on_menu_edit_clicked(self, options, path, peer_id, pv):
+        try:
+            options.dismiss()
+            parentChatActivity = get_private_field(pv, "parentChatActivity")
+            self.launch_editor(parentChatActivity, path, peer_id, True)
+        except Exception as e:
+            dlog(f"[ImageFX+] on_menu_edit_clicked error: {e}")
+
+    def on_send_without_sound_clicked(self, options):
+        try:
+            options.dismiss()
+            self.trigger_send_without_sound()
+        except Exception as e:
+            dlog(f"[ImageFX+] on_send_without_sound_clicked error: {e}")
+
+    def on_schedule_clicked(self, options):
+        try:
+            options.dismiss()
+            pv = PhotoViewerClass.getInstance()
+            if pv:
+                self.resolve_schedule_dialog(pv)
+        except Exception as e:
+            dlog(f"[ImageFX+] on_schedule_clicked error: {e}")
+
+    def get_locale_string(self, key):
+        try:
+            R_string = find_class("org.telegram.messenger.R$string")
+            res_id = int(getattr(R_string, key, 0))
+            if res_id != 0:
+                return LocaleControllerClass.getString(key, res_id)
+        except Exception:
+            pass
+        fallbacks = {
+            "SetReminder": "Set Reminder",
+            "ScheduleMessage": "Schedule Message",
+            "SendWithoutSound": "Send Without Sound"
+        }
+        return fallbacks.get(key, key)
+
+    def trigger_send_without_sound(self):
+        try:
+            pv = PhotoViewerClass.getInstance()
+            if not pv: return
+            try:
+                self.resolve_send_pressed(pv, (False, 0, 0))
+                return
+            except Exception:
+                pass
+            try:
+                self.resolve_send_pressed(pv, (False, 0, 0, False, False, False))
+                return
+            except Exception as e6:
+                dlog(f"[ImageFX+] Failed to trigger sendPressed: {e6}")
+        except Exception as e:
+            dlog(f"[ImageFX+] trigger_send_without_sound critical error: {e}\n{traceback.format_exc()}")
+
+    def resolve_send_pressed(self, pv, args):
+        Boolean_TYPE = find_class("java.lang.Boolean").TYPE
+        Integer_TYPE = find_class("java.lang.Integer").TYPE
+        if len(args) == 3:
+            sig = [Boolean_TYPE, Integer_TYPE, Integer_TYPE]
+        elif len(args) == 6:
+            sig = [Boolean_TYPE, Integer_TYPE, Integer_TYPE, Boolean_TYPE, Boolean_TYPE, Boolean_TYPE]
+        else:
+            raise ValueError("Invalid args size")
+            
+        photo_viewer_class = _to_class(PhotoViewerClass)
+        try:
+            m = photo_viewer_class.getDeclaredMethod("sendPressed", *sig)
+            m.setAccessible(True)
+            java_args = self.to_java_args_for_method(m, args)
+            return m.invoke(pv, java_args)
+        except Exception:
+            pass
+            
+        for m in photo_viewer_class.getDeclaredMethods():
+            name = m.getName()
+            if name.startswith("lambda$") or name.startswith("access$"):
+                continue
+            if m.getReturnType().getName() == "void":
+                m_params = m.getParameterTypes()
+                if len(m_params) == len(sig):
+                    match = True
+                    for p_actual, p_expected in zip(m_params, sig):
+                        if p_actual != p_expected:
+                            match = False
+                            break
+                    if match:
+                        m.setAccessible(True)
+                        java_args = self.to_java_args_for_method(m, args)
+                        return m.invoke(pv, java_args)
+        raise AttributeError("sendPressed method not found")
+
+    def resolve_schedule_dialog(self, pv):
+        Object = find_class("java.lang.Object")
+        empty_args = jarray(Object)([])
+        photo_viewer_class = _to_class(PhotoViewerClass)
+        try:
+            m = photo_viewer_class.getDeclaredMethod("showScheduleDatePickerDialog")
+            m.setAccessible(True)
+            return m.invoke(pv, empty_args)
+        except Exception:
+            pass
+        for m in photo_viewer_class.getDeclaredMethods():
+            name = m.getName()
+            if name.startswith("lambda$") or name.startswith("access$"):
+                continue
+            if m.getReturnType().getName() == "void" and len(m.getParameterTypes()) == 0:
+                if any(x in name.lower() for x in ["schedule", "date", "picker"]):
+                    m.setAccessible(True)
+                    return m.invoke(pv, empty_args)
+        raise AttributeError("showScheduleDatePickerDialog method not found")
+
+    def to_java_args_for_method(self, method, args):
+        Integer = find_class("java.lang.Integer")
+        Boolean = find_class("java.lang.Boolean")
+        Long = find_class("java.lang.Long")
+        Object = find_class("java.lang.Object")
+        param_types = method.getParameterTypes()
+        wrapped_args = []
+        for i, x in enumerate(args):
+            if i >= len(param_types):
+                wrapped_args.append(x)
+                continue
+            p_type = param_types[i].getName()
+            if p_type == "long":
+                wrapped_args.append(Long(int(x)))
+            elif p_type == "int":
+                wrapped_args.append(Integer(int(x)))
+            elif p_type == "boolean":
+                wrapped_args.append(Boolean(bool(x)))
+            else:
+                wrapped_args.append(x)
+        return jarray(Object)(wrapped_args)
+
+    def on_message_click(self, ctx):
+        dlog("[ImageFX+] Message context menu clicked.")
+        try:
+            msg = ctx.get("message")
+            fragment = ctx.get("fragment")
+            if msg and fragment:
+                if not self._has_photo(msg):
+                    BulletinHelper.show_error("Это сообщение не содержит изображение.")
+                    return
+                activity = fragment.getParentActivity() if fragment else None
+                peer_id = msg.getDialogId()
+                dlog(f"[ImageFX+] Message dialog ID: {peer_id}, initiating download...")
+                BulletinHelper.show_info("Загрузка оригинального изображения...")
+                
+                def bg_download():
+                    try:
+                        path = self._download_photo_sync(msg)
+                        if path and os.path.exists(path):
+                            dlog(f"[ImageFX+] Message photo downloaded: {path}")
+                            run_on_ui_thread(R(lambda: self.launch_editor(activity, path, peer_id, False)))
+                        else:
+                            run_on_ui_thread(R(lambda: BulletinHelper.show_error("Не удалось скачать фото.")))
+                    except Exception as e:
+                        dlog(f"[ImageFX+] bg_download error: {e}\n{traceback.format_exc()}")
+                        run_on_ui_thread(R(lambda: BulletinHelper.show_error(f"Ошибка загрузки: {e}")))
+
+                threading.Thread(target=bg_download, daemon=True).start()
+        except Exception as e:
+            dlog(f"[ImageFX+] on_message_click error: {e}\n{traceback.format_exc()}")
+
+    def launch_editor(self, activity, photo_path, peer_id, is_from_viewer):
+        dlog(f"[ImageFX+] launch_editor initiated. activity={activity}, path={photo_path}, peer={peer_id}")
+        
+        # Safe extraction of Android Activity context
+        if activity and hasattr(activity, "getParentActivity"):
+            dlog("[ImageFX+] Activity parameter is a fragment. Extracting parent activity...")
+            try:
+                activity = activity.getParentActivity()
+            except Exception as e:
+                dlog(f"[ImageFX+] Failed to get parent activity from fragment: {e}")
+
+        if not activity:
+            dlog("[ImageFX+] Activity is null. Resolving last visible fragment...")
+            try:
+                from client_utils import get_last_fragment
+                fragment = get_last_fragment()
+                if fragment:
+                    activity = fragment.getParentActivity()
+            except Exception as e:
+                dlog(f"[ImageFX+] Failed fallback activity resolution: {e}")
+
+        dlog(f"[ImageFX+] Final resolved Android activity instance: {activity}")
+        if not activity:
+            dlog("[ImageFX+] Critical error: activity context could not be resolved.")
+            BulletinHelper.show_error("Не удалось определить active Activity.")
+            return
+
+        # Resize original image to 1024px preview image for fast editor loading
+        preview_name = f"editor_preview_{uuid.uuid4()}.jpg"
+        preview_path = os.path.join(self.temp_dir.getAbsolutePath(), preview_name)
+        dlog(f"[ImageFX+] Resizing original image to: {preview_path}")
+        
+        try:
+            img = Image.open(photo_path)
+            img = ImageOps.exif_transpose(img)
+            w, h = img.size
+            scale = min(1024.0 / w, 1024.0 / h)
+            if scale < 1.0:
+                img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+            img.convert("RGB").save(preview_path, "JPEG", quality=85)
+            self.temp_files.append(preview_path)
+            dlog(f"[ImageFX+] Saved 1024px preview image at: {preview_path}")
+        except Exception as e:
+            dlog(f"[ImageFX+] Preview generation failed: {e}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("Не удалось подготовить изображение.")
+            return
+
+        try:
+            # Instantiate Python-based editor Dialog layout!
+            editor = ImageFXEditor(activity, photo_path, preview_path, peer_id, is_from_viewer, self)
+            editor.show()
+            dlog("[ImageFX+] Python-based ImageFXEditor displayed successfully.")
+        except Exception as e:
+            dlog(f"[ImageFX+] launch_editor error: {e}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("Не удалось запустить редактор.")
+
+    def apply_filter_to_file(self, filepath_or_img: Any, filter_key: str) -> Optional[Any]:
+        try:
+            if isinstance(filepath_or_img, str):
+                img = Image.open(filepath_or_img)
+            else:
+                img = filepath_or_img
+            img = ImageOps.exif_transpose(img)
+            
+            # 1. Base filters
+            if filter_key == "sepia":
+                grayscale = ImageOps.grayscale(img.convert("RGB"))
+                return ImageOps.colorize(grayscale, black="#704214", white="#C2B280")
+            elif filter_key == "blur":
+                radius = max(1.0, img.size[0] * 0.008)
+                return img.filter(ImageFilter.GaussianBlur(radius=radius))
+            elif filter_key == "grayscale":
+                return ImageOps.grayscale(img).convert("RGB")
+            elif filter_key == "invert":
+                return ImageOps.invert(img.convert("RGB"))
+            elif filter_key == "contour":
+                return img.filter(ImageFilter.CONTOUR)
+            elif filter_key == "emboss":
+                return img.filter(ImageFilter.EMBOSS)
+            elif filter_key == "sharpen":
+                return img.filter(ImageFilter.SHARPEN)
+            elif filter_key == "detail":
+                return img.filter(ImageFilter.DETAIL)
+            elif filter_key == "smooth":
+                return img.filter(ImageFilter.SMOOTH_MORE)
+            elif filter_key == "edge_enhance":
+                return img.filter(ImageFilter.EDGE_ENHANCE_MORE)
+            
+            # 2. Aesthetic filters
+            elif filter_key == "retro":
+                r, g, b = img.convert("RGB").split()
+                r_new = r.point(lambda i: min(255, int(i * 1.15 + 12)))
+                g_new = g.point(lambda i: min(255, int(i * 1.05 + 4)))
+                b_new = b.point(lambda i: int(i * 0.85))
+                return Image.merge("RGB", (r_new, g_new, b_new))
+            elif filter_key == "cool":
+                r, g, b = img.convert("RGB").split()
+                r_new = r.point(lambda i: int(i * 0.85))
+                g_new = g.point(lambda i: min(255, int(i * 1.05 + 5)))
+                b_new = b.point(lambda i: min(255, int(i * 1.2 + 15)))
+                return Image.merge("RGB", (r_new, g_new, b_new))
+            elif filter_key == "neon":
+                grayscale = ImageOps.grayscale(img.convert("RGB"))
+                return ImageOps.colorize(grayscale, black="#00FFFF", white="#FF00FF")
+            elif filter_key == "hdr":
+                contrast = ImageEnhance.Contrast(img).enhance(1.4)
+                sharp = ImageEnhance.Sharpness(contrast).enhance(1.6)
+                return sharp
+            elif filter_key == "posterize":
+                return ImageOps.posterize(img.convert("RGB"), 3)
+            elif filter_key == "solarize":
+                return ImageOps.solarize(img.convert("RGB"), 128)
+            elif filter_key == "sunshine":
+                color = ImageEnhance.Color(img).enhance(1.4)
+                bright = ImageEnhance.Brightness(color).enhance(1.1)
+                r, g, b = bright.split()
+                r_new = r.point(lambda i: min(255, int(i * 1.05 + 5)))
+                return Image.merge("RGB", (r_new, g, b))
+            elif filter_key == "gold":
+                grayscale = ImageOps.grayscale(img.convert("RGB"))
+                return ImageOps.colorize(grayscale, black="#1f1410", white="#FFD700")
+            
+            # 3. TikTok & Meme filters
+            elif filter_key == "glitch":
+                r, g, b = img.convert("RGB").split()
+                shift = max(1.0, img.size[0] * 0.012)
+                r_shifted = r.transform(r.size, Image.Transform.AFFINE, (1.0, 0.0, shift, 0.0, 1.0, 0.0))
+                b_shifted = b.transform(b.size, Image.Transform.AFFINE, (1.0, 0.0, -shift, 0.0, 1.0, 0.0))
+                return Image.merge("RGB", (r_shifted, g, b_shifted))
+            elif filter_key == "deep_fried":
+                w, h = img.size
+                block_size = max(2, w // 100)
+                small = img.resize((max(16, w // block_size), max(16, h // block_size)), Image.Resampling.NEAREST)
+                pixelated = small.resize((w, h), Image.Resampling.NEAREST)
+                contrast = ImageEnhance.Contrast(pixelated).enhance(2.5)
+                color = ImageEnhance.Color(contrast).enhance(3.0)
+                sharp = ImageEnhance.Sharpness(color).enhance(2.0)
+                return sharp
+            elif filter_key == "pixel":
+                w, h = img.size
+                target_w = max(16, w // 8)
+                target_h = max(16, h // 8)
+                small = img.resize((target_w, target_h), Image.Resampling.NEAREST)
+                return small.resize((w, h), Image.Resampling.NEAREST)
+            elif filter_key == "thermal":
+                r_lut = []
+                g_lut = []
+                b_lut = []
+                for i in range(256):
+                    if i < 64:
+                        r_lut.append(0)
+                        g_lut.append(0)
+                        b_lut.append(int(i * 4))
+                    elif i < 128:
+                        r_lut.append(0)
+                        g_lut.append(int((i - 64) * 4))
+                        b_lut.append(255 - int((i - 64) * 4))
+                    elif i < 192:
+                        r_lut.append(int((i - 128) * 4))
+                        g_lut.append(255)
+                        b_lut.append(0)
+                    else:
+                        r_lut.append(255)
+                        g_lut.append(255 - int((i - 192) * 4))
+                        b_lut.append(int((i - 192) * 4))
+                lut = r_lut + g_lut + b_lut
+                return img.convert("L").point(lut, "RGB")
+            elif filter_key == "gigachad":
+                gray = ImageOps.grayscale(img).convert("RGB")
+                contrast = ImageEnhance.Contrast(gray).enhance(2.2)
+                sharp = ImageEnhance.Sharpness(contrast).enhance(3.0)
+                return sharp
+            
+            return img
+        except Exception as e:
+            dlog(f"[ImageFX+] Filter processing failed: {e}")
+            return None
+
+    def send_processed_image(self, peer_id: int, image_path: str):
+        try:
+            dlog(f"[ImageFX+] Generating Telegram sizes and sending to peer: {peer_id}...")
+            send_helper = get_send_messages_helper()
+            generated_photo = send_helper.generatePhotoSizes(image_path, None)
+            if not generated_photo:
+                run_on_ui_thread(R(lambda: BulletinHelper.show_error("Ошибка генерации превью фото.")))
+                return
+
+            send_message({
+                "peer": peer_id,
+                "photo": generated_photo,
+                "path": image_path,
+                "replyToMsg": None,
+                "asRound": False,
+                "silent": False,
+                "scheduleDate": 0,
+                "ttl": 0,
+                "sendAsGiga": False
+            })
+            run_on_ui_thread(R(lambda: BulletinHelper.show_success("Фотография успешно отправлена!")))
+            dlog("[ImageFX+] Message sent successfully.")
+        except Exception as e:
+            dlog(f"[ImageFX+] Error sending message: {e}\n{traceback.format_exc()}")
+            run_on_ui_thread(R(lambda: BulletinHelper.show_error("Не удалось отправить фото.")))
+
+    def _has_photo(self, message_obj: MessageObject) -> bool:
+        if not message_obj or not message_obj.messageOwner: return False
+        media = message_obj.messageOwner.media
+        return isinstance(media, TLRPC.TL_messageMediaPhoto) and media.photo is not None
+
+    def _download_photo_sync(self, message_obj: MessageObject) -> Optional[str]:
+        try:
+            media = message_obj.messageOwner.media
+            photo = media.photo
+            largest_size = None
+            max_dim = 0
+            
+            if photo.sizes and not photo.sizes.isEmpty():
+                for i in range(photo.sizes.size()):
+                    size = photo.sizes.get(i)
+                    if isinstance(size, (TLRPC.TL_photoSize, TLRPC.TL_photoSizeProgressive, TLRPC.TL_photoCachedSize)):
+                        current_dim = max(size.w, size.h)
+                        if current_dim > max_dim:
+                            max_dim = current_dim
+                            largest_size = size
+            
+            if not largest_size and photo.sizes and not photo.sizes.isEmpty():
+                largest_size = photo.sizes.get(photo.sizes.size() - 1)
+
+            if not largest_size: return None
+            current_account = UserConfig.selectedAccount
+            file_loader = FileLoader.getInstance(current_account)
+            file_path_obj = file_loader.getPathToAttach(largest_size, True)
+            if not file_path_obj: return None
+            file_path = file_path_obj.getAbsolutePath()
+
+            if os.path.exists(file_path): return file_path
+            image_location = ImageLocation.getForPhoto(largest_size, photo)
+            if not image_location: return None
+
+            dlog("[ImageFX+] Downloading file size object from servers...")
+            file_loader.loadFile(image_location, message_obj, "jpg", FileLoader.PRIORITY_HIGH, 1)
+
+            timeout = 30
+            for _ in range(timeout):
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    return file_path
+                time.sleep(1)
+            return None
+        except Exception as e:
+            dlog(f"[ImageFX+] _download_photo_sync error: {e}\n{traceback.format_exc()}")
+            return None
+
+    def _copy_uri_to_cache(self, path: str) -> str:
+        try:
+            UriClass = find_class("android.net.Uri")
+            uri = UriClass.parse(path)
+            cr = ApplicationLoader.applicationContext.getContentResolver()
+            ins = cr.openInputStream(uri)
+            if not ins:
+                return path
+            
+            cache_dir = ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath()
+            dest_path = os.path.join(cache_dir, f"copied_fx_{int(time.time() * 1000)}.jpg")
+            
+            from java.io import FileOutputStream
+            out = FileOutputStream(dest_path)
+            
+            j_bytes = bytearray(4096)
+            while True:
+                bytes_read = ins.read(j_bytes)
+                if bytes_read <= 0:
+                    break
+                out.write(j_bytes, 0, bytes_read)
+            
+            ins.close()
+            out.close()
+            self.temp_files.append(dest_path)
+            return dest_path
+        except Exception as e:
+            dlog(f"[ImageFX+] copy_uri_to_cache error: {e}")
+            return path
+
+    def _get_temp_dir(self) -> Optional[File]:
+        try:
+            base_dir = ApplicationLoader.getFilesDirFixed()
+            if not base_dir: return None
+            temp_dir = File(base_dir, "ImageFX_Ultimate_Temp")
+            if not temp_dir.exists() and not temp_dir.mkdirs(): return None
+            return temp_dir
+        except Exception as e:
+            dlog(f"[ImageFX+] Error creating temp dir: {e}")
+            return None
+
+    def _cleanup_temp_files(self):
+        dlog("[ImageFX+] Cleaning up temporary editor files...")
+        for path in self.temp_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    dlog(f"[ImageFX+] Deleted temp file: {path}")
+            except Exception as e:
+                dlog(f"[ImageFX+] Cleanup failed for {path}: {e}")
+        self.temp_files = []
+
+class Plugin(ImageFXPlugin):
+    pass
