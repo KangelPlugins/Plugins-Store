@@ -1,0 +1,866 @@
+"""Contact Time — local per-contact time zones for exteraGram/AyuGram."""
+
+import json
+import re
+import traceback
+from android.view import Gravity, HapticFeedbackConstants, MotionEvent, View
+from android.widget import EditText as AndroidEditText
+from java import dynamic_proxy, jint
+from java.lang import System
+from java.time import ZoneId, ZonedDateTime
+from java.time.format import DateTimeFormatter
+from java.util import WeakHashMap
+from org.telegram.messenger import AndroidUtilities, UserConfig
+from org.telegram.ui.ActionBar import Theme
+
+from android_utils import (
+    OnClickListener,
+    R,
+    copy_to_clipboard,
+    run_on_ui_thread,
+)
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import (
+    find_class,
+    get_private_field,
+    get_static_private_field,
+    set_private_field,
+)
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+
+__id__ = "contact_time"
+__name__ = "Contact Time"
+__description__ = "Показывает местное время контакта по назначенному вручную часовому поясу."
+__author__ = "@engiPlugins"
+__version__ = "1.0.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+
+STORAGE_KEY = "contact_time_zones_v1"
+TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm")
+TIME_SUFFIX_RE = re.compile(
+    r"\s+•\s+местное:\s+\d{2}:\d{2}\s+·\s+(?:утро|день|вечер|ночь)$"
+)
+
+POPULAR_ZONES = [
+    ("Москва", "Europe/Moscow"),
+    ("Калининград", "Europe/Kaliningrad"),
+    ("Самара", "Europe/Samara"),
+    ("Екатеринбург", "Asia/Yekaterinburg"),
+    ("Омск", "Asia/Omsk"),
+    ("Красноярск", "Asia/Krasnoyarsk"),
+    ("Иркутск", "Asia/Irkutsk"),
+    ("Владивосток", "Asia/Vladivostok"),
+    ("Лондон", "Europe/London"),
+    ("Берлин", "Europe/Berlin"),
+    ("Нью-Йорк", "America/New_York"),
+    ("Лос-Анджелес", "America/Los_Angeles"),
+    ("Токио", "Asia/Tokyo"),
+]
+
+
+def period_for_hour(hour):
+    hour = int(hour)
+    if 5 <= hour < 12:
+        return "утро"
+    if 12 <= hour < 17:
+        return "день"
+    if 17 <= hour < 23:
+        return "вечер"
+    return "ночь"
+
+
+class TimeRowTouchListener(dynamic_proxy(View.OnTouchListener)):
+    HOLD_MS = 600
+
+    def __init__(self, plugin, profile):
+        super().__init__()
+        self.plugin = plugin
+        self.profile = profile
+        self.pending = None
+        self.fired = False
+        self.down_x = 0.0
+        self.down_y = 0.0
+
+    def _cancel(self, view):
+        runnable = self.pending
+        self.pending = None
+        if runnable is not None:
+            try:
+                view.removeCallbacks(runnable)
+            except Exception:
+                pass
+
+    def dispose(self, view):
+        self._cancel(view)
+        self.fired = False
+        self.profile = None
+        self.plugin = None
+
+    def _fire(self, view):
+        self.pending = None
+        plugin = self.plugin
+        profile = self.profile
+        if plugin is None or profile is None or not plugin._active:
+            return
+        try:
+            if not bool(view.isAttachedToWindow()):
+                return
+            self.fired = True
+            plugin._copy_time_row(profile, view)
+        except Exception:
+            plugin._record_error("time_row_hold", traceback.format_exc())
+
+    def onTouch(self, view, event):
+        action = int(event.getActionMasked())
+        if action == int(MotionEvent.ACTION_DOWN):
+            self._cancel(view)
+            self.fired = False
+            self.down_x = float(event.getX())
+            self.down_y = float(event.getY())
+            runnable = R(lambda: self._fire(view))
+            self.pending = runnable
+            view.postDelayed(runnable, self.HOLD_MS)
+            return False
+
+        if action == int(MotionEvent.ACTION_MOVE):
+            if not self.fired:
+                slop = float(AndroidUtilities.dp(12))
+                dx = float(event.getX()) - self.down_x
+                dy = float(event.getY()) - self.down_y
+                if dx * dx + dy * dy > slop * slop:
+                    self._cancel(view)
+            return False
+
+        if action == int(MotionEvent.ACTION_UP):
+            was_fired = self.fired
+            self._cancel(view)
+            self.fired = False
+            return was_fired
+
+        if action == int(MotionEvent.ACTION_CANCEL):
+            self._cancel(view)
+            self.fired = False
+            return False
+
+        return False
+
+
+class ProfileRowsHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._install_profile_row(param.thisObject)
+        except Exception:
+            self.plugin._record_error("profile_rows", traceback.format_exc())
+
+
+class ProfileAdapterHook(MethodHook):
+    def __init__(self, plugin, mode):
+        self.plugin = plugin
+        self.mode = mode
+
+    def before_hooked_method(self, param):
+        try:
+            if self.mode == "type" and len(param.args) >= 1:
+                state = self.plugin._adapter_state(param.thisObject)
+                if state and int(param.args[0]) == state[1]:
+                    param.setResult(jint(state[2]))
+            elif self.mode == "enabled" and len(param.args) >= 1:
+                state = self.plugin._adapter_state(param.thisObject)
+                if state:
+                    position = int(param.args[0].getAdapterPosition())
+                    if position == state[1]:
+                        # Mark the row enabled so RecyclerListView provides
+                        # its native pressed/ripple feedback. The cell keeps
+                        # its own click listener, so Telegram's divider action
+                        # is not used.
+                        param.setResult(True)
+        except Exception:
+            self.plugin._record_error("adapter_" + self.mode, traceback.format_exc())
+
+    def after_hooked_method(self, param):
+        try:
+            if self.mode == "bind" and len(param.args) >= 2:
+                self.plugin._bind_profile_row(
+                    param.thisObject, param.args[0], int(param.args[1])
+                )
+            elif self.mode == "detach" and len(param.args) >= 1:
+                self.plugin._detach_profile_cell(param.args[0].itemView)
+        except Exception:
+            self.plugin._record_error("adapter_" + self.mode, traceback.format_exc())
+
+
+class ContactTimePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._zones = {}
+        self._profile_rows = WeakHashMap()
+        self._profile_types = WeakHashMap()
+        self._cell_timers = WeakHashMap()
+        self._touch_listeners = WeakHashMap()
+        self._owned_cells = WeakHashMap()
+        self._active = True
+        self._hook_counts = {}
+        self._errors = []
+
+    def on_plugin_load(self):
+        self._load_zones()
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                text="Contact Time",
+                subtext="Местное время контакта",
+                icon="msg_schedule",
+                item_id="contact_time_profile",
+                on_click=self._on_contact_menu,
+                priority=20,
+            )
+        )
+
+        profile_class = find_class("org.telegram.ui.ProfileActivity")
+        adapter_class = find_class("org.telegram.ui.ProfileActivity$ListAdapter")
+        if profile_class is None:
+            self._hook_counts["profile_class"] = -1
+            return
+
+        try:
+            hooks = self.hook_all_methods(
+                profile_class, "updateRowsIds", ProfileRowsHook(self)
+            )
+            self._hook_counts["updateRowsIds"] = len(hooks) if hooks else 0
+        except Exception:
+            self._hook_counts["updateRowsIds"] = -1
+            self._record_error("hook_updateRowsIds", traceback.format_exc())
+
+        if adapter_class is None:
+            self._hook_counts["adapter_class"] = -1
+            return
+        for method_name, mode in (
+            ("getItemViewType", "type"),
+            ("onBindViewHolder", "bind"),
+            ("onViewDetachedFromWindow", "detach"),
+            ("isEnabled", "enabled"),
+        ):
+            try:
+                hooks = self.hook_all_methods(
+                    adapter_class, method_name, ProfileAdapterHook(self, mode)
+                )
+                self._hook_counts[method_name] = len(hooks) if hooks else 0
+            except Exception:
+                self._hook_counts[method_name] = -1
+                self._record_error("hook_" + method_name, traceback.format_exc())
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._stop_all_cell_timers()
+        try:
+            profiles = self._profile_rows.keySet().toArray()
+            for profile in profiles:
+                if profile is not None:
+                    self._rebuild_profile_rows(profile)
+        except Exception:
+            self._record_error("unload_rows", traceback.format_exc())
+        self._profile_rows.clear()
+        self._profile_types.clear()
+        self._touch_listeners.clear()
+        self._owned_cells.clear()
+
+    def _record_error(self, where, details):
+        tail = str(details).strip().splitlines()
+        message = tail[-1] if tail else "unknown"
+        self._errors.append("%s: %s" % (where, message))
+        if len(self._errors) > 30:
+            del self._errors[:-30]
+        try:
+            self.log("%s: %s" % (where, details))
+        except Exception:
+            pass
+
+    def _load_zones(self):
+        raw = self.get_setting(STORAGE_KEY, "{}")
+        try:
+            data = json.loads(str(raw or "{}"))
+            self._zones = {
+                str(key): str(value)
+                for key, value in data.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        except Exception:
+            self._zones = {}
+            self._record_error("load_zones", traceback.format_exc())
+
+    def _save_zones(self):
+        payload = json.dumps(
+            self._zones, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        self.set_setting(STORAGE_KEY, payload)
+
+    def _account_key(self, account):
+        account = int(account)
+        try:
+            client_id = int(UserConfig.getInstance(account).getClientUserId())
+            if client_id:
+                return "user_%s" % client_id
+        except Exception:
+            pass
+        return "slot_%s" % account
+
+    def _storage_key(self, account, user_id):
+        return "%s:contact_%s" % (self._account_key(account), int(user_id))
+
+    def _zone_for(self, account, user_id):
+        return self._zones.get(self._storage_key(account, user_id))
+
+    def _set_zone(self, account, user_id, zone_name):
+        zone_name = str(zone_name).strip()
+        ZoneId.of(zone_name)
+        self._zones[self._storage_key(account, user_id)] = zone_name
+        self._save_zones()
+
+    def _delete_zone(self, account, user_id):
+        key = self._storage_key(account, user_id)
+        if key in self._zones:
+            del self._zones[key]
+            self._save_zones()
+            return True
+        return False
+
+    def _time_info(self, zone_name):
+        now = ZonedDateTime.now(ZoneId.of(str(zone_name)))
+        time_text = str(now.format(TIME_FORMATTER))
+        period = period_for_hour(int(now.getHour()))
+        return time_text, period
+
+    def _resolve_target(self, context):
+        account = context.get("account")
+        if account is None:
+            account = UserConfig.selectedAccount
+        account = int(account)
+        user = context.get("user")
+        user_id = context.get("userId")
+        if user_id is None and user is not None:
+            user_id = getattr(user, "id", None)
+        if user_id is None:
+            dialog_id = context.get("dialog_id")
+            if dialog_id is not None and int(dialog_id) > 0:
+                user_id = int(dialog_id)
+        if user_id is None or int(user_id) <= 0:
+            return None
+        name = "Контакт"
+        if user is not None:
+            first = str(getattr(user, "first_name", "") or "").strip()
+            last = str(getattr(user, "last_name", "") or "").strip()
+            name = (first + " " + last).strip() or name
+        fragment = context.get("fragment")
+        return account, int(user_id), name, fragment
+
+    def _activity_for(self, context, fragment=None):
+        candidates = [fragment, context.get("context"), get_last_fragment()]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                activity = candidate.getParentActivity()
+                if activity is not None:
+                    return activity
+            except Exception:
+                pass
+            try:
+                if candidate.getWindow() is not None:
+                    return candidate
+            except Exception:
+                pass
+        return None
+
+    def _on_contact_menu(self, context):
+        try:
+            target = self._resolve_target(context)
+            if target is None:
+                BulletinHelper.show_error("Contact Time доступен только для пользователей")
+                return
+            account, user_id, name, fragment = target
+            activity = self._activity_for(context, fragment)
+            if activity is None:
+                BulletinHelper.show_error("Не удалось открыть окно Contact Time")
+                return
+            zone_name = self._zone_for(account, user_id)
+            if zone_name:
+                self._show_current_dialog(
+                    activity, account, user_id, name, fragment, zone_name
+                )
+            else:
+                self._show_zone_picker(
+                    activity, account, user_id, name, fragment, None
+                )
+        except Exception:
+            self._record_error("contact_menu", traceback.format_exc())
+            BulletinHelper.show_error("Ошибка Contact Time")
+
+    def _show_current_dialog(
+        self, activity, account, user_id, name, fragment, zone_name
+    ):
+        try:
+            time_text, period = self._time_info(zone_name)
+            message = "%s · %s\n%s" % (time_text, period, zone_name)
+        except Exception:
+            message = "Не удалось вычислить время\n%s" % zone_name
+
+        items = ["Изменить часовой пояс", "Удалить часовой пояс"]
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(name)
+        builder.set_message(message)
+
+        def on_item(dialog, which):
+            dialog.dismiss()
+            if int(which) == 0:
+                self._show_zone_picker(
+                    activity, account, user_id, name, fragment, zone_name
+                )
+            elif int(which) == 1:
+                self._show_delete_dialog(
+                    activity, account, user_id, name, fragment, zone_name
+                )
+
+        builder.set_items(items, on_item)
+        builder.set_negative_button("Закрыть", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _show_zone_picker(
+        self, activity, account, user_id, name, fragment, current_zone
+    ):
+        labels = ["%s — %s" % item for item in POPULAR_ZONES]
+        labels.append("Ввести IANA-зону вручную…")
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Часовой пояс: %s" % name)
+
+        def on_item(dialog, which):
+            index = int(which)
+            dialog.dismiss()
+            if index < len(POPULAR_ZONES):
+                zone_name = POPULAR_ZONES[index][1]
+                self._assign_zone(
+                    account, user_id, zone_name, fragment
+                )
+            else:
+                self._show_manual_zone_dialog(
+                    activity, account, user_id, name, fragment, current_zone
+                )
+
+        builder.set_items(labels, on_item)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _show_manual_zone_dialog(
+        self, activity, account, user_id, name, fragment, current_zone
+    ):
+        edit = AndroidEditText(activity)
+        edit.setSingleLine(True)
+        edit.setHint("Europe/Paris")
+        edit.setText(str(current_zone or ""))
+        edit.setTextColor(
+            Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+        )
+        edit.setHintTextColor(
+            Theme.getColor(Theme.key_windowBackgroundWhiteHintText)
+        )
+        edit.setTextSize(18)
+        edit.setGravity(Gravity.CENTER_VERTICAL)
+        horizontal = int(AndroidUtilities.dp(20))
+        vertical = int(AndroidUtilities.dp(8))
+        edit.setPadding(horizontal, vertical, horizontal, vertical)
+        edit.setMinHeight(int(AndroidUtilities.dp(56)))
+        edit.setSelection(edit.length())
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("IANA-зона: %s" % name)
+        builder.set_message("Например: Europe/Paris")
+        builder.set_view(edit)
+
+        def on_save(dialog, which):
+            zone_name = str(edit.getText()).strip()
+            try:
+                self._set_zone(account, user_id, zone_name)
+            except Exception:
+                BulletinHelper.show_error("Некорректная IANA-зона")
+                return
+            dialog.dismiss()
+            self._after_zone_change(fragment)
+            time_text, period = self._time_info(zone_name)
+            BulletinHelper.show_info(
+                "%s · %s (%s)" % (time_text, period, zone_name)
+            )
+
+        builder.set_positive_button("Сохранить", on_save)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _show_delete_dialog(
+        self, activity, account, user_id, name, fragment, zone_name
+    ):
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить часовой пояс?")
+        builder.set_message("%s\n%s" % (name, zone_name))
+
+        def on_delete(dialog, which):
+            self._delete_zone(account, user_id)
+            dialog.dismiss()
+            self._after_zone_change(fragment)
+            BulletinHelper.show_info("Часовой пояс удалён")
+
+        builder.set_positive_button("Удалить", on_delete)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.create()
+        builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        builder.show()
+
+    def _assign_zone(self, account, user_id, zone_name, fragment):
+        try:
+            self._set_zone(account, user_id, zone_name)
+            self._after_zone_change(fragment)
+            time_text, period = self._time_info(zone_name)
+            BulletinHelper.show_info(
+                "%s · %s (%s)" % (time_text, period, zone_name)
+            )
+        except Exception:
+            self._record_error("assign_zone", traceback.format_exc())
+            BulletinHelper.show_error("Не удалось сохранить часовой пояс")
+
+    def _after_zone_change(self, fragment):
+        if fragment is not None:
+            try:
+                self._rebuild_profile_rows(fragment)
+            except Exception:
+                self._record_error("refresh_profile", traceback.format_exc())
+
+    def _strip_suffix(self, text):
+        return TIME_SUFFIX_RE.sub("", str(text or "")).rstrip()
+
+    def _clean_legacy_header(self, profile):
+        views = get_private_field(profile, "onlineTextView")
+        if views is None:
+            return
+        for view in views:
+            if view is None:
+                continue
+            clean = self._strip_suffix(view.getText())
+            if str(view.getText()) != clean:
+                view.setText(clean)
+
+    def _profile_identity(self, profile):
+        user_id = get_private_field(profile, "userId")
+        if user_id is None or int(user_id) <= 0:
+            return None
+        account = get_private_field(profile, "currentAccount")
+        if account is None:
+            account = UserConfig.selectedAccount
+        return int(account), int(user_id)
+
+    def _detail_view_type(self, profile, adapter):
+        try:
+            value = get_static_private_field(
+                adapter.getClass(), "VIEW_TYPE_TEXT_DETAIL"
+            )
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+        for name in ("phoneRow", "birthdayRow", "locationRow", "usernameRow"):
+            position = get_private_field(profile, name)
+            if position is not None and int(position) >= 0:
+                return int(adapter.getItemViewType(int(position)))
+        return None
+
+    def _install_profile_row(self, profile):
+        if profile is None:
+            return
+        self._clean_legacy_header(profile)
+        self._profile_rows.remove(profile)
+        self._profile_types.remove(profile)
+        if not self._active:
+            return
+
+        identity = self._profile_identity(profile)
+        if identity is None:
+            return
+        account, user_id = identity
+        zone_name = self._zone_for(account, user_id)
+        if not zone_name:
+            return
+
+        row_count = get_private_field(profile, "rowCount")
+        row_position = get_private_field(profile, "infoSectionRow")
+        adapter = get_private_field(profile, "listAdapter")
+        if row_count is None or row_position is None or adapter is None:
+            return
+        row_count = int(row_count)
+        row_position = int(row_position)
+        if row_position < 0 or row_position >= row_count:
+            return
+
+        view_type = self._detail_view_type(profile, adapter)
+        if view_type is None:
+            self._record_error("profile_row_type", "detail view type unavailable")
+            return
+
+        # Reuse the existing info-section divider slot instead of changing
+        # rowCount or shifting Telegram's row indexes. This keeps profile
+        # layout, clicks and animations native and stable.
+        set_private_field(profile, "infoEndRow", jint(row_position))
+        self._profile_rows.put(profile, jint(row_position))
+        self._profile_types.put(profile, jint(view_type))
+
+    def _adapter_state(self, adapter):
+        profile = get_private_field(adapter, "this$0")
+        if profile is None:
+            return None
+        position = self._profile_rows.get(profile)
+        view_type = self._profile_types.get(profile)
+        if position is None or view_type is None:
+            return None
+        return profile, int(position), int(view_type)
+
+    def _bind_profile_row(self, adapter, holder, position):
+        cell = holder.itemView
+        state = self._adapter_state(adapter)
+        if state is None or position != state[1]:
+            if self._owned_cells.get(cell) is not None:
+                self._stop_cell_timer(cell)
+                self._stop_touch_listener(cell)
+                cell.setOnClickListener(None)
+                cell.setForeground(None)
+                cell.setHapticFeedbackEnabled(True)
+                self._owned_cells.remove(cell)
+            return
+
+        profile = state[0]
+        if not self._render_profile_cell(cell, profile, position):
+            return
+        self._owned_cells.put(cell, jint(1))
+        cell.setOnClickListener(
+            OnClickListener(lambda view: self._open_time_row(profile))
+        )
+        self._attach_touch_listener(cell, profile)
+        # Preserve the rounded card background and draw Telegram's native
+        # pressed/ripple selector above it.
+        cell.setForeground(Theme.getSelectorDrawable(False))
+        # The custom 600 ms touch timer emits one controlled tick and
+        # avoids RecyclerListView's additional native long-press vibration.
+        cell.setHapticFeedbackEnabled(False)
+        self._start_cell_timer(cell, profile, position)
+
+    def _render_profile_cell(self, cell, profile, position):
+        identity = self._profile_identity(profile)
+        if identity is None:
+            return False
+        zone_name = self._zone_for(identity[0], identity[1])
+        if not zone_name:
+            return False
+        time_text, period = self._time_info(zone_name)
+        cell.setTextAndValue(
+            "%s · %s" % (time_text, period),
+            "Местное время · %s" % zone_name,
+            False,
+        )
+        try:
+            cell.setImage(None, None)
+        except Exception:
+            pass
+        cell.setTag(jint(position))
+        return True
+
+    def _profile_name(self, profile):
+        views = get_private_field(profile, "nameTextView")
+        if views is not None:
+            for view in views:
+                if view is not None:
+                    text = str(view.getText() or "").strip()
+                    if text:
+                        return text
+        return "Контакт"
+
+    def _open_time_row(self, profile):
+        try:
+            identity = self._profile_identity(profile)
+            if identity is None:
+                return
+            account, user_id = identity
+            zone_name = self._zone_for(account, user_id)
+            if not zone_name:
+                return
+            activity = profile.getParentActivity()
+            if activity is None:
+                return
+            self._show_current_dialog(
+                activity,
+                account,
+                user_id,
+                self._profile_name(profile),
+                profile,
+                zone_name,
+            )
+        except Exception:
+            self._record_error("time_row_click", traceback.format_exc())
+
+    def _copy_time_row(self, profile, view=None):
+        try:
+            identity = self._profile_identity(profile)
+            if identity is None:
+                return True
+            zone_name = self._zone_for(identity[0], identity[1])
+            if not zone_name:
+                return True
+            time_text, period = self._time_info(zone_name)
+            copied_text = "%s · %s" % (time_text, period)
+            copy_to_clipboard(copied_text)
+            if view is not None:
+                flags = (
+                    HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
+                    | HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
+                )
+                view.performHapticFeedback(
+                    HapticFeedbackConstants.VIRTUAL_KEY, flags
+                )
+        except Exception:
+            self._record_error("time_row_copy", traceback.format_exc())
+        return True
+
+
+    def _attach_touch_listener(self, cell, profile):
+        self._stop_touch_listener(cell)
+        listener = TimeRowTouchListener(self, profile)
+        self._touch_listeners.put(cell, listener)
+        cell.setOnLongClickListener(None)
+        cell.setLongClickable(False)
+        cell.setOnTouchListener(listener)
+
+    def _stop_touch_listener(self, cell):
+        if cell is None:
+            return
+        listener = self._touch_listeners.get(cell)
+        if listener is not None:
+            try:
+                listener.dispose(cell)
+            except Exception:
+                pass
+            self._touch_listeners.remove(cell)
+        try:
+            cell.setOnTouchListener(None)
+            cell.setOnLongClickListener(None)
+            cell.setLongClickable(False)
+        except Exception:
+            pass
+
+    def _detach_profile_cell(self, cell):
+        self._stop_cell_timer(cell)
+        self._stop_touch_listener(cell)
+
+    def _next_minute_delay(self):
+        millis = int(System.currentTimeMillis())
+        return max(250, 60050 - millis % 60000)
+
+    def _start_cell_timer(self, cell, profile, position):
+        self._stop_cell_timer(cell)
+        box = {}
+
+        def tick():
+            try:
+                if not self._active or not bool(cell.isAttachedToWindow()):
+                    self._cell_timers.remove(cell)
+                    return
+                if not self._render_profile_cell(cell, profile, position):
+                    self._cell_timers.remove(cell)
+                    return
+                runnable = box.get("runnable")
+                if runnable is not None:
+                    cell.postDelayed(runnable, self._next_minute_delay())
+            except Exception:
+                self._cell_timers.remove(cell)
+                self._record_error("minute_timer", traceback.format_exc())
+
+        runnable = R(tick)
+        box["runnable"] = runnable
+        self._cell_timers.put(cell, runnable)
+        cell.postDelayed(runnable, self._next_minute_delay())
+
+    def _stop_cell_timer(self, cell):
+        if cell is None:
+            return
+        runnable = self._cell_timers.get(cell)
+        if runnable is not None:
+            try:
+                cell.removeCallbacks(runnable)
+            except Exception:
+                pass
+            self._cell_timers.remove(cell)
+
+    def _stop_all_cell_timers(self):
+        try:
+            cells = self._owned_cells.keySet().toArray()
+            for cell in cells:
+                if cell is None:
+                    continue
+                self._stop_cell_timer(cell)
+                self._stop_touch_listener(cell)
+                try:
+                    cell.setOnClickListener(None)
+                    cell.setForeground(None)
+                    cell.setHapticFeedbackEnabled(True)
+                except Exception:
+                    pass
+        except Exception:
+            self._record_error("stop_timers", traceback.format_exc())
+
+    def _invoke_update_rows(self, profile):
+        method = profile.getClass().getDeclaredMethod("updateRowsIds")
+        method.setAccessible(True)
+        method.invoke(profile)
+
+    def _rebuild_profile_rows(self, profile):
+        if profile is None:
+            return
+        attempts = [0]
+
+        def perform():
+            attempts[0] += 1
+            try:
+                list_view = get_private_field(profile, "listView")
+                if list_view is not None:
+                    computing = bool(list_view.isComputingLayout())
+                    scrolling = int(list_view.getScrollState()) != 0
+                    if computing or scrolling:
+                        if attempts[0] < 20:
+                            run_on_ui_thread(perform, 60)
+                        return
+
+                old_position = self._profile_rows.get(profile)
+                if old_position is not None:
+                    old_position = int(old_position)
+
+                self._invoke_update_rows(profile)
+
+                new_position = self._profile_rows.get(profile)
+                if new_position is not None:
+                    new_position = int(new_position)
+
+                adapter = get_private_field(profile, "listAdapter")
+                changed_position = (
+                    new_position if new_position is not None else old_position
+                )
+                if adapter is not None and changed_position is not None:
+                    # The row reuses an existing divider slot, so only that
+                    # item changes its view type. A targeted change avoids the
+                    # full-profile hitch and lets RecyclerView crossfade it.
+                    adapter.notifyItemChanged(jint(changed_position))
+            except Exception:
+                self._record_error("rebuild_profile_rows", traceback.format_exc())
+
+        # Defer one frame so dialog dismissal and RecyclerView layout finish.
+        run_on_ui_thread(perform, 32)
+
