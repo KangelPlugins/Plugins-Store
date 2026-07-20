@@ -1,6 +1,7 @@
 """Contact Time — local per-contact time zones for exteraGram/AyuGram."""
 
 import json
+import re
 import traceback
 from android.view import Gravity, HapticFeedbackConstants, MotionEvent, View
 from android.widget import EditText as AndroidEditText
@@ -34,13 +35,17 @@ __id__ = "contact_time"
 __name__ = "Contact Time"
 __description__ = "Показывает местное время контакта по назначенному вручную часовому поясу."
 __author__ = "@engiPlugins"
-__version__ = "1.0.2"
+__version__ = "1.0.0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
 
 
 STORAGE_KEY = "contact_time_zones_v1"
 TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm")
+TIME_SUFFIX_RE = re.compile(
+    r"\s+•\s+местное:\s+\d{2}:\d{2}\s+·\s+(?:утро|день|вечер|ночь)$"
+)
+
 POPULAR_ZONES = [
     ("Москва", "Europe/Moscow"),
     ("Калининград", "Europe/Kaliningrad"),
@@ -78,49 +83,70 @@ class TimeRowTouchListener(dynamic_proxy(View.OnTouchListener)):
         self.profile = profile
         self.pending = None
         self.fired = False
-        self.down_x = self.down_y = 0.0
+        self.down_x = 0.0
+        self.down_y = 0.0
 
     def _cancel(self, view):
-        if self.pending is not None:
-            view.removeCallbacks(self.pending)
-            self.pending = None
+        runnable = self.pending
+        self.pending = None
+        if runnable is not None:
+            try:
+                view.removeCallbacks(runnable)
+            except Exception:
+                pass
 
     def dispose(self, view):
         self._cancel(view)
-        self.plugin = self.profile = None
+        self.fired = False
+        self.profile = None
+        self.plugin = None
 
     def _fire(self, view):
         self.pending = None
-        if (
-            self.plugin is not None
-            and self.profile is not None
-            and self.plugin._active
-            and bool(view.isAttachedToWindow())
-        ):
+        plugin = self.plugin
+        profile = self.profile
+        if plugin is None or profile is None or not plugin._active:
+            return
+        try:
+            if not bool(view.isAttachedToWindow()):
+                return
             self.fired = True
-            self.plugin._copy_time_row(self.profile, view)
+            plugin._copy_time_row(profile, view)
+        except Exception:
+            plugin._record_error("time_row_hold", traceback.format_exc())
 
     def onTouch(self, view, event):
         action = int(event.getActionMasked())
         if action == int(MotionEvent.ACTION_DOWN):
             self._cancel(view)
             self.fired = False
-            self.down_x, self.down_y = float(event.getX()), float(event.getY())
-            self.pending = R(lambda: self._fire(view))
-            view.postDelayed(self.pending, self.HOLD_MS)
-        elif action == int(MotionEvent.ACTION_MOVE) and not self.fired:
-            dx = float(event.getX()) - self.down_x
-            dy = float(event.getY()) - self.down_y
-            if dx * dx + dy * dy > float(AndroidUtilities.dp(12)) ** 2:
-                self._cancel(view)
-        elif action == int(MotionEvent.ACTION_UP):
-            fired = self.fired
+            self.down_x = float(event.getX())
+            self.down_y = float(event.getY())
+            runnable = R(lambda: self._fire(view))
+            self.pending = runnable
+            view.postDelayed(runnable, self.HOLD_MS)
+            return False
+
+        if action == int(MotionEvent.ACTION_MOVE):
+            if not self.fired:
+                slop = float(AndroidUtilities.dp(12))
+                dx = float(event.getX()) - self.down_x
+                dy = float(event.getY()) - self.down_y
+                if dx * dx + dy * dy > slop * slop:
+                    self._cancel(view)
+            return False
+
+        if action == int(MotionEvent.ACTION_UP):
+            was_fired = self.fired
             self._cancel(view)
             self.fired = False
-            return fired
-        elif action == int(MotionEvent.ACTION_CANCEL):
+            return was_fired
+
+        if action == int(MotionEvent.ACTION_CANCEL):
             self._cancel(view)
             self.fired = False
+            return False
+
         return False
 
 
@@ -181,6 +207,8 @@ class ContactTimePlugin(BasePlugin):
         self._touch_listeners = WeakHashMap()
         self._owned_cells = WeakHashMap()
         self._active = True
+        self._hook_counts = {}
+        self._errors = []
 
     def on_plugin_load(self):
         self._load_zones()
@@ -198,15 +226,22 @@ class ContactTimePlugin(BasePlugin):
 
         profile_class = find_class("org.telegram.ui.ProfileActivity")
         adapter_class = find_class("org.telegram.ui.ProfileActivity$ListAdapter")
-        if profile_class is None or adapter_class is None:
+        if profile_class is None:
+            self._hook_counts["profile_class"] = -1
             return
+
         try:
-            self.hook_all_methods(
+            hooks = self.hook_all_methods(
                 profile_class, "updateRowsIds", ProfileRowsHook(self)
             )
+            self._hook_counts["updateRowsIds"] = len(hooks) if hooks else 0
         except Exception:
+            self._hook_counts["updateRowsIds"] = -1
             self._record_error("hook_updateRowsIds", traceback.format_exc())
 
+        if adapter_class is None:
+            self._hook_counts["adapter_class"] = -1
+            return
         for method_name, mode in (
             ("getItemViewType", "type"),
             ("onBindViewHolder", "bind"),
@@ -214,10 +249,12 @@ class ContactTimePlugin(BasePlugin):
             ("isEnabled", "enabled"),
         ):
             try:
-                self.hook_all_methods(
+                hooks = self.hook_all_methods(
                     adapter_class, method_name, ProfileAdapterHook(self, mode)
                 )
+                self._hook_counts[method_name] = len(hooks) if hooks else 0
             except Exception:
+                self._hook_counts[method_name] = -1
                 self._record_error("hook_" + method_name, traceback.format_exc())
 
     def on_plugin_unload(self):
@@ -236,6 +273,11 @@ class ContactTimePlugin(BasePlugin):
         self._owned_cells.clear()
 
     def _record_error(self, where, details):
+        tail = str(details).strip().splitlines()
+        message = tail[-1] if tail else "unknown"
+        self._errors.append("%s: %s" % (where, message))
+        if len(self._errors) > 30:
+            del self._errors[:-30]
         try:
             self.log("%s: %s" % (where, details))
         except Exception:
@@ -292,12 +334,9 @@ class ContactTimePlugin(BasePlugin):
 
     def _time_info(self, zone_name):
         now = ZonedDateTime.now(ZoneId.of(str(zone_name)))
-        return str(now.format(TIME_FORMATTER)), period_for_hour(now.getHour())
-
-    def _format_time_line(self, zone_name, with_zone=False):
-        time_text, period = self._time_info(zone_name)
-        line = "%s · %s" % (time_text, period)
-        return "%s (%s)" % (line, zone_name) if with_zone else line
+        time_text = str(now.format(TIME_FORMATTER))
+        period = period_for_hour(int(now.getHour()))
+        return time_text, period
 
     def _resolve_target(self, context):
         account = context.get("account")
@@ -368,9 +407,8 @@ class ContactTimePlugin(BasePlugin):
         self, activity, account, user_id, name, fragment, zone_name
     ):
         try:
-            message = "%s\n%s" % (
-                self._format_time_line(zone_name), zone_name
-            )
+            time_text, period = self._time_info(zone_name)
+            message = "%s · %s\n%s" % (time_text, period, zone_name)
         except Exception:
             message = "Не удалось вычислить время\n%s" % zone_name
 
@@ -454,8 +492,9 @@ class ContactTimePlugin(BasePlugin):
                 return
             dialog.dismiss()
             self._after_zone_change(fragment)
+            time_text, period = self._time_info(zone_name)
             BulletinHelper.show_info(
-                self._format_time_line(zone_name, with_zone=True)
+                "%s · %s (%s)" % (time_text, period, zone_name)
             )
 
         builder.set_positive_button("Сохранить", on_save)
@@ -485,8 +524,9 @@ class ContactTimePlugin(BasePlugin):
         try:
             self._set_zone(account, user_id, zone_name)
             self._after_zone_change(fragment)
+            time_text, period = self._time_info(zone_name)
             BulletinHelper.show_info(
-                self._format_time_line(zone_name, with_zone=True)
+                "%s · %s (%s)" % (time_text, period, zone_name)
             )
         except Exception:
             self._record_error("assign_zone", traceback.format_exc())
@@ -494,7 +534,24 @@ class ContactTimePlugin(BasePlugin):
 
     def _after_zone_change(self, fragment):
         if fragment is not None:
-            self._rebuild_profile_rows(fragment)
+            try:
+                self._rebuild_profile_rows(fragment)
+            except Exception:
+                self._record_error("refresh_profile", traceback.format_exc())
+
+    def _strip_suffix(self, text):
+        return TIME_SUFFIX_RE.sub("", str(text or "")).rstrip()
+
+    def _clean_legacy_header(self, profile):
+        views = get_private_field(profile, "onlineTextView")
+        if views is None:
+            return
+        for view in views:
+            if view is None:
+                continue
+            clean = self._strip_suffix(view.getText())
+            if str(view.getText()) != clean:
+                view.setText(clean)
 
     def _profile_identity(self, profile):
         user_id = get_private_field(profile, "userId")
@@ -523,6 +580,7 @@ class ContactTimePlugin(BasePlugin):
     def _install_profile_row(self, profile):
         if profile is None:
             return
+        self._clean_legacy_header(profile)
         self._profile_rows.remove(profile)
         self._profile_types.remove(profile)
         if not self._active:
@@ -604,8 +662,9 @@ class ContactTimePlugin(BasePlugin):
         zone_name = self._zone_for(identity[0], identity[1])
         if not zone_name:
             return False
+        time_text, period = self._time_info(zone_name)
         cell.setTextAndValue(
-            self._format_time_line(zone_name),
+            "%s · %s" % (time_text, period),
             "Местное время · %s" % zone_name,
             False,
         )
@@ -657,7 +716,9 @@ class ContactTimePlugin(BasePlugin):
             zone_name = self._zone_for(identity[0], identity[1])
             if not zone_name:
                 return True
-            copy_to_clipboard(self._format_time_line(zone_name))
+            time_text, period = self._time_info(zone_name)
+            copied_text = "%s · %s" % (time_text, period)
+            copy_to_clipboard(copied_text)
             if view is not None:
                 flags = (
                     HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
@@ -669,6 +730,7 @@ class ContactTimePlugin(BasePlugin):
         except Exception:
             self._record_error("time_row_copy", traceback.format_exc())
         return True
+
 
     def _attach_touch_listener(self, cell, profile):
         self._stop_touch_listener(cell)
