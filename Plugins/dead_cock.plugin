@@ -1,0 +1,871 @@
+import re
+import traceback
+import time
+import weakref
+from typing import Any, Optional, List, Tuple
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook, hook_filters, HookFilter
+from ui.settings import Header, Selector, Text, Divider, Switch
+from hook_utils import find_class
+from org.telegram.messenger import AndroidUtilities, MessageObject, MessagesController, MessagesStorage, NotificationCenter
+from org.telegram.tgnet import TLRPC, ConnectionsManager, RequestDelegate
+from java.util import ArrayList
+from java.lang import CharSequence, Thread, Integer
+from android.net import Uri
+from android_utils import run_on_ui_thread
+from java import dynamic_proxy, jlong
+from org.telegram.tgnet.tl import TL_account
+
+__id__ = "itt"
+__name__ = "Invisible TikTok"
+__description__ = "Чтобы не кидать кенту тонну ебучих ссылок на дилдок"
+__author__ = "@la_cringe | @dmkrjplug"
+__version__ = "1.3.0"
+__icon__ = "stickersfailed/31"
+__min_version__ = "11.12.0"
+
+
+
+
+
+TT_MSG_FLAG_ENTITIES = 128
+TT_MSG_FLAG_MEDIA = 512
+TT_FULL_MESSAGE_UPDATES = (
+    "TL_updateNewMessage",
+    "TL_updateNewChannelMessage",
+    "TL_updateEditMessage",
+    "TL_updateEditChannelMessage",
+)
+TT_CONTAINER_UPDATES = (
+    "TL_updates",
+    "TL_updatesCombined",
+    "TL_updateShort",
+)
+TT_WEBPAGE_UPDATE = "TL_updateWebPage"
+TT_PREVIEW_CACHE_LIMIT = 64
+TT_TRAILING_PUNCT = ".,!?;:)]}"
+TT_INCOMING_URL_RE = re.compile(
+    r"(?<![\w.@-])"
+    r"(?:(?P<scheme>https?://)?)"
+    r"(?P<host>(?:(?:www|m|vm|vt)\.)?(?:tiktok|kktiktok|tnktok|tiktokez|tiktokfix)\.com)"
+    r"(?P<tail>(?:[/?#][^\s<>\"']*)?)",
+    re.IGNORECASE,
+)
+
+
+def _safe_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+class PreviewRequestDelegate(dynamic_proxy(RequestDelegate)):
+    def __init__(self, plugin, account: int, message: Any, dialog_id: int, preview_text: str, request_text: str):
+        super().__init__()
+        self.plugin_ref = weakref.ref(plugin)
+        self.account = int(account)
+        self.message = message
+        self.dialog_id = int(dialog_id)
+        self.preview_text = str(preview_text or "")
+        self.request_text = str(request_text or "")
+
+    def run(self, response, error):
+        plugin = self.plugin_ref()
+        if plugin is None:
+            return
+        run_on_ui_thread(lambda: plugin._on_preview_response(
+            self.account,
+            self.message,
+            self.dialog_id,
+            self.preview_text,
+            self.request_text,
+            response,
+            error,
+        ))
+
+
+class IncomingPreviewCellHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin_ref = weakref.ref(plugin)
+
+    def before_hooked_method(self, param):
+        plugin = self.plugin_ref()
+        if plugin is None or not param.args:
+            return
+        try:
+            plugin._rewrite_message_object_for_render(param.args[0], param.thisObject)
+        except Exception as e:
+            plugin.log(f"Incoming preview render hook error: {e}\n{traceback.format_exc()}")
+class ModifyUrlsHook(MethodHook):
+    def __init__(self, plugin) -> None:
+        self.plugin = plugin
+
+    @hook_filters(HookFilter.ArgumentEqual(0, " "))
+    def before_hooked_method(self, param):
+        try:
+            called_from_intended_context = False
+            for element in Thread.currentThread().getStackTrace()[2:]:
+                if (
+                    element.getClassName().startswith("org.telegram.messenger.DispatchQueue")
+                    and element.getMethodName() == "run"
+                ):
+                    called_from_intended_context = True
+                    break
+
+            if not called_from_intended_context:
+                return
+
+            modified_urls = ArrayList()
+            modified_count = 0
+
+            for url_sequence in param.args[1].toArray():
+                if not isinstance(url_sequence, CharSequence):
+                    modified_urls.add(url_sequence)
+                    continue
+
+                original_url = str(url_sequence)
+                modified_url = self.plugin._apply_url_fix_for_preview(original_url)
+
+                if modified_url != original_url:
+                    modified_count += 1
+
+                modified_urls.add(modified_url)
+
+            if modified_count > 0:
+                param.args[1] = modified_urls
+
+        except Exception as e:
+            self.plugin.log(f"ModifyUrlsHook error: {e}\n{traceback.format_exc()}")
+
+
+class LargeVideoHook(MethodHook):
+    def __init__(self, plugin) -> None:
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if param.thisObject.isVideo:
+                param.thisObject.webpageSmall = False
+        except Exception as e:
+            self.plugin.log(f"LargeVideoHook error: {e}")
+
+
+class InvisibleTikTokPlugin(BasePlugin):
+
+    SOFT_HYPHEN = '\u00AD'
+
+    TIKTOK_PATTERN = re.compile(
+        r'https?://((?:vt|vm|www)\.)?(tiktok|kktiktok|tnktok|tiktokez|tiktokfix)\.com(/[^\s\)\]\>\"\',]*)?',
+        re.IGNORECASE
+    )
+
+
+    VIDEO_PATH_PATTERN = re.compile(
+        r'(/@[^/?#\s]+/video/\d+|/video/\d+)',
+        re.IGNORECASE
+    )
+
+    PROXY_HOSTS = [
+        {'name': 'kktiktok.com', 'desc': 'KKTikTok Only vid'},
+        {'name': 'tnktok.com', 'desc': 'TNKTok Vid + Photo + desc'},
+        {'name': 'tiktokez.com', 'desc': 'EmbedEZ Only Vid + desc'},
+        {'name': 'tiktokfix.com', 'desc': 'TikTokFix Vid + Photo + desc'},
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self._stats = 0
+        self._incoming_pending_by_webpage_id = {}
+        self._incoming_preview_cache = {}
+        self._incoming_preview_inflight = {}
+        self._incoming_unhooks = []
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self._register_incoming_preview_hooks()
+        if self.get_setting("host") is None:
+            self.set_setting("host", 0)
+        self._stats = self.get_setting("stats", 0)
+
+        try:
+            text_utils = find_class("android.text.TextUtils")
+            if text_utils:
+                join_method = text_utils.getClass().getDeclaredMethod(
+                    "join", CharSequence.getClass(), find_class("java.lang.Iterable").getClass()
+                )
+                self.hook_method(join_method, ModifyUrlsHook(self))
+
+            preview_params = find_class("org.telegram.messenger.MessagePreviewParams")
+            if preview_params:
+                update_link = preview_params.getClass().getDeclaredMethod(
+                    "updateLink",
+                    Integer.TYPE,
+                    find_class("org.telegram.tgnet.TLRPC$WebPage").getClass(),
+                    CharSequence.getClass(),
+                    find_class("org.telegram.messenger.MessageObject").getClass(),
+                    find_class("org.telegram.ui.ChatActivity$ReplyQuote").getClass(),
+                    find_class("org.telegram.messenger.MessageObject").getClass()
+                )
+                self.hook_method(update_link, LargeVideoHook(self))
+
+        except Exception as e:
+            self.log(f"Ошибка активации хуков превью: {e}\n{traceback.format_exc()}")
+
+        self.log(f"Invisible TikTok v{__version__} загружен")
+
+    def on_plugin_unload(self):
+        self._incoming_pending_by_webpage_id.clear()
+        self._incoming_preview_cache.clear()
+        self._incoming_preview_inflight.clear()
+        for unhook in list(self._incoming_unhooks):
+            try:
+                unhook()
+            except Exception:
+                try:
+                    self.unhook_method(unhook)
+                except Exception:
+                    pass
+        self._incoming_unhooks.clear()
+        self.log(f"Invisible TikTok выгружен | Заменено: {self._stats}")
+
+    def _get_proxy_host(self) -> str:
+        idx = self.get_setting("host", 0)
+        if idx < 0 or idx >= len(self.PROXY_HOSTS):
+            idx = 0
+        return self.PROXY_HOSTS[idx]['name']
+
+    def _strip_path(self, subdomain: str, raw_path: str) -> str:
+        path = re.split(r'[?#]', raw_path)[0]
+        is_short = subdomain.rstrip('.') in ('vt', 'vm')
+        if is_short:
+            short_m = re.match(r'(/[A-Za-z0-9]+)', path)
+            return short_m.group(1) if short_m else path
+        m = self.VIDEO_PATH_PATTERN.match(path)
+        return m.group(1) if m else path
+
+    def _apply_url_fix_for_preview(self, url: str) -> str:
+        try:
+            normalized = url if url.startswith("http") else "https://" + url
+            uri = Uri.parse(normalized)
+            if uri is None:
+                return url
+
+            host = AndroidUtilities.getHostAuthority(normalized.lower())
+            if host is None:
+                return url
+
+            if host in ["tiktok.com", "kktiktok.com", "tnktok.com", "tiktokez.com", "tiktokfix.com"] or host.endswith(".tiktok.com"):
+                proxy = self._get_proxy_host()
+                subdomain = host[: -len("tiktok.com")] if host.endswith(".tiktok.com") else ""
+                raw_path = str(uri.getPath()) or ""
+                
+                if raw_path.startswith('/@') and '/video/' not in raw_path:
+                    return url
+                    
+                clean_path = self._strip_path(subdomain, raw_path)
+                return f"https://{subdomain}{proxy}{clean_path}"
+
+            return url
+
+        except Exception as e:
+            self.log(f"Ошибка в _apply_url_fix_for_preview: {e}")
+            return url
+
+    def _build_url(self, subdomain: str, raw_path: str) -> str:
+        proxy = self._get_proxy_host()
+        clean_path = self._strip_path(subdomain, raw_path)
+        return f"https://{subdomain}{proxy}{clean_path}"
+
+    def _utf16_len(self, s: str) -> int:
+        return len(s.encode('utf-16-le')) // 2
+
+    def _clean_message(self, msg: str, valid_matches: list) -> str:
+        clean = msg
+        for m in reversed(valid_matches):
+            clean = clean[:m.start()] + ' ' + clean[m.end():]
+        clean = re.sub(r' ([,\.!?])', r'\1', clean)
+        clean = re.sub(r'\s{2,}', ' ', clean).strip()
+        return clean
+
+
+    def _register_incoming_preview_hooks(self):
+        try:
+            for name in TT_FULL_MESSAGE_UPDATES + TT_CONTAINER_UPDATES + (TT_WEBPAGE_UPDATE,):
+                self.add_hook(name, priority=60)
+            self._install_incoming_render_hook()
+        except Exception as e:
+            self.log(f"Incoming preview hook init error: {e}\n{traceback.format_exc()}")
+
+    def _install_incoming_render_hook(self):
+        try:
+            cls = find_class("org.telegram.ui.Cells.ChatMessageCell")
+            if not cls:
+                return
+            result = self.hook_all_methods(cls, "setMessageContent", IncomingPreviewCellHook(self))
+            self._remember_incoming_unhooks(result)
+        except Exception as e:
+            self.log(f"Incoming preview render hook install error: {e}\n{traceback.format_exc()}")
+
+    def _remember_incoming_unhooks(self, result):
+        if not result:
+            return
+        if isinstance(result, (list, tuple)):
+            self._incoming_unhooks.extend([item for item in result if item])
+        else:
+            self._incoming_unhooks.append(result)
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        if update_name == TT_WEBPAGE_UPDATE:
+            self._handle_webpage_update(update)
+            return HookResult()
+        if not self.get_setting("incoming_preview_enabled", True):
+            return HookResult()
+        if update_name in TT_FULL_MESSAGE_UPDATES and self._rewrite_full_update(account, update):
+            return HookResult(strategy=HookStrategy.MODIFY, update=update)
+        return HookResult()
+
+    def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
+        if container_name not in TT_CONTAINER_UPDATES:
+            return HookResult()
+
+        changed = False
+        nested = getattr(updates, "update", None)
+        if nested is not None:
+            nested_name = self._class_name(nested)
+            if nested_name == TT_WEBPAGE_UPDATE:
+                self._handle_webpage_update(nested)
+            elif self.get_setting("incoming_preview_enabled", True) and nested_name in TT_FULL_MESSAGE_UPDATES:
+                changed = self._rewrite_full_update(account, nested) or changed
+
+        for item in self._iter_java_list(getattr(updates, "updates", None)):
+            item_name = self._class_name(item)
+            if item_name == TT_WEBPAGE_UPDATE:
+                self._handle_webpage_update(item)
+            elif self.get_setting("incoming_preview_enabled", True) and item_name in TT_FULL_MESSAGE_UPDATES:
+                changed = self._rewrite_full_update(account, item) or changed
+
+        if changed:
+            return HookResult(strategy=HookStrategy.MODIFY, updates=updates)
+        return HookResult()
+
+    def _rewrite_message_object_for_render(self, message_object, cell=None):
+        if not self.get_setting("incoming_preview_enabled", True) or message_object is None:
+            return
+        message = getattr(message_object, "messageOwner", None)
+        account = _safe_int(getattr(message_object, "currentAccount", 0), 0)
+        if not self._rewrite_message(account, message, allow_preview=True):
+            return
+
+        try:
+            message_object.applyNewText(message.message)
+        except Exception:
+            try:
+                message_object.messageText = message.message
+            except Exception:
+                pass
+        for method_name in ("setType", "resetLayout"):
+            try:
+                getattr(message_object, method_name)()
+            except Exception:
+                pass
+        try:
+            message_object.generateThumbs(False)
+            message_object.createMediaThumbs()
+        except Exception:
+            pass
+        try:
+            message_object.forceUpdate = True
+        except Exception:
+            pass
+        if cell is not None:
+            try:
+                cell.requestLayout()
+                cell.invalidate()
+            except Exception:
+                pass
+
+    def _rewrite_full_update(self, account: int, update: Any) -> bool:
+        return self._rewrite_message(account, getattr(update, "message", None), allow_preview=True)
+
+    def _rewrite_message(self, account: int, message: Any, allow_preview: bool) -> bool:
+        if message is None or self._is_tl(message, "TL_messageService"):
+            return False
+        if bool(getattr(message, "out", False)):
+            return False
+
+        text = getattr(message, "message", None)
+        if not isinstance(text, str):
+            return False
+
+        new_text, replacements, proxy_urls = self._rewrite_incoming_text(text)
+        if not replacements:
+            return False
+
+        message.message = new_text
+        self._adjust_entities(getattr(message, "entities", None), replacements)
+        self._sync_entities_flag(message)
+
+        if allow_preview and self.get_setting("incoming_render_preview", True) and proxy_urls:
+            if self._can_replace_media(message):
+                dialog_id = self._dialog_id(account, message)
+                preview_url = proxy_urls[0]
+                self._set_pending_preview_media(account, message, preview_url, new_text)
+                self._request_preview(account, message, dialog_id, preview_url, new_text)
+            else:
+                self.log("Incoming preview skipped: message already has real media")
+        return True
+
+    def _rewrite_incoming_text(self, text: str) -> Tuple[str, List[Tuple[int, int, int]], List[str]]:
+        chunks = []
+        replacements = []
+        proxy_urls = []
+        last = 0
+
+        for match in TT_INCOMING_URL_RE.finditer(text):
+            original = match.group(0)
+            actual = original.rstrip(TT_TRAILING_PUNCT)
+            suffix = original[len(actual):]
+            if not actual:
+                continue
+            replacement = self._apply_url_fix_for_preview(actual)
+            if replacement == actual:
+                continue
+
+            actual_start = match.start()
+            actual_end = match.end() - len(suffix)
+            chunks.append(text[last:actual_start])
+            chunks.append(replacement)
+            if suffix:
+                chunks.append(suffix)
+            replacements.append((actual_start, actual_end, len(replacement)))
+            proxy_urls.append(replacement)
+            last = match.end()
+
+        if not replacements:
+            return text, [], []
+        chunks.append(text[last:])
+        return "".join(chunks), replacements, proxy_urls
+
+    def _set_pending_preview_media(self, account: int, message: Any, preview_url: str, preview_text: str):
+        media = TLRPC.TL_messageMediaWebPage()
+        webpage = TLRPC.TL_webPagePending()
+        webpage.flags = 1
+        webpage.url = str(preview_url or "")
+        webpage.display_url = str(preview_url or "")
+        webpage.displayedText = str(preview_text or "")
+        webpage.id = 0
+        webpage.date = self._current_time(account) + 60
+        media.webpage = webpage
+        message.media = media
+        message.flags = _safe_int(getattr(message, "flags", 0)) | TT_MSG_FLAG_MEDIA
+
+    def _request_preview(self, account: int, message: Any, dialog_id: int, request_text: str, preview_text: str):
+        request_text = str(request_text or "").strip()
+        preview_text = str(preview_text or request_text)
+        if not request_text:
+            return
+
+        cached_media = self._incoming_preview_cache.get(request_text)
+        if cached_media is not None:
+            self._apply_preview_media(account, message, dialog_id, cached_media, preview_text, request_text)
+            return
+
+        record = {
+            "account": int(account),
+            "message": message,
+            "dialog_id": int(dialog_id),
+            "preview_text": preview_text,
+            "request_text": request_text,
+        }
+        waiting = self._incoming_preview_inflight.get(request_text)
+        if waiting is not None:
+            waiting.append(record)
+            return
+
+        self._incoming_preview_inflight[request_text] = [record]
+        try:
+            req = TL_account.getWebPagePreview()
+            req.message = request_text
+            ConnectionsManager.getInstance(account).sendRequest(
+                req,
+                PreviewRequestDelegate(self, account, message, dialog_id, preview_text, request_text)
+            )
+        except Exception as e:
+            self._incoming_preview_inflight.pop(request_text, None)
+            self.log(f"Incoming preview request error: {e}")
+
+    def _on_preview_response(self, account: int, message: Any, dialog_id: int, preview_text: str, request_text: str, response: Any, error: Any):
+        request_text = str(request_text or "")
+        records = self._incoming_preview_inflight.pop(request_text, None)
+        if not records:
+            records = [{
+                "account": int(account),
+                "message": message,
+                "dialog_id": int(dialog_id),
+                "preview_text": str(preview_text or ""),
+                "request_text": request_text,
+            }]
+
+        if error is not None:
+            try:
+                self.log(f"Incoming preview error: {error.text}")
+            except Exception:
+                self.log("Incoming preview error")
+            for record in records:
+                self._clear_preview_media(record["account"], record["message"], record["dialog_id"])
+            return
+        media = self._extract_preview_media(account, response)
+        if media is None:
+            for record in records:
+                self._clear_preview_media(record["account"], record["message"], record["dialog_id"])
+            return
+        webpage = getattr(media, "webpage", None)
+        if self._is_webpage_pending(webpage):
+            for record in records:
+                record_preview = record.get("preview_text") or ""
+                record_request = record.get("request_text") or request_text
+                self._apply_preview_media(record["account"], record["message"], record["dialog_id"], media, record_preview, record_request)
+                self._remember_pending(record["account"], record["message"], record["dialog_id"], record_preview, webpage, record_request)
+        elif self._is_webpage_empty(webpage):
+            for record in records:
+                self._clear_preview_media(record["account"], record["message"], record["dialog_id"])
+        else:
+            self._cache_preview_media(request_text, media)
+            for record in records:
+                record_preview = record.get("preview_text") or ""
+                record_request = record.get("request_text") or request_text
+                self._apply_preview_media(record["account"], record["message"], record["dialog_id"], media, record_preview, record_request)
+
+    def _extract_preview_media(self, account: int, response: Any):
+        if response is None or not self._is_tl(response, "webPagePreview"):
+            return None
+        try:
+            controller = MessagesController.getInstance(account)
+            users = getattr(response, "users", None)
+            chats = getattr(response, "chats", None)
+            if users is not None:
+                controller.putUsers(users, False)
+            if chats is not None:
+                controller.putChats(chats, False)
+        except Exception:
+            pass
+        media = getattr(response, "media", None)
+        return media if self._is_media_webpage(media) else None
+
+    def _handle_webpage_update(self, update: Any):
+        webpage = getattr(update, "webpage", None)
+        webpage_id = _safe_int(getattr(webpage, "id", 0)) if webpage is not None else 0
+        if not webpage_id:
+            return
+        records = self._incoming_pending_by_webpage_id.pop(webpage_id, [])
+        for record in records:
+            media = TLRPC.TL_messageMediaWebPage()
+            media.webpage = webpage
+            preview_text = record.get("preview_text") or ""
+            request_text = record.get("request_text") or ""
+            self._prepare_webpage(media.webpage, preview_text, request_text)
+            if self._is_webpage_empty(media.webpage):
+                self._clear_preview_media(record["account"], record["message"], record["dialog_id"])
+            elif not self._is_webpage_pending(media.webpage):
+                self._cache_preview_media(request_text, media)
+                self._apply_preview_media(record["account"], record["message"], record["dialog_id"], media, preview_text, request_text)
+            else:
+                self._remember_pending(record["account"], record["message"], record["dialog_id"], preview_text, media.webpage, request_text)
+
+    def _remember_pending(self, account: int, message: Any, dialog_id: int, preview_text: str, webpage: Any, request_text: str = ""):
+        webpage_id = _safe_int(getattr(webpage, "id", 0))
+        if not webpage_id:
+            return
+        self._incoming_pending_by_webpage_id.setdefault(webpage_id, []).append({
+            "account": int(account),
+            "message": message,
+            "dialog_id": int(dialog_id),
+            "preview_text": str(preview_text or ""),
+            "request_text": str(request_text or ""),
+        })
+
+    def _cache_preview_media(self, request_text: str, media: Any):
+        request_text = str(request_text or "")
+        if not request_text or not self._is_media_webpage(media):
+            return
+        webpage = getattr(media, "webpage", None)
+        if self._is_webpage_empty(webpage) or self._is_webpage_pending(webpage):
+            return
+        if request_text in self._incoming_preview_cache:
+            self._incoming_preview_cache.pop(request_text, None)
+        self._incoming_preview_cache[request_text] = media
+        while len(self._incoming_preview_cache) > TT_PREVIEW_CACHE_LIMIT:
+            try:
+                self._incoming_preview_cache.pop(next(iter(self._incoming_preview_cache)))
+            except Exception:
+                break
+
+    def _apply_preview_media(self, account: int, message: Any, dialog_id: int, media: Any, preview_text: str, display_url: str = ""):
+        if message is None or not self._is_media_webpage(media):
+            return
+        message.media = media
+        message.flags = _safe_int(getattr(message, "flags", 0)) | TT_MSG_FLAG_MEDIA
+        self._prepare_webpage(getattr(media, "webpage", None), preview_text, display_url)
+        self._store_and_refresh(account, message, dialog_id)
+
+    def _clear_preview_media(self, account: int, message: Any, dialog_id: int):
+        if message is None:
+            return
+        message.media = TLRPC.TL_messageMediaEmpty()
+        message.flags = _safe_int(getattr(message, "flags", 0)) & ~TT_MSG_FLAG_MEDIA
+        self._store_and_refresh(account, message, dialog_id)
+
+    def _store_and_refresh(self, account: int, message: Any, dialog_id: int):
+        try:
+            if not dialog_id:
+                dialog_id = self._dialog_id(account, message)
+            obj = MessageObject(account, message, False, True)
+            try:
+                obj.resetLayout()
+                obj.generateThumbs(False)
+                obj.createMediaThumbs()
+            except Exception:
+                pass
+            raw_messages = ArrayList()
+            raw_messages.add(message)
+            objects = ArrayList()
+            objects.add(obj)
+            try:
+                MessagesStorage.getInstance(account).putMessages(raw_messages, True, True, False, 0, 0, 0)
+            except Exception as e:
+                self.log(f"Incoming preview storage error: {e}")
+
+            def refresh():
+                try:
+                    controller = MessagesController.getInstance(account)
+                    if not self._notify_replace(controller, dialog_id, objects):
+                        controller.updateInterfaceWithMessages(jlong(int(dialog_id)), objects, 0)
+                except Exception as e:
+                    self.log(f"Incoming preview refresh error: {e}")
+            run_on_ui_thread(refresh)
+        except Exception as e:
+            self.log(f"Incoming preview apply error: {e}")
+
+    def _notify_replace(self, controller: Any, dialog_id: int, objects: Any) -> bool:
+        try:
+            post = getattr(controller.getNotificationCenter(), "lambda$postNotificationNameOnUIThread$1")
+            post(NotificationCenter.replaceMessagesObjects, jlong(int(dialog_id)), objects)
+            return True
+        except Exception:
+            return False
+
+    def _prepare_webpage(self, webpage: Any, preview_text: str, display_url: str = ""):
+        if webpage is None:
+            return
+        preview_text = str(preview_text or "")
+        display_url = str(display_url or "")
+        try:
+            webpage.displayedText = preview_text
+        except Exception:
+            pass
+        try:
+            if display_url and not getattr(webpage, "display_url", None):
+                webpage.display_url = display_url
+            elif not getattr(webpage, "display_url", None):
+                webpage.display_url = preview_text
+        except Exception:
+            pass
+        try:
+            if display_url and not getattr(webpage, "url", None):
+                webpage.url = display_url
+        except Exception:
+            pass
+
+    def _dialog_id(self, account: int, message: Any) -> int:
+        try:
+            return int(MessageObject.getDialogId(message))
+        except Exception:
+            pass
+        try:
+            return int(MessageObject(account, message, False, True).getDialogId())
+        except Exception:
+            return int(getattr(message, "dialog_id", 0) or 0)
+
+    def _current_time(self, account: int) -> int:
+        try:
+            return int(ConnectionsManager.getInstance(account).getCurrentTime())
+        except Exception:
+            return int(time.time())
+
+    def _can_replace_media(self, message: Any) -> bool:
+        if not self.get_setting("incoming_skip_real_media", True):
+            return True
+        media = getattr(message, "media", None)
+        return media is None or self._is_tl(media, "TL_messageMediaEmpty") or self._is_media_webpage(media)
+
+    def _sync_entities_flag(self, obj: Any):
+        try:
+            flags = _safe_int(getattr(obj, "flags", 0))
+            if self._java_list_size(getattr(obj, "entities", None)) > 0:
+                flags |= TT_MSG_FLAG_ENTITIES
+            else:
+                flags &= ~TT_MSG_FLAG_ENTITIES
+            obj.flags = flags
+        except Exception:
+            pass
+
+    def _adjust_entities(self, entities: Any, replacements: List[Tuple[int, int, int]]):
+        if not entities:
+            return
+        for entity in self._iter_java_list(entities):
+            try:
+                old_offset = int(entity.offset)
+                old_length = int(entity.length)
+                old_end = old_offset + old_length
+                new_offset = self._map_position(old_offset, replacements, stick_to_end=False)
+                new_end = self._map_position(old_end, replacements, stick_to_end=True)
+                entity.offset = max(0, new_offset)
+                entity.length = max(0, new_end - new_offset)
+            except Exception:
+                continue
+
+    def _iter_java_list(self, items: Any) -> List[Any]:
+        if items is None:
+            return []
+        try:
+            return [items.get(i) for i in range(int(items.size()))]
+        except Exception:
+            pass
+        try:
+            return list(items)
+        except Exception:
+            return []
+
+    def _java_list_size(self, items: Any) -> int:
+        if items is None:
+            return 0
+        try:
+            return int(items.size())
+        except Exception:
+            pass
+        try:
+            return len(items)
+        except Exception:
+            return 0
+
+    def _map_position(self, pos: int, replacements: List[Tuple[int, int, int]], stick_to_end: bool) -> int:
+        mapped = int(pos)
+        for start, end, new_len in replacements:
+            old_len = end - start
+            delta = new_len - old_len
+            if pos > end or (stick_to_end and pos == end):
+                mapped += delta
+            elif start < pos < end:
+                mapped += min(pos - start, new_len) - (pos - start)
+        return mapped
+
+    def _is_media_webpage(self, obj: Any) -> bool:
+        return self._is_tl(obj, "TL_messageMediaWebPage")
+
+    def _is_webpage_pending(self, obj: Any) -> bool:
+        return self._is_tl(obj, "TL_webPagePending") or self._is_tl(obj, "TL_webPageUrlPending")
+
+    def _is_webpage_empty(self, obj: Any) -> bool:
+        return self._is_tl(obj, "TL_webPageEmpty")
+
+    def _is_tl(self, obj: Any, suffix: str) -> bool:
+        return obj is not None and self._class_name(obj).endswith(suffix)
+
+    def _class_name(self, obj: Any) -> str:
+        if obj is None:
+            return ""
+        try:
+            return str(obj.getClass().getSimpleName())
+        except Exception:
+            pass
+        try:
+            return str(obj.getClass().getName()).split("$")[-1].split(".")[-1]
+        except Exception:
+            pass
+        return obj.__class__.__name__
+    def on_send_message_hook(self, account: int, params: Optional[Any] = None) -> HookResult:
+        if not params or not hasattr(params, 'message'):
+            return HookResult()
+
+        if not isinstance(params.message, str):
+            return HookResult()
+
+        msg = params.message
+        matches = list(self.TIKTOK_PATTERN.finditer(msg))
+
+        if not matches:
+            return HookResult()
+
+        try:
+            valid_matches = []
+            urls = []
+            for m in matches:
+                subdomain = m.group(1) or ''
+                domain = m.group(2).lower()
+                raw_path = m.group(3) or ''
+                
+                if raw_path.startswith('/@') and '/video/' not in raw_path:
+                    continue
+                    
+                valid_matches.append(m)
+                if domain != 'tiktok':
+                    urls.append(m.group(0))
+                else:
+                    urls.append(self._build_url(subdomain, raw_path))
+
+            if not valid_matches:
+                return HookResult()
+
+            clean = self._clean_message(msg, valid_matches)
+
+            for _ in urls:
+                clean += self.SOFT_HYPHEN
+
+            if params.entities is None:
+                params.entities = ArrayList()
+
+            msg_len = self._utf16_len(clean)
+            base = msg_len - len(urls)
+
+            for i, url in enumerate(urls):
+                ent = TLRPC.TL_messageEntityTextUrl()
+                ent.offset = base + i
+                ent.length = 1
+                ent.url = url
+                params.entities.add(ent)
+
+            params.message = clean
+
+            self._stats += len(urls)
+            self.set_setting("stats", self._stats)
+
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        except Exception as e:
+            self.log(f"Ошибка: {e}\n{traceback.format_exc()}")
+            return HookResult()
+
+    def create_settings(self):
+        items = [h['desc'] for h in self.PROXY_HOSTS]
+
+        return [
+            Header(text="Invisible TikTok"),
+            Text(text=f"Скинуто хуйни: {self.get_setting('stats', 0)}", icon="msg_stats"),
+            Divider(text=""),
+            Selector(
+                key="host",
+                text="Прокси-сервер",
+                default=0,
+                items=items,
+                icon="msg_link2"
+            ),
+            Divider(text=""),
+            Header(text="Входящие превью"),
+            Switch(key="incoming_preview_enabled", text="Менять входящие TikTok", default=True, icon="msg_link2"),
+            Switch(key="incoming_render_preview", text="Рендерить web preview", default=True, icon="msg_viewchats"),
+            Switch(key="incoming_skip_real_media", text="Не трогать медиа-подписи", default=True, icon="msg_photo"),
+        ]
+
+
+
