@@ -1,0 +1,579 @@
+import base64
+import traceback
+import threading
+import time
+import math
+from base_plugin import BasePlugin, MethodHook
+from java.nio import ByteBuffer, ByteOrder
+from dalvik.system import InMemoryDexClassLoader
+from org.telegram.messenger import ApplicationLoader
+from client_utils import get_last_fragment, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from ui.settings import Text, Header, Divider, EditText, Switch, Input
+from java import jint, jfloat, jarray
+
+__id__ = "iphone_like_Portret"
+__name__ = "iPhone Like Portret"
+__description__ = "Портретный режим аля Айфон на основе MLkit модели. Требуются сервисы Google. РАЗМЫТИЕ ВИДНО ТОЛЬКО ПОСЛЕ ОТПРАВКИ КРУЖКА!!!"
+__author__ = "@dekma0091"
+__version__ = "1.1"
+__icon__ = "pixelcamera/8"
+__min_version__ = "12.5.1"
+
+
+
+def get_java_class(cls):
+    if cls is None: return None
+    try:
+        if hasattr(cls, "getDeclaredMethod"): return cls
+        elif hasattr(cls, "getClass"): return cls.getClass()
+    except: pass
+    return cls
+
+def _find_texture_view(view):
+    if not view: return None
+    try:
+        cls_name = str(view.getClass().getName())
+        if "TextureView" in cls_name or "PreviewView" in cls_name or "SurfaceView" in cls_name:
+            return view
+        if hasattr(view, "getChildCount"):
+            count = int(view.getChildCount())
+            for i in range(count):
+                res = _find_texture_view(view.getChildAt(i))
+                if res: return res
+    except: pass
+    return None
+
+GL_BLEND = 0x0BE2
+GL_SRC_ALPHA = 0x0302
+GL_ONE_MINUS_SRC_ALPHA = 0x0303
+GL_FLOAT = 0x1406
+GL_TRIANGLE_STRIP = 0x0005
+GL_VERTEX_SHADER = 0x8B31
+GL_FRAGMENT_SHADER = 0x8B30
+
+_VERT_SRC = (
+    "attribute vec4 aPosition;\n"
+    "varying vec2 vPos;\n"
+    "void main(){\n"
+    "    gl_Position = aPosition;\n"
+    "    vPos = aPosition.xy;\n"
+    "}\n"
+)
+
+_FRAG_SRC = (
+    "precision mediump float;\n"
+    "varying vec2 vPos;\n"
+    "uniform float uFaceX;\n"
+    "uniform float uFaceY;\n"
+    "uniform float uFaceRadius;\n"
+    "uniform float uBlurIntensity;\n"
+    "uniform float uDebugGrid;\n"
+    "uniform float uMaskStart;\n"
+    "uniform float uMaskEnd;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform vec2 uTexSize;\n"
+    "uniform vec2 uOffsets[16];\n"
+    "void main(){\n"
+    "    vec2 uv = vPos * 0.5 + 0.5;\n"
+    "    vec2 center = vec2(uFaceX, 1.0 - uFaceY);\n"
+    "    float aspect = uTexSize.x / uTexSize.y;\n"
+    "    vec2 diff = uv - center;\n"
+    "    diff.x *= aspect;\n"
+    "    diff.y *= 0.75;\n"
+    "    float dist = length(diff);\n"
+    "    vec4 clearColor = texture2D(uTex, uv);\n"
+    "    float mask = smoothstep(uFaceRadius * uMaskStart, uFaceRadius * uMaskEnd, dist);\n"
+    "    vec4 sum = vec4(0.0);\n"
+    "    float totalW = 0.0;\n"
+    "    vec2 step = (uBlurIntensity / uTexSize) * mask;\n"
+    "    for (int i = 0; i < 16; i++) {\n"
+    "        vec4 tap = texture2D(uTex, uv + uOffsets[i] * step);\n"
+    "        float w = 1.0 + dot(tap.rgb, tap.rgb) * 3.0;\n"
+    "        sum += tap * w;\n"
+    "        totalW += w;\n"
+    "    }\n"
+    "    sum /= totalW;\n"
+    "    vec3 finalColor = mix(clearColor.rgb, sum.rgb, mask);\n"
+    "    if (uDebugGrid > 0.5) {\n"
+    "        if (abs(uv.x - 0.5) < 0.002 || abs(uv.y - 0.5) < 0.002) finalColor = vec3(0.0, 1.0, 0.0);\n"
+    "        if (dist < 0.015) finalColor = vec3(1.0, 0.0, 0.0);\n"
+    "        if (abs(dist - uFaceRadius) < 0.003) finalColor = vec3(1.0, 1.0, 0.0);\n"
+    "    }\n"
+    "    gl_FragColor = vec4(finalColor, 1.0);\n"
+    "}\n"
+)
+
+class GlRes:
+    def __init__(self):
+        self.program = 0
+        self.u_face_x = -1
+        self.u_face_y = -1
+        self.u_face_r = -1
+        self.u_blur_intensity = -1
+        self.u_mask_start = -1
+        self.u_mask_end = -1
+        self.u_tex = -1
+        self.u_tex_size = -1
+        self.u_offsets = -1
+        self.a_pos = -1
+        self.tex_id = -1
+        self.offsets_arr = None
+        verts = [-1.0, -1.0, 0.0,  1.0, -1.0, 0.0,  -1.0, 1.0, 0.0,  1.0, 1.0, 0.0]
+        bb = ByteBuffer.allocateDirect(len(verts) * 4)
+        bb.order(ByteOrder.nativeOrder())
+        self.vbo = bb.asFloatBuffer()
+        self.vbo.put(verts)
+        self.vbo.position(0)
+        self.initialized = False
+
+class _RenderHook(MethodHook):
+    __slots__ = ("plugin",)
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+    def before_hooked_method(self, param):
+        if not getattr(self.plugin, '_is_running_method', None): return
+        is_front = True
+        if self.plugin._is_front_camera_field and self.plugin.current_icv:
+            try: is_front = bool(self.plugin._is_front_camera_field.getBoolean(self.plugin.current_icv))
+            except: pass
+        if not is_front and not getattr(self.plugin, 'cfg_blur_rear', False): return
+        try:
+            if not bool(self.plugin._is_running_method.invoke(None, [])): return
+            GLES20 = self.plugin._gles_class
+            if GLES20 is None: return
+            gl = self.plugin.gl_res
+            if not gl.initialized:
+                vs = GLES20.glCreateShader(GL_VERTEX_SHADER)
+                GLES20.glShaderSource(vs, _VERT_SRC)
+                GLES20.glCompileShader(vs)
+                fs = GLES20.glCreateShader(GL_FRAGMENT_SHADER)
+                GLES20.glShaderSource(fs, _FRAG_SRC)
+                GLES20.glCompileShader(fs)
+                prog = GLES20.glCreateProgram()
+                GLES20.glAttachShader(prog, vs)
+                GLES20.glAttachShader(prog, fs)
+                GLES20.glLinkProgram(prog)
+                gl.program = int(prog)
+                gl.u_face_x = int(GLES20.glGetUniformLocation(prog, "uFaceX"))
+                gl.u_face_y = int(GLES20.glGetUniformLocation(prog, "uFaceY"))
+                gl.u_face_r = int(GLES20.glGetUniformLocation(prog, "uFaceRadius"))
+                gl.u_blur_intensity = int(GLES20.glGetUniformLocation(prog, "uBlurIntensity"))
+                gl.u_debug_grid = int(GLES20.glGetUniformLocation(prog, "uDebugGrid"))
+                gl.u_mask_start = int(GLES20.glGetUniformLocation(prog, "uMaskStart"))
+                gl.u_mask_end = int(GLES20.glGetUniformLocation(prog, "uMaskEnd"))
+                gl.u_tex = int(GLES20.glGetUniformLocation(prog, "uTex"))
+                gl.u_tex_size = int(GLES20.glGetUniformLocation(prog, "uTexSize"))
+                gl.u_offsets = int(GLES20.glGetUniformLocation(prog, "uOffsets"))
+                gl.a_pos = int(GLES20.glGetAttribLocation(prog, "aPosition"))
+                
+                offsets = []
+                for i in range(16):
+                    angle = i * 2.399963
+                    r = math.sqrt(i + 0.5) / 4.0
+                    offsets.extend([math.cos(angle) * r, math.sin(angle) * r])
+                gl.offsets_arr = jarray(jfloat)(offsets)
+
+                textures = jarray(jint)(1)
+                GLES20.glGenTextures(1, textures, 0)
+                gl.tex_id = textures[0]
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, gl.tex_id)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, 0x812F)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, 0x812F)
+                gl.initialized = True
+
+            face_x = self.plugin.cur_x
+            face_y = self.plugin.cur_y
+            face_r = self.plugin.cur_r
+            
+            viewport = jarray(jint)(4)
+            GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0)
+            vx, vy = viewport[0], viewport[1]
+            w, h = viewport[2], viewport[3]
+            
+            if w > 0 and h > 0:
+                if not hasattr(self.plugin, 'gl_fc'): self.plugin.gl_fc = 0
+                self.plugin.gl_fc += 1
+                if self.plugin.gl_fc % 6 == 0 and self.plugin._process_bitmap_method:
+                    try:
+                        cap = w * h * 4
+                        if not hasattr(self.plugin, 'gl_buf') or self.plugin.gl_buf.capacity() < cap:
+                            from java.nio import ByteBuffer, ByteOrder
+                            self.plugin.gl_buf = ByteBuffer.allocateDirect(cap)
+                            self.plugin.gl_buf.order(ByteOrder.nativeOrder())
+                        self.plugin.gl_buf.position(0)
+                        GLES20.glReadPixels(vx, vy, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, self.plugin.gl_buf)
+                        self.plugin.gl_buf.position(0)
+                        
+                        BitmapClass = find_class("android.graphics.Bitmap")
+                        BitmapConfig = find_class("android.graphics.Bitmap$Config")
+                        MatrixClass = find_class("android.graphics.Matrix")
+                        
+                        bmp = BitmapClass.createBitmap(w, h, BitmapConfig.ARGB_8888)
+                        bmp.copyPixelsFromBuffer(self.plugin.gl_buf)
+                        
+                        sbmp = BitmapClass.createScaledBitmap(bmp, 320, 320, True)
+                        bmp.recycle()
+                        
+                        matrix = MatrixClass()
+                        matrix.preScale(1.0, -1.0)
+                        final_bmp = BitmapClass.createBitmap(sbmp, 0, 0, 320, 320, matrix, False)
+                        sbmp.recycle()
+                        
+                        self.plugin._process_bitmap_method.invoke(None, [final_bmp])
+                    except: pass
+                    
+                if face_r <= 0.01:
+                    return
+
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, gl.tex_id)
+                GLES20.glCopyTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGB, vx, vy, w, h, 0)
+
+            GLES20.glEnable(GL_BLEND)
+            GLES20.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            GLES20.glUseProgram(gl.program)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, gl.tex_id)
+            GLES20.glUniform1i(gl.u_tex, 0)
+            GLES20.glUniform2f(gl.u_tex_size, float(w), float(h))
+            GLES20.glUniform1f(gl.u_face_x, float(face_x))
+            GLES20.glUniform1f(gl.u_face_y, float(face_y))
+            GLES20.glUniform1f(gl.u_face_r, float(face_r))
+            GLES20.glUniform1f(gl.u_blur_intensity, float(self.plugin.cfg_blur_intensity))
+            GLES20.glUniform1f(gl.u_debug_grid, 1.0 if getattr(self.plugin, 'cfg_debug_grid', False) else 0.0)
+            GLES20.glUniform1f(gl.u_mask_start, float(self.plugin.cfg_mask_start))
+            GLES20.glUniform1f(gl.u_mask_end, float(self.plugin.cfg_mask_end))
+            if gl.offsets_arr is not None: GLES20.glUniform2fv(gl.u_offsets, 16, gl.offsets_arr, 0)
+            
+            gl.vbo.position(0)
+            GLES20.glVertexAttribPointer(gl.a_pos, 3, GL_FLOAT, False, 12, gl.vbo)
+            GLES20.glEnableVertexAttribArray(gl.a_pos)
+            GLES20.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glDisableVertexAttribArray(gl.a_pos)
+            GLES20.glUseProgram(0)
+            GLES20.glDisable(GL_BLEND)
+        except: pass
+        finally: del param
+    def after_hooked_method(self, param): pass
+
+class PollerThread(threading.Thread):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self.active = True
+        self.daemon = True
+
+    def run(self):
+        while self.active:
+            try:
+                icv = self.plugin.current_icv
+                if not icv or int(icv.getVisibility()) != 0:
+                    self.plugin.target_r = 0.0
+                    if getattr(self.plugin, '_cam_is_visible', False):
+                        self.plugin._cam_is_visible = False
+                        self.plugin.gl_res.initialized = False
+                        self.plugin.cached_tv = None
+                    time.sleep(0.2)
+                    continue
+
+                is_front = True
+                if self.plugin._is_front_camera_field and icv:
+                    try: is_front = bool(self.plugin._is_front_camera_field.getBoolean(icv))
+                    except: pass
+                if not is_front and not getattr(self.plugin, 'cfg_blur_rear', False):
+                    self.plugin.target_r = 0.0
+                    self.plugin.cur_r = 0.0
+                    time.sleep(0.2)
+                    continue
+
+                self.plugin._cam_is_visible = True
+                tv = getattr(self.plugin, 'cached_tv', None)
+                if not tv:
+                    tv = get_private_field(icv, "textureView") or _find_texture_view(icv)
+                    if tv: self.plugin.cached_tv = tv
+
+                try:
+                    raw_x = float(self.plugin._get_face_x_method.invoke(None, []))
+                    raw_y = float(self.plugin._get_face_y_method.invoke(None, []))
+                    raw_r = float(self.plugin._get_face_r_method.invoke(None, []))
+
+                    if getattr(self.plugin, 'cfg_disable_center_shift', False):
+                        raw_x -= raw_r
+                        raw_y -= raw_r
+
+                    if raw_r > 0.01:
+                        self.plugin.target_x = raw_x
+                        self.plugin.target_y = raw_y
+                        self.plugin.target_r = raw_r
+                    else:
+                        self.plugin.target_r = 0.0
+                except: pass
+            except: pass
+            try:
+                poll = 2.0 if getattr(self.plugin, 'cfg_low_latency', False) else self.plugin.cfg_poll_ms
+                time.sleep(max(5.0, poll) / 1000.0)
+            except: time.sleep(0.04)
+
+class AnimatorThread(threading.Thread):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self.active = True
+        self.daemon = True
+        self.last_time = time.time()
+
+    def run(self):
+        while self.active:
+            try:
+                now = time.time()
+                dt = min(now - self.last_time, 0.1)
+                self.last_time = now
+
+                icv = self.plugin.current_icv
+                if not icv or not getattr(self.plugin, '_cam_is_visible', False):
+                    time.sleep(0.1)
+                    continue
+
+                tx = self.plugin.target_x
+                ty = self.plugin.target_y
+                tr = self.plugin.target_r
+
+                if tr > 0.01:
+                    if self.plugin.cfg_swap: tx, ty = ty, tx
+                    if self.plugin.cfg_mx: tx = 1.0 - tx
+                    if self.plugin.cfg_my: ty = 1.0 - ty
+
+                    tx += self.plugin.cfg_ox
+                    ty += self.plugin.cfg_oy
+                    tr *= self.plugin.cfg_scale
+
+                fps_ratio = dt / 0.0333
+                speed = max(0.01, min(1.0, self.plugin.cfg_lerp * fps_ratio))
+                
+                self.plugin.vel_x += ((tx - self.plugin.cur_x) * speed - self.plugin.vel_x) * speed
+                self.plugin.cur_x += self.plugin.vel_x
+                
+                self.plugin.vel_y += ((ty - self.plugin.cur_y) * speed - self.plugin.vel_y) * speed
+                self.plugin.cur_y += self.plugin.vel_y
+                
+                self.plugin.vel_r += ((tr - self.plugin.cur_r) * speed - self.plugin.vel_r) * speed
+                self.plugin.cur_r += self.plugin.vel_r
+
+            except: pass
+            try: time.sleep(max(5.0, self.plugin.cfg_anim_ms) / 1000.0)
+            except: time.sleep(0.033)
+
+class _ICVGrabberHook(MethodHook):
+    __slots__ = ("plugin", "method_name")
+    def __init__(self, plugin, method_name):
+        super().__init__()
+        self.plugin = plugin
+        self.method_name = method_name
+    def before_hooked_method(self, param): pass
+    def after_hooked_method(self, param):
+        try:
+            icv = param.thisObject
+            if icv and self.plugin.current_icv != icv:
+                self.plugin.gl_res.initialized = False
+                self.plugin.current_icv = icv
+                self.plugin._start_polling()
+        except: pass
+
+class VisionCorePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._java_detector_class = None
+        self._poller = None
+        self._animator = None
+        self.current_icv = None
+        self.cached_tv = None
+        self._is_front_camera_field = None
+        self._load_error = None
+        self._gles_class = None
+        self.gl_res = GlRes()
+        
+        self.target_x, self.target_y, self.target_r = 0.5, 0.5, 0.0
+        self.cur_x, self.cur_y, self.cur_r = 0.5, 0.5, 0.0
+        self.vel_x, self.vel_y, self.vel_r = 0.0, 0.0, 0.0
+        self._cam_is_visible = False
+        
+        self.cfg_blur_rear = False
+        self.cfg_swap = False
+        self.cfg_mx = False
+        self.cfg_my = False
+        self.cfg_ox = 0.0
+        self.cfg_oy = 0.0
+        self.cfg_scale = 0.8
+        self.cfg_blur_intensity = 11.0
+        self.cfg_mask_start = 0.25
+        self.cfg_mask_end = 2.5
+        self.cfg_poll_ms = 25.0
+        self.cfg_anim_ms = 20.0
+        self.cfg_lerp = 0.40
+        self.cfg_low_latency = False
+
+    def safe_f(self, key, def_val):
+        try:
+            val = self.get_setting(key, str(def_val))
+            if val is None: return float(def_val)
+            s = str(val).strip().replace(',', '.')
+            if s in ('', '-', '.', '-.', '-0', '+'): return float(def_val)
+            return float(s)
+        except:
+            return float(def_val)
+
+    def safe_b(self, key, def_val):
+        val = self.get_setting(key, def_val)
+        if isinstance(val, str): return val.lower() == "true"
+        return bool(val)
+
+    def _update_cache(self):
+        self.cfg_blur_rear = self.safe_b("blur_rear_camera", False)
+        self.cfg_disable_center_shift = self.safe_b("disable_center_shift", True)
+        self.cfg_debug_grid = self.safe_b("debug_grid", False)
+        self.cfg_swap = self.safe_b("swap_xy_v15_1", False)
+        self.cfg_mx = self.safe_b("flip_x_v15_1", False)
+        self.cfg_my = self.safe_b("flip_y_v15_1", False)
+        self.cfg_low_latency = self.safe_b("low_latency", False)
+        
+        self.cfg_ox = self.safe_f("offset_x", 0.0)
+        self.cfg_oy = self.safe_f("offset_y", 0.0)
+        self.cfg_scale = self.safe_f("radius_scale", 0.8)
+        self.cfg_blur_intensity = self.safe_f("blur_intensity", 11.0)
+        self.cfg_mask_start = self.safe_f("mask_start", 0.25)
+        self.cfg_mask_end = self.safe_f("mask_end", 2.5)
+        self.cfg_poll_ms = self.safe_f("poll_rate_ms", 25.0)
+        self.cfg_anim_ms = self.safe_f("anim_rate_ms", 20.0)
+        self.cfg_lerp = self.safe_f("lerp_speed", 0.40)
+
+    def _on_cfg(self, key, val):
+        self.set_setting(key, val)
+        self._update_cache()
+
+    def _start_polling(self):
+        if not (self._poller and self._poller.active):
+            self._poller = PollerThread(self)
+            self._poller.start()
+        if not (self._animator and self._animator.active):
+            self._animator = AnimatorThread(self)
+            self._animator.start()
+
+    def _stop_polling(self):
+        if self._poller:
+            self._poller.active = False
+            self._poller = None
+        if self._animator:
+            self._animator.active = False
+            self._animator = None
+
+    def _find_ui_class(self, name):
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            loader = ApplicationLoader.applicationContext.getClassLoader()
+            for sub in ("Components", "Stories.recorder"):
+                try:
+                    c = loader.loadClass(f"org.telegram.ui.{sub}.{name}")
+                    if c: return c
+                except: pass
+        except: pass
+        return None
+
+    def on_plugin_load(self) -> None:
+        self._update_cache()
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            Context = find_class("android.content.Context")
+            
+            if not _DEX_BASE64:
+                self.log("DEX string is empty! Build script failed to inject.")
+                self._load_error = "DEX is empty"
+                return
+                
+            dex_bytes = base64.b64decode(_DEX_BASE64)
+            buffer = ByteBuffer.wrap(dex_bytes)
+            dex_loader = InMemoryDexClassLoader(buffer, ApplicationLoader.applicationContext.getClassLoader())
+            self._java_detector_class = dex_loader.loadClass("ni.dekma.MLKitDekma.MLKitDekma")
+
+            if not self._java_detector_class:
+                self.log("Java class MLKitDekma not found.")
+                return
+
+            BitmapClass = find_class("android.graphics.Bitmap")
+            self._gles_class = find_class("android.opengl.GLES20")
+            
+            self._process_bitmap_method = self._java_detector_class.getMethod("processBitmap", [BitmapClass])
+            self._is_running_method = self._java_detector_class.getMethod("isRunning", [])
+            self._get_frames_method = self._java_detector_class.getMethod("getFramesProcessed", [])
+            self._release_method = self._java_detector_class.getMethod("release", [])
+            self._get_face_x_method = self._java_detector_class.getMethod("getFaceX", [])
+            self._get_face_y_method = self._java_detector_class.getMethod("getFaceY", [])
+            self._get_face_r_method = self._java_detector_class.getMethod("getFaceRadius", [])
+            
+            init_method = self._java_detector_class.getMethod("init", [Context])
+            init_method.invoke(None, [ApplicationLoader.applicationContext])
+            
+            ICV = self._find_ui_class("InstantCameraView")
+            if ICV:
+                ICV_java = get_java_class(ICV)
+                self._is_front_camera_field = None
+                for f in ICV_java.getDeclaredFields():
+                    fname = str(f.getName()).lower()
+                    if "boolean" in str(f.getType()) and ("isfrontcamera" in fname or "frontcamera" in fname or "isfront" in fname):
+                        f.setAccessible(True)
+                        self._is_front_camera_field = f
+                        break
+                for m in ICV_java.getDeclaredMethods():
+                    if str(m.getName()) in ["onMeasure", "onLayout", "dispatchDraw"]:
+                        self.hook_method(m, _ICVGrabberHook(self, str(m.getName())))
+
+            OVH = self._find_ui_class("InstantCameraVideoEncoderOverlayHelper")
+            if OVH:
+                OVH_java = get_java_class(OVH)
+                for m in OVH_java.getDeclaredMethods():
+                    if str(m.getName()) == "render":
+                        self.hook_method(m, _RenderHook(self))
+        except Exception as e:
+            self._load_error = str(e)
+            self.log(traceback.format_exc())
+
+    def on_plugin_unload(self) -> None:
+        self.gl_res.initialized = False
+        self._stop_polling()
+        self.current_icv = None
+        try: self._release_method.invoke(None, [])
+        except: pass
+
+    def create_settings(self) -> list:
+        if self._load_error: return [Text(text=f"Error: {self._load_error}")]
+        return [
+            Header(text="Калибровка Боке"),
+            Switch(key="disable_center_shift", text="Исправление координат", default=True, on_change=lambda v: self._on_cfg("disable_center_shift", v), icon="msg_retry"),
+            Divider(text="Включите, если маска съезжает. Компенсирует нестандартное поведение ML Kit."),
+            Switch(key="debug_grid", text="Отладочная сетка", default=False, on_change=lambda v: self._on_cfg("debug_grid", v), icon="msg_info"),
+            Divider(text="Выводит на экран матрицу и маркер слежения. Использовать только для диагностики. Ну или ради ХИХИХАХА"),
+            
+            Header(text="Оси и геометрия"),
+            Switch(key="swap_xy_v15_1", text="Поменять X и Y (Поворот 90°)", default=False, on_change=lambda v: self._on_cfg("swap_xy_v15_1", v), icon="msg_retry"),
+            Switch(key="flip_x_v15_1", text="Зеркалить по X (Горизонталь)", default=False, on_change=lambda v: self._on_cfg("flip_x_v15_1", v), icon="msg_retry"),
+            Switch(key="flip_y_v15_1", text="Зеркалить по Y (Вертикаль)", default=False, on_change=lambda v: self._on_cfg("flip_y_v15_1", v), icon="msg_retry"),
+            Input(key="offset_x", text="Смещение X", default="0.0", on_change=lambda v: self._on_cfg("offset_x", v), icon="msg_settings"),
+            Input(key="offset_y", text="Смещение Y", default="0.0", on_change=lambda v: self._on_cfg("offset_y", v), icon="msg_settings"),
+            
+            Header(text="Рендеринг и камера"),
+            Switch(key="blur_rear_camera", text="Размывать на основной камере", default=False, on_change=lambda v: self._on_cfg("blur_rear_camera", v), icon="msg_video"),
+            Input(key="radius_scale", text="Масштаб боке", default="0.8", on_change=lambda v: self._on_cfg("radius_scale", v), icon="msg_customize"),
+            Input(key="blur_intensity", text="Сила размытия", default="11.0", on_change=lambda v: self._on_cfg("blur_intensity", v), icon="msg_photo"),
+            Input(key="mask_start", text="Начало размытия (0.0-1.0+)", default="0.25", on_change=lambda v: self._on_cfg("mask_start", v), icon="msg_customize"),
+            Input(key="mask_end", text="Конец размытия (1.0-5.0+)", default="2.5", on_change=lambda v: self._on_cfg("mask_end", v), icon="msg_customize"),
+            
+            Header(text="Производительность"),
+            Switch(key="low_latency", text="Режим низкой задержки (Low Latency)", default=False, on_change=lambda v: self._on_cfg("low_latency", v), icon="msg_retry"),
+            Divider(text="Форсирует частоту опроса ML Kit. Повышает нагрузку, но маска следует за лицом моментально. Выключать при сильном нагреве или лагах."),
+            Input(key="poll_rate_ms", text="Задержка ML API (мс)", default="25", on_change=lambda v: self._on_cfg("poll_rate_ms", v), icon="msg_stats"),
+            Input(key="anim_rate_ms", text="Задержка отрисовки (мс)", default="20", on_change=lambda v: self._on_cfg("anim_rate_ms", v), icon="msg_stats"),
+            Input(key="lerp_speed", text="Резкость следования", default="0.40", on_change=lambda v: self._on_cfg("lerp_speed", v), icon="msg_info")
+        ]
+_DEX_BASE64 = "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AANMTEwAAkxaABlMYW5kcm9pZC9jb250ZW50L0NvbnRleHQ7ABlMYW5kcm9pZC9ncmFwaGljcy9CaXRtYXA7ABlMYW5kcm9pZC9ncmFwaGljcy9Qb2ludEY7ABpMYW5kcm9pZC91dGlsL1NwYXJzZUFycmF5OwAjTGRhbHZpay9hbm5vdGF0aW9uL0VuY2xvc2luZ01ldGhvZDsAHkxkYWx2aWsvYW5ub3RhdGlvbi9Jbm5lckNsYXNzOwAdTGRhbHZpay9hbm5vdGF0aW9uL1NpZ25hdHVyZTsAE0xqYXZhL2xhbmcvQm9vbGVhbjsAEUxqYXZhL2xhbmcvQ2xhc3M7ABFMamF2YS9sYW5nL0NsYXNzPAAVTGphdmEvbGFuZy9FeGNlcHRpb247ABFMamF2YS9sYW5nL0Zsb2F0OwATTGphdmEvbGFuZy9JbnRlZ2VyOwAgTGphdmEvbGFuZy9JbnRlcnJ1cHRlZEV4Y2VwdGlvbjsAEExqYXZhL2xhbmcvTWF0aDsAEkxqYXZhL2xhbmcvT2JqZWN0OwAUTGphdmEvbGFuZy9SdW5uYWJsZTsAEkxqYXZhL2xhbmcvU3RyaW5nOwAZTGphdmEvbGFuZy9TdHJpbmdCdWlsZGVyOwASTGphdmEvbGFuZy9TeXN0ZW07ABJMamF2YS9sYW5nL1RocmVhZDsAFUxqYXZhL2xhbmcvVGhyb3dhYmxlOwAfTGphdmEvbGFuZy9yZWZsZWN0L0NvbnN0cnVjdG9yOwAfTGphdmEvbGFuZy9yZWZsZWN0L0NvbnN0cnVjdG9yPAAZTGphdmEvbGFuZy9yZWZsZWN0L0ZpZWxkOwAaTGphdmEvbGFuZy9yZWZsZWN0L01ldGhvZDsAIkxuaS9kZWttYS9NTEtpdERla21hL01MS2l0RGVrbWEkMTsAIExuaS9kZWttYS9NTEtpdERla21hL01MS2l0RGVrbWE7AA9NTEtpdERla21hLmphdmEAD1Byb2Nlc3MgZXJyb3I6IAAdU21hcnQgUmVmbGVjdGlvbiBBUEkgc3RhcnRlZAoABFRZUEUAAVYAAlZMAAJWWgABWgACWkwAAlpaABJbTGphdmEvbGFuZy9DbGFzczsAE1tMamF2YS9sYW5nL09iamVjdDsAGltMamF2YS9sYW5nL3JlZmxlY3QvRmllbGQ7ABtbTGphdmEvbGFuZy9yZWZsZWN0L01ldGhvZDsACmFjY2VzcyQwMDAACmFjY2VzcyQxMDAAC2FjY2VzcyQxMDAwAAthY2Nlc3MkMTEwMAALYWNjZXNzJDExMDIAC2FjY2VzcyQxMjAwAAthY2Nlc3MkMTIwMgALYWNjZXNzJDEzMDAAC2FjY2VzcyQxMzAyAAthY2Nlc3MkMTQwMAALYWNjZXNzJDE0MDIAC2FjY2VzcyQxNTAwAAthY2Nlc3MkMTUwMgALYWNjZXNzJDE2MDAAC2FjY2VzcyQxNjAyAAthY2Nlc3MkMTcwMAALYWNjZXNzJDE3MDIAC2FjY2VzcyQxODAwAAthY2Nlc3MkMTgwMgALYWNjZXNzJDE5MDIACmFjY2VzcyQyMDAAC2FjY2VzcyQyMDAyAAphY2Nlc3MkMjAyAAthY2Nlc3MkMjEwMgALYWNjZXNzJDIyMDgACmFjY2VzcyQzMDAACmFjY2VzcyQ0MDAACmFjY2VzcyQ1MDAACmFjY2VzcyQ2MDAACmFjY2VzcyQ2MDIACmFjY2VzcyQ3MDAACmFjY2VzcyQ4MDAACmFjY2VzcyQ4MDIACmFjY2VzcyQ5MDAACmFjY2VzcyQ5MDIAC2FjY2Vzc0ZsYWdzAAZhZGRMb2cABmFwcGVuZAAPYmFyY29kZURldGVjdG9yAAxib29sZWFuVmFsdWUABWJ1aWxkACNjb20uZ29vZ2xlLmFuZHJvaWQuZ21zLnZpc2lvbi5GcmFtZQArY29tLmdvb2dsZS5hbmRyb2lkLmdtcy52aXNpb24uRnJhbWUkQnVpbGRlcgA3Y29tLmdvb2dsZS5hbmRyb2lkLmdtcy52aXNpb24uZmFjZS5GYWNlRGV0ZWN0b3IkQnVpbGRlcgARY3VycmVudEZhY2VSYWRpdXMADGN1cnJlbnRGYWNlWAAMY3VycmVudEZhY2VZABFjdXJyZW50VGltZU1pbGxpcwAIZGVidWdMb2cABmRldGVjdAAMZGV0ZWN0TWV0aG9kAAZlcXVhbHMADGZhY2VEZXRlY3RvcgAPZmFjZUhlaWdodEZpZWxkABBmYWNlSGVpZ2h0TWV0aG9kABFmYWNlUG9zaXRpb25GaWVsZAASZmFjZVBvc2l0aW9uTWV0aG9kAA5mYWNlV2lkdGhGaWVsZAAPZmFjZVdpZHRoTWV0aG9kAApmbG9hdFZhbHVlAAdmb3JOYW1lABBmcmFtZUJ1aWxkTWV0aG9kABFmcmFtZUJ1aWxkZXJDbGFzcwAXZnJhbWVCdWlsZGVyQ29uc3RydWN0b3IACmZyYW1lQ2xhc3MAFGZyYW1lU2V0Qml0bWFwTWV0aG9kAA9mcmFtZXNQcm9jZXNzZWQAA2dldAAIZ2V0Q2xhc3MADmdldENvbnN0cnVjdG9yAAtnZXREZWJ1Z0xvZwARZ2V0RGVjbGFyZWRGaWVsZHMAEmdldERlY2xhcmVkTWV0aG9kcwANZ2V0RmFjZVJhZGl1cwAIZ2V0RmFjZVgACGdldEZhY2VZAAhnZXRGbG9hdAASZ2V0RnJhbWVzUHJvY2Vzc2VkAAlnZXRIZWlnaHQADGdldExhc3RFcnJvcgAKZ2V0TWVzc2FnZQAJZ2V0TWV0aG9kAAdnZXROYW1lABFnZXRQYXJhbWV0ZXJUeXBlcwALZ2V0UG9zaXRpb24ADWdldFJldHVyblR5cGUAB2dldFR5cGUACGdldFdpZHRoAARpbml0AAZpbnZva2UADWlzT3BlcmF0aW9uYWwAE2lzT3BlcmF0aW9uYWxNZXRob2QACmlzUmVjeWNsZWQACWlzUnVubmluZwALbGFzdEJhcmNvZGUACWxhc3RFcnJvcgANbGFzdEZyYW1lVGltZQASbGFzdFJlY29nbml6ZWRUZXh0AA9sYXN0U21pbGVSYXRpbmcABmxlbmd0aAAEbG9jawADbWF4AARuYW1lAAtuZXdJbnN0YW5jZQAHbmV4dEJtcAAJbm90aWZ5QWxsAA1wcm9jZXNzQml0bWFwABBwcm9jZXNzaW5nVGhyZWFkAAdyZWN5Y2xlABVyZWZsZWN0aW9uSW5pdGlhbGl6ZWQAB3JlbGVhc2UAA3J1bgANc2V0QWNjZXNzaWJsZQAVc2V0Q2xhc3NpZmljYXRpb25UeXBlAA9zZXRMYW5kbWFya1R5cGUAB3NldE1vZGUAFHNldFByb21pbmVudEZhY2VPbmx5ABJzZXRUcmFja2luZ0VuYWJsZWQABHNpemUABXN0YXJ0ABVzdGFydFByb2Nlc3NpbmdUaHJlYWQACXN1YnN0cmluZwAOdGV4dFJlY29nbml6ZXIACHRvU3RyaW5nAAp1c2VNZXRob2RzAAV2YWx1ZQAHdmFsdWVBdAAHdmFsdWVPZgAEd2FpdAABeAABeQCbAX5+RDh7ImJhY2tlbmQiOiJkZXgiLCJjb21waWxhdGlvbi1tb2RlIjoiZGVidWciLCJoYXMtY2hlY2tzdW1zIjpmYWxzZSwibWluLWFwaSI6MSwic2hhLTEiOiJmYWNlZGY0MWJiZDI4YjU2M2QxZTllMDljNWY3MmQ3YzVjYTU5OGQ1IiwidmVyc2lvbiI6IjguMi4yLWRldiJ9AAIHAbsBGl0CCAJhBACkAR4CCQG7ARwCFx0XAgIJAbsBHAIXKxcCAAABASuAgATUFCwB7BQgADEABQoBSgFKAUoBCQEKAQoBCgEKAQoBCgEKAQoBCgEKAQoBCgEKAUoBCgFKAUoBCgFKAUoBSgEaAQoBCgEKAQoBCi2IgATAKAGBgAT0KQGIIPggAYgggCQBiCDQIwGIIJAhAYggqCEBiCCgJgGIILgmAYgg0CYBiCDoJgGIIIAnAYggmCcBiCDAIQGIINghAYggkCUBiCCoJQGIIMAlAYgg2CUBiCDwJQGIIIgmAYggiCIBiCDIIAGIIKAiAYgg4CABiCC4IgGIIJgjAYgg6CMBiCCwJwGIIMgnAYgg4CQBiCD4JAGIIJgkAYgg4CcBiCD4JwGIIJAoAYggqCgBiYAIjCoBCbAkAQnQIgEJ6CIBCYAjAQm4IwEJyCQBiYAItCsBCfAhAQn0MAGJgAiAMgEKvDMAAAAAAAIAAABeJwAAZScAAAEAAABuJwAAAQAAAHknAADMKAAAAAAAAAAAAAAAAAAAyCgAAAMAAAAAAAAAAAAAABMAAADYKAAAFAAAAOAoAAAVAAAA2CgAABAAAAAAAAAAAQAAAAAAAAABAAAAwgAAAHAAAAACAAAAIwAAAHgDAAADAAAAKgAAAAQEAAAEAAAAJQAAAPwFAAAFAAAAXgAAACQHAAAGAAAAAgAAABQKAAABIAAAMwAAAFQKAAADIAAAEQAAAOwZAAABEAAAEQAAADAbAAACIAAAwgAAALYbAAAEIAAABAAAAF4nAAAAIAAAAgAAAIQnAAADEAAABAAAAMgoAAAGIAAAAgAAAOgoAAAAEAAAAQAAACApAAA="
