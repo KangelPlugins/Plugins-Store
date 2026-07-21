@@ -1,0 +1,1312 @@
+"""
+UtilitiesPro — standalone объединение обхода лимитов и сохранения данных профиля.
+
+Плагин построен на локальных реализациях нужных helper-функций и не требует
+дополнительных библиотек, каналов обновления или внешних сервисов.
+"""
+
+import gzip
+import json
+import logging
+import os
+import zlib
+from datetime import datetime
+
+from android.os import Environment
+from android.view import View
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, MethodHook
+from client_utils import get_last_fragment, get_messages_controller
+from hook_utils import find_class, get_private_field, get_static_private_field, set_private_field
+from java.lang import Boolean, Integer, Long
+from java.util import ArrayList
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+
+__name__ = "UtilitiesPro"
+__description__ = (
+    "Обход лимита пересылки/удаления сообщений и сохранение коротких данных "
+    "профиля собеседника в одном standalone-плагине.\n\n"
+    "Основано на исходной идее плагинов @zwylair, переработано и объединено "
+    "@VibeSPluginS при участии @kvuco без внешних зависимостей."
+)
+__icon__ = "zwyPluginsIcons/6"
+__id__ = "utilities_pro"
+__version__ = "1.1.7"
+__author__ = "@VibeSPluginS, при участии @kvuco"
+__min_version__ = "12.0.1"
+
+logger = logging.getLogger(__name__)
+
+PLUGIN_PREFIX = "UtilitiesPro"
+STORAGE_NAME = "utilities_pro__peer_settings"
+BACKUP_PREFIX = "utilities_pro_backup_"
+OLD_PEER_STORAGE_NAME = "zwyUserInfoSaver__peer_settings_storage"
+PRECIOUS_PEER_FIELDS = ("registration_month", "phone_country", "name_change_date", "photo_change_date")
+
+FIELD_DIALOG_ID = "dialog_id"
+FIELD_SELECTED_MESSAGES_IDS = "selectedMessagesIds"
+FIELD_MESSAGES = "messages"
+FIELD_REPLY_BUTTON = "replyButton"
+FIELD_ACTIONS_BUTTONS_LAYOUT = "actionsButtonsLayout"
+FIELD_SELECT_BUTTON = "selectButton"
+FIELD_SELECT_BUTTON_ANIMATION = "selectButtonAnimation"
+FIELD_CHAT_MODE = "chatMode"
+FIELD_CURRENT_CHAT = "currentChat"
+FIELD_CANT_FORWARD_COUNT = "cantForwardMessagesCount"
+FIELD_FORWARD_BUTTON = "forwardButton"
+FIELD_CANT_DELETE_COUNT = "cantDeleteMessagesCount"
+FIELD_DELETE_ITEM = "deleteItem"
+FIELD_CHAT_LIST_VIEW = "chatListView"
+FIELD_MULTI_SELECTION_LISTENER = "multiSelectionListener"
+FIELD_USER_PEER_SETTINGS = "userPeerSettings"
+
+ChatActivityClass = None
+MessagesControllerClass = None
+ApplicationLoaderClass = None
+MessageObjectClass = None
+TLObjectClass = None
+TLRPCEncryptedChatClass = None
+TLRPCPeerSettingsClass = None
+hide_action_mode_method = None
+update_pinned_msg_view_method = None
+active_dialogs = []
+current_plugin = None
+
+
+# ─────────────────────────────────────────────────────────────
+# SDK-safe helpers
+# ─────────────────────────────────────────────────────────────
+
+def notify_info(message):
+    fragment = get_last_fragment()
+    BulletinHelper.show_info(f"{PLUGIN_PREFIX}: {message}", fragment)
+
+
+def notify_success(message):
+    fragment = get_last_fragment()
+    BulletinHelper.show_success(f"{PLUGIN_PREFIX}: {message}", fragment)
+
+
+def notify_error(message):
+    fragment = get_last_fragment()
+    BulletinHelper.show_error(f"{PLUGIN_PREFIX}: {message}", fragment)
+
+
+def run_ui(fn):
+    run_on_ui_thread(fn)
+
+
+def arraylist_to_list(value):
+    return list(value.toArray()) if value and value.size() > 0 else []
+
+
+def iterable_to_arraylist(items):
+    result = ArrayList()
+    for item in items:
+        result.add(item)
+    return result
+
+
+def split_list_into_chunks(items, chunk_size):
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def hook_max_args_method(clazz, method_name, hook_instance, hook_method):
+    try:
+        method = max(
+            [m for m in clazz.getDeclaredMethods() if m.getName() == method_name],
+            key=lambda m: m.getParameterCount(),
+            default=None,
+        )
+        if not method:
+            logger.warning("Method not found: %s", method_name)
+            return False
+        method.setAccessible(True)
+        hook_method(method, hook_instance)
+        return True
+    except Exception:
+        logger.error("Failed to hook %s:", method_name, exc_info=True)
+        return False
+
+
+def get_declared_method(clazz, method_name, *param_types):
+    if not clazz:
+        return None
+    try:
+        method = clazz.getDeclaredMethod(method_name, *param_types)
+        method.setAccessible(True)
+        return method
+    except Exception:
+        logger.error("Failed to resolve %s.%s:", clazz.getName() if hasattr(clazz, "getName") else clazz, method_name, exc_info=True)
+        return None
+
+
+def new_java_instance(clazz):
+    if not clazz:
+        return None
+    try:
+        return clazz.newInstance()
+    except Exception:
+        pass
+    try:
+        constructor = clazz.getDeclaredConstructor()
+        constructor.setAccessible(True)
+        return constructor.newInstance([])
+    except Exception:
+        logger.error("Failed to instantiate %s:", clazz.getName() if hasattr(clazz, "getName") else clazz, exc_info=True)
+        return None
+
+
+def ensure_messages_controller_class():
+    global MessagesControllerClass
+    if MessagesControllerClass:
+        return MessagesControllerClass
+    MessagesControllerClass = find_class("org.telegram.messenger.MessagesController")
+    if not MessagesControllerClass:
+        logger.warning("MessagesController class not found")
+    return MessagesControllerClass
+
+
+def ensure_application_loader_class():
+    global ApplicationLoaderClass
+    if ApplicationLoaderClass:
+        return ApplicationLoaderClass
+    ApplicationLoaderClass = find_class("org.telegram.messenger.ApplicationLoader")
+    if not ApplicationLoaderClass:
+        logger.warning("ApplicationLoader class not found")
+    return ApplicationLoaderClass
+
+
+def ensure_message_object_class():
+    global MessageObjectClass
+    if MessageObjectClass:
+        return MessageObjectClass
+    MessageObjectClass = find_class("org.telegram.messenger.MessageObject")
+    if not MessageObjectClass:
+        logger.warning("MessageObject class not found")
+    return MessageObjectClass
+
+
+def ensure_tlobject_class():
+    global TLObjectClass
+    if TLObjectClass:
+        return TLObjectClass
+    TLObjectClass = find_class("org.telegram.tgnet.TLObject")
+    if not TLObjectClass:
+        logger.warning("TLObject class not found")
+    return TLObjectClass
+
+
+def ensure_encrypted_chat_class():
+    global TLRPCEncryptedChatClass
+    if TLRPCEncryptedChatClass:
+        return TLRPCEncryptedChatClass
+    TLRPCEncryptedChatClass = find_class("org.telegram.tgnet.TLRPC$EncryptedChat")
+    if not TLRPCEncryptedChatClass:
+        logger.warning("TLRPC.EncryptedChat class not found")
+    return TLRPCEncryptedChatClass
+
+
+def ensure_peer_settings_class():
+    global TLRPCPeerSettingsClass
+    if TLRPCPeerSettingsClass:
+        return TLRPCPeerSettingsClass
+    TLRPCPeerSettingsClass = find_class("org.telegram.tgnet.TLRPC$TL_peerSettings")
+    if not TLRPCPeerSettingsClass:
+        logger.warning("TLRPC.TL_peerSettings class not found")
+    return TLRPCPeerSettingsClass
+
+
+def get_app_files_dir_path():
+    context = get_app_context()
+    if context:
+        return context.getFilesDir().getAbsolutePath()
+    return os.path.join(
+        Environment.getExternalStorageDirectory().getAbsolutePath(),
+        "Android",
+        "data",
+        "com.exteragram.messenger",
+        "files",
+    )
+
+
+def get_downloads_dir():
+    try:
+        return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
+    except Exception:
+        return os.path.join(Environment.getExternalStorageDirectory().getAbsolutePath(), "Download")
+
+
+def get_backup_dir():
+    return os.path.join(get_downloads_dir(), "exteraGram", __id__)
+
+
+def get_app_context():
+    try:
+        app_loader = ensure_application_loader_class()
+        context = get_static_private_field(app_loader, "applicationContext") if app_loader else None
+        if context:
+            return context
+    except Exception:
+        pass
+    try:
+        from android.app import ActivityThread
+        app = ActivityThread.currentApplication()
+        if app:
+            return app
+    except Exception:
+        pass
+    logger.error("Failed to get application context")
+    return None
+
+
+def get_activity_context():
+    fragment = get_last_fragment()
+    if not fragment:
+        return None
+    return fragment.getParentActivity()
+
+
+def show_alert(title, message, buttons=None, cancelable=True):
+    context = get_activity_context()
+    if not context:
+        notify_error("Не удалось открыть диалог: нет активного окна")
+        return None
+    builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+    builder.set_title(title)
+    builder.set_message(message)
+    builder.create()
+    builder.set_cancelable(cancelable)
+    builder.set_canceled_on_touch_outside(cancelable)
+    for kind, text, callback in buttons or []:
+        if kind == "positive":
+            builder.set_positive_button(text, callback)
+        elif kind == "negative":
+            builder.set_negative_button(text, callback)
+        elif kind == "neutral":
+            builder.set_neutral_button(text, callback)
+    builder.show()
+    register_dialog(builder)
+    return builder
+
+
+def register_dialog(builder):
+    compact_active_dialogs()
+    if builder and builder not in active_dialogs:
+        active_dialogs.append(builder)
+    return builder
+
+
+def dismiss_active_dialogs():
+    for builder in list(active_dialogs):
+        try:
+            builder.dismiss()
+        except Exception:
+            pass
+    active_dialogs.clear()
+
+
+def compact_active_dialogs():
+    alive = []
+    for builder in list(active_dialogs):
+        try:
+            dialog = builder.get_dialog() if hasattr(builder, "get_dialog") else None
+            if dialog and dialog.isShowing():
+                alive.append(builder)
+        except Exception:
+            pass
+    active_dialogs[:] = alive
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────
+
+class S:
+    enable_forward_bypass = True
+    enable_peer_info_saver = True
+
+    @classmethod
+    def get(cls, key, default=None):
+        plugin = current_plugin
+        if not plugin:
+            return default
+        return plugin.get_setting(key, default)
+
+    @classmethod
+    def set(cls, key, value):
+        plugin = current_plugin
+        if not plugin:
+            return
+        try:
+            plugin.set_setting(key, value, reload_settings=False)
+        except Exception:
+            logger.error("Failed to save setting %s", key, exc_info=True)
+        cls.load()
+
+    @classmethod
+    def load(cls):
+        cls.enable_forward_bypass = bool(cls.get("enable_forward_bypass", True))
+        cls.enable_peer_info_saver = bool(cls.get("enable_peer_info_saver", True))
+
+
+def on_forward_toggle(enabled):
+    S.set("enable_forward_bypass", enabled)
+
+
+def on_peer_saver_toggle(enabled):
+    S.set("enable_peer_info_saver", enabled)
+
+
+# ─────────────────────────────────────────────────────────────
+# Storage
+# ─────────────────────────────────────────────────────────────
+
+class JsonStorage:
+    def __init__(self, name, default=None, compress=True):
+        self.name = name
+        self.default = default if default is not None else {}
+        self.compress = compress
+        self.content = self._copy_default()
+        self.loaded = False
+
+    def _copy_default(self):
+        return dict(self.default) if isinstance(self.default, dict) else self.default
+
+    def path(self):
+        base = get_app_files_dir_path()
+        suffix = ".jsonz" if self.compress else ".json"
+        return os.path.join(base, "plugins_data", self.name + suffix)
+
+    def read(self):
+        path = self.path()
+        if not os.path.exists(path):
+            self.content = self._copy_default()
+            self.loaded = True
+            return False
+        try:
+            if self.compress:
+                with gzip.open(path, "rt", encoding="utf-8") as file:
+                    data = json.load(file)
+            else:
+                with open(path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+            self.content = data if isinstance(data, dict) else self._copy_default()
+            self.loaded = True
+            return True
+        except Exception:
+            logger.error("Failed to read storage %s:", path, exc_info=True)
+            self.content = self._copy_default()
+            self.loaded = True
+            return False
+
+    def ensure_loaded(self):
+        if not self.loaded:
+            self.read()
+
+    def write(self):
+        path = self.path()
+        temp_path = path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if self.compress:
+                with gzip.open(temp_path, "wt", encoding="utf-8") as file:
+                    json.dump(self.content, file, ensure_ascii=False, separators=(",", ":"))
+            else:
+                with open(temp_path, "w", encoding="utf-8") as file:
+                    json.dump(self.content, file, ensure_ascii=False, separators=(",", ":"))
+            os.replace(temp_path, path)
+            self.loaded = True
+            return True
+        except Exception:
+            logger.error("Failed to write storage %s:", path, exc_info=True)
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return False
+
+    def count(self):
+        self.ensure_loaded()
+        return len(self.content) if isinstance(self.content, dict) else 0
+
+
+peer_storage = JsonStorage(STORAGE_NAME, default={}, compress=True)
+
+
+def normalize_peer_dump(data):
+    if not isinstance(data, dict):
+        return {}
+    normalized = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            normalized[str(key)] = value
+    return normalized
+
+
+# ─────────────────────────────────────────────────────────────
+# Migration and backup
+# ─────────────────────────────────────────────────────────────
+
+def get_old_cache_path():
+    try:
+        import file_utils
+        return os.path.join(file_utils.get_plugins_dir(), "cache", OLD_PEER_STORAGE_NAME)
+    except Exception:
+        return None
+
+
+def read_maybe_zlib_json(path):
+    with open(path, "rb") as file:
+        raw = file.read()
+    if not raw:
+        return {}
+    is_zlib = len(raw) >= 2 and (raw[0] & 0x0F) == 8 and (raw[0] * 256 + raw[1]) % 31 == 0
+    if is_zlib:
+        raw = zlib.decompress(raw)
+    return normalize_peer_dump(json.loads(raw.decode("utf-8", errors="replace")))
+
+
+def import_peer_dump(data):
+    normalized = normalize_peer_dump(data)
+    if not normalized:
+        return 0
+    peer_storage.ensure_loaded()
+    peer_storage.content.update(normalized)
+    if not peer_storage.write():
+        raise RuntimeError("storage_write_failed")
+    return len(normalized)
+
+
+def migrate_old_storage(delete_after_success=True):
+    old_path = get_old_cache_path()
+    if not old_path or not os.path.exists(old_path):
+        return 0
+    data = read_maybe_zlib_json(old_path)
+    count = import_peer_dump(data)
+    if count and delete_after_success:
+        try:
+            os.remove(old_path)
+        except Exception:
+            logger.error("Failed to delete old storage after migration:", exc_info=True)
+    return count
+
+
+def inspect_old_storage():
+    old_path = get_old_cache_path()
+    try:
+        if not old_path or not os.path.exists(old_path):
+            return {"exists": False, "count": 0, "path": old_path, "error": None}
+        count = len(read_maybe_zlib_json(old_path))
+        return {"exists": True, "count": count, "path": old_path, "error": None}
+    except Exception:
+        logger.error("Failed to inspect old storage:", exc_info=True)
+        return {"exists": False, "count": 0, "path": old_path, "error": "inspect_failed"}
+
+
+def import_old_storage_now():
+    try:
+        imported = migrate_old_storage(delete_after_success=True)
+        if imported > 0:
+            notify_success(f"Импортировано {imported} записей")
+        else:
+            notify_info("Старые данные не найдены или уже пусты")
+    except Exception:
+        logger.error("Migration failed:", exc_info=True)
+        notify_error("Ошибка миграции старых данных")
+
+
+def export_backup():
+    try:
+        peer_storage.ensure_loaded()
+        backup_dir = get_backup_dir()
+        os.makedirs(backup_dir, exist_ok=True)
+        filename = BACKUP_PREFIX + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json"
+        path = os.path.join(backup_dir, filename)
+        payload = {
+            "plugin": __id__,
+            "version": __version__,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "records": normalize_peer_dump(peer_storage.content),
+        }
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        run_ui(lambda: notify_success(f"Экспортировано {len(payload['records'])} записей\n{filename}"))
+    except Exception:
+        logger.error("Export failed:", exc_info=True)
+        run_ui(lambda: notify_error("Ошибка экспорта"))
+
+
+def list_backup_files():
+    backup_dir = get_backup_dir()
+    if not os.path.exists(backup_dir):
+        return []
+    files = [name for name in os.listdir(backup_dir) if name.startswith(BACKUP_PREFIX) and name.endswith(".json")]
+    return sorted(files, reverse=True)
+
+
+def read_backup_file(path):
+    with open(path, "r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if isinstance(payload, dict) and isinstance(payload.get("records"), dict):
+        return normalize_peer_dump(payload["records"])
+    return normalize_peer_dump(payload)
+
+
+def import_backup_file(filename):
+    try:
+        path = os.path.join(get_backup_dir(), filename)
+        records = read_backup_file(path)
+        count = import_peer_dump(records)
+        run_ui(lambda: notify_success(f"Импортировано {count} записей из {filename}"))
+    except Exception:
+        logger.error("Import failed:", exc_info=True)
+        run_ui(lambda: notify_error("Ошибка импорта"))
+
+
+def wipe_saved_peer_data():
+    def confirm(_, __):
+        peer_storage.content = {}
+        if peer_storage.write():
+            notify_success("Сохранённые данные очищены")
+        else:
+            notify_error("Не удалось очистить данные")
+
+    show_alert(
+        "Очистить данные?",
+        "Будут удалены только данные UtilitiesPro. Backup-файлы и старые плагины не затрагиваются.",
+        buttons=[
+            ("positive", "Очистить", confirm),
+            ("negative", "Отмена", lambda _, __: None),
+        ],
+        cancelable=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Forward/delete limit bypass
+# ─────────────────────────────────────────────────────────────
+
+def ensure_chat_activity_methods():
+    global ChatActivityClass, hide_action_mode_method, update_pinned_msg_view_method
+    if ChatActivityClass:
+        return True
+    try:
+        ChatActivityClass = find_class("org.telegram.ui.ChatActivity")
+        if not ChatActivityClass:
+            return False
+        hide_action_mode_method = get_declared_method(ChatActivityClass, "hideActionMode")
+        update_pinned_msg_view_method = get_declared_method(ChatActivityClass, "updatePinnedMessageView", Boolean.TYPE)
+        if not hide_action_mode_method or not update_pinned_msg_view_method:
+            return False
+        return True
+    except Exception:
+        logger.error("Failed to resolve ChatActivity methods:", exc_info=True)
+        return False
+
+
+def get_selected_msgs_array_index(param):
+    message_object = param.args[0]
+    current_dialog_id = get_private_field(param.thisObject, FIELD_DIALOG_ID)
+    return int(message_object.getDialogId() != current_dialog_id)
+
+
+def get_sparsearray_keys(sparse_array):
+    return [] if sparse_array is None else [sparse_array.keyAt(i) for i in range(sparse_array.size())]
+
+
+def get_actions_buttons_layout(chat_activity):
+    return get_private_field(chat_activity, FIELD_ACTIONS_BUTTONS_LAYOUT)
+
+
+def get_reply_button(chat_activity):
+    return get_private_field(chat_activity, FIELD_REPLY_BUTTON)
+
+
+def get_select_button(chat_activity):
+    return get_private_field(chat_activity, FIELD_SELECT_BUTTON)
+
+
+def update_reply_button_visibility(chat_activity, should_show):
+    actions_buttons_layout = get_actions_buttons_layout(chat_activity)
+    if actions_buttons_layout:
+        actions_buttons_layout.showReplyButton(should_show, True)
+        return
+    reply_button = get_reply_button(chat_activity)
+    if reply_button:
+        reply_button.setVisibility(View.VISIBLE if should_show else View.GONE)
+
+
+def update_select_button_visibility(chat_activity):
+    java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
+    messages = get_private_field(chat_activity, FIELD_MESSAGES)
+    actions_buttons_layout = get_actions_buttons_layout(chat_activity)
+    select_button = None if actions_buttons_layout else get_select_button(chat_activity)
+    if (actions_buttons_layout is None and select_button is None) or java_msgs_sparse is None or messages is None:
+        return
+
+    java_msgs_main = java_msgs_sparse[0]
+    new_select_visibility = View.GONE
+    if java_msgs_main and java_msgs_main.size() > 1:
+        all_selected_msg_ids = get_sparsearray_keys(java_msgs_main) + get_sparsearray_keys(java_msgs_sparse[1])
+        all_selected_msg_ids.sort()
+        if all_selected_msg_ids:
+            begin = all_selected_msg_ids[0]
+            end = all_selected_msg_ids[-1]
+            for i in range(messages.size()):
+                msg = messages.get(i)
+                msg_id = msg.getId()
+                if begin < msg_id < end and java_msgs_main.indexOfKey(msg_id) < 0 and msg.contentType == 0:
+                    new_select_visibility = View.VISIBLE
+                    break
+    
+    should_show = new_select_visibility == View.VISIBLE
+    if actions_buttons_layout:
+        actions_buttons_layout.showSelectButton(should_show, True)
+    else:
+        select_button_animator = get_private_field(chat_activity, FIELD_SELECT_BUTTON_ANIMATION)
+        if select_button_animator:
+            select_button_animator.cancel()
+        if new_select_visibility != select_button.getVisibility():
+            select_button.setVisibility(View.GONE if should_show else View.VISIBLE)
+            select_button.setAlpha(0.0 if should_show else 1.0)
+            select_button.setScaleY(0.0 if should_show else 1.0)
+
+
+def cancel_selection_mode(chat_activity):
+    if hide_action_mode_method:
+        hide_action_mode_method.invoke(chat_activity)
+    if update_pinned_msg_view_method:
+        update_pinned_msg_view_method.invoke(chat_activity, [True])
+
+
+def decrement_private_counter(chat_activity, field_name, target_field_name=None):
+    value = get_private_field(chat_activity, field_name)
+    if value is None:
+        return
+    value = max(0, int(value) - 2)
+    set_private_field(chat_activity, field_name, Integer(value))
+    if value == 0 and target_field_name:
+        target = get_private_field(chat_activity, target_field_name)
+        if target:
+            if target_field_name == FIELD_FORWARD_BUTTON:
+                target.setEnabled(True)
+                target.setAlpha(1.0)
+            elif target_field_name == FIELD_DELETE_ITEM:
+                target.setVisibility(View.VISIBLE)
+
+
+class SelectorHook(MethodHook):
+    def __init__(self):
+        super().__init__()
+        self.messages_array = {}
+        self.is_processing_msg_group = False
+        self.is_last_in_group = False
+        self.handle_end_of_select_msg_group_call = False
+
+    def before_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            chat_activity = param.thisObject
+            selected_msg_obj = param.args[0]
+            tapped_outside = param.args[1]
+            is_last = param.args[2]
+            is_grouped = selected_msg_obj.getGroupId() != 0
+            if self.is_processing_msg_group:
+                self.is_last_in_group = is_last
+                return
+            if tapped_outside and is_last and is_grouped:
+                self.is_processing_msg_group = True
+            index = get_selected_msgs_array_index(param)
+            java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
+            if java_msgs_sparse is None:
+                return
+            java_msgs_sparse[index] = param.thisObject.SparseArrayWithTouch()
+            set_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS, java_msgs_sparse)
+        except Exception:
+            logger.error("Selector before hook failed:", exc_info=True)
+
+    def after_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            if self.handle_end_of_select_msg_group_call:
+                self.handle_end_of_select_msg_group_call = False
+                return
+            if self.is_processing_msg_group:
+                if not self.is_last_in_group:
+                    return
+                self.is_processing_msg_group = False
+                self.is_last_in_group = False
+                self.handle_end_of_select_msg_group_call = True
+
+            chat_activity = param.thisObject
+            index = get_selected_msgs_array_index(param)
+            java_msgs_sparse = get_private_field(chat_activity, FIELD_SELECTED_MESSAGES_IDS)
+            if java_msgs_sparse is None:
+                return
+            selected_msgs_array = java_msgs_sparse[index]
+            if selected_msgs_array is None:
+                return
+
+            chat_mode = get_private_field(chat_activity, FIELD_CHAT_MODE)
+            current_chat = get_private_field(chat_activity, FIELD_CURRENT_CHAT)
+            is_in_schedule_mode = chat_mode == 1
+
+            for array_index in reversed(range(selected_msgs_array.size())):
+                message_id = selected_msgs_array.keyAt(array_index)
+                message_object = selected_msgs_array.get(message_id)
+                if message_id in self.messages_array:
+                    if not message_object.canForwardMessage():
+                        decrement_private_counter(chat_activity, FIELD_CANT_FORWARD_COUNT, FIELD_FORWARD_BUTTON)
+                    if not message_object.canDeleteMessage(is_in_schedule_mode, current_chat):
+                        decrement_private_counter(chat_activity, FIELD_CANT_DELETE_COUNT, FIELD_DELETE_ITEM)
+                    self.messages_array.pop(message_id)
+                else:
+                    self.messages_array[message_id] = message_object
+
+            selected_msgs_array.clear()
+            for key, value in self.messages_array.items():
+                selected_msgs_array.put(key, value)
+            if not self.messages_array:
+                cancel_selection_mode(chat_activity)
+                return
+            update_reply_button_visibility(chat_activity, len(self.messages_array) == 1)
+            update_select_button_visibility(chat_activity)
+        except Exception:
+            logger.error("Selector after hook failed:", exc_info=True)
+
+    def clear_message_storage(self):
+        self.messages_array.clear()
+        self.is_processing_msg_group = False
+        self.is_last_in_group = False
+        self.handle_end_of_select_msg_group_call = False
+
+
+class ClearSelectionHook(MethodHook):
+    def __init__(self, selector):
+        super().__init__()
+        self.selector = selector
+
+    def before_hooked_method(self, _param):
+        if S.enable_forward_bypass:
+            self.selector.clear_message_storage()
+
+
+class MultiSelectorHook(MethodHook):
+    def __init__(self, hook_method):
+        super().__init__()
+        self.hook_method = hook_method
+        self.limit_hooked = False
+
+    def after_hooked_method(self, param):
+        if not S.enable_forward_bypass or self.limit_hooked:
+            return
+        try:
+            chat_list_view = get_private_field(param.thisObject, FIELD_CHAT_LIST_VIEW)
+            selection_listener = get_private_field(chat_list_view, FIELD_MULTI_SELECTION_LISTENER) if chat_list_view else None
+            if not selection_listener:
+                return
+            method = selection_listener.getClass().getMethod("limitReached")
+            self.hook_method(method, self.BypassLimitReachedHook())
+            self.limit_hooked = True
+        except Exception:
+            logger.error("Multi-selector hook failed:", exc_info=True)
+
+    class BypassLimitReachedHook(MethodHook):
+        def after_hooked_method(self, param):
+            if S.enable_forward_bypass:
+                param.setResult(False)
+
+
+class DeleteMessagesHook(MethodHook):
+    chunk_size = 100
+
+    def before_hooked_method(self, param):
+        if not S.enable_forward_bypass:
+            return
+        try:
+            first_msg_array = param.args[0]
+            second_msg_array = param.args[1]
+            if first_msg_array and first_msg_array.size() > 0:
+                messages_array = first_msg_array
+                selected_arg_index = 0
+            else:
+                messages_array = second_msg_array
+                selected_arg_index = 1
+            messages = arraylist_to_list(messages_array)
+            if len(messages) <= self.chunk_size:
+                return
+            chunks = split_list_into_chunks(messages, self.chunk_size)
+            last_chunk_index = len(chunks) - 1
+            for index, chunk in enumerate(chunks):
+                param.args[selected_arg_index] = iterable_to_arraylist(chunk)
+                if index < last_chunk_index:
+                    param.method.invoke(param.thisObject, param.args)
+        except Exception:
+            logger.error("DeleteMessages hook failed:", exc_info=True)
+
+
+selector_hook = SelectorHook()
+
+
+def setup_forward_limit_bypass(plugin_instance):
+    if not ensure_chat_activity_methods():
+        return False
+    ok = True
+    hook_method = plugin_instance.hook_method
+    message_object_class = ensure_message_object_class()
+    encrypted_chat_class = ensure_encrypted_chat_class()
+    tlobject_class = ensure_tlobject_class()
+    if not message_object_class or not encrypted_chat_class or not tlobject_class:
+        return False
+    try:
+        selector_method = get_declared_method(ChatActivityClass, "addToSelectedMessages", message_object_class, Boolean.TYPE, Boolean.TYPE)
+        if selector_method:
+            hook_method(selector_method, selector_hook)
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook message selection:", exc_info=True)
+    try:
+        clear_selection_method = get_declared_method(ChatActivityClass, "hideActionMode")
+        if clear_selection_method:
+            hook_method(clear_selection_method, ClearSelectionHook(selector_hook))
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook selection clear:", exc_info=True)
+    try:
+        multi_selector_method = get_declared_method(ChatActivityClass, "startMultiselect", Integer.TYPE)
+        if multi_selector_method:
+            hook_method(multi_selector_method, MultiSelectorHook(hook_method))
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook multiselect:", exc_info=True)
+    try:
+        clazz = ensure_messages_controller_class()
+        delete_messages_method = get_declared_method(
+            clazz,
+            "deleteMessages",
+            ArrayList, ArrayList, encrypted_chat_class, Long.TYPE, Boolean.TYPE,
+            Integer.TYPE, Boolean.TYPE, Long.TYPE, tlobject_class, Integer.TYPE,
+            Boolean.TYPE, Integer.TYPE,
+        )
+        if delete_messages_method:
+            hook_method(delete_messages_method, DeleteMessagesHook())
+        else:
+            ok = False
+    except Exception:
+        ok = False
+        logger.error("Failed to hook deleteMessages:", exc_info=True)
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+# Peer info saver
+# ─────────────────────────────────────────────────────────────
+
+def settings_has_necessary_field(settings):
+    if isinstance(settings, dict):
+        return settings.get("phone_country") is not None
+    return getattr(settings, "phone_country", None) is not None
+
+
+def peer_settings_to_dict(settings):
+    if not settings:
+        return None
+    data = {}
+    try:
+        for field in settings.getClass().getFields():
+            key = field.getName()
+            if not key.islower() or key.startswith("_"):
+                continue
+            data[key] = field.get(settings)
+    except Exception:
+        logger.error("Failed to convert peer settings:", exc_info=True)
+        return None
+    return data
+
+
+def dict_to_peer_settings(dumped):
+    dumped = dumped if isinstance(dumped, dict) else None
+    if not dumped:
+        return None
+    peer_settings_class = ensure_peer_settings_class()
+    if not peer_settings_class:
+        return None
+    settings = new_java_instance(peer_settings_class)
+    if not settings:
+        return None
+    for key, value in dumped.items():
+        try:
+            setattr(settings, key, value)
+        except Exception:
+            logger.error("Failed to restore peer field %s", key, exc_info=True)
+    return settings
+
+
+def load_saved_peer_settings(dialog_id):
+    peer_storage.ensure_loaded()
+    return peer_storage.content.get(str(dialog_id)) if isinstance(peer_storage.content, dict) else None
+
+
+def save_peer_settings(dialog_id, settings):
+    peer_storage.ensure_loaded()
+    new_settings = peer_settings_to_dict(settings)
+    if not new_settings:
+        return
+    old_settings = load_saved_peer_settings(dialog_id)
+    if old_settings:
+        for field in PRECIOUS_PEER_FIELDS:
+            if not new_settings.get(field) and old_settings.get(field):
+                new_settings[field] = old_settings[field]
+    peer_storage.content[str(dialog_id)] = new_settings
+    peer_storage.write()
+
+
+def resolve_peer_settings(dialog_id, original_settings=None):
+    if settings_has_necessary_field(original_settings):
+        return original_settings
+    msg_controller = get_messages_controller()
+    user_full_settings = None
+    msg_controller_settings = None
+    try:
+        user_full = msg_controller.getUserFull(dialog_id)
+        user_full_settings = getattr(user_full, "settings", None)
+        if settings_has_necessary_field(user_full_settings):
+            return user_full_settings
+    except Exception:
+        pass
+    try:
+        user_peer_settings = get_private_field(msg_controller, FIELD_USER_PEER_SETTINGS)
+        msg_controller_settings = user_peer_settings.get(dialog_id) if user_peer_settings else None
+        if settings_has_necessary_field(msg_controller_settings):
+            return msg_controller_settings
+    except Exception:
+        pass
+    saved_settings = load_saved_peer_settings(dialog_id)
+    if settings_has_necessary_field(saved_settings):
+        return dict_to_peer_settings(saved_settings)
+    return original_settings or user_full_settings or msg_controller_settings or dict_to_peer_settings(saved_settings)
+
+
+class SavePeerSettingsHook(MethodHook):
+    def before_hooked_method(self, param):
+        if not S.enable_peer_info_saver:
+            return
+        try:
+            save_peer_settings(param.args[0], param.args[1])
+        except Exception:
+            logger.error("SavePeerSettings hook failed:", exc_info=True)
+
+
+class LoadPeerSettingsHook(MethodHook):
+    def after_hooked_method(self, param):
+        if not S.enable_peer_info_saver:
+            return
+        try:
+            original = param.getResult()
+            resolved = resolve_peer_settings(param.args[0], original)
+            if resolved and resolved != original:
+                param.setResult(resolved)
+        except Exception:
+            logger.error("LoadPeerSettings hook failed:", exc_info=True)
+
+
+def setup_peer_info_saver(plugin_instance):
+    try:
+        clazz = ensure_messages_controller_class()
+        if not clazz:
+            return False
+        get_ok = hook_max_args_method(clazz, "getPeerSettings", LoadPeerSettingsHook(), plugin_instance.hook_method)
+        save_ok = hook_max_args_method(clazz, "savePeerSettings", SavePeerSettingsHook(), plugin_instance.hook_method)
+        return get_ok and save_ok
+    except Exception:
+        logger.error("Failed to setup peer info saver:", exc_info=True)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings UI
+# ─────────────────────────────────────────────────────────────
+
+PAGE_MAIN = "main"
+PAGE_STATUS = "status"
+PAGE_FORWARD = "forward"
+PAGE_PEER_SAVER = "peer_saver"
+PAGE_DATA = "data"
+PAGE_STORAGE = "storage"
+PAGE_BACKUP_IMPORT = "backup_import"
+PAGE_MIGRATION = "migration"
+PAGE_COMPAT = "compat"
+PAGE_COMPAT_INFO = "compat_info"
+PAGE_ABOUT = "about"
+
+
+def create_settings(page_id=PAGE_MAIN):
+    def subpage(target_page):
+        return lambda: create_settings(target_page)
+
+    def feature_state(include_old=False, include_saved=True):
+        S.load()
+        state = {
+            "forward_state": "включён" if S.enable_forward_bypass else "выключен",
+            "saver_state": "включено" if S.enable_peer_info_saver else "выключено",
+        }
+        if include_saved:
+            state["saved_count"] = peer_storage.count()
+        if include_old:
+            old_info = inspect_old_storage()
+            state["old_info"] = old_info
+            state["old_state"] = f"найдены ({old_info['count']})" if old_info["exists"] else "не найдены"
+        return state
+
+    def info_page(title, lines):
+        return [Header(title)] + [Divider(line) for line in lines]
+
+    if page_id == PAGE_STATUS:
+        state = feature_state(include_old=True)
+        return info_page("Состояние", [
+            f"Обход лимита: {state['forward_state']}",
+            f"Сохранение данных: {state['saver_state']}",
+            "Миграция: вручную через настройки",
+            f"Сохранённых записей: {state['saved_count']}",
+            f"Старые данные user_info_saver: {state['old_state']}",
+        ])
+
+    if page_id == PAGE_STORAGE:
+        return info_page("Хранилище", [
+            f"Сохранённых записей: {peer_storage.count()}",
+            f"Файл данных: {peer_storage.path()}",
+            f"Папка backup: {get_backup_dir()}",
+        ])
+
+    if page_id == PAGE_MIGRATION:
+        info = inspect_old_storage()
+        entries = [Header("Проверка старых данных")]
+        if info["error"]:
+            entries.append(Divider("Не удалось прочитать старое хранилище user_info_saver."))
+            return entries
+        if not info["exists"]:
+            entries.append(Divider("Старое хранилище user_info_saver не найдено."))
+            return entries
+        entries.extend([
+            Divider(f"Путь: {info['path']}"),
+            Divider(f"Найдено записей: {info['count']}"),
+            Divider("После успешного импорта старый файл будет удалён автоматически."),
+            Text(
+                text="Импортировать сейчас",
+                icon="msg_download",
+                accent=True,
+                on_click=lambda _: import_old_storage_now(),
+            ),
+        ])
+        return entries
+
+    if page_id == PAGE_BACKUP_IMPORT:
+        files = list_backup_files()
+        entries = [Header("Импорт backup")]
+        if not files:
+            entries.append(Divider("Backup-файлы не найдены в Download/exteraGram/utilities_pro."))
+            return entries
+        entries.append(Divider(f"Найдено файлов: {len(files)}"))
+        for filename in files:
+            entries.append(Text(
+                text=filename,
+                icon="msg_download",
+                on_click=lambda _, name=filename: import_backup_file(name),
+            ))
+        return entries
+
+    if page_id == PAGE_COMPAT_INFO:
+        return info_page("Конфликты", [
+            "UtilitiesPro уже содержит функционал zwyNoForwardLimit и user_info_saver.",
+            "Если старые плагины включены одновременно, они hook-ают те же методы Telegram.",
+            "Это может вызвать двойную обработку выделения сообщений, удаления или peer settings.",
+            "Рекомендация: отключить zwyNoForwardLimit и user_info_saver перед тестом UtilitiesPro.",
+        ])
+
+    if page_id == PAGE_FORWARD:
+        S.load()
+        return [
+            Header("Обход лимита"),
+            Switch(
+                key="enable_forward_bypass",
+                text="Обход лимита пересылки и удаления",
+                subtext="Позволяет выбирать, пересылать и удалять больше 100 сообщений. Работает сразу после переключения.",
+                default=S.enable_forward_bypass,
+                icon="msg_share",
+                on_change=on_forward_toggle,
+            ),
+            Divider("Если старый NoForwardLimit включён одновременно, возможны двойные hooks и нестабильное выделение сообщений."),
+        ]
+
+    if page_id == PAGE_PEER_SAVER:
+        state = feature_state(include_old=True, include_saved=False)
+        old_info = state["old_info"]
+        return [
+            Header("Сохранение данных"),
+            Switch(
+                key="enable_peer_info_saver",
+                text="Сохранять данные собеседников",
+                subtext="Сохраняет страну телефона, дату регистрации и важные поля, если Telegram перестал их отдавать.",
+                default=S.enable_peer_info_saver,
+                icon="msg_openprofile",
+                on_change=on_peer_saver_toggle,
+            ),
+            Text(
+                text="Проверить старые данные",
+                subtext=(
+                    f"Найдено записей: {old_info['count']}. Открывает страницу проверки и импорта."
+                    if old_info["exists"] else
+                    "Ищет старое хранилище user_info_saver и показывает результат проверки."
+                ),
+                icon="msg_download_settings",
+                accent=True,
+                create_sub_fragment=subpage(PAGE_MIGRATION),
+            ),
+            Divider("Если старый UserInfoSaver включён одновременно, оба плагина будут hook-ать одни и те же методы."),
+        ]
+
+    if page_id == PAGE_DATA:
+        return [
+            Header("Данные и backup"),
+            Text(
+                text="Статистика хранилища",
+                subtext=f"Сохранено записей: {peer_storage.count()}",
+                icon="msg_stats",
+                create_sub_fragment=subpage(PAGE_STORAGE),
+            ),
+            Text(
+                text="Экспортировать backup",
+                subtext="Сохранить JSON в Download/exteraGram/utilities_pro.",
+                icon="msg_share",
+                accent=True,
+                on_click=lambda _: export_backup(),
+            ),
+            Text(
+                text="Импортировать backup",
+                subtext="Выбрать один из найденных backup-файлов в Downloads.",
+                icon="msg_download",
+                create_sub_fragment=subpage(PAGE_BACKUP_IMPORT),
+            ),
+            Text(
+                text="Очистить сохранённые данные",
+                subtext="Удаляет только локальные данные UtilitiesPro.",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda _: wipe_saved_peer_data(),
+            ),
+        ]
+
+    if page_id == PAGE_COMPAT:
+        return [
+            Header("Совместимость"),
+            Divider("Автопоказ диалогов при запуске отключён, чтобы не создавать ANR/view-leak в UI thread."),
+            Divider("Миграция доступна вручную: Сохранение данных -> Проверить старые данные."),
+            Text(
+                text="Важно: отключите старые плагины",
+                subtext="zwyNoForwardLimit и user_info_saver лучше выключить, чтобы избежать двойных hooks.",
+                icon="msg_warning",
+                create_sub_fragment=subpage(PAGE_COMPAT_INFO),
+            ),
+            Divider("UtilitiesPro уже содержит оба модуля и не требует дополнительных библиотек."),
+        ]
+
+    if page_id == PAGE_ABOUT:
+        return [
+            Header("О плагине"),
+            Divider(f"Версия: {__version__}"),
+            Divider(f"Автор: {__author__}"),
+            Divider("Помощь с кодом: @kvuco"),
+            Divider("Standalone-плагин без zwylib, внешних каналов и сторонних сервисов."),
+            Header("Что внутри"),
+            Divider("Обход лимита пересылки, удаления и массового выбора сообщений."),
+            Divider("Сохранение коротких данных профиля собеседников."),
+            Divider("Миграция старых данных user_info_saver."),
+            Divider("Экспорт и импорт backup-файлов."),
+            Divider("Standalone-версия без внешних каналов обновления и сторонних зависимостей."),
+        ]
+
+    state = feature_state()
+    return [
+        Header("UtilitiesPro"),
+        Text(
+            text="Состояние",
+            subtext=f"Обход лимита: {state['forward_state']} · сохранение данных: {state['saver_state']} · записей: {state['saved_count']}",
+            icon="msg_info",
+            create_sub_fragment=subpage(PAGE_STATUS),
+        ),
+        Text(
+            text="Обход лимита",
+            subtext="Настройки пересылки, удаления и выбора большого числа сообщений.",
+            icon="msg_share",
+            create_sub_fragment=subpage(PAGE_FORWARD),
+        ),
+        Text(
+            text="Сохранение данных",
+            subtext="Сохранение и восстановление коротких данных профиля собеседников.",
+            icon="msg_openprofile",
+            create_sub_fragment=subpage(PAGE_PEER_SAVER),
+        ),
+        Text(
+            text="Данные и резервные копии",
+            subtext="Экспорт, импорт, статистика и очистка локального хранилища.",
+            icon="files_storage",
+            create_sub_fragment=subpage(PAGE_DATA),
+        ),
+        Text(
+            text="Совместимость",
+            subtext="Миграция и предупреждения о старых плагинах.",
+            icon="msg_warning",
+            create_sub_fragment=subpage(PAGE_COMPAT),
+        ),
+        Text(
+            text="О плагине",
+            subtext="Версия, автор и состав модулей.",
+            icon="msg_info",
+            create_sub_fragment=subpage(PAGE_ABOUT),
+        ),
+    ]
+
+
+# ─────────────────────────────────────────────────────────────
+# Main plugin
+# ─────────────────────────────────────────────────────────────
+
+class UtilitiesPro(BasePlugin):
+    def on_plugin_load(self):
+        global current_plugin
+        current_plugin = self
+        S.load()
+        peer_storage.ensure_loaded()
+        setup_forward_limit_bypass(self)
+        setup_peer_info_saver(self)
+        self.add_hook("TL_messages_forwardMessages")
+        logger.info("Loaded.")
+
+    def on_plugin_unload(self):
+        global current_plugin
+        selector_hook.clear_message_storage()
+        dismiss_active_dialogs()
+        current_plugin = None
+        logger.info("Unloaded.")
+
+    def create_settings(self):
+        global current_plugin
+        current_plugin = self
+        return create_settings()
+
+    def pre_request_hook(self, req_name, account, req):
+        if req_name == "TL_messages_forwardMessages" and S.enable_forward_bypass:
+            selector_hook.clear_message_storage()
+        return HookResult()

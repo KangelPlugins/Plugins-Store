@@ -1,0 +1,376 @@
+from typing import Any, Dict, Optional
+import time
+
+from base_plugin import BasePlugin
+from hook_utils import find_class, get_private_field
+from ui.bulletin import BulletinHelper
+
+from org.telegram.messenger import FileLoader, MessageObject, UserConfig
+from org.telegram.tgnet import TLRPC
+
+
+__id__ = "anonymous_stickers"
+__name__ = "Anonymous Stickers"
+__description__ = "Отправляет стикеры без привязки к исходному стикерпаку"
+__author__ = "@mishabotov & @mishabotov"
+__version__ = "1.0"
+__icon__ = "sfsymbols/266"
+
+class _AnonymousStickerSendHook:
+    def __init__(self, plugin: "AnonymousStickersPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        try:
+            if not self.plugin.enabled:
+                return
+            if not param.args or len(param.args) == 0:
+                return
+
+            send_params = param.args[0]
+            if send_params is None or not hasattr(send_params, "document"):
+                return
+
+            result = self.plugin._prepare_anonymous_sticker(send_params, param.thisObject)
+            if result == "cancel":
+                param.setResult(None)
+        except Exception as e:
+            try:
+                self.plugin.log(f"[AnonymousStickers] send hook error: {e}")
+            except Exception:
+                pass
+
+
+class AnonymousStickersPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hook_refs = []
+        self._download_request_times: Dict[int, float] = {}
+        self._notify_times: Dict[int, float] = {}
+
+    def on_plugin_load(self):
+        self._hook_send_message()
+        self.log("Anonymous Stickers loaded")
+
+    def on_plugin_unload(self):
+        for ref in list(self._hook_refs):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hook_refs.clear()
+        self._download_request_times.clear()
+        self._notify_times.clear()
+        self.log("Anonymous Stickers unloaded")
+
+    def _hook_send_message(self) -> None:
+        try:
+            send_helper_cls = find_class("org.telegram.messenger.SendMessagesHelper")
+            if send_helper_cls is None:
+                self.log("[AnonymousStickers] SendMessagesHelper class not found")
+                return
+
+            try:
+                methods = list(send_helper_cls.getClass().getDeclaredMethods())
+            except Exception:
+                methods = []
+
+            hooked = 0
+            for method in methods:
+                try:
+                    if method is None:
+                        continue
+                    if method.getName() != "sendMessage":
+                        continue
+                    method.setAccessible(True)
+                    ref = self.hook_method(method, _AnonymousStickerSendHook(self))
+                    if ref is not None:
+                        self._hook_refs.append(ref)
+                        hooked += 1
+                except Exception:
+                    pass
+
+            self.log(f"[AnonymousStickers] Hooked sendMessage overloads: {hooked}")
+        except Exception as e:
+            self.log(f"[AnonymousStickers] hook setup error: {e}")
+
+    def _prepare_anonymous_sticker(self, send_params: Any, send_helper: Any) -> Optional[str]:
+        document = getattr(send_params, "document", None)
+        if document is None:
+            return None
+
+        sticker_attr = self._get_sticker_attribute(document)
+        if sticker_attr is None:
+            return None
+
+        if not self._looks_like_sticker(document):
+            return None
+
+        if self._is_already_anonymous_upload(document, send_params):
+            self._strip_runtime_pack_hints(send_params)
+            return None
+
+        account = self._resolve_account(send_helper)
+        local_file = self._find_existing_sticker_file(account, document)
+        if local_file is None:
+            self._request_download_if_needed(account, document, getattr(send_params, "parentObject", None))
+            self._notify_once(
+                int(getattr(document, "id", 0) or 0),
+                "Стикер скачивается, нажми на него ещё раз после загрузки",
+                is_error=False,
+            )
+            return "cancel"
+
+        try:
+            anonymous_document = self._clone_document_for_upload(document, local_file)
+            setattr(send_params, "document", anonymous_document)
+            setattr(send_params, "path", local_file.getAbsolutePath())
+            self._strip_runtime_pack_hints(send_params)
+            return None
+        except Exception as e:
+            self.log(f"[AnonymousStickers] anonymize failed: {e}")
+            self._show_error("Не удалось обезличить стикер. Отправка отменена.")
+            return "cancel"
+
+    def _looks_like_sticker(self, document: Any) -> bool:
+        try:
+            return bool(
+                MessageObject.isStickerDocument(document)
+                or MessageObject.isAnimatedStickerDocument(document, True)
+                or MessageObject.isVideoSticker(document)
+            )
+        except Exception:
+            mime_type = str(getattr(document, "mime_type", "") or "")
+            return mime_type in ("image/webp", "application/x-tgsticker", "video/webm")
+
+    def _get_sticker_attribute(self, document: Any) -> Any:
+        attrs = getattr(document, "attributes", None)
+        if attrs is None:
+            return None
+        try:
+            size = attrs.size()
+            for i in range(size):
+                attr = attrs.get(i)
+                if isinstance(attr, TLRPC.TL_documentAttributeSticker):
+                    return attr
+        except Exception:
+            try:
+                for attr in attrs:
+                    if isinstance(attr, TLRPC.TL_documentAttributeSticker):
+                        return attr
+            except Exception:
+                return None
+        return None
+
+    def _is_already_anonymous_upload(self, document: Any, send_params: Any) -> bool:
+        try:
+            if int(getattr(document, "access_hash", 0) or 0) != 0:
+                return False
+            path = getattr(send_params, "path", None)
+            if not path:
+                return False
+            attr = self._get_sticker_attribute(document)
+            sticker_set = getattr(attr, "stickerset", None) if attr is not None else None
+            return sticker_set is None or isinstance(sticker_set, TLRPC.TL_inputStickerSetEmpty)
+        except Exception:
+            return False
+
+    def _find_existing_sticker_file(self, account: int, document: Any) -> Any:
+        file_loader = FileLoader.getInstance(int(account))
+        candidates = []
+        for force_cache in (False, True):
+            try:
+                file_obj = file_loader.getPathToAttach(document, force_cache)
+                if file_obj is not None:
+                    candidates.append(file_obj)
+            except Exception:
+                pass
+
+        try:
+            local_path = getattr(document, "localPath", None)
+            if local_path:
+                from java.io import File
+                candidates.append(File(str(local_path)))
+        except Exception:
+            pass
+
+        for file_obj in candidates:
+            try:
+                if file_obj is not None and file_obj.exists() and file_obj.length() > 0:
+                    return file_obj
+            except Exception:
+                pass
+        return None
+
+    def _request_download_if_needed(self, account: int, document: Any, parent_object: Any) -> None:
+        try:
+            doc_id = int(getattr(document, "id", 0) or 0)
+            now = time.time()
+            last = float(self._download_request_times.get(doc_id, 0) or 0)
+            if now - last < 2.0:
+                return
+            self._download_request_times[doc_id] = now
+            FileLoader.getInstance(int(account)).loadFile(document, parent_object, FileLoader.PRIORITY_HIGH, 0)
+        except Exception as e:
+            self.log(f"[AnonymousStickers] download request failed: {e}")
+
+    def _clone_document_for_upload(self, document: Any, local_file: Any) -> Any:
+        new_document = TLRPC.TL_document()
+        new_document.flags = 0
+        new_document.id = 0
+        new_document.access_hash = 0
+        new_document.file_reference = bytearray()
+        new_document.date = int(time.time())
+        new_document.mime_type = str(getattr(document, "mime_type", "") or "")
+        try:
+            new_document.size = local_file.length()
+        except Exception:
+            new_document.size = int(getattr(document, "size", 0) or 0)
+        new_document.dc_id = 0
+        try:
+            new_document.localPath = local_file.getAbsolutePath()
+        except Exception:
+            pass
+
+        self._copy_safe_thumbs(document, new_document)
+        self._copy_attributes_without_pack(document, new_document)
+        return new_document
+
+    def _copy_safe_thumbs(self, source: Any, target: Any) -> None:
+        copied = False
+        try:
+            thumbs = getattr(source, "thumbs", None)
+            if thumbs is not None:
+                count = thumbs.size()
+                for i in range(count):
+                    thumb = thumbs.get(i)
+                    if isinstance(thumb, TLRPC.TL_photoStrippedSize):
+                        target.thumbs.add(thumb)
+                        copied = True
+        except Exception:
+            copied = False
+
+        if copied:
+            try:
+                target.flags = int(getattr(target, "flags", 0) or 0) | 1
+            except Exception:
+                pass
+
+    def _copy_attributes_without_pack(self, source: Any, target: Any) -> None:
+        attrs = getattr(source, "attributes", None)
+        if attrs is None:
+            return
+
+        has_filename = False
+        try:
+            count = attrs.size()
+            for i in range(count):
+                attr = attrs.get(i)
+                if isinstance(attr, TLRPC.TL_documentAttributeSticker):
+                    target.attributes.add(self._anonymous_sticker_attribute(attr))
+                else:
+                    if isinstance(attr, TLRPC.TL_documentAttributeFilename):
+                        has_filename = True
+                    target.attributes.add(attr)
+        except Exception:
+            for attr in attrs:
+                if isinstance(attr, TLRPC.TL_documentAttributeSticker):
+                    target.attributes.add(self._anonymous_sticker_attribute(attr))
+                else:
+                    if isinstance(attr, TLRPC.TL_documentAttributeFilename):
+                        has_filename = True
+                    target.attributes.add(attr)
+
+        if not has_filename:
+            filename_attr = TLRPC.TL_documentAttributeFilename()
+            filename_attr.file_name = self._default_file_name(str(getattr(source, "mime_type", "") or ""))
+            target.attributes.add(filename_attr)
+
+    def _anonymous_sticker_attribute(self, source_attr: Any) -> Any:
+        attr = TLRPC.TL_documentAttributeSticker()
+        try:
+            attr.flags = int(getattr(source_attr, "flags", 0) or 0)
+        except Exception:
+            attr.flags = 0
+        try:
+            attr.alt = str(getattr(source_attr, "alt", "") or "")
+        except Exception:
+            attr.alt = ""
+        try:
+            attr.mask = bool(getattr(source_attr, "mask", False))
+        except Exception:
+            attr.mask = False
+        try:
+            attr.mask_coords = getattr(source_attr, "mask_coords", None)
+        except Exception:
+            pass
+        attr.stickerset = TLRPC.TL_inputStickerSetEmpty()
+        return attr
+
+    def _default_file_name(self, mime_type: str) -> str:
+        if mime_type == "application/x-tgsticker":
+            return "sticker.tgs"
+        if mime_type == "video/webm":
+            return "sticker.webm"
+        return "sticker.webp"
+
+    def _strip_runtime_pack_hints(self, send_params: Any) -> None:
+        try:
+            setattr(send_params, "updateStickersOrder", False)
+        except Exception:
+            pass
+        try:
+            setattr(send_params, "parentObject", None)
+        except Exception:
+            pass
+        try:
+            params = getattr(send_params, "params", None)
+            if params is not None:
+                try:
+                    params.remove("query")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _resolve_account(self, send_helper: Any) -> int:
+        for field_name in ("currentAccount",):
+            try:
+                value = get_private_field(send_helper, field_name)
+                if value is not None:
+                    return int(value)
+            except Exception:
+                pass
+            try:
+                value = getattr(send_helper, field_name)
+                if value is not None:
+                    return int(value)
+            except Exception:
+                pass
+        try:
+            return int(UserConfig.selectedAccount)
+        except Exception:
+            return 0
+
+    def _notify_once(self, doc_id: int, text: str, is_error: bool = False) -> None:
+        now = time.time()
+        last = float(self._notify_times.get(doc_id, 0) or 0)
+        if now - last < 1.5:
+            return
+        self._notify_times[doc_id] = now
+        if is_error:
+            self._show_error(text)
+        else:
+            self._show_info(text)
+
+    def _show_info(self, text: str) -> None:
+        try:
+            BulletinHelper.show_info(text)
+        except Exception:
+            self.log(f"[AnonymousStickers] {text}")
+
+    def _show_error(self, text: str) -> None:
+        try:
+            BulletinHelper.show_error(text)
+        except Exception:
+            self.log(f"[AnonymousStickers] {text}")

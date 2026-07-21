@@ -1,0 +1,527 @@
+from typing import Any, List
+from contextlib import redirect_stdout, redirect_stderr
+import ast
+import builtins
+import io
+import os
+import threading
+import traceback
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Input, Text, Switch, Divider
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread
+from client_utils import get_messages_controller, get_last_fragment
+from org.telegram.messenger import FileLoader
+
+__id__ = "python_interpreter"
+__name__ = "Python Interpreter"
+__description__ = "Выполняет код Python командой прямо в чате или из файлов.\n\nКоманды:\n>py [code] - код Python\n>pyopen - запуск .py файла из ответа\n>help - помощь\n>history - история\n>repeat - повтор\n>reset - сброс контекста\n>info - инфо\n\nОБЯЗАТЕЛЬНО ПРОЧТИТЕ ВАЖНУЮ ИНФОРМАЦИЮ В НАСТРОЙКАХ ПЛАГИНА."
+__author__ = "@Exorned, @ExerealPlugins"
+__version__ = "0.1.0"
+__icon__ = "ExerealPlugins/2"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.6"
+
+
+class PythonInterpreterPlugin(BasePlugin):
+    DEFAULT_MAX_HISTORY = 5
+    DEFAULT_MAX_OUTPUT_LEN = 3500
+    DEFAULT_MAX_FILE_SIZE_KB = 64
+    DEFAULT_TIMEOUT = 5
+    DANGEROUS_BUILTINS = ("eval", "exec", "compile", "open", "__import__", "input")
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.history = []
+        self.last_result = ""
+        self._execution_lock = threading.Lock()
+        self._load_settings()
+        self._reset_scope()
+        self.log("Python Interpreter loaded")
+
+    def _load_settings(self):
+        self.max_history = self._safe_int_setting("max_history", self.DEFAULT_MAX_HISTORY, minimum=0)
+        self.enable_py = bool(self.get_setting("enable_py", True))
+        self.show_traceback = bool(self.get_setting("show_traceback", False))
+        self.timeout_seconds = self._safe_int_setting("timeout_seconds", self.DEFAULT_TIMEOUT, minimum=1)
+        self.max_output_len = self._safe_int_setting("max_output_len", self.DEFAULT_MAX_OUTPUT_LEN, minimum=100)
+        self.max_file_size_kb = self._safe_int_setting("max_file_size_kb", self.DEFAULT_MAX_FILE_SIZE_KB, minimum=1)
+        self.restrict_dangerous = bool(self.get_setting("restrict_dangerous", False))
+
+    def _safe_int_setting(self, key: str, default: int, minimum: int = 0) -> int:
+        try:
+            value = int(self.get_setting(key, default))
+            return max(minimum, value)
+        except Exception:
+            return default
+
+    def _reset_scope(self):
+        safe_builtins = dict(vars(builtins))
+        if getattr(self, "restrict_dangerous", False):
+            for name in self.DANGEROUS_BUILTINS:
+                safe_builtins.pop(name, None)
+        self.scope = {"__builtins__": safe_builtins, "_": None}
+        self.log("Scope reset")
+
+    def _clip_text(self, text: str, limit: int = None) -> str:
+        limit = limit or self.max_output_len
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n\n...[output truncated]"
+
+    def _add_to_history(self, cmd: str, res: str):
+        if self.max_history <= 0:
+            self.last_result = res
+            return
+
+        self.history.append((cmd, res))
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+        self.last_result = res
+
+    def _on_max_history_change(self, value: str):
+        try:
+            parsed = max(0, int(value))
+        except ValueError:
+            parsed = self.DEFAULT_MAX_HISTORY
+
+        self.max_history = parsed
+        self.set_setting("max_history", parsed)
+
+    def _on_timeout_change(self, value: str):
+        try:
+            parsed = max(1, int(value))
+        except ValueError:
+            parsed = self.DEFAULT_TIMEOUT
+
+        self.timeout_seconds = parsed
+        self.set_setting("timeout_seconds", parsed)
+
+    def _on_max_output_len_change(self, value: str):
+        try:
+            parsed = max(100, int(value))
+        except ValueError:
+            parsed = self.DEFAULT_MAX_OUTPUT_LEN
+
+        self.max_output_len = parsed
+        self.set_setting("max_output_len", parsed)
+
+    def _on_max_file_size_change(self, value: str):
+        try:
+            parsed = max(1, int(value))
+        except ValueError:
+            parsed = self.DEFAULT_MAX_FILE_SIZE_KB
+
+        self.max_file_size_kb = parsed
+        self.set_setting("max_file_size_kb", parsed)
+
+    def _on_restrict_dangerous_change(self, value: bool):
+        self.restrict_dangerous = bool(value)
+        self.set_setting("restrict_dangerous", self.restrict_dangerous)
+        self._reset_scope()
+
+    def _on_reset_context_click(self, view):
+        self._reset_scope()
+        BulletinHelper.show_success("Контекст (scope) сброшен.")
+
+    def _on_clear_history_click(self, view):
+        self.history = []
+        self.last_result = ""
+        BulletinHelper.show_success("История очищена.")
+
+    def _on_enable_py_change(self, value: bool):
+        self.enable_py = bool(value)
+        self.set_setting("enable_py", self.enable_py)
+
+    def _on_show_traceback_change(self, value: bool):
+        self.show_traceback = bool(value)
+        self.set_setting("show_traceback", self.show_traceback)
+
+    def _contact_dev(self, view):
+        run_on_ui_thread(
+            lambda: get_messages_controller().openByUserName(
+                "Exorned", get_last_fragment(), 1
+            )
+        )
+
+    def _show_safety_dialog(self, view):
+        run_on_ui_thread(self._actual_show_dialog)
+
+    def _actual_show_dialog(self):
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                self.log("Cannot show dialog, no current fragment.")
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                self.log("Cannot show dialog, no parent activity.")
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Важная информация")
+            builder.set_message(
+                "Плагин выполняет произвольный Python-код. Не запускайте "
+                "непроверенный код, которому не доверяете. Это может привести "
+                "к утечке данных, поломке приложения или нежелательным действиям.\n\n"
+                f"У выполнения есть тайм-аут ({self.timeout_seconds} с из настроек): если код "
+                "не укладывается в это время, интерпретатор перестаёт его ждать и "
+                "возвращает управление. Сам код при этом может остаться работать в "
+                "фоне - если после тайм-аута что-то ведёт себя странно, используйте >reset."
+            )
+            builder.set_positive_button("Закрыть", lambda bld, which: bld.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log(f"Error showing dialog: {e}")
+
+    def create_settings(self) -> List[Any]:
+        enable_py = getattr(self, "enable_py", bool(self.get_setting("enable_py", True)))
+        show_traceback = getattr(
+            self, "show_traceback", bool(self.get_setting("show_traceback", False))
+        )
+        max_history = getattr(
+            self, "max_history",
+            self._safe_int_setting("max_history", self.DEFAULT_MAX_HISTORY, minimum=0)
+        )
+        timeout_seconds = getattr(self, "timeout_seconds", self.DEFAULT_TIMEOUT)
+        max_output_len = getattr(self, "max_output_len", self.DEFAULT_MAX_OUTPUT_LEN)
+        max_file_size_kb = getattr(self, "max_file_size_kb", self.DEFAULT_MAX_FILE_SIZE_KB)
+        restrict_dangerous = getattr(
+            self, "restrict_dangerous", bool(self.get_setting("restrict_dangerous", False))
+        )
+
+        history_count = len(getattr(self, "history", []))
+        scope_var_count = len([
+            k for k in getattr(self, "scope", {}).keys() if k not in ("__builtins__", "_")
+        ])
+
+        return [
+            Header(text="Безопасность"),
+            Text(
+                text="Важная информация",
+                icon="msg_error",
+                red=True,
+                on_click=self._show_safety_dialog,
+            ),
+            Switch(
+                key="restrict_dangerous",
+                text="Ограничить опасные функции",
+                default=restrict_dangerous,
+                subtext="Блокирует import, open, eval, exec, compile в выполняемом коде. Применяется сразу и сбрасывает контекст.",
+                icon="floating_check",
+                on_change=self._on_restrict_dangerous_change,
+            ),
+            Divider(),
+            Header(text="Выполнение кода"),
+            Switch(
+                key="enable_py",
+                text="Включить выполнение кода",
+                default=enable_py,
+                icon="msg_settings",
+                on_change=self._on_enable_py_change,
+            ),
+            Switch(
+                key="show_traceback",
+                text="Показывать полную ошибку",
+                default=show_traceback,
+                subtext="При ошибке будет показан полный traceback",
+                icon="msg_info",
+                on_change=self._on_show_traceback_change,
+            ),
+            Input(
+                key="timeout_seconds",
+                text="Тайм-аут выполнения (сек)",
+                default=str(timeout_seconds),
+                subtext="Если код не уложился в это время, интерпретатор перестаёт ждать (сам код может остаться висеть в фоне)",
+                icon="msg_settings",
+                on_change=self._on_timeout_change,
+            ),
+            Divider(),
+            Header(text="Лимиты"),
+            Input(
+                key="max_history",
+                text="Лимит истории",
+                default=str(max_history),
+                subtext="Максимальное количество команд в истории",
+                icon="msg_list",
+                on_change=self._on_max_history_change,
+            ),
+            Input(
+                key="max_output_len",
+                text="Лимит длины вывода",
+                default=str(max_output_len),
+                subtext="Максимальная длина результата в символах, дальше — обрезается",
+                icon="msg_text",
+                on_change=self._on_max_output_len_change,
+            ),
+            Input(
+                key="max_file_size_kb",
+                text="Лимит размера .py файла (КБ)",
+                default=str(max_file_size_kb),
+                subtext="Максимальный размер файла для >pyopen",
+                icon="msg_edit",
+                on_change=self._on_max_file_size_change,
+            ),
+            Divider(),
+            Header(text="Управление"),
+            Text(
+                text="Сбросить контекст",
+                subtext=f"Сейчас в scope переменных: {scope_var_count}",
+                icon="msg_arrow_forward",
+                on_click=self._on_reset_context_click,
+            ),
+            Text(
+                text="Очистить историю",
+                subtext=f"Записей в истории: {history_count}",
+                icon="msg_list",
+                on_click=self._on_clear_history_click,
+            ),
+            Divider(),
+            Header(text="Связь с разработчиком"),
+            Text(
+                text="Написать @Exorned",
+                icon="msg_info",
+                on_click=self._contact_dev,
+            ),
+        ]
+
+    def _parse_py_command(self, raw_text: str):
+        if raw_text == ">py":
+            return ""
+        if raw_text.startswith(">py "):
+            return raw_text[4:]
+        if raw_text.startswith(">py\n"):
+            return raw_text[4:]
+        return None
+
+    def _format_no_output(self, code: str) -> str:
+        stripped = code.lstrip()
+        if not stripped:
+            return "<пустой код>"
+
+        starters = ("def ", "class ", "import ", "from ", "for ", "while ", "if ", "try:", "with ")
+        if stripped.startswith(starters):
+            first = stripped.split(None, 1)[0].rstrip(":")
+            return f"OK: {first} executed"
+        return "<нет вывода>"
+
+    def _compile_repl(self, code: str):
+        tree = ast.parse(code, mode="exec")
+        eval_expr = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last = tree.body.pop()
+            eval_expr = ast.Expression(last.value)
+            ast.fix_missing_locations(eval_expr)
+        exec_part = compile(tree, "<chat-py>", "exec") if tree.body else None
+        eval_part = compile(eval_expr, "<chat-py>", "eval") if eval_expr else None
+        return exec_part, eval_part
+
+    def _execute_code(self, code: str, command_name: str) -> str:
+        code = code.strip()
+        if not code:
+            return "<пустой код>"
+
+        if not self._execution_lock.acquire(blocking=False):
+            return "Предыдущий код ещё выполняется, дождитесь завершения."
+
+        result_container = {}
+
+        def runner():
+            buffer = io.StringIO()
+            try:
+                exec_part, eval_part = self._compile_repl(code)
+                with redirect_stdout(buffer), redirect_stderr(buffer):
+                    if exec_part:
+                        exec(exec_part, self.scope, self.scope)
+                    if eval_part:
+                        result_val = eval(eval_part, self.scope, self.scope)
+                        self.scope["_"] = result_val
+                        if result_val is not None:
+                            print(result_val)
+                out = buffer.getvalue().strip()
+                if not out:
+                    out = self._format_no_output(code)
+                result_container["result"] = out
+            except (SystemExit, KeyboardInterrupt) as e:
+                result_container["result"] = f"Blocked: {type(e).__name__}"
+            except Exception:
+                result_container["result"] = (
+                    traceback.format_exc().strip() if self.show_traceback
+                    else str(traceback.format_exc().splitlines()[-1])
+                )
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        thread.join(self.timeout_seconds)
+
+        if thread.is_alive():
+            self._execution_lock.release()
+            result = (
+                f"Тайм-аут выполнения ({self.timeout_seconds} с). Код не завершился и "
+                "может продолжать работать в фоне. Если что-то пойдёт не так — используйте >reset."
+            )
+            self._add_to_history(command_name, result)
+            return result
+
+        self._execution_lock.release()
+        result = self._clip_text(result_container.get("result", "<нет вывода>"))
+        self._add_to_history(command_name, result)
+        return result
+
+    def _read_python_file(self, file_path: str) -> str:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError("Файл не найден на устройстве.")
+
+        if os.path.getsize(file_path) > self.max_file_size_kb * 1024:
+            raise ValueError("Файл слишком большой для безопасного выполнения.")
+
+        encodings = ("utf-8", "utf-8-sig", "cp1251")
+        last_error = None
+
+        for enc in encodings:
+            try:
+                with open(file_path, "r", encoding=enc) as f:
+                    return f.read()
+            except Exception as e:
+                last_error = e
+
+        raise ValueError(f"Не удалось прочитать файл: {last_error}")
+
+    def _get_document_filename(self, document):
+        try:
+            name = FileLoader.getDocumentFileName(document)
+            if name and str(name).strip():
+                return str(name)
+        except Exception:
+            pass
+
+        try:
+            for attribute in document.attributes:
+                candidate = getattr(attribute, "file_name", None)
+                if candidate:
+                    return str(candidate)
+        except Exception:
+            pass
+
+        fallback = getattr(document, "file_name", None) or getattr(document, "fileName", None)
+        return str(fallback) if fallback else "unknown"
+
+    def _extract_document_path(self, account: int, reply_to_msg):
+        def find_doc(obj):
+            if not obj:
+                return None
+            if hasattr(obj, "document") and obj.document:
+                return obj.document
+            if hasattr(obj, "media"):
+                if hasattr(obj.media, "document") and obj.media.document:
+                    return obj.media.document
+                if hasattr(obj.media, "file") and obj.media.file:
+                    return obj.media.file
+            return None
+
+        document = find_doc(reply_to_msg)
+        if not document:
+            return None, None, "Не удалось найти файл в ответе."
+
+        file_name = self._get_document_filename(document)
+        if not file_name.lower().endswith(".py"):
+            return None, None, f"Поддерживаются только .py файлы (получено: {file_name})."
+
+        try:
+            java_file = FileLoader.getInstance(account).getPathToAttach(document)
+            file_path = java_file.getAbsolutePath() if java_file else None
+            if not file_path:
+                return None, None, "Не удалось получить путь к файлу."
+            return document, file_path, None
+        except Exception:
+            return None, None, "Ошибка при получении пути к файлу."
+
+    def _render_history(self) -> str:
+        if not self.history:
+            return "История пуста."
+
+        lines = []
+        for i, (cmd, res) in enumerate(self.history, start=1):
+            cmd_preview = cmd.replace("\n", " ")[:40]
+            res_preview = res.replace("\n", " ")[:60]
+            lines.append(f"{i}. {cmd_preview} -> {res_preview}")
+        return "\n".join(lines)
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not isinstance(getattr(params, "message", None), str):
+            return HookResult()
+
+        raw_text = params.message.strip()
+
+        if raw_text == ">help":
+            params.message = (
+                "Команды Python Interpreter:\n"
+                ">py <code> — код Python\n"
+                ">pyopen — запуск .py файла из ответа\n"
+                ">history — история\n"
+                ">repeat — повтор последнего результата\n"
+                ">reset — сброс контекста\n"
+                ">info — информация о плагине\n"
+            )
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if raw_text in (">info", ">status"):
+            params.message = (
+                f"Plugin: {__name__}\n"
+                f"Dev: {__author__}\n"
+                f"Version: {__version__}\n"
+                f"Status: {'Active' if self.enable_py else 'Disabled'}"
+            )
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if raw_text == ">history":
+            params.message = self._render_history()
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if raw_text == ">repeat":
+            params.message = self.last_result if self.last_result else "Нет результата для повтора."
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if raw_text == ">reset":
+            self._reset_scope()
+            params.message = "Контекст (scope) сброшен."
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        code = self._parse_py_command(raw_text)
+        if code is not None:
+            if not self.enable_py:
+                params.message = "Выполнение кода отключено."
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            params.message = self._execute_code(code, code or ">py")
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if raw_text == ">pyopen":
+            if not self.enable_py:
+                params.message = "Выполнение кода отключено."
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            reply_obj = getattr(params, "replyToMsg", None) or getattr(params, "reply_to_msg", None)
+            reply_to_msg = getattr(reply_obj, "messageOwner", reply_obj)
+
+            if not reply_to_msg:
+                params.message = "Ответьте на сообщение с .py файлом командой >pyopen"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            document, file_path, error = self._extract_document_path(account, reply_to_msg)
+            if error:
+                params.message = error
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            try:
+                code = self._read_python_file(file_path)
+                cmd_name = f"File: {self._get_document_filename(document)}"
+                params.message = self._execute_code(code, cmd_name)
+            except Exception as e:
+                params.message = f"Ошибка чтения файла: {e}"
+
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        return HookResult()
