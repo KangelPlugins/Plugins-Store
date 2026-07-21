@@ -1,0 +1,1234 @@
+__id__ = "music_dl"
+__name__ = "Music Downloader"
+__description__ = """Ищи, скачивай и получай рекомендованные тебе треки с помощью SoundCloud.
+Рад, что вам понравилась прошлая версия!
+(Придумайте какой нибудь бред здесь)"""
+__author__ = "@s1mclick"
+__version__ = "3.1.1"
+__icon__ = "IbukiMiodaOneLove/0"
+__app_version__ = ">=12.5.1"
+
+import json
+import os
+import re
+import struct
+import threading
+import time
+from collections import Counter
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from requests.exceptions import SSLError
+import urllib3
+from PIL import Image
+import io
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import run_on_queue, send_audio, send_text
+from ui.settings import Header, Input, Divider, Switch, Selector, Text, EditText
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─────────────────────────────────────────────────────────────────────────────
+SC_API = "https://api-v2.soundcloud.com"
+SC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": "https://soundcloud.com",
+    "Referer": "https://soundcloud.com/",
+}
+
+STOP_WORDS = {
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "feat",
+    "ft", "mix", "remix", "edit", "radio", "version", "official", "audio", "lyrics",
+    "music", "track", "song", "full", "hd", "video",
+}
+
+_sc_client_id = None
+_search_sessions: dict = {}   # peer_id → session dict
+_locks = {
+    "likes": threading.Lock(),
+    "update": threading.Lock(),
+}
+
+
+def _sc_get(url: str, *, fallback_insecure: bool = True, **kwargs):
+    try:
+        return requests.get(url, **kwargs)
+    except SSLError:
+        if not fallback_insecure:
+            raise
+        kwargs = dict(kwargs)
+        kwargs["verify"] = False
+        return requests.get(url, **kwargs)
+
+
+# ─── small utils ─────────────────────────────────────────────────────────────
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _safe_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _normalize(text: str) -> str:
+    text = _safe_text(text).lower()
+    text = re.sub(r"[\[\]()<>{}_~`*!?.,:;\"'\\/|+=\-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _tokens(text: str) -> List[str]:
+    out = []
+    for token in _normalize(text).split():
+        if token and token not in STOP_WORDS and len(token) > 1:
+            out.append(token)
+    return out
+
+
+def _version_tuple(value: str) -> Tuple[int, ...]:
+    parts = re.findall(r"\d+", value or "")
+    return tuple(int(p) for p in parts[:4]) or (0,)
+
+
+def _dedupe_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for track in tracks:
+        tid = track.get("id")
+        if tid in seen:
+            continue
+        seen.add(tid)
+        out.append(track)
+    return out
+
+
+# ─── SoundCloud ───────────────────────────────────────────────────────────────
+
+def get_sc_client_id():
+    global _sc_client_id
+    if _sc_client_id:
+        return _sc_client_id
+    try:
+        resp = _sc_get("https://soundcloud.com", headers=SC_HEADERS, timeout=10)
+        js_urls = re.findall(r'"(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', resp.text)
+        for url in reversed(js_urls):
+            try:
+                js = _sc_get(url, headers=SC_HEADERS, timeout=10)
+                match = re.search(r'client_id\s*:\s*"([a-zA-Z0-9]{32})"', js.text)
+                if not match:
+                    match = re.search(r'"client_id"\s*,\s*"([a-zA-Z0-9]{32})"', js.text)
+                if match:
+                    _sc_client_id = match.group(1)
+                    return _sc_client_id
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _track_blob(track: Dict[str, Any]) -> str:
+    return " | ".join(
+        x for x in [
+            track.get("title", ""),
+            track.get("artist", ""),
+            track.get("genre", ""),
+            track.get("year", ""),
+        ] if x
+    )
+
+
+def _base_score(query: str, track: Dict[str, Any]) -> float:
+    q = _normalize(query)
+    if not q:
+        return 0.0
+
+    title = _normalize(track.get("title", ""))
+    artist = _normalize(track.get("artist", ""))
+    genre = _normalize(track.get("genre", ""))
+    combo = " ".join(x for x in [title, artist, genre] if x)
+
+    q_tokens = set(_tokens(query))
+    c_tokens = set(_tokens(combo))
+    overlap = len(q_tokens & c_tokens) / max(1, len(q_tokens))
+
+    score = 0.0
+    if q == combo:
+        score += 10.0
+    if q in title:
+        score += 4.0
+    if q in artist:
+        score += 2.5
+    if q in combo:
+        score += 1.5
+    if q_tokens:
+        score += overlap * 4.0
+
+    score += SequenceMatcher(None, q, combo).ratio() * 3.5
+    score += SequenceMatcher(None, q, title).ratio() * 1.6
+    score += SequenceMatcher(None, q, artist).ratio() * 1.2
+
+    # tiny bump for visible activity
+    score += min(track.get("plays", 0) or 0, 250000) / 250000.0
+    score += min(track.get("likes", 0) or 0, 100000) / 50000.0
+
+    return score
+
+
+def _profile_score(track: Dict[str, Any], liked_tracks: List[Dict[str, Any]]) -> float:
+    if not liked_tracks:
+        return 0.0
+
+    track_blob = _track_blob(track)
+    track_tokens = set(_tokens(track_blob))
+    best = 0.0
+
+    for liked in liked_tracks:
+        liked_blob = _track_blob(liked)
+        liked_tokens = set(_tokens(liked_blob))
+        if not liked_tokens:
+            continue
+
+        overlap = len(track_tokens & liked_tokens) / max(1, len(track_tokens | liked_tokens))
+        similarity = SequenceMatcher(None, _normalize(track_blob), _normalize(liked_blob)).ratio()
+        score = overlap * 6.0 + similarity * 4.0
+
+        if liked.get("genre") and track.get("genre") and _normalize(liked["genre"]) == _normalize(track["genre"]):
+            score += 1.25
+
+        best = max(best, score)
+
+    return best
+
+
+def sc_search(query, limit=20):
+    client_id = get_sc_client_id()
+    if not client_id:
+        return [], "❌ Не удалось получить SoundCloud client_id"
+
+    try:
+        limit = max(1, min(int(limit), 50))
+        resp = _sc_get(
+            f"{SC_API}/search/tracks",
+            params={
+                "q": query,
+                "limit": limit,
+                "client_id": client_id,
+                "app_version": "1735820463",
+            },
+            headers=SC_HEADERS,
+            timeout=10,
+        )
+        tracks = resp.json().get("collection", [])
+        results = []
+        for t in tracks:
+            dur_ms = t.get("duration", 0)
+            duration = f"{dur_ms // 60000}:{(dur_ms % 60000) // 1000:02d}" if dur_ms else ""
+            if t.get("id") and t.get("streamable") and t.get("policy") != "BLOCK":
+                results.append({
+                    "title": t.get("title", ""),
+                    "artist": t.get("user", {}).get("username", ""),
+                    "duration": duration,
+                    "id": t.get("id"),
+                    "artwork_url": (t.get("artwork_url") or "").replace("large", "t200x200"),
+                    "genre": t.get("genre", ""),
+                    "year": (t.get("created_at") or "")[:4],
+                    "plays": t.get("playback_count", 0),
+                    "likes": t.get("likes_count", 0),
+                    "_query_score": 0.0,
+                })
+
+        results = _dedupe_tracks(results)
+        for t in results:
+            t["_query_score"] = _base_score(query, t)
+
+        results.sort(key=lambda x: x.get("_query_score", 0.0), reverse=True)
+        return results, None
+    except Exception as e:
+        return [], f"❌ Ошибка поиска: {e}"
+
+
+def get_stream_url(track_id):
+    client_id = get_sc_client_id()
+    if not client_id:
+        return None, "нет client_id"
+    try:
+        resp = _sc_get(
+            f"{SC_API}/tracks/{track_id}",
+            params={"client_id": client_id},
+            headers=SC_HEADERS,
+            timeout=10,
+        )
+        transcodings = resp.json().get("media", {}).get("transcodings", [])
+        mp3_url = None
+        for tc in transcodings:
+            fmt = tc.get("format", {})
+            if fmt.get("mime_type") == "audio/mpeg" and fmt.get("protocol") == "progressive":
+                mp3_url = tc.get("url")
+                break
+        if not mp3_url:
+            for tc in transcodings:
+                if "mp3" in tc.get("url", ""):
+                    mp3_url = tc.get("url")
+                    break
+        if not mp3_url:
+            return None, f"нет mp3 (форматов: {len(transcodings)})"
+        final = _sc_get(
+            mp3_url,
+            params={"client_id": client_id},
+            headers=SC_HEADERS,
+            timeout=10,
+        ).json().get("url")
+        return (final, None) if final else (None, "нет url в ответе")
+    except Exception as e:
+        return None, str(e)
+
+
+def download_file(url, path):
+    try:
+        with _sc_get(url, headers=SC_HEADERS, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_artwork(url):
+    if not url:
+        return None
+    try:
+        resp = _sc_get(url, timeout=8)
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+# ─── ID3 (pure Python) ────────────────────────────────────────────────────────
+
+def _syncsafe(n):
+    r = bytearray(4)
+    for i in range(3, -1, -1):
+        r[i] = n & 0x7F
+        n >>= 7
+    return bytes(r)
+
+
+def _frame(fid, data):
+    return fid.encode() + struct.pack(">I", len(data)) + b"\x00\x00" + data
+
+
+def _tf(fid, text):
+    return _frame(fid, b"\x03" + text.encode("utf-8"))
+
+
+def _apic(jpeg):
+    return _frame("APIC", b"\x03image/jpeg\x00\x03\x00" + jpeg)
+
+
+def write_id3(path, title, artist, performer_tag, genre, year, artwork):
+    try:
+        frames = b""
+        frames += _tf("TIT2", title)
+        frames += _tf("TPE1", performer_tag)
+        frames += _tf("TPE2", artist)
+        if genre:
+            frames += _tf("TCON", genre)
+        if year:
+            frames += _tf("TDRC", year)
+        frames += _tf("TENC", "music_dl")
+        if artwork:
+            frames += _apic(artwork)
+
+        header = b"ID3\x03\x00\x00" + _syncsafe(len(frames))
+        with open(path, "rb") as f:
+            mp3 = f.read()
+        if mp3[:3] == b"ID3":
+            old = ((mp3[6] & 0x7F) << 21 | (mp3[7] & 0x7F) << 14 | (mp3[8] & 0x7F) << 7 | (mp3[9] & 0x7F))
+            mp3 = mp3[10 + old:]
+        with open(path, "wb") as f:
+            f.write(header + frames + mp3)
+    except Exception:
+        pass
+
+
+# ─── text builders ────────────────────────────────────────────────────────────
+
+def build_page(results, page, per_page, query, show_stats, show_genre):
+    total_pages = max(1, (len(results) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    chunk = results[start: start + per_page]
+
+    lines = [
+        "🎵 Music Downloader",
+        f"🔎 «{query}»  •  стр. {page}/{total_pages}",
+        "",
+    ]
+    for i, t in enumerate(chunk, start + 1):
+        dur = f" [{t['duration']}]" if t["duration"] else ""
+        extra = []
+        if show_stats:
+            if t.get("plays"):
+                extra.append(f"▶{t['plays']:,}")
+            if t.get("likes"):
+                extra.append(f"♥{t['likes']:,}")
+        if show_genre and t.get("genre"):
+            extra.append(t["genre"])
+        extra_txt = f"  ({' • '.join(extra)})" if extra else ""
+        lines.append(f"{i}. {t['title']} — {t['artist']}{dur}{extra_txt}")
+
+    lines.append("")
+    lines.append(f"Лайк: .like [1–{start + len(chunk)}]  |  Скачивание: dlf [номер]")
+    if total_pages > 1:
+        lines.append("Листать: .fc next / .fc prev")
+    lines.append("Меню сообщения: лайк, избранное, рекомендации, инфо")
+    return "\n".join(lines)
+
+
+def _format_track_line(track: Dict[str, Any], index: Optional[int] = None) -> str:
+    dur = f" [{track.get('duration')}]" if track.get("duration") else ""
+    prefix = f"{index}. " if index is not None else ""
+    return f"{prefix}{track.get('title', '')} — {track.get('artist', '')}{dur}"
+
+
+def _extract_peer_id(context: Dict[str, Any]):
+    for key in ("dialog_id", "chatId", "userId", "peer", "dialogId"):
+        if context.get(key) is not None:
+            return context.get(key)
+    return None
+
+
+def _extract_first_listed_track(text: str) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    for line in text.splitlines():
+        m = re.match(r"^\s*\d+\.\s*(.+?)\s+—\s+(.+?)(?:\s+\[.*?\])?(?:\s+\(.*?\))?\s*$", line)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+    return None
+
+
+# ─── Plugin ───────────────────────────────────────────────────────────────────
+
+class MusicPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+        self._menu_item_ids = []
+        self._menu_item_ids.append(
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU,
+                    text="Music Downloader",
+                    subtext="Поиск, избранное и рекомендации",
+                    icon="msg_search",
+                    on_click=self.handle_music_menu,
+                    priority=20,
+                )
+            )
+        )
+        self._menu_item_ids.append(
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU,
+                    text="Favorites",
+                    subtext="Показать сохранённые лайки",
+                    icon="msg_saved",
+                    on_click=self.handle_favorites_menu,
+                    priority=19,
+                )
+            )
+        )
+        self._menu_item_ids.append(
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU,
+                    text="Recommendations",
+                    subtext="10 треков на основе лайков",
+                    icon="msg_info",
+                    on_click=self.handle_recommendations_menu,
+                    priority=18,
+                )
+            )
+        )
+        self._menu_item_ids.append(
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.DRAWER_MENU,
+                    text="Check update",
+                    subtext="Проверить новую версию",
+                    icon="msg_info",
+                    on_click=self.handle_update_menu,
+                    priority=17,
+                )
+            )
+        )
+        self._menu_item_ids.append(
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Like best match",
+                    subtext="Сохранить трек из последнего поиска",
+                    icon="msg_saved",
+                    on_click=self.handle_like_message_menu,
+                    priority=15,
+                )
+            )
+        )
+
+    def on_plugin_unload(self):
+        for item_id in getattr(self, "_menu_item_ids", []):
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+
+    # ── settings ──────────────────────────────────────────────────────────────
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Интерфейс"),
+            Selector(
+                key="results_per_page",
+                text="Результатов на странице",
+                default=1,
+                items=["3", "5", "7", "10"],
+                icon="msg_list",
+            ),
+            Selector(
+                key="search_limit",
+                text="Всего результатов",
+                default=1,
+                items=["10", "20", "30", "50"],
+                icon="msg_search",
+            ),
+            Switch(
+                key="show_stats",
+                text="Показывать статистику",
+                default=True,
+                subtext="Прослушивания и лайки в списке",
+                icon="msg_stats",
+            ),
+            Switch(
+                key="show_genre",
+                text="Показывать жанр",
+                default=False,
+                subtext="Жанр рядом с треком",
+                icon="msg_topic",
+            ),
+            Divider(),
+            Header(text="Избранное"),
+            Switch(
+                key="auto_like_downloads",
+                text="Автолайк после скачивания",
+                default=True,
+                subtext="Сохранять скачанные треки в избранное",
+                icon="msg_saved",
+            ),
+            Input(
+                key="favorites_cap",
+                text="Лимит избранного",
+                default="200",
+                subtext="Сколько треков хранить локально",
+                icon="msg_more",
+            ),
+            Divider(),
+            Header(text="Обновления"),
+            Switch(
+                key="auto_update_check",
+                text="Показывать предупреждение об обновлении",
+                default=True,
+                subtext="Сообщать о новой версии в чате",
+                icon="msg_info",
+            ),
+            Input(
+                key="update_feed_url",
+                text="URL обновлений",
+                default="",
+                subtext='JSON: {"version":"4.0.1","notes":"..."}',
+                icon="msg_info",
+            ),
+            Divider(),
+            Header(text="Водяной знак"),
+            Input(
+                key="watermark_user",
+                text="Ваш username",
+                default="@s1mclick",
+                subtext="Появится в теге: [Автор] | dled by @вы",
+                icon="msg_mention",
+            ),
+        ]
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _per_page(self):
+        return [3, 5, 7, 10][self.get_setting("results_per_page", 1)]
+
+    def _limit(self):
+        return [10, 20, 30, 50][self.get_setting("search_limit", 1)]
+
+    def _wm(self):
+        return self.get_setting("watermark_user", "@s1mclick")
+
+    def _performer(self, artist):
+        return f"{artist} | dled by {self._wm()}"
+
+    def _get_favorites(self) -> List[Dict[str, Any]]:
+        value = self.get_setting("liked_tracks", [])
+        return value if isinstance(value, list) else []
+
+    def _save_favorites(self, items: List[Dict[str, Any]]) -> None:
+        self.set_setting("liked_tracks", items, reload_settings=False)
+
+    def _trim_favorites(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        try:
+            cap = int(self.get_setting("favorites_cap", "200"))
+        except Exception:
+            cap = 200
+        cap = max(10, min(cap, 1000))
+        return items[:cap]
+
+    def _track_record(self, track: Dict[str, Any], query: str = "") -> Dict[str, Any]:
+        return {
+            "id": track.get("id"),
+            "title": track.get("title", ""),
+            "artist": track.get("artist", ""),
+            "duration": track.get("duration", ""),
+            "genre": track.get("genre", ""),
+            "year": track.get("year", ""),
+            "plays": track.get("plays", 0),
+            "likes": track.get("likes", 0),
+            "artwork_url": track.get("artwork_url", ""),
+            "query": query,
+            "liked_at": _now_ts(),
+            "like_count": 1,
+        }
+
+    def _upsert_favorite(self, track: Dict[str, Any], query: str = "", delta: int = 1) -> Dict[str, Any]:
+        with _locks["likes"]:
+            favorites = self._get_favorites()
+            tid = track.get("id")
+            found = False
+            for item in favorites:
+                if item.get("id") == tid:
+                    item["like_count"] = max(1, int(item.get("like_count", 1)) + delta)
+                    item["liked_at"] = _now_ts()
+                    item["title"] = track.get("title", item.get("title", ""))
+                    item["artist"] = track.get("artist", item.get("artist", ""))
+                    item["duration"] = track.get("duration", item.get("duration", ""))
+                    item["genre"] = track.get("genre", item.get("genre", ""))
+                    item["year"] = track.get("year", item.get("year", ""))
+                    item["plays"] = track.get("plays", item.get("plays", 0))
+                    item["likes"] = track.get("likes", item.get("likes", 0))
+                    item["artwork_url"] = track.get("artwork_url", item.get("artwork_url", ""))
+                    if query:
+                        item["query"] = query
+                    found = True
+                    saved = item
+                    break
+
+            if not found:
+                saved = self._track_record(track, query=query)
+                favorites.insert(0, saved)
+
+            favorites.sort(key=lambda x: (int(x.get("like_count", 1)), int(x.get("liked_at", 0))), reverse=True)
+            favorites = self._trim_favorites(favorites)
+            self._save_favorites(favorites)
+            return saved
+
+    def _remove_favorite(self, track_id: Any) -> bool:
+        with _locks["likes"]:
+            favorites = self._get_favorites()
+            before = len(favorites)
+            favorites = [x for x in favorites if x.get("id") != track_id]
+            if len(favorites) == before:
+                return False
+            self._save_favorites(favorites)
+            return True
+
+    def _favorites_as_text(self, favorites: List[Dict[str, Any]], title: str) -> str:
+        if not favorites:
+            return f"{title}\n\nПока пусто."
+        lines = [title, ""]
+        for i, t in enumerate(favorites[:10], 1):
+            cnt = int(t.get("like_count", 1))
+            dur = f" [{t.get('duration')}]" if t.get("duration") else ""
+            extra = []
+            if t.get("genre"):
+                extra.append(t["genre"])
+            if t.get("year"):
+                extra.append(t["year"])
+            extra_txt = f"  ({' • '.join(extra)})" if extra else ""
+            lines.append(f"{i}. {t.get('title', '')} — {t.get('artist', '')}{dur}  ×{cnt}{extra_txt}")
+        return "\n".join(lines)
+
+    def _warn_update_if_needed(self, peer_id) -> None:
+        if not self.get_setting("auto_update_check", True):
+            return
+
+        url = _safe_text(self.get_setting("update_feed_url", "")).strip()
+        if not url:
+            return
+
+        def task():
+            with _locks["update"]:
+                try:
+                    last_notified = _safe_text(self.get_setting("last_update_notified", ""))
+                    resp = _sc_get(url, timeout=8, headers=SC_HEADERS)
+                    text = resp.text.strip()
+                    latest = None
+                    notes = ""
+
+                    try:
+                        payload = resp.json()
+                        if isinstance(payload, dict):
+                            latest = _safe_text(payload.get("version") or payload.get("latest") or payload.get("tag") or "").strip()
+                            notes = _safe_text(payload.get("notes") or payload.get("changelog") or "").strip()
+                    except Exception:
+                        pass
+
+                    if not latest:
+                        latest = text.splitlines()[0].strip()
+
+                    if not latest:
+                        return
+
+                    if _version_tuple(latest) <= _version_tuple(__version__):
+                        return
+
+                    if last_notified == latest:
+                        return
+
+                    msg = f"⚠️ Доступно обновление: {latest} (сейчас {__version__})"
+                    if notes:
+                        msg += f"\n{notes[:700]}"
+                    send_text(peer_id, msg)
+                    self.set_setting("last_update_notified", latest, reload_settings=False)
+                except Exception:
+                    return
+
+        run_on_queue(task)
+
+    def _do_download(self, peer_id, track):
+        dur = f" [{track['duration']}]" if track.get("duration") else ""
+        send_text(peer_id, f"⬇️ Скачиваю: {track['title']} — {track['artist']}{dur}")
+
+        artwork_result = [None]
+
+        def _fetch_art():
+            if self.get_setting("send_artwork", True):
+                artwork_result[0] = fetch_artwork(track.get("artwork_url", ""))
+
+        art_thread = threading.Thread(target=_fetch_art, daemon=True)
+        art_thread.start()
+
+        stream_url, err = get_stream_url(track["id"])
+        if not stream_url:
+            send_text(peer_id, f"❌ Не удалось получить поток: {err}")
+            return
+
+        path = "/sdcard/Download/music_dl.mp3"
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+        if not download_file(stream_url, path):
+            send_text(peer_id, "❌ Ошибка при скачивании файла")
+            return
+
+        art_thread.join(timeout=10)
+
+        write_id3(
+            path=path,
+            title=track["title"],
+            artist=track["artist"],
+            performer_tag=self._performer(track["artist"]),
+            genre=track.get("genre", ""),
+            year=track.get("year", ""),
+            artwork=artwork_result[0],
+        )
+
+        if self.get_setting("auto_like_downloads", True):
+            self._upsert_favorite(track, query=track.get("query", "") or "", delta=1)
+
+        caption = f"🎧 {track['title']} — {track['artist']}{dur}"
+        if self.get_setting("show_dl_stats", True):
+            if track.get("plays"):
+                caption += f"\n▶ {track['plays']:,} прослушиваний"
+            if track.get("likes"):
+                caption += f"  ♥ {track['likes']:,} лайков"
+            if track.get("genre"):
+                caption += f"\n🎵 {track['genre']}"
+        caption += f"\n\n♥ saved locally via music_dl"
+        send_audio(peer_id, path, caption=caption)
+
+    def _recommend_tracks(self, seed_tracks: List[Dict[str, Any]], limit: int = 10) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        favorites = self._get_favorites()
+        if not favorites and not seed_tracks:
+            return [], "Сначала добавь несколько лайков."
+
+        # Build a compact query profile from liked tracks.
+        token_counter = Counter()
+        for item in favorites[:25]:
+            token_counter.update(_tokens(_track_blob(item)))
+
+        if not token_counter and seed_tracks:
+            for item in seed_tracks[:5]:
+                token_counter.update(_tokens(_track_blob(item)))
+
+        profile_tokens = [t for t, _ in token_counter.most_common(5)]
+        profile_query = " ".join(profile_tokens).strip()
+
+        candidate_sources: List[Dict[str, Any]] = []
+        queries = []
+
+        if profile_query:
+            queries.append(profile_query)
+        for item in favorites[:3]:
+            q = " ".join(x for x in [item.get("artist", ""), item.get("title", "")] if x).strip()
+            if q:
+                queries.append(q)
+
+        if seed_tracks:
+            for item in seed_tracks[:2]:
+                q = " ".join(x for x in [item.get("artist", ""), item.get("title", "")] if x).strip()
+                if q:
+                    queries.append(q)
+
+        queries = list(dict.fromkeys(queries))  # preserve order, drop dupes
+
+        for q in queries[:4]:
+            results, _err = sc_search(q, limit=max(20, limit * 3))
+            candidate_sources.extend(results)
+
+        candidate_sources = _dedupe_tracks(candidate_sources)
+        liked_ids = {x.get("id") for x in favorites}
+        seed_blob = " ".join(_track_blob(x) for x in seed_tracks)
+
+        scored = []
+        for track in candidate_sources:
+            if track.get("id") in liked_ids:
+                continue
+
+            score = 0.0
+            score += _profile_score(track, favorites)
+            if seed_tracks:
+                score += SequenceMatcher(None, _normalize(_track_blob(track)), _normalize(seed_blob)).ratio() * 2.0
+            if profile_query:
+                score += _base_score(profile_query, track) * 0.35
+            if track.get("plays"):
+                score += min(track["plays"], 500000) / 500000.0
+            scored.append((score, track))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out = []
+        seen = set()
+        for score, track in scored:
+            tid = track.get("id")
+            if tid in seen:
+                continue
+            seen.add(tid)
+            track["_rec_score"] = score
+            out.append(track)
+            if len(out) >= limit:
+                break
+
+        if not out:
+            return [], "Не удалось собрать рекомендации."
+        return out, None
+
+    def _handle_like_track(self, peer_id, track: Dict[str, Any], query: str = "", respond: bool = True):
+        liked = self._upsert_favorite(track, query=query, delta=1)
+        if respond:
+            msg = f"♥ В избранное: {liked.get('title', '')} — {liked.get('artist', '')}"
+            send_text(peer_id, msg)
+
+    def _handle_unlike_track(self, peer_id, track_id: Any):
+        if self._remove_favorite(track_id):
+            send_text(peer_id, "🗑 Удалено из избранного")
+        else:
+            send_text(peer_id, "❌ Трек не найден в избранном")
+
+    def _show_info(self, peer_id):
+        favorites = self._get_favorites()
+        total_likes = sum(int(x.get("like_count", 1)) for x in favorites)
+        text = [
+            "ℹ️ Music Downloader",
+            f"Версия: {__version__}",
+            f"Избранное: {len(favorites)}",
+            f"Суммарно лайков: {total_likes}",
+            "",
+            "Команды:",
+            ".find <название>",
+            ".like [номер]",
+            ".unlike [номер]",
+            ".rec",
+            ".info",
+            "",
+            "Меню:",
+            "Music Downloader, Favorites, Recommendations, Check update",
+        ]
+        send_text(peer_id, "\n".join(text))
+        self._warn_update_if_needed(peer_id)
+
+    def _show_favorites(self, peer_id):
+        favorites = self._get_favorites()
+        favorites.sort(key=lambda x: (int(x.get("like_count", 1)), int(x.get("liked_at", 0))), reverse=True)
+        send_text(peer_id, self._favorites_as_text(favorites, "⭐ Избранное"))
+        self._warn_update_if_needed(peer_id)
+
+    def _show_recommendations(self, peer_id):
+        favorites = self._get_favorites()
+        favorites.sort(key=lambda x: (int(x.get("like_count", 1)), int(x.get("liked_at", 0))), reverse=True)
+        seeds = favorites[:5]
+        recs, err = self._recommend_tracks(seeds, limit=10)
+        if not recs:
+            send_text(peer_id, err or "Нет рекомендаций")
+            return
+
+        lines = ["✨ Рекомендации", ""]
+        for i, t in enumerate(recs, 1):
+            dur = f" [{t['duration']}]" if t.get("duration") else ""
+            score = t.get("_rec_score", 0.0)
+            extra = []
+            if t.get("genre"):
+                extra.append(t["genre"])
+            if t.get("plays"):
+                extra.append(f"▶{t['plays']:,}")
+            extra_txt = f"  ({' • '.join(extra)})" if extra else ""
+            lines.append(f"{i}. {t.get('title', '')} — {t.get('artist', '')}{dur}  · {score:.2f}{extra_txt}")
+        send_text(peer_id, "\n".join(lines))
+        self._warn_update_if_needed(peer_id)
+
+    def _check_update_now(self, peer_id):
+        url = _safe_text(self.get_setting("update_feed_url", "")).strip()
+        if not url:
+            send_text(peer_id, "ℹ️ Сначала укажи URL обновлений в настройках")
+            return
+
+        def task():
+            try:
+                resp = requests.get(url, timeout=8, headers=SC_HEADERS)
+                latest = None
+                notes = ""
+
+                try:
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        latest = _safe_text(payload.get("version") or payload.get("latest") or payload.get("tag") or "").strip()
+                        notes = _safe_text(payload.get("notes") or payload.get("changelog") or "").strip()
+                except Exception:
+                    pass
+
+                if not latest:
+                    latest = resp.text.strip().splitlines()[0].strip()
+
+                if not latest:
+                    send_text(peer_id, "❌ Не удалось прочитать версию из feed")
+                    return
+
+                if _version_tuple(latest) > _version_tuple(__version__):
+                    msg = f"⚠️ Доступно обновление: {latest} (сейчас {__version__})"
+                    if notes:
+                        msg += f"\n{notes[:700]}"
+                    send_text(peer_id, msg)
+                    self.set_setting("last_update_notified", latest, reload_settings=False)
+                else:
+                    send_text(peer_id, f"✅ Обновлений нет. Текущая версия: {__version__}")
+            except Exception as e:
+                send_text(peer_id, f"❌ Ошибка проверки обновления: {e}")
+
+        run_on_queue(task)
+
+    # ── menu handlers ─────────────────────────────────────────────────────────
+
+    def handle_music_menu(self, context: Dict[str, Any]):
+        peer_id = _extract_peer_id(context)
+        if peer_id is None:
+            return
+        text = (
+            "🎵 Music Downloader\n\n"
+            "Поиск:\n"
+            ".find <название>\n\n"
+            "Лайки:\n"
+            ".like [номер]\n"
+            ".unlike [номер]\n\n"
+            "Ещё:\n"
+            ".rec\n"
+            ".info"
+        )
+        send_text(peer_id, text)
+        self._warn_update_if_needed(peer_id)
+
+    def handle_favorites_menu(self, context: Dict[str, Any]):
+        peer_id = _extract_peer_id(context)
+        if peer_id is None:
+            return
+        self._show_favorites(peer_id)
+
+    def handle_recommendations_menu(self, context: Dict[str, Any]):
+        peer_id = _extract_peer_id(context)
+        if peer_id is None:
+            return
+        self._show_recommendations(peer_id)
+
+    def handle_update_menu(self, context: Dict[str, Any]):
+        peer_id = _extract_peer_id(context)
+        if peer_id is None:
+            return
+        self._check_update_now(peer_id)
+
+    def handle_like_message_menu(self, context: Dict[str, Any]):
+        peer_id = _extract_peer_id(context)
+        if peer_id is None:
+            return
+
+        session = _search_sessions.get(peer_id)
+        chosen = None
+        query = ""
+
+        if session and session.get("results"):
+            text = _safe_text(context.get("message").messageText if context.get("message") else "")
+            parsed = _extract_first_listed_track(text)
+            if parsed:
+                title, artist = parsed
+                candidate_query = f"{artist} {title}".strip()
+                results, _err = sc_search(candidate_query, limit=10)
+                if results:
+                    chosen = results[0]
+                    query = candidate_query
+            if chosen is None:
+                chosen = session["results"][0]
+                query = session.get("query", "")
+
+        else:
+            message = context.get("message")
+            text = _safe_text(getattr(message, "messageText", "") or getattr(message, "caption", "") or "")
+            parsed = _extract_first_listed_track(text)
+            if parsed:
+                title, artist = parsed
+                candidate_query = f"{artist} {title}".strip()
+                results, _err = sc_search(candidate_query, limit=10)
+                if results:
+                    chosen = results[0]
+                    query = candidate_query
+
+        if not chosen:
+            send_text(peer_id, "❌ Не удалось определить трек для лайка")
+            return
+
+        self._handle_like_track(peer_id, chosen, query=query, respond=True)
+
+    # ── command-like helpers ──────────────────────────────────────────────────
+
+    def _like_by_number(self, peer_id, arg: str):
+        session = _search_sessions.get(peer_id)
+        if not session:
+            send_text(peer_id, "❌ Нет активного поиска. Сначала используй .find")
+            return
+
+        if not arg:
+            idx = 0
+        else:
+            if not arg.isdigit():
+                send_text(peer_id, "Использование: .like [номер]")
+                return
+            idx = int(arg) - 1
+
+        results = session["results"]
+        if idx < 0 or idx >= len(results):
+            send_text(peer_id, f"❌ Номер вне диапазона (1–{len(results)})")
+            return
+
+        self._handle_like_track(peer_id, results[idx], query=session.get("query", ""), respond=True)
+
+    def _unlike_by_number(self, peer_id, arg: str):
+        favorites = self._get_favorites()
+        favorites.sort(key=lambda x: (int(x.get("like_count", 1)), int(x.get("liked_at", 0))), reverse=True)
+
+        if not arg:
+            idx = 0
+        else:
+            if not arg.isdigit():
+                send_text(peer_id, "Использование: .unlike [номер]")
+                return
+            idx = int(arg) - 1
+
+        if idx < 0 or idx >= len(favorites):
+            send_text(peer_id, f"❌ Номер вне диапазона (1–{len(favorites)})")
+            return
+
+        self._handle_unlike_track(peer_id, favorites[idx].get("id"))
+
+    # ── hook ──────────────────────────────────────────────────────────────────
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not isinstance(params.message, str):
+            return HookResult()
+
+        msg = params.message.strip()
+        peer_id = params.peer
+
+        # .find
+        if msg.startswith(".find"):
+            query = msg[5:].strip()
+            if not query:
+                params.message = "Использование: .find <название>"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            per_page = self._per_page()
+            limit = self._limit()
+            show_stats = self.get_setting("show_stats", True)
+            show_genre = self.get_setting("show_genre", False)
+
+            def search_task():
+                results, err = sc_search(query, limit=limit)
+                if not results:
+                    send_text(peer_id, err or f"❌ Ничего не найдено: {query}")
+                    return
+                _search_sessions[peer_id] = {
+                    "query": query,
+                    "results": results,
+                    "page": 1,
+                    "per_page": per_page,
+                    "show_stats": show_stats,
+                    "show_genre": show_genre,
+                }
+                send_text(peer_id, build_page(results, 1, per_page, query, show_stats, show_genre))
+                self._warn_update_if_needed(peer_id)
+
+            run_on_queue(search_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # .fc next / .fc prev
+        if msg.startswith(".fc"):
+            arg = msg[3:].strip().lower()
+            session = _search_sessions.get(peer_id)
+
+            if not session:
+                params.message = "❌ Нет активного поиска. Сначала используй .find"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            if arg not in ("next", "prev", "previous"):
+                params.message = "Использование: .fc next / .fc prev"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            results = session["results"]
+            per_page = session["per_page"]
+            total_pgs = max(1, (len(results) + per_page - 1) // per_page)
+            new_page = session["page"] + (1 if arg == "next" else -1)
+
+            if new_page < 1:
+                params.message = "❌ Это первая страница"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            if new_page > total_pgs:
+                params.message = "❌ Больше страниц нет"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            session["page"] = new_page
+            text = build_page(
+                results,
+                new_page,
+                per_page,
+                session["query"],
+                session["show_stats"],
+                session["show_genre"],
+            )
+
+            def fc_task():
+                send_text(peer_id, text)
+
+            run_on_queue(fc_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # .like
+        if msg.lower().startswith(".like"):
+            arg = msg[5:].strip()
+            def like_task():
+                self._like_by_number(peer_id, arg)
+            run_on_queue(like_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # .unlike
+        if msg.lower().startswith(".unlike"):
+            arg = msg[7:].strip()
+            def unlike_task():
+                self._unlike_by_number(peer_id, arg)
+            run_on_queue(unlike_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # .rec
+        if msg.startswith(".rec"):
+            def rec_task():
+                self._show_recommendations(peer_id)
+            run_on_queue(rec_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # .info
+        if msg.startswith(".info"):
+            def info_task():
+                self._show_info(peer_id)
+            run_on_queue(info_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # dlf <number>
+        if msg.lower().startswith("dlf"):
+            arg = msg[3:].strip()
+            if not arg.isdigit():
+                params.message = "Использование: dlF [номер из списка]"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            session = _search_sessions.get(peer_id)
+            if not session:
+                params.message = "❌ Нет активного поиска. Сначала используй .find"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            idx = int(arg) - 1
+            if idx < 0 or idx >= len(session["results"]):
+                params.message = f"❌ Номер вне диапазона (1–{len(session['results'])})"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            track = dict(session["results"][idx])
+            track["query"] = session.get("query", "")
+
+            def dlf_task():
+                self._do_download(peer_id, track)
+
+            run_on_queue(dlf_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # .download
+        if msg.startswith(".download"):
+            query = msg[9:].strip()
+            if not query:
+                params.message = "Использование: .download <название>"
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            def quick_task():
+                send_text(peer_id, f"⏳ Ищу: {query}...")
+                results, err = sc_search(query, limit=1)
+                if not results:
+                    send_text(peer_id, err or "❌ Ничего не найдено")
+                    return
+                track = dict(results[0])
+                track["query"] = query
+                self._do_download(peer_id, track)
+                self._warn_update_if_needed(peer_id)
+
+            run_on_queue(quick_task)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()

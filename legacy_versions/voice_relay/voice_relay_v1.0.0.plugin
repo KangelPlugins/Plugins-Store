@@ -1,0 +1,377 @@
+__id__ = "voice_relay"
+__name__ = "Voice Relay"
+__description__ = "Пр*кси для звонков"
+__author__ = "@Altyplugins"
+__version__ = "1.0.0"
+__icon__ = "bratpass/2"
+__min_version__ = "12.2.10"
+
+import hashlib
+import hmac
+import os
+import socket
+import struct
+import time
+import urllib.parse
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from org.telegram.messenger import ApplicationLoader
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, EditText, Header, Switch, Text
+
+try:
+    from java import jclass
+except:
+    jclass = None
+
+
+DEFAULT_RELAY_IP = "138.124.97.180"
+DEFAULT_RELAY_PORT = 8765
+DEFAULT_RELAY_HMAC = "723392ffa20befb5deab772004b1703ca61b59dab57310d9097d0f4ab0a80b92a"
+RELAY_SETUP_URL = "https://github.com/Altuskhins/Telegram-VoIP-Proxy/blob/main/README.md"
+ALLOCATE_TIMEOUT_SEC = 1.5
+TELEGRAM_REFLECTOR_CIDRS = (
+    "91.108.4.0/22",
+    "91.108.8.0/22",
+    "91.108.12.0/22",
+    "91.108.16.0/22",
+    "91.108.20.0/22",
+    "91.108.56.0/22",
+    "91.108.58.0/23",
+    "91.105.192.0/23",
+    "95.161.64.0/20",
+    "149.154.160.0/20",
+    "185.76.151.0/24",
+)
+
+
+def _ipv4_to_int(value):
+    try:
+        parts = str(value).strip().split(".")
+        if len(parts) != 4:
+            return -1
+        octets = [int(part) for part in parts]
+        if any(part < 0 or part > 255 for part in octets):
+            return -1
+        return (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+    except:
+        return -1
+
+
+def _cidr_contains(ip, cidr):
+    try:
+        base, prefix = str(cidr).split("/", 1)
+        address = _ipv4_to_int(ip)
+        network = _ipv4_to_int(base)
+        prefix = int(prefix)
+        if address < 0 or network < 0 or prefix < 0 or prefix > 32:
+            return False
+        mask = 0 if prefix == 0 else (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+        return address & mask == network & mask
+    except:
+        return False
+
+
+def _is_telegram_reflector_ip(ip):
+    return any(_cidr_contains(ip, cidr) for cidr in TELEGRAM_REFLECTOR_CIDRS)
+
+
+def _validate_relay(ip, port, secret):
+    ip = str(ip or "").strip()
+    secret = str(secret or "")
+    try:
+        port = int(str(port).strip())
+    except:
+        return None, "Порт должен быть числом"
+    if _ipv4_to_int(ip) < 0:
+        return None, "Неверный IP релея"
+    if port < 1 or port > 65535:
+        return None, "Порт вне диапазона 1–65535"
+    secret_bytes = secret.encode("utf-8")
+    if len(secret_bytes) < 16 or len(secret_bytes) > 512:
+        return None, "HMAC-ключ: от 16 до 512 байт"
+    return (ip, port, secret), ""
+
+
+def _parse_relay_link(url):
+    text = str(url or "").strip().replace("$h=", "&h=")
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        if parsed.scheme.lower() != "tg" or parsed.netloc.lower() != "relay":
+            return None, "Не ссылка Voice Relay"
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        return _validate_relay(
+            query.get("ip", [""])[-1],
+            query.get("port", [""])[-1],
+            query.get("h", [""])[-1],
+        )
+    except:
+        return None, "Неверная ссылка Voice Relay"
+
+
+class _VoipEndpointRewriteHook(MethodHook):
+    def __init__(self, plugin, endpoint_cls):
+        self.plugin = plugin
+        self.endpoint_cls = endpoint_cls
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin.active and len(param.args or []) >= 4:
+                self.plugin._rewrite_endpoints(param.args[3], self.endpoint_cls)
+        except:
+            pass
+
+
+class _RelayBrowserHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.active:
+                return
+            for arg in list(param.args or []):
+                url = str(arg or "")
+                if url.lower().startswith("tg://relay?"):
+                    param.setResult(None)
+                    run_on_ui_thread(lambda url=url: self.plugin._apply_link(url))
+                    return
+        except:
+            pass
+
+
+class _RelayIntentHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.active or not param.args:
+                return
+            intent = param.args[0]
+            if intent is None or str(intent.getAction()) != "android.intent.action.VIEW":
+                return
+            data = intent.getData()
+            url = str(data or "")
+            if url.lower().startswith("tg://relay?"):
+                param.setResult(None)
+                run_on_ui_thread(lambda url=url: self.plugin._apply_link(url))
+        except:
+            pass
+
+
+class VoiceRelayPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.active = False
+
+    def on_plugin_load(self):
+        self.active = True
+        try:
+            instance_cls = find_class("org.telegram.messenger.voip.Instance")
+            endpoint_cls = (
+                jclass("org.telegram.messenger.voip.Instance$Endpoint")
+                if jclass is not None
+                else find_class("org.telegram.messenger.voip.Instance$Endpoint")
+            )
+            if instance_cls is not None and endpoint_cls is not None:
+                self.hook_all_methods(
+                    instance_cls,
+                    "makeInstance",
+                    _VoipEndpointRewriteHook(self, endpoint_cls),
+                )
+        except:
+            pass
+        try:
+            browser_cls = find_class("org.telegram.messenger.browser.Browser")
+            if browser_cls is not None:
+                self.hook_all_methods(browser_cls, "openUrl", _RelayBrowserHook(self))
+        except:
+            pass
+        try:
+            launch_cls = find_class("org.telegram.ui.LaunchActivity")
+            if launch_cls is not None:
+                self.hook_all_methods(launch_cls, "handleIntent", _RelayIntentHook(self))
+        except:
+            pass
+
+    def on_plugin_unload(self):
+        self.active = False
+
+    def _config(self):
+        return _validate_relay(
+            self.get_setting("relay_ip", DEFAULT_RELAY_IP),
+            self.get_setting("relay_port", str(DEFAULT_RELAY_PORT)),
+            self.get_setting("relay_hmac", DEFAULT_RELAY_HMAC),
+        )[0]
+
+    def _allocate(self, target_ip, target_port):
+        config = self._config()
+        if config is None or not _is_telegram_reflector_ip(target_ip):
+            return None
+        relay_ip, control_port, secret = config
+        try:
+            target_port = int(target_port)
+            if target_port < 1 or target_port > 65535:
+                return None
+            nonce = os.urandom(16)
+            secret = secret.encode("utf-8")
+
+            def request(operation, request_nonce):
+                body = bytearray((2, int(operation)))
+                body.extend(struct.pack(">Q", int(time.time())))
+                body.extend(request_nonce)
+                body.extend(struct.pack(">IHH", _ipv4_to_int(target_ip), target_port, 0))
+                body.extend(hmac.new(secret, bytes(body), hashlib.sha256).digest())
+                return bytes(body)
+
+            def valid_response(data):
+                return (
+                    len(data) == 48
+                    and data[0] == 2
+                    and hmac.compare_digest(
+                        data[16:],
+                        hmac.new(secret, data[:16], hashlib.sha256).digest(),
+                    )
+                )
+
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(ALLOCATE_TIMEOUT_SEC)
+                sock.connect((relay_ip, control_port))
+                sock.send(request(1, nonce))
+                challenge = sock.recv(128)
+                if not valid_response(challenge) or challenge[1] != 9:
+                    return None
+                sock.send(request(2, nonce[:8] + challenge[8:16]))
+                response = sock.recv(128)
+            if not valid_response(response) or response[8:16] != nonce[:8]:
+                return None
+            relay_port = struct.unpack(">H", response[2:4])[0]
+            if response[1] != 0 or relay_port < 1:
+                return None
+            return relay_ip, relay_port
+        except:
+            return None
+
+    def _rewrite_endpoints(self, endpoints, endpoint_cls):
+        if not bool(self.get_setting("enabled", True)):
+            return 0
+        try:
+            replacements = []
+            for index in range(len(endpoints)):
+                endpoint = endpoints[index]
+                target_ip = str(getattr(endpoint, "ipv4", "") or "")
+                if bool(getattr(endpoint, "tcp", False)) or not _is_telegram_reflector_ip(target_ip):
+                    continue
+                relay = self._allocate(target_ip, int(endpoint.port))
+                if relay is None:
+                    return 0
+                replacement = endpoint_cls(
+                    bool(endpoint.isRtc),
+                    int(endpoint.id),
+                    relay[0],
+                    "",
+                    int(relay[1]),
+                    int(endpoint.type),
+                    endpoint.peerTag,
+                    bool(endpoint.turn),
+                    bool(endpoint.stun),
+                    getattr(endpoint, "username", None),
+                    getattr(endpoint, "password", None),
+                    False,
+                )
+                try:
+                    replacement.reflectorId = int(endpoint.reflectorId)
+                except:
+                    pass
+                replacements.append((index, endpoint, replacement))
+            applied = []
+            try:
+                for index, original, replacement in replacements:
+                    endpoints[index] = replacement
+                    applied.append((index, original))
+            except:
+                for index, original in applied:
+                    try:
+                        endpoints[index] = original
+                    except:
+                        pass
+                return 0
+            return len(replacements)
+        except:
+            return 0
+
+    def _apply_link(self, url):
+        config, error = _parse_relay_link(url)
+        if config is None:
+            BulletinHelper.show_error(error)
+            return
+        relay_ip, relay_port, secret = config
+        self.set_setting("relay_ip", relay_ip, reload_settings=False)
+        self.set_setting("relay_port", str(relay_port), reload_settings=False)
+        self.set_setting("relay_hmac", secret, reload_settings=False)
+        self.set_setting("enabled", True, reload_settings=True)
+
+    def _copy_link(self, *_):
+        config, error = _validate_relay(
+            self.get_setting("relay_ip", DEFAULT_RELAY_IP),
+            self.get_setting("relay_port", str(DEFAULT_RELAY_PORT)),
+            self.get_setting("relay_hmac", DEFAULT_RELAY_HMAC),
+        )
+        if config is None:
+            BulletinHelper.show_error(error)
+            return
+        relay_ip, relay_port, secret = config
+        link = "tg://relay?" + urllib.parse.urlencode(
+            {"ip": relay_ip, "port": relay_port, "h": secret}
+        )
+        try:
+            from android.content import ClipData, Context
+
+            clipboard = ApplicationLoader.applicationContext.getSystemService(Context.CLIPBOARD_SERVICE)
+            clipboard.setPrimaryClip(ClipData.newPlainText("Voice Relay", link))
+            BulletinHelper.show_success("Ссылка скопирована")
+        except:
+            BulletinHelper.show_error("Не удалось скопировать")
+
+    def _open_relay_setup(self, *_):
+        try:
+            from org.telegram.messenger.browser import Browser
+
+            Browser.openUrl(ApplicationLoader.applicationContext, RELAY_SETUP_URL)
+        except:
+            BulletinHelper.show_error("Не удалось открыть ссылку")
+
+    def create_settings(self):
+        return [
+            Header(text="Voice Relay"),
+            Switch(
+                key="enabled",
+                text="Использовать Relay",
+                default=bool(self.get_setting("enabled", True)),
+                icon="msg_settings",
+            ),
+            EditText(
+                key="relay_ip",
+                hint="IPv4 релея",
+                default=str(self.get_setting("relay_ip", DEFAULT_RELAY_IP)),
+                max_length=15,
+            ),
+            EditText(
+                key="relay_port",
+                hint="UDP-порт",
+                default=str(self.get_setting("relay_port", str(DEFAULT_RELAY_PORT))),
+                max_length=5,
+            ),
+            EditText(
+                key="relay_hmac",
+                hint="HMAC-ключ",
+                default=str(self.get_setting("relay_hmac", DEFAULT_RELAY_HMAC)),
+                max_length=512,
+            ),
+            Divider(),
+            Text(text="Скопировать ссылку", icon="msg_link", on_click=self._copy_link),
+            Text(text="Запустить свой Relay (инструкция)", icon="msg_link", on_click=self._open_relay_setup),
+        ]

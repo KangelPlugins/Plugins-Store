@@ -1,0 +1,1574 @@
+import json
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from android.app import Notification, NotificationChannel, NotificationManager, PendingIntent
+from android.content import Intent
+from android.os import Build, Bundle, PowerManager
+from android_utils import run_on_ui_thread
+from base_plugin import AppEvent, BasePlugin, HookResult, HookStrategy, MethodHook
+from client_utils import (
+    PLUGINS_QUEUE,
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    run_on_queue,
+    send_message,
+)
+from java import dynamic_proxy, jclass
+from hook_utils import find_class
+from hook_utils import find_class
+from org.telegram.messenger import (
+    ApplicationLoader,
+    DialogObject,
+    KeepAliveJob,
+    MessageObject,
+    NotificationsService,
+    R as TelegramR,
+    UserConfig,
+)
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui import DialogsActivity
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, EditText, Header, Input, Selector, Switch, Text
+
+__id__ = "auto_sender"
+__name__ = "Auto Sender"
+__description__ = "автоматом отправляет заданное сообщение в выбранные чаты по расписанию"
+__author__ = "@mishabotov"
+__version__ = "1.0"
+__icon__ = "gzhelkitty/3"
+__min_version__ = "11.12.0"
+
+
+COMMAND_PREFIX = ".autosend"
+MARKER_KEY = "auto_sender_internal"
+MARKER_VALUE = "1"
+
+TARGETS_SETTING = "targets_json"
+LEGACY_TARGET_DIALOG_ID = "target_dialog_id"
+LEGACY_TARGET_TOPIC_ID = "target_topic_id"
+
+DEFAULT_ENABLED = True
+DEFAULT_MESSAGE = "Автоматическое сообщение"
+DEFAULT_TARGETS_JSON = "[]"
+OLD_DEFAULT_INTERVAL_PRESET = 3
+DEFAULT_INTERVAL_PRESET = 8
+DEFAULT_CUSTOM_INTERVAL_SECONDS = "90"
+DEFAULT_SEND_ON_ENABLE = False
+DEFAULT_CATCH_UP = False
+DEFAULT_SILENT = False
+DEFAULT_BACKGROUND_MODE = True
+DEFAULT_BACKGROUND_WAKE_LOCK = True
+
+CUSTOM_INTERVAL_SECONDS_KEY = "custom_interval_seconds"
+LEGACY_CUSTOM_INTERVAL_MINUTES_KEY = "custom_interval_minutes"
+INTERVAL_MIGRATION_KEY = "interval_seconds_migration_done"
+BACKGROUND_MODE_KEY = "background_mode"
+BACKGROUND_WAKE_LOCK_KEY = "background_wake_lock"
+BACKGROUND_NOTIFICATION_CHANNEL_ID = "auto_sender_background"
+BACKGROUND_NOTIFICATION_ID = 9051701
+BACKGROUND_NOTIFICATION_REQUEST_CODE = 9051702
+BACKGROUND_KEEP_ALIVE_PULSE_MS = 65000
+WAKE_LOCK_TAG = "exteragram:auto_sender"
+
+INTERVAL_PRESETS: List[Optional[int]] = [1, 5, 10, 30, 60, 300, 900, 1800, 3600, 10800, 21600, 43200, 86400, None]
+OLD_TO_NEW_INTERVAL_PRESET = {
+    0: 5,
+    1: 6,
+    2: 7,
+    3: 8,
+    4: 9,
+    5: 10,
+    6: 11,
+    7: 12,
+    8: 13,
+}
+INTERVAL_LABELS = [
+    "Каждую секунду",
+    "Каждые 5 секунд",
+    "Каждые 10 секунд",
+    "Каждые 30 секунд",
+    "Каждую минуту",
+    "Каждые 5 минут",
+    "Каждые 15 минут",
+    "Каждые 30 минут",
+    "Каждый час",
+    "Каждые 3 часа",
+    "Каждые 6 часов",
+    "Каждые 12 часов",
+    "Каждый день",
+    "Свое значение",
+]
+
+MIN_INTERVAL_SECONDS = 1
+MAX_INTERVAL_SECONDS = 2592000
+MAX_MESSAGE_CHARS = 32000
+MESSAGE_CHUNK_SIZE = 3900
+BUSY_RETRY_DELAY_MS = 60000
+IMMEDIATE_DELAY_MS = 1000
+DIALOGS_TYPE_DEFAULT = 0
+
+DialogsDelegate = jclass("org.telegram.ui.DialogsActivity$DialogsActivityDelegate")
+
+
+class _TargetPickerDelegate(dynamic_proxy(DialogsDelegate)):
+    def __init__(self, plugin: "AutoSenderPlugin"):
+        super().__init__()
+        self.plugin = plugin
+
+    def didSelectDialogs(self, fragment, dids, message, param, notify, scheduleDate, scheduleRepeatPeriod, topicsFragment):
+        try:
+            self.plugin._handle_picker_result(fragment, dids)
+        except Exception as error:
+            self.plugin.log(f"[AutoSender] Ошибка выбора чата: {error}")
+            self.plugin._show_bulletin("Не удалось сохранить выбранный чат.", "error")
+        return True
+
+
+class _NotificationsServiceHook(MethodHook):
+    def __init__(self, plugin: "AutoSenderPlugin", method_name: str) -> None:
+        self.plugin = plugin
+        self.method_name = method_name
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            service = getattr(param, "thisObject", None)
+            if self.method_name == "onDestroy":
+                self.plugin._on_notifications_service_destroyed(service)
+            else:
+                self.plugin._promote_notifications_service(service)
+        except Exception as error:
+            self.plugin.log(f"[AutoSender] Ошибка foreground hook: {error}")
+
+
+class AutoSenderPlugin(BasePlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self._schedule_token = 0
+        self._background_token = 0
+        self._busy = False
+        self._background_running = False
+        self._wake_lock = None
+        self._hook_refs: List[Any] = []
+        self._notifications_service_instance = None
+        self._unloading = False
+        self._picker_delegates: List[Any] = []
+
+    def on_plugin_load(self) -> None:
+        self._unloading = False
+        self._migrate_interval_settings()
+        self._install_background_service_hooks()
+        self.add_on_send_message_hook(priority=20)
+        self._schedule_next(startup=True)
+        self._sync_background_runtime()
+
+    def on_plugin_unload(self) -> None:
+        self._unloading = True
+        self._invalidate_scheduler()
+        self._stop_background_runtime()
+        self._picker_delegates.clear()
+        for ref in list(self._hook_refs):
+            try:
+                self.unhook_method(ref)
+            except Exception:
+                pass
+        self._hook_refs.clear()
+        try:
+            self.remove_hook("on_send_message_hook")
+        except Exception:
+            pass
+
+    def on_app_event(self, event_type: AppEvent) -> None:
+        event_name = getattr(event_type, "name", str(event_type))
+        if event_name in ("START", "RESUME"):
+            self._schedule_next(startup=True)
+        if event_name in ("START", "RESUME", "PAUSE", "STOP"):
+            self._sync_background_runtime()
+
+    def create_settings(self):
+        self._migrate_interval_settings()
+        targets_count = len(self._targets_for_current_account())
+        return [
+            Header(text="Куда отправлять"),
+            Text(
+                text="Добавить чат или тему",
+                icon="msg_add",
+                accent=True,
+                on_click=self._open_target_picker,
+            ),
+            Text(
+                text=f"Список получателей ({targets_count})",
+                icon="msg_members_list2",
+                create_sub_fragment=self._create_targets_settings,
+            ),
+            Header(text="Дополнительно"),
+            Switch(
+                key="send_on_enable",
+                text="Отправить сразу",
+                default=DEFAULT_SEND_ON_ENABLE,
+                subtext="сразу при включении",
+                icon="msg_send",
+            ),
+            Switch(
+                key="catch_up",
+                text="Отправлять пропущенные",
+                default=DEFAULT_CATCH_UP,
+                subtext="если приложение закрывалось",
+                icon="msg_retry",
+                on_change=self._on_schedule_changed,
+            ),
+            Switch(
+                key="silent",
+                text="Без звука",
+                default=DEFAULT_SILENT,
+                subtext="без уведомления (если разрешено)",
+                icon="msg_silent",
+            ),
+            Header(text="В фоне"),
+            Switch(
+                key=BACKGROUND_MODE_KEY,
+                text="Фоновый режим",
+                default=DEFAULT_BACKGROUND_MODE,
+                subtext="автоотправка работает в фоне",
+                icon="notifications_on",
+                on_change=self._on_background_runtime_changed,
+            ),
+            Switch(
+                key=BACKGROUND_WAKE_LOCK_KEY,
+                text="Не давать уснуть",
+                default=DEFAULT_BACKGROUND_WAKE_LOCK,
+                subtext="надежнее, но ест батарею",
+                icon="settings_power",
+                on_change=self._on_background_runtime_changed,
+            ),
+            Header(text="Действия"),
+            Text(text="Отправить тест", icon="msg_send", accent=True, on_click=self._on_test_clicked),
+            Text(text="Сбросить таймер", icon="msg_retry", on_click=self._on_reset_clicked),
+        ]
+
+    def _create_targets_settings(self) -> List[Any]:
+        targets = self._targets_for_current_account()
+        rows: List[Any] = [
+            Header(text="Куда отправлять"),
+            Text(
+                text="Добавить чат/тему",
+                icon="msg_add",
+                accent=True,
+                on_click=self._open_target_picker,
+            ),
+        ]
+
+        if not targets:
+            rows.append(Divider(text="Пусто."))
+            return rows
+
+        for target in sorted(targets, key=lambda item: self._target_title(item).lower()):
+            target_key = self._target_key(target)
+            rows.append(Text(
+                text=self._target_title(target),
+                icon="msg_discussion",
+                create_sub_fragment=lambda key=target_key: self._create_target_config(key)
+            ))
+
+        rows.append(Divider())
+        rows.append(
+            Text(
+                text="Очистить всё",
+                icon="msg_delete",
+                red=True,
+                on_click=self._clear_current_targets,
+            )
+        )
+        return rows
+
+    def _create_target_config(self, target_key: str) -> List[Any]:
+        targets = self._targets_for_current_account()
+        target = next((t for t in targets if self._target_key(t) == target_key), None)
+        if not target:
+            return []
+
+        count_key = f"msg_count_{target_key}"
+        count = self._to_int(self.get_setting(count_key, 1), 1)
+
+        rows = [
+            Header(text="Таймер"),
+            Selector(
+                key=f"interval_preset_{target_key}",
+                text="Как часто",
+                default=DEFAULT_INTERVAL_PRESET,
+                items=INTERVAL_LABELS,
+                icon="msg_stories_timer",
+                on_change=self._on_schedule_changed,
+            ),
+            Input(
+                key=f"custom_interval_seconds_{target_key}",
+                text="Свой интервал (в секундах)",
+                default=DEFAULT_CUSTOM_INTERVAL_SECONDS,
+                subtext="только для «Свое значение»",
+                icon="msg_contacts_time",
+                on_change=self._on_custom_interval_changed,
+            ),
+            Header(text=f"Сообщения ({count})")
+        ]
+        for i in range(count):
+            rows.append(EditText(
+                key=f"msg_{target_key}_{i}",
+                hint=f"Сообщение {i+1}",
+                default="",
+                multiline=True,
+                max_length=MAX_MESSAGE_CHARS,
+            ))
+
+        rows.append(Text(
+            text="Добавить сообщение",
+            icon="msg_add",
+            accent=True,
+            on_click=lambda _view=None, tk=target_key: self._add_message_to_target(tk)
+        ))
+        
+        if count > 1:
+            rows.append(Text(
+                text="Удалить последнее",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda _view=None, tk=target_key: self._remove_message_from_target(tk)
+            ))
+
+        rows.append(Header(text="Действия"))
+        rows.append(Text(
+            text="Удалить чат из рассылки",
+            icon="msg_delete",
+            red=True,
+            on_click=lambda _view=None, tk=target_key: self._remove_target_and_close(tk)
+        ))
+        return rows
+
+    def _add_message_to_target(self, target_key: str) -> None:
+        count_key = f"msg_count_{target_key}"
+        count = self._to_int(self.get_setting(count_key, 1), 1)
+        self.set_setting(count_key, count + 1, reload_settings=True)
+
+    def _remove_message_from_target(self, target_key: str) -> None:
+        count_key = f"msg_count_{target_key}"
+        count = self._to_int(self.get_setting(count_key, 1), 1)
+        if count > 1:
+            self.set_setting(f"msg_{target_key}_{count-1}", "")
+            self.set_setting(count_key, count - 1, reload_settings=True)
+
+    def _remove_target_and_close(self, key: str) -> None:
+        self._remove_target_by_key(key)
+        try:
+            fragment = get_last_fragment()
+            if fragment:
+                self._close_fragment(fragment)
+        except Exception:
+            pass
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if self._has_marker(params):
+            return HookResult()
+
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        command = message.strip()
+        command_lower = command.lower()
+        if command_lower != COMMAND_PREFIX and not command_lower.startswith(COMMAND_PREFIX + " "):
+            return HookResult()
+
+        self._handle_command(account, params, command)
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _open_target_picker(self, _view: Any = None) -> None:
+        def open_now() -> None:
+            try:
+                fragment = get_last_fragment()
+                if fragment is None:
+                    self._show_bulletin("Не удалось открыть выбор чата.", "error")
+                    return
+
+                args = Bundle()
+                args.putBoolean("onlySelect", True)
+                args.putInt("dialogsType", DIALOGS_TYPE_DEFAULT)
+                args.putBoolean("resetDelegate", False)
+                args.putBoolean("closeFragment", True)
+                args.putBoolean("canSelectTopics", True)
+                args.putBoolean("checkCanWrite", True)
+                args.putBoolean("allowGlobalSearch", True)
+                args.putBoolean("allowUsers", True)
+                args.putBoolean("allowBots", True)
+                args.putBoolean("allowGroups", True)
+                args.putBoolean("allowMegagroups", True)
+                args.putBoolean("allowLegacyGroups", True)
+                args.putBoolean("allowChannels", True)
+
+                picker = DialogsActivity(args)
+                delegate = _TargetPickerDelegate(self)
+                self._picker_delegates.append(delegate)
+                picker.setDelegate(delegate)
+                fragment.presentFragment(picker)
+            except Exception as error:
+                self.log(f"[AutoSender] Не удалось открыть выбор чата: {error}")
+                self._show_bulletin("Не удалось открыть выбор чата.", "error")
+
+        run_on_ui_thread(open_now)
+
+    def _handle_picker_result(self, fragment: Any, dids: Any) -> None:
+        dialog_id, topic_id = self._first_topic_key_parts(dids)
+        if dialog_id == 0:
+            self._show_bulletin("Чат не выбран.", "error")
+            return
+        if self._is_folder_dialog_id(dialog_id):
+            self._show_bulletin("Папку нельзя добавить в получатели.", "error")
+            return
+
+        target = {
+            "account": self._current_account(),
+            "dialog_id": int(dialog_id),
+            "topic_id": max(0, int(topic_id)),
+        }
+        added = self._add_target(target)
+        self._picker_delegates.clear()
+        self._close_fragment(fragment)
+        if added:
+            self._show_bulletin(f"Получатель добавлен: {self._target_title(target)}", "success")
+        else:
+            self._show_bulletin("Этот получатель уже есть в списке.", "info")
+        self._schedule_next()
+
+    def _on_enabled_changed(self, enabled: bool) -> None:
+        if self._as_bool(enabled, DEFAULT_ENABLED):
+            if self._setting_bool("send_on_enable", DEFAULT_SEND_ON_ENABLE):
+                self._schedule_next(delay_ms=IMMEDIATE_DELAY_MS)
+            else:
+                for target in self._targets_for_current_account():
+                    self.set_setting(f"last_run_at_ms_{self._target_key(target)}", self._now_ms())
+                self._schedule_next()
+        else:
+            self._invalidate_scheduler()
+            self.set_setting("next_run_at_ms", 0)
+            self._sync_background_runtime()
+
+    def _on_schedule_changed(self, _value=None) -> None:
+        self._schedule_next()
+
+    def _on_custom_interval_changed(self, value: Any = None) -> None:
+        self._schedule_next()
+
+    def _on_background_runtime_changed(self, _value=None) -> None:
+        self._sync_background_runtime()
+
+    def _on_test_clicked(self, _view=None) -> None:
+        ok, text = self._send_messages_to_targets(self._targets_for_current_account(), source="manual")
+        if ok:
+            self._show_bulletin("Тестовое сообщение отправлено.", "success")
+        else:
+            self._show_bulletin(f"Автоотправка: {text}", "error")
+
+    def _on_reset_clicked(self, _view=None) -> None:
+        for target in self._targets_for_current_account():
+            self.set_setting(f"last_run_at_ms_{self._target_key(target)}", self._now_ms())
+        self._schedule_next()
+        self._show_bulletin("Таймер перезапущен.", "success")
+
+    def _handle_command(self, account: int, params: Any, command: str) -> None:
+        body = command[len(COMMAND_PREFIX):].strip()
+        lowered = body.lower()
+
+        if not body or lowered == "help":
+            self._send_command_reply(params, self._help_text())
+            return
+
+        if lowered == "bind":
+            self._bind_to_current_chat(account, params)
+            return
+
+        if lowered == "test":
+            ok, text = self._send_messages_to_targets(self._targets_for_current_account(), source="manual")
+            self._send_command_reply(params, "Тестовое сообщение отправлено." if ok else f"Тест не удался: {text}")
+            return
+
+        if lowered == "status":
+            self._send_command_reply(params, self._status_text())
+            return
+
+        if lowered == "targets":
+            self._send_command_reply(params, self._targets_text())
+            return
+
+        if lowered == "clear":
+            self._clear_targets_for_account(self._normalize_account(account), reload_settings=True)
+            self._schedule_next()
+            self._send_command_reply(params, "Получатели текущего аккаунта очищены.")
+            return
+
+        if lowered == "on":
+            self.set_setting("enabled", True)
+            if self._setting_bool("send_on_enable", DEFAULT_SEND_ON_ENABLE):
+                self._schedule_next(delay_ms=IMMEDIATE_DELAY_MS)
+            else:
+                for target in self._targets_for_current_account():
+                    self.set_setting(f"last_run_at_ms_{self._target_key(target)}", self._now_ms())
+                self._schedule_next()
+            self._send_command_reply(params, "Автоотправка включена.")
+            return
+
+        if lowered == "off":
+            self.set_setting("enabled", False)
+            self._invalidate_scheduler()
+            self.set_setting("next_run_at_ms", 0)
+            self._send_command_reply(params, "Автоотправка выключена.")
+            return
+
+        if lowered == "reset":
+            for target in self._targets_for_current_account():
+                self.set_setting(f"last_run_at_ms_{self._target_key(target)}", self._now_ms())
+            self._schedule_next()
+            self._send_command_reply(params, "Таймер перезапущен.")
+            return
+
+        self._send_command_reply(params, "Неизвестная команда. Отправьте .autosend help.")
+
+    def _bind_to_current_chat(self, account: int, params: Any) -> None:
+        peer = self._plain_attr(params, "peer")
+        dialog_id = self._to_int(peer, 0)
+        if dialog_id == 0:
+            self._send_command_reply(params, "Не удалось определить этот чат.")
+            return
+        if self._is_folder_dialog_id(dialog_id):
+            self._send_command_reply(params, "Папку нельзя добавить в получатели.")
+            return
+
+        topic_id = self._extract_topic_id(params)
+        target = {
+            "account": self._normalize_account(account),
+            "dialog_id": int(dialog_id),
+            "topic_id": max(0, int(topic_id)),
+        }
+        added = self._add_target(target)
+        self._schedule_next()
+
+        if added:
+            self._send_command_reply(params, f"Получатель добавлен: {self._target_title(target)}.")
+        else:
+            self._send_command_reply(params, "Этот получатель уже есть в списке.")
+
+    def _schedule_next(self, startup: bool = False, delay_ms: Optional[int] = None) -> None:
+        self._invalidate_scheduler()
+        if not self._setting_bool("enabled", DEFAULT_ENABLED):
+            self.set_setting("next_run_at_ms", 0)
+            self._sync_background_runtime()
+            return
+
+        validation_error = self._validate_configuration()
+        if validation_error:
+            self.set_setting("next_run_at_ms", 0)
+            self.log(f"[AutoSender] Таймер остановлен: {validation_error}")
+            self._sync_background_runtime()
+            return
+
+        if delay_ms is None:
+            delay_ms = self._compute_next_delay_ms(startup=startup)
+        delay_ms = max(IMMEDIATE_DELAY_MS, int(delay_ms))
+
+        token = self._schedule_token
+        self.set_setting("next_run_at_ms", self._now_ms() + delay_ms)
+        run_on_queue(lambda: self._scheduled_tick(token), queue_name=PLUGINS_QUEUE, delay=delay_ms)
+        self._sync_background_runtime()
+
+    def _scheduled_tick(self, token: int) -> None:
+        if token != self._schedule_token:
+            return
+        if not self._setting_bool("enabled", DEFAULT_ENABLED):
+            return
+
+        if self._busy:
+            run_on_queue(lambda: self._scheduled_tick(token), queue_name=PLUGINS_QUEUE, delay=BUSY_RETRY_DELAY_MS)
+            return
+
+        now_ms = self._now_ms()
+        targets = self._targets_for_current_account()
+        targets_to_run = []
+        
+        for target in targets:
+            target_key = self._target_key(target)
+            interval_ms = self._interval_ms(target_key)
+            last_run_ms = self._to_int(self.get_setting(f"last_run_at_ms_{target_key}", 0), 0)
+            
+            if last_run_ms <= 0 or (now_ms - last_run_ms) >= interval_ms - 1000:
+                targets_to_run.append(target)
+                
+        if not targets_to_run:
+            self._schedule_next()
+            return
+
+        ok, error = self._send_messages_to_targets(targets_to_run, source="auto")
+        if ok:
+            for target in targets_to_run:
+                target_key = self._target_key(target)
+                self.set_setting(f"last_run_at_ms_{target_key}", self._now_ms())
+            self.set_setting("last_sent_at_ms", self._now_ms())
+            self.set_setting("last_error", "")
+            self.set_setting("last_status", "sent")
+        else:
+            self._record_error(error)
+            self.log(f"[AutoSender] Ошибка отправки: {error}")
+
+        self._schedule_next()
+
+    def _send_messages_to_targets(self, targets: List[Dict[str, int]], source: str) -> Tuple[bool, str]:
+        if not targets:
+            return False, "нет получателей"
+
+        if self._busy:
+            return False, "другая отправка еще выполняется"
+
+        sent_targets = 0
+        errors: List[str] = []
+
+        self._busy = True
+        try:
+            for target in targets:
+                target_key = self._target_key(target)
+                count_key = f"msg_count_{target_key}"
+                count = self._to_int(self.get_setting(count_key, 1), 1)
+                
+                messages = []
+                for i in range(count):
+                    msg = str(self.get_setting(f"msg_{target_key}_{i}", "") or "").strip()
+                    if msg:
+                        messages.append(msg)
+                
+                if not messages:
+                    continue
+                
+                try:
+                    for msg in messages:
+                        chunks = self._split_message(msg)
+                        for index, chunk in enumerate(chunks):
+                            payload = self._build_payload(target, chunk, source)
+                            send_message(payload)
+                            if index + 1 < len(chunks):
+                                time.sleep(0.35)
+                        if len(messages) > 1:
+                            time.sleep(0.35)
+                    sent_targets += 1
+                except Exception as error:
+                    errors.append(f"{self._target_title(target)}: {error}")
+            if errors:
+                return False, "; ".join(errors[:3])
+            if sent_targets <= 0:
+                return False, "нет получателей с текстом"
+            return True, ""
+        finally:
+            self._busy = False
+
+    def _build_payload(self, target: Dict[str, int], message: str, source: str) -> Dict[str, Any]:
+        dialog_id = int(target.get("dialog_id", 0) or 0)
+        topic_id = int(target.get("topic_id", 0) or 0)
+        payload: Dict[str, Any] = {
+            "peer": dialog_id,
+            "message": message,
+            "notify": not self._setting_bool("silent", DEFAULT_SILENT),
+            "searchLinks": False,
+            "webPage": None,
+            "params": {MARKER_KEY: f"{MARKER_VALUE}:{source}"},
+        }
+
+        if topic_id > 0:
+            reply_to_top = self._create_topic_reply(dialog_id, topic_id)
+            if reply_to_top is not None:
+                payload["replyToTopMsg"] = reply_to_top
+
+        return payload
+
+    def _create_topic_reply(self, dialog_id: int, topic_id: int):
+        try:
+            reply_message = TLRPC.TL_message()
+            reply_message.message = ""
+            reply_message.id = int(topic_id)
+            reply_message.peer_id = get_messages_controller().getPeer(int(dialog_id))
+            return MessageObject(self._current_account(), reply_message, False, False)
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось создать replyToTopMsg: {error}")
+            return None
+
+    def _send_command_reply(self, params: Any, text: str) -> None:
+        try:
+            peer = self._to_int(self._plain_attr(params, "peer"), 0)
+            if peer == 0:
+                return
+            payload: Dict[str, Any] = {
+                "peer": peer,
+                "message": text,
+                "notify": False,
+                "searchLinks": False,
+                "webPage": None,
+                "params": {MARKER_KEY: f"{MARKER_VALUE}:command"},
+            }
+            reply_to_top = self._plain_attr(params, "replyToTopMsg")
+            if reply_to_top is not None:
+                payload["replyToTopMsg"] = reply_to_top
+            send_message(payload)
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось отправить ответ команды: {error}")
+
+    def _validate_configuration(self) -> Optional[str]:
+        if not self._targets_for_current_account():
+            return "нет получателей для текущего аккаунта"
+        return None
+
+    def _load_targets(self) -> List[Dict[str, int]]:
+        raw = self.get_setting(TARGETS_SETTING, DEFAULT_TARGETS_JSON)
+        targets, changed = self._decode_targets(raw)
+
+        legacy_dialog_id = self._to_int(self.get_setting(LEGACY_TARGET_DIALOG_ID, ""), 0)
+        if not targets and legacy_dialog_id != 0:
+            targets.append(
+                {
+                    "account": self._current_account(),
+                    "dialog_id": legacy_dialog_id,
+                    "topic_id": max(0, self._to_int(self.get_setting(LEGACY_TARGET_TOPIC_ID, ""), 0)),
+                }
+            )
+            changed = True
+
+        canonical = self._canonical_targets(targets)
+        encoded = self._encode_targets(canonical)
+        if changed or str(raw or "").strip() != encoded:
+            self.set_setting(TARGETS_SETTING, encoded, reload_settings=False)
+        return canonical
+
+    def _decode_targets(self, raw: Any) -> Tuple[List[Dict[str, int]], bool]:
+        if raw in (None, ""):
+            return [], False
+        try:
+            data = raw if isinstance(raw, list) else json.loads(str(raw))
+        except Exception:
+            return [], True
+        if not isinstance(data, list):
+            return [], True
+
+        targets: List[Dict[str, int]] = []
+        changed = False
+        for item in data:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            account = self._to_int(item.get("account", self._current_account()), self._current_account())
+            dialog_id = self._to_int(item.get("dialog_id", item.get("dialogId", 0)), 0)
+            topic_id = max(0, self._to_int(item.get("topic_id", item.get("topicId", 0)), 0))
+            if account < 0 or dialog_id == 0:
+                changed = True
+                continue
+            targets.append({"account": account, "dialog_id": dialog_id, "topic_id": topic_id})
+        return targets, changed
+
+    def _canonical_targets(self, targets: List[Dict[str, int]]) -> List[Dict[str, int]]:
+        result: List[Dict[str, int]] = []
+        seen: Set[str] = set()
+        for target in targets:
+            normalized = {
+                "account": max(0, self._to_int(target.get("account", self._current_account()), self._current_account())),
+                "dialog_id": self._to_int(target.get("dialog_id", 0), 0),
+                "topic_id": max(0, self._to_int(target.get("topic_id", 0), 0)),
+            }
+            if normalized["dialog_id"] == 0 or self._is_folder_dialog_id(normalized["dialog_id"]):
+                continue
+            key = self._target_key(normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(normalized)
+        return result
+
+    def _encode_targets(self, targets: List[Dict[str, int]]) -> str:
+        return json.dumps(targets, ensure_ascii=False, separators=(",", ":"))
+
+    def _save_targets(self, targets: List[Dict[str, int]], reload_settings: bool = False) -> None:
+        self.set_setting(TARGETS_SETTING, self._encode_targets(self._canonical_targets(targets)), reload_settings=reload_settings)
+
+    def _targets_for_current_account(self) -> List[Dict[str, int]]:
+        account = self._current_account()
+        return [target for target in self._load_targets() if int(target.get("account", -1)) == account]
+
+    def _add_target(self, target: Dict[str, int]) -> bool:
+        targets = self._load_targets()
+        normalized = self._canonical_targets([target])
+        if not normalized:
+            return False
+        key = self._target_key(normalized[0])
+        if any(self._target_key(item) == key for item in targets):
+            return False
+        targets.append(normalized[0])
+        self._save_targets(targets, reload_settings=True)
+        return True
+
+    def _remove_target_by_key(self, key: str) -> None:
+        targets = [target for target in self._load_targets() if self._target_key(target) != key]
+        self._save_targets(targets, reload_settings=True)
+        self._schedule_next()
+        self._show_bulletin("Получатель удален.", "success")
+
+    def _clear_current_targets(self, _view: Any = None) -> None:
+        self._clear_targets_for_account(self._current_account(), reload_settings=True)
+        self._schedule_next()
+        self._show_bulletin("Получатели текущего аккаунта очищены.", "success")
+
+    def _clear_targets_for_account(self, account: int, reload_settings: bool = False) -> None:
+        targets = [target for target in self._load_targets() if int(target.get("account", -1)) != int(account)]
+        self._save_targets(targets, reload_settings=reload_settings)
+
+    def _target_key(self, target: Dict[str, int]) -> str:
+        return f"{int(target.get('account', 0))}:{int(target.get('dialog_id', 0))}:{int(target.get('topic_id', 0))}"
+
+    def _target_title(self, target: Dict[str, int]) -> str:
+        dialog_id = int(target.get("dialog_id", 0) or 0)
+        topic_id = int(target.get("topic_id", 0) or 0)
+        title = self._dialog_title(dialog_id)
+        if topic_id > 0:
+            title = f"{title} / тема: {self._topic_title(dialog_id, topic_id)}"
+        return title
+
+    def _dialog_title(self, dialog_id: int) -> str:
+        did = int(dialog_id or 0)
+        if did == 0:
+            return "Неизвестный чат"
+
+        try:
+            user_config = get_user_config()
+            if user_config is not None and did == int(user_config.getClientUserId()):
+                return "Избранное"
+        except Exception:
+            pass
+
+        mc = get_messages_controller()
+        if mc is None:
+            return str(did)
+
+        try:
+            if did > 0:
+                user = mc.getUser(int(did))
+                if user is not None:
+                    first = str(getattr(user, "first_name", "") or "").strip()
+                    last = str(getattr(user, "last_name", "") or "").strip()
+                    username = str(getattr(user, "username", "") or "").strip()
+                    title = " ".join(part for part in (first, last) if part).strip()
+                    if title:
+                        return title
+                    if username:
+                        return f"@{username}"
+            else:
+                chat = mc.getChat(self._chat_id_from_dialog_id(did))
+                if chat is None:
+                    chat = mc.getChat(int(-did))
+                if chat is not None:
+                    title = str(getattr(chat, "title", "") or "").strip()
+                    if title:
+                        return title
+        except Exception:
+            pass
+
+        return str(did)
+
+    def _topic_title(self, dialog_id: int, topic_id: int) -> str:
+        if topic_id <= 0:
+            return "общий чат"
+        try:
+            mc = get_messages_controller()
+            controller = mc.getTopicsController() if mc is not None else None
+            topic = controller.findTopic(self._chat_id_from_dialog_id(dialog_id), int(topic_id)) if controller is not None else None
+            if topic is not None:
+                title = str(getattr(topic, "title", "") or "").strip()
+                if title:
+                    return title
+        except Exception:
+            pass
+        return f"#{topic_id}"
+
+    def _chat_id_from_dialog_id(self, dialog_id: int) -> int:
+        did = int(dialog_id or 0)
+        if did >= 0:
+            return did
+        chat_id = int(-did)
+        if chat_id > 1000000000000:
+            chat_id -= 1000000000000
+        return chat_id
+
+    def _first_topic_key_parts(self, dids: Any) -> Tuple[int, int]:
+        if dids is None or self._java_len(dids) <= 0:
+            return 0, 0
+        try:
+            topic_key = dids.get(0)
+        except Exception:
+            try:
+                topic_key = dids[0]
+            except Exception:
+                return 0, 0
+        return self._topic_key_parts(topic_key)
+
+    def _topic_key_parts(self, topic_key: Any) -> Tuple[int, int]:
+        if topic_key is None:
+            return 0, 0
+
+        dialog_id = 0
+        topic_id = 0
+        for name in ("dialogId", "dialog_id"):
+            try:
+                value = int(getattr(topic_key, name, 0) or 0)
+                if value != 0:
+                    dialog_id = value
+                    break
+            except Exception:
+                pass
+        for name in ("topicId", "topic_id"):
+            try:
+                value = int(getattr(topic_key, name, 0) or 0)
+                if value > 0:
+                    topic_id = value
+                    break
+            except Exception:
+                pass
+
+        if dialog_id == 0:
+            try:
+                dialog_id = int(topic_key)
+            except Exception:
+                pass
+        if dialog_id == 0:
+            try:
+                dialog_id = int(topic_key.longValue())
+            except Exception:
+                pass
+        return dialog_id, max(0, topic_id)
+
+    def _is_folder_dialog_id(self, dialog_id: int) -> bool:
+        try:
+            return bool(DialogObject.isFolderDialogId(int(dialog_id)))
+        except Exception:
+            return False
+
+    def _background_should_run(self) -> bool:
+        if not self._setting_bool("enabled", DEFAULT_ENABLED):
+            return False
+        if not self._setting_bool(BACKGROUND_MODE_KEY, DEFAULT_BACKGROUND_MODE):
+            return False
+        return bool(self._targets_for_current_account())
+
+    def _install_background_service_hooks(self) -> None:
+        if self._hook_refs:
+            return
+        service_cls = find_class("org.telegram.messenger.NotificationsService")
+        if service_cls is None:
+            self.log("[AutoSender] NotificationsService не найден")
+            return
+
+        hooked: Set[str] = set()
+        try:
+            methods = list(service_cls.getDeclaredMethods())
+        except Exception:
+            try:
+                methods = list(service_cls.getClass().getDeclaredMethods())
+            except Exception as error:
+                self.log(f"[AutoSender] Не удалось прочитать методы NotificationsService: {error}")
+                return
+
+        for method in methods:
+            try:
+                name = str(method.getName())
+                if name not in ("onCreate", "onStartCommand", "onDestroy"):
+                    continue
+                method.setAccessible(True)
+                ref = self.hook_method(method, _NotificationsServiceHook(self, name), priority=100)
+                if ref is not None:
+                    self._hook_refs.append(ref)
+                    hooked.add(name)
+            except Exception as error:
+                self.log(f"[AutoSender] Не удалось hook NotificationsService: {error}")
+        if hooked:
+            self.log(f"[AutoSender] Foreground hooks: {', '.join(sorted(hooked))}")
+
+    def _sync_background_runtime(self) -> None:
+        if self._background_should_run():
+            self._start_notifications_service()
+            self._show_background_notification()
+            self._sync_wake_lock()
+            if not self._background_running:
+                self._background_running = True
+                self._schedule_background_pulse()
+        else:
+            self._stop_background_runtime()
+
+    def _stop_background_runtime(self) -> None:
+        self._background_token += 1
+        self._background_running = False
+        self._demote_notifications_service()
+        self._release_wake_lock()
+        self._cancel_background_notification()
+
+    def _schedule_background_pulse(self) -> None:
+        self._background_token += 1
+        token = self._background_token
+        run_on_queue(lambda: self._background_pulse(token), queue_name=PLUGINS_QUEUE, delay=1000)
+
+    def _background_pulse(self, token: int) -> None:
+        if token != self._background_token or not self._background_should_run():
+            return
+        self._start_notifications_service()
+        self._start_keep_alive_job()
+        self._show_background_notification()
+        self._sync_wake_lock()
+        run_on_queue(
+            lambda: self._background_pulse(token),
+            queue_name=PLUGINS_QUEUE,
+            delay=BACKGROUND_KEEP_ALIVE_PULSE_MS,
+        )
+
+    def _start_notifications_service(self) -> None:
+        try:
+            context = self._notification_context()
+            if context is None:
+                return
+            intent = Intent(context, NotificationsService)
+            if Build.VERSION.SDK_INT >= 26:
+                try:
+                    context.startForegroundService(intent)
+                    return
+                except Exception as error:
+                    self.log(f"[AutoSender] startForegroundService не сработал, пробую startService: {error}")
+            context.startService(intent)
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось запустить сервис уведомлений: {error}")
+
+    def _promote_notifications_service(self, service: Any) -> None:
+        if service is None or not self._background_should_run():
+            return
+        try:
+            self._notifications_service_instance = service
+            manager = service.getSystemService("notification")
+            self._ensure_background_notification_channel(manager)
+            service.startForeground(BACKGROUND_NOTIFICATION_ID, self._build_background_notification(service))
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось перевести NotificationsService в foreground: {error}")
+
+    def _demote_notifications_service(self) -> None:
+        service = self._notifications_service_instance
+        self._notifications_service_instance = None
+        if service is None:
+            return
+        try:
+            service.stopForeground(True)
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось убрать foreground у NotificationsService: {error}")
+
+    def _on_notifications_service_destroyed(self, service: Any) -> None:
+        if service is self._notifications_service_instance:
+            self._notifications_service_instance = None
+        if self._unloading or not self._background_should_run():
+            return
+        run_on_queue(lambda: self._sync_background_runtime(), queue_name=PLUGINS_QUEUE, delay=3000)
+
+    def _start_keep_alive_job(self) -> None:
+        try:
+            KeepAliveJob.startJob()
+        except Exception as error:
+            self.log(f"[AutoSender] KeepAliveJob недоступен: {error}")
+
+    def _sync_wake_lock(self) -> None:
+        if self._background_should_run() and self._setting_bool(BACKGROUND_WAKE_LOCK_KEY, DEFAULT_BACKGROUND_WAKE_LOCK):
+            self._acquire_wake_lock()
+        else:
+            self._release_wake_lock()
+
+    def _acquire_wake_lock(self) -> None:
+        try:
+            if self._wake_lock is not None and bool(self._wake_lock.isHeld()):
+                return
+        except Exception:
+            self._wake_lock = None
+
+        try:
+            context = self._notification_context()
+            if context is None:
+                return
+            power_manager = context.getSystemService("power")
+            if power_manager is None:
+                return
+            wake_lock = power_manager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+            try:
+                wake_lock.setReferenceCounted(False)
+            except Exception:
+                pass
+            wake_lock.acquire()
+            self._wake_lock = wake_lock
+        except Exception as error:
+            self._wake_lock = None
+            self.log(f"[AutoSender] Не удалось удержать wake lock: {error}")
+
+    def _release_wake_lock(self) -> None:
+        wake_lock = self._wake_lock
+        self._wake_lock = None
+        if wake_lock is None:
+            return
+        try:
+            if bool(wake_lock.isHeld()):
+                wake_lock.release()
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось отпустить wake lock: {error}")
+
+    def _notification_context(self):
+        try:
+            context = getattr(ApplicationLoader, "applicationContext", None)
+            if context is not None:
+                return context
+        except Exception:
+            pass
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                return fragment.getParentActivity()
+        except Exception:
+            pass
+        return None
+
+    def _notification_manager(self):
+        context = self._notification_context()
+        if context is None:
+            return None, None
+        try:
+            return context, context.getSystemService("notification")
+        except Exception:
+            return context, None
+
+    def _ensure_background_notification_channel(self, manager: Any) -> None:
+        if manager is None or Build.VERSION.SDK_INT < 26:
+            return
+        channel = NotificationChannel(
+            BACKGROUND_NOTIFICATION_CHANNEL_ID,
+            "Автоотправка",
+            NotificationManager.IMPORTANCE_LOW,
+        )
+        channel.setDescription("Фоновая работа автоотправки")
+        channel.enableVibration(False)
+        try:
+            channel.setSound(None, None)
+        except Exception:
+            pass
+        manager.createNotificationChannel(channel)
+
+    def _background_pending_intent(self, context: Any):
+        try:
+            intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName())
+            if intent is None:
+                return None
+            intent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+            flags = PendingIntent.FLAG_UPDATE_CURRENT
+            if Build.VERSION.SDK_INT >= 23:
+                flags |= PendingIntent.FLAG_IMMUTABLE
+            return PendingIntent.getActivity(context, BACKGROUND_NOTIFICATION_REQUEST_CODE, intent, flags)
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось создать PendingIntent уведомления: {error}")
+            return None
+
+    def _build_background_notification(self, context: Any):
+        builder_class = jclass("android.app.Notification$Builder")
+        if Build.VERSION.SDK_INT >= 26:
+            builder = builder_class(context, BACKGROUND_NOTIFICATION_CHANNEL_ID)
+        else:
+            builder = builder_class(context)
+            builder.setPriority(Notification.PRIORITY_LOW)
+
+        builder.setContentTitle("Автоотправка работает")
+        builder.setContentText(self._background_notification_text())
+        builder.setSmallIcon(TelegramR.drawable.notification)
+        builder.setOngoing(True)
+        builder.setShowWhen(False)
+        try:
+            builder.setOnlyAlertOnce(True)
+        except Exception:
+            pass
+        try:
+            builder.setCategory(Notification.CATEGORY_STATUS)
+        except Exception:
+            pass
+
+        pending_intent = self._background_pending_intent(context)
+        if pending_intent is not None:
+            builder.setContentIntent(pending_intent)
+
+        notification = builder.build()
+        notification.flags |= (
+            Notification.FLAG_ONGOING_EVENT
+            | Notification.FLAG_NO_CLEAR
+            | Notification.FLAG_ONLY_ALERT_ONCE
+        )
+        return notification
+
+    def _show_background_notification(self) -> None:
+        try:
+            if self._notifications_service_instance is not None and self._background_should_run():
+                self._promote_notifications_service(self._notifications_service_instance)
+                return
+            context, manager = self._notification_manager()
+            if context is None or manager is None:
+                return
+            self._ensure_background_notification_channel(manager)
+            manager.notify(BACKGROUND_NOTIFICATION_ID, self._build_background_notification(context))
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось показать фоновое уведомление: {error}")
+
+    def _cancel_background_notification(self) -> None:
+        try:
+            _, manager = self._notification_manager()
+            if manager is not None:
+                manager.cancel(BACKGROUND_NOTIFICATION_ID)
+        except Exception as error:
+            self.log(f"[AutoSender] Не удалось убрать фоновое уведомление: {error}")
+
+    def _background_notification_text(self) -> str:
+        targets_count = len(self._targets_for_current_account())
+        next_run = self._to_int(self.get_setting("next_run_at_ms", 0), 0)
+        if targets_count <= 0:
+            return "Ожидает выбора получателей"
+        if next_run > 0:
+            return f"Получателей: {targets_count}; следующая отправка {self._format_time(next_run)}"
+        return f"Получателей: {targets_count}; таймер не запланирован"
+
+    def _migrate_interval_settings(self) -> None:
+        pass
+
+    def _interval_ms(self, target_key: str) -> int:
+        preset = self._to_int(self.get_setting(f"interval_preset_{target_key}", DEFAULT_INTERVAL_PRESET), DEFAULT_INTERVAL_PRESET)
+        preset = max(0, min(preset, len(INTERVAL_PRESETS) - 1))
+        seconds = INTERVAL_PRESETS[preset]
+        if seconds is None:
+            raw = self.get_setting(f"custom_interval_seconds_{target_key}", DEFAULT_CUSTOM_INTERVAL_SECONDS)
+            seconds = self._sanitize_seconds(raw)
+        return int(seconds) * 1000
+
+    def _sanitize_seconds(self, value: Any) -> int:
+        seconds = self._to_int(value, int(DEFAULT_CUSTOM_INTERVAL_SECONDS))
+        return max(MIN_INTERVAL_SECONDS, min(seconds, MAX_INTERVAL_SECONDS))
+
+    def _compute_next_delay_ms(self, startup: bool) -> int:
+        now_ms = self._now_ms()
+        min_delay = None
+        
+        for target in self._targets_for_current_account():
+            target_key = self._target_key(target)
+            interval_ms = self._interval_ms(target_key)
+            last_run_ms = self._to_int(self.get_setting(f"last_run_at_ms_{target_key}", 0), 0)
+            
+            if last_run_ms <= 0:
+                delay = interval_ms
+            else:
+                due_in_ms = last_run_ms + interval_ms - now_ms
+                if due_in_ms > 0:
+                    delay = due_in_ms
+                elif startup and not self._setting_bool("catch_up", DEFAULT_CATCH_UP):
+                    delay = interval_ms
+                else:
+                    delay = IMMEDIATE_DELAY_MS
+            
+            if min_delay is None or delay < min_delay:
+                min_delay = delay
+                
+        return min_delay if min_delay is not None else IMMEDIATE_DELAY_MS
+
+    def _split_message(self, message: str) -> List[str]:
+        if len(message) <= MESSAGE_CHUNK_SIZE:
+            return [message]
+
+        chunks = []
+        remaining = message
+        while remaining:
+            if len(remaining) <= MESSAGE_CHUNK_SIZE:
+                chunks.append(remaining)
+                break
+            split_at = self._best_split_index(remaining, MESSAGE_CHUNK_SIZE)
+            chunks.append(remaining[:split_at].rstrip())
+            remaining = remaining[split_at:].lstrip()
+        return [chunk for chunk in chunks if chunk]
+
+    def _best_split_index(self, text: str, limit: int) -> int:
+        window = text[:limit]
+        for separator in ("\n\n", "\n", ". ", "! ", "? ", " "):
+            index = window.rfind(separator)
+            if index > int(limit * 0.55):
+                return index + len(separator)
+        return limit
+
+    def _extract_topic_id(self, params: Any) -> int:
+        reply_to_top = self._plain_attr(params, "replyToTopMsg")
+        if reply_to_top is None:
+            return 0
+        try:
+            return int(reply_to_top.getId())
+        except Exception:
+            pass
+        try:
+            message_owner = getattr(reply_to_top, "messageOwner", None)
+            return int(getattr(message_owner, "id", 0) or 0)
+        except Exception:
+            return 0
+
+    def _has_marker(self, params: Any) -> bool:
+        raw_params = self._plain_attr(params, "params")
+        value = self._param_value(raw_params, MARKER_KEY)
+        return value is not None and str(value).startswith(MARKER_VALUE)
+
+    def _param_value(self, raw_params: Any, key: str):
+        if raw_params is None:
+            return None
+        try:
+            return raw_params.get(key)
+        except Exception:
+            pass
+        try:
+            return raw_params[key]
+        except Exception:
+            return None
+
+    def _record_error(self, error: str) -> None:
+        self.set_setting("last_status", "error")
+        self.set_setting("last_error", str(error or "неизвестная ошибка"))
+
+    def _status_text(self) -> str:
+        targets = self._targets_for_current_account()
+        next_run = self._to_int(self.get_setting("next_run_at_ms", 0), 0)
+        last_sent = self._to_int(self.get_setting("last_sent_at_ms", 0), 0)
+        last_error = str(self.get_setting("last_error", "") or "")
+
+        lines = [
+            "Статус автоотправки",
+            f"Включено: {'да' if self._setting_bool('enabled', DEFAULT_ENABLED) else 'нет'}",
+            f"Аккаунт: {self._current_account()}",
+            f"Получателей: {len(targets)}",
+            f"Следующая отправка: {self._format_time(next_run) if next_run > 0 else 'не запланирована'}",
+            f"Последняя отправка: {self._format_time(last_sent) if last_sent > 0 else 'никогда'}",
+        ]
+        if last_error:
+            lines.append(f"Последняя ошибка: {last_error}")
+        return "\n".join(lines)
+
+    def _targets_text(self) -> str:
+        targets = self._targets_for_current_account()
+        if not targets:
+            return "Получатели текущего аккаунта не выбраны."
+        lines = ["Получатели текущего аккаунта:"]
+        for index, target in enumerate(sorted(targets, key=lambda item: self._target_title(item).lower()), start=1):
+            lines.append(f"{index}. {self._target_title(target)}")
+        return "\n".join(lines)
+
+    def _help_text(self) -> str:
+        return (
+            "Команды автоотправки\n"
+            ".autosend bind - добавить текущий чат или тему в получатели\n"
+            ".autosend targets - показать получателей текущего аккаунта\n"
+            ".autosend clear - очистить получателей текущего аккаунта\n"
+            ".autosend test - отправить сейчас\n"
+            ".autosend status - показать состояние таймера\n"
+            ".autosend on / .autosend off - включить или выключить\n"
+            ".autosend reset - перезапустить таймеры"
+        )
+
+    def _format_interval_seconds(self, seconds: int) -> str:
+        if seconds % 86400 == 0:
+            days = seconds // 86400
+            return self._plural(days, "день", "дня", "дней")
+        if seconds % 3600 == 0:
+            hours = seconds // 3600
+            return self._plural(hours, "час", "часа", "часов")
+        if seconds % 60 == 0:
+            minutes = seconds // 60
+            return self._plural(minutes, "минута", "минуты", "минут")
+        return self._plural(seconds, "секунда", "секунды", "секунд")
+
+    def _plural(self, value: int, one: str, few: str, many: str) -> str:
+        number = abs(int(value))
+        if 11 <= number % 100 <= 14:
+            word = many
+        elif number % 10 == 1:
+            word = one
+        elif 2 <= number % 10 <= 4:
+            word = few
+        else:
+            word = many
+        return f"{value} {word}"
+
+    def _format_time(self, ms: int) -> str:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ms) / 1000))
+        except Exception:
+            return "неизвестно"
+
+    def _current_account(self) -> int:
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                return int(fragment.getCurrentAccount())
+        except Exception:
+            pass
+        try:
+            return int(UserConfig.selectedAccount)
+        except Exception:
+            pass
+        try:
+            user_config = get_user_config()
+            return int(getattr(user_config, "selectedAccount", 0) or 0)
+        except Exception:
+            return 0
+
+    def _normalize_account(self, account: Any) -> int:
+        try:
+            number = int(account)
+            if number >= 0:
+                return number
+        except Exception:
+            pass
+        return self._current_account()
+
+    def _close_fragment(self, fragment: Any) -> None:
+        for name in ("finishFragment", "removeSelfFromStack"):
+            try:
+                getattr(fragment, name)()
+                return
+            except Exception:
+                continue
+
+    def _show_bulletin(self, text: str, kind: str = "info") -> None:
+        def show() -> None:
+            try:
+                fragment = get_last_fragment()
+                method = BulletinHelper.show_info
+                if kind == "success":
+                    method = BulletinHelper.show_success
+                elif kind == "error":
+                    method = BulletinHelper.show_error
+                try:
+                    method(text, fragment)
+                except TypeError:
+                    method(text)
+            except Exception:
+                pass
+
+        run_on_ui_thread(show)
+
+    def _java_len(self, value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            return int(len(value))
+        except Exception:
+            pass
+        try:
+            return int(value.size())
+        except Exception:
+            pass
+        try:
+            return int(value.length)
+        except Exception:
+            return 0
+
+    def _plain_attr(self, obj: Any, field_name: str):
+        if obj is None:
+            return None
+        try:
+            value = getattr(obj, field_name)
+        except Exception:
+            return None
+        return None if callable(value) else value
+
+    def _parse_interval_seconds(self, value: Any) -> Optional[int]:
+        text = str(value or "").strip().lower()
+        if not text:
+            return None
+
+        multiplier = 1
+        suffixes = (
+            ("seconds", 1),
+            ("second", 1),
+            ("secs", 1),
+            ("sec", 1),
+            ("секунд", 1),
+            ("секунды", 1),
+            ("секунда", 1),
+            ("сек", 1),
+            ("minutes", 60),
+            ("minute", 60),
+            ("mins", 60),
+            ("min", 60),
+            ("минут", 60),
+            ("минуты", 60),
+            ("минута", 60),
+            ("мин", 60),
+            ("hours", 3600),
+            ("hour", 3600),
+            ("hrs", 3600),
+            ("hr", 3600),
+            ("часов", 3600),
+            ("часа", 3600),
+            ("час", 3600),
+            ("ч", 3600),
+            ("days", 86400),
+            ("day", 86400),
+            ("дней", 86400),
+            ("дня", 86400),
+            ("день", 86400),
+            ("s", 1),
+            ("m", 60),
+            ("h", 3600),
+            ("д", 86400),
+            ("d", 86400),
+        )
+        for suffix, suffix_multiplier in sorted(suffixes, key=lambda item: len(item[0]), reverse=True):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+                multiplier = suffix_multiplier
+                break
+
+        try:
+            seconds = int(text) * multiplier
+        except Exception:
+            return None
+        if seconds < MIN_INTERVAL_SECONDS or seconds > MAX_INTERVAL_SECONDS:
+            return None
+        return seconds
+
+    def _to_int(self, value: Any, default: int) -> int:
+        try:
+            text = str(value).strip()
+            if not text:
+                return default
+            return int(text)
+        except Exception:
+            return default
+
+    def _as_bool(self, value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on", "да"):
+            return True
+        if text in ("0", "false", "no", "off", "нет"):
+            return False
+        return default
+
+    def _setting_bool(self, key: str, default: bool) -> bool:
+        return self._as_bool(self.get_setting(key, default), default)
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def _invalidate_scheduler(self) -> None:
+        self._schedule_token += 1

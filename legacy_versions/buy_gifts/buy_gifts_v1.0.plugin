@@ -1,0 +1,2045 @@
+__id__ = "buy_gifts"
+__name__ = "Gift"
+__description__ = "диалог -> три точки -> плагины -> скрытый подарок"
+__author__ = "@mihailkotovski"
+__version__ = "1.0"
+__icon__ = "DMJDuckX/0"
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import (
+    RequestCallback,
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    run_on_queue,
+    send_request,
+)
+from android_utils import OnClickListener, R, run_on_ui_thread
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from markdown_utils import parse_markdown
+from org.telegram.messenger import MessageObject
+from org.telegram.tgnet import TLRPC
+from org.telegram.tgnet.tl import TL_stars
+from java import dynamic_proxy, jclass
+from java.util import ArrayList
+
+_TEXTS: Dict[str, str] = {
+    "menu_title": "Скрытый подарок",
+    "picker_title": "Скрытые гифты",
+    "picker_text": "Нажмите, чтобы открыть форму отправки подарка.",
+    "picker_manual": "Отправить подарок",
+    "dialog_title": "Отправка подарка",
+    "preview_section": "Предпросмотр подарка",
+    "preview_loading_title": "Подбираю карточку подарка…",
+    "preview_loading_subtitle": "Сверяю gift_id с каталогом Telegram.",
+    "preview_invalid_title": "Введите корректный gift_id",
+    "preview_invalid_subtitle": "После этого появится визуальный предпросмотр.",
+    "preview_fallback_subtitle": "Подарок не найден в каталоге, но отправка по ID доступна.",
+    "preview_price": "Цена: {stars}⭐",
+    "preview_flag_limited": "лимит",
+    "preview_flag_sold_out": "распродано",
+    "preview_flag_premium": "только Premium",
+    "preview_flag_upgradeable": "с улучшением",
+    "preview_target": "Получатель: {target}",
+    "preview_target_current": "текущий чат",
+    "preview_target_self": "себе",
+    "preview_target_dialog": "диалог {dialog_id}",
+    "preview_option_mode": "Режим: {mode}",
+    "preview_mode_anonymous": "анонимно",
+    "preview_mode_named": "с именем",
+    "preview_option_upgrade": "Улучшение: {upgrade}",
+    "preview_upgrade_on": "включено",
+    "preview_upgrade_off": "выключено",
+    "preview_message_empty": "Сообщение: без текста",
+    "preview_message_label": "Сообщение: {message}",
+    "target_unknown": "не выбран",
+    "gift_label": "ID подарка",
+    "gift_hint": "Например: 5801108895304779062",
+    "target_label": "ID получателя",
+    "target_hint": "Пусто = текущий чат, 0 = отправить себе",
+    "message_label": "Сообщение (опционально)",
+    "message_hint": "Введите текст сообщения",
+    "message_emoji_button": "Добавить premium-эмодзи",
+    "message_emoji_unavailable": "Выбор premium-эмодзи недоступен в этой сборке.",
+    "message_emoji_open_error": "Не удалось открыть выбор premium-эмодзи.",
+    "message_emoji_invalid": "Выбранный элемент не подходит для сообщения.",
+    "message_emoji_insert_error": "Не удалось вставить premium-эмодзи.",
+    "anonymous_label": "Скрыть отправителя",
+    "upgrade_label": "Учитывать улучшение",
+    "send_button": "Отправить",
+    "cancel_button": "Отмена",
+    "no_context": "Не удалось получить активное окно Telegram.",
+    "invalid_gift_id": "Некорректный ID подарка.",
+    "invalid_target_id": "Некорректный ID получателя.",
+    "cannot_resolve_peer": "Не удалось определить peer получателя.",
+    "progress_title": "Отправка подарка…",
+    "progress_text": "Пожалуйста, подождите.",
+    "send_success": "Подарок отправлен. {stars}⭐",
+    "error_balance_low": "Недостаточно Stars для отправки подарка.",
+    "error_usage_limited": "Ограничение Telegram: {code}",
+    "error_no_form": "Платёжная форма не получена.",
+    "error_with_code": "Ошибка отправки: {code}",
+    "unknown_error": "Неизвестная ошибка.",
+}
+
+
+class HiddenStarGiftSenderPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._menu_item_id = None
+        self._progress_dialog = None
+        self._gift_catalog_cache: Dict[int, Any] = {}
+        self._gift_catalog_loading = False
+        self._gift_catalog_attempted = False
+        self._preview_session_seq = 0
+        self._active_preview_session = 0
+        self._message_emoji_picker_dialog_ref = None
+        self._message_emoji_picker_delegate_ref = None
+        self._message_emoji_picker_dismiss_ref = None
+
+    def on_plugin_load(self):
+        try:
+            self._menu_item_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    item_id="hidden_star_gift_sender.menu",
+                    text=self._t("menu_title"),
+                    icon="menu_stars_gift",
+                    on_click=self._on_chat_menu_click,
+                )
+            )
+            self.log("[HiddenGift] plugin loaded")
+        except Exception as e:
+            self.log(f"[HiddenGift] on_plugin_load error: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            if self._menu_item_id is not None:
+                self.remove_menu_item(self._menu_item_id)
+                self._menu_item_id = None
+        except Exception as e:
+            self.log(f"[HiddenGift] remove menu item error: {e}")
+        self._active_preview_session = -1
+        self._dismiss_message_emoji_picker()
+        self._dismiss_progress()
+        self.log("[HiddenGift] plugin unloaded")
+
+    def _on_chat_menu_click(self, context: Any):
+        dialog_id = self._resolve_context_dialog_id(context)
+        run_on_ui_thread(lambda: self._open_picker_dialog(dialog_id, context))
+
+    def _open_picker_dialog(self, context_dialog_id: int, context: Any = None):
+        activity, _ = self._get_ui_context()
+        if activity is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        if self._open_picker_item_options(context_dialog_id, context):
+            return
+
+        items = [self._t("picker_manual")]
+
+        def on_pick(_builder: AlertDialogBuilder, which: int):
+            if int(which) == 0:
+                self._open_send_dialog(context_dialog_id, "")
+
+        try:
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            builder.set_title(self._t("picker_title"))
+            builder.set_message(self._t("picker_text"))
+            builder.set_items(items, on_pick)
+            builder.set_negative_button(self._t("cancel_button"), lambda b, _w: b.dismiss())
+            self._apply_dialog_style(builder, activity)
+            builder.show()
+        except Exception as e:
+            self.log(f"[HiddenGift] picker dialog error: {e}")
+            self._notify_error(self._t("no_context"))
+
+    def _open_picker_item_options(self, context_dialog_id: int, context: Any) -> bool:
+        activity, fragment = self._get_ui_context()
+        if activity is None or fragment is None:
+            return False
+
+        try:
+            ItemOptions = jclass("org.telegram.ui.Components.ItemOptions")
+        except Exception:
+            return False
+
+        anchor = self._resolve_picker_anchor_view(activity, context)
+        if anchor is None:
+            return False
+
+        manual_icon = 0
+        try:
+            TelegramR = jclass("org.telegram.messenger.R")
+            manual_icon = int(getattr(getattr(TelegramR, "drawable", None), "menu_stars_gift", 0) or 0)
+        except Exception:
+            pass
+
+        try:
+            options = ItemOptions.makeOptions(fragment, anchor)
+            try:
+                options.setDrawScrim(False)
+            except Exception:
+                pass
+
+            manual_action = R(lambda: self._open_send_dialog(context_dialog_id, ""))
+            if manual_icon:
+                options.add(manual_icon, self._t("picker_manual"), manual_action)
+            else:
+                options.add(self._t("picker_manual"), manual_action)
+
+            options.show()
+            return True
+        except Exception as e:
+            self.log(f"[HiddenGift] item options picker error: {e}")
+            return False
+
+    def _resolve_picker_anchor_view(self, activity: Any, context: Any):
+        if context is not None and hasattr(context, "get"):
+            for key in ("view", "menu_view", "anchor_view", "item_view", "clicked_view"):
+                try:
+                    view = context.get(key)
+                    if view is not None:
+                        return view
+                except Exception:
+                    pass
+
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None and hasattr(fragment, "getFragmentView"):
+                view = fragment.getFragmentView()
+                if view is not None:
+                    return view
+        except Exception:
+            pass
+
+        try:
+            window = activity.getWindow() if activity is not None else None
+            if window is None:
+                return None
+            decor = window.getDecorView()
+            if decor is not None:
+                return decor
+        except Exception:
+            pass
+        return None
+
+    def _open_send_dialog(self, context_dialog_id: int, preset_gift_id: str):
+        activity, _ = self._get_ui_context()
+        if activity is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        form = self._build_send_form(activity, context_dialog_id, preset_gift_id)
+        if form is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        try:
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            builder.set_title(self._t("dialog_title"))
+            builder.set_view(form["root"])
+            builder.set_positive_button(
+                self._t("send_button"),
+                lambda b, _w: self._on_send_click(b, form, context_dialog_id),
+            )
+            builder.set_negative_button(self._t("cancel_button"), lambda b, _w: b.dismiss())
+            try:
+                builder.set_on_dismiss_listener(lambda _b: self._on_form_dismiss(form))
+            except Exception:
+                pass
+            self._apply_dialog_style(builder, activity)
+            builder.show()
+            if "preview_title" in form:
+                self._refresh_preview(form, allow_remote=True)
+        except Exception as e:
+            self.log(f"[HiddenGift] send dialog error: {e}")
+            self._notify_error(self._t("no_context"))
+
+    def _build_send_form(self, context: Any, context_dialog_id: int, preset_gift_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            LinearLayout = jclass("android.widget.LinearLayout")
+            ScrollView = jclass("android.widget.ScrollView")
+            ViewGroupLayoutParams = jclass("android.view.ViewGroup$LayoutParams")
+            LayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+
+            scroll = ScrollView(context)
+            container = LinearLayout(context)
+            container.setOrientation(LinearLayout.VERTICAL)
+            pad = self._dp(16)
+            container.setPadding(pad, pad, pad, pad)
+            scroll.addView(container)
+
+            default_gift_id = str(preset_gift_id or "").strip()
+
+            default_target = ""
+            if not default_target and context_dialog_id:
+                default_target = str(context_dialog_id)
+
+            default_message = ""
+            default_anonymous = True
+
+            preview_session = self._next_preview_session()
+            self._active_preview_session = preview_session
+
+            preview = self._build_preview_card(context)
+            if preview is not None:
+                preview_lp = LayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+                preview_lp.setMargins(0, self._dp(10), 0, self._dp(14))
+                container.addView(preview["preview_root"], preview_lp)
+
+            gift_input = self._create_text_input(
+                context=context,
+                hint=self._t("gift_hint"),
+                value=default_gift_id,
+                multiline=False,
+                numeric=True,
+            )
+            self._add_field_card(container, context, self._t("gift_label"), gift_input)
+
+            target_input = self._create_text_input(
+                context=context,
+                hint=self._t("target_hint"),
+                value=default_target,
+                multiline=False,
+                numeric=True,
+            )
+            self._add_field_card(container, context, self._t("target_label"), target_input)
+
+            message_input = self._create_text_input(
+                context=context,
+                hint=self._t("message_hint"),
+                value=default_message,
+                multiline=True,
+                numeric=False,
+            )
+            message_card = self._add_field_card(container, context, self._t("message_label"), message_input)
+            self._add_message_emoji_action(message_card, context, message_input)
+
+            anonymous_switch = self._create_telegram_toggle(context, self._t("anonymous_label"), default_anonymous)
+            self._add_switch_row(container, context, anonymous_switch, top_margin_dp=12)
+
+            form: Dict[str, Any] = {
+                "root": scroll,
+                "gift_input": gift_input,
+                "target_input": target_input,
+                "message_input": message_input,
+                "anonymous_switch": anonymous_switch,
+                "context_dialog_id": int(context_dialog_id or 0),
+                "preview_session": int(preview_session),
+                "_cleanup": [],
+            }
+            if preview is not None:
+                form.update(preview)
+                self._attach_preview_listeners(form)
+                self._refresh_preview(form, allow_remote=True)
+            return form
+        except Exception as e:
+            self.log(f"[HiddenGift] build form error: {e}")
+            return None
+
+    def _on_send_click(self, builder: AlertDialogBuilder, form: Dict[str, Any], context_dialog_id: int):
+        gift_raw = self._read_text(form.get("gift_input"))
+        target_raw = self._read_text(form.get("target_input"))
+        anonymous = self._read_checked(form.get("anonymous_switch"), True)
+
+        gift_id = self._to_int(gift_raw)
+        if gift_id is None:
+            self._notify_error(self._t("invalid_gift_id"))
+            return
+
+        if target_raw == "":
+            target_dialog_id = context_dialog_id
+        else:
+            parsed_target = self._to_int(target_raw)
+            if parsed_target is None:
+                self._notify_error(self._t("invalid_target_id"))
+                return
+            target_dialog_id = parsed_target
+
+        if int(target_dialog_id or 0) == 0:
+            try:
+                user_config = get_user_config()
+                target_dialog_id = int(user_config.getClientUserId())
+            except Exception:
+                target_dialog_id = 0
+        if int(target_dialog_id or 0) == 0:
+            self._notify_error(self._t("invalid_target_id"))
+            return
+
+        messages_controller = get_messages_controller()
+        if messages_controller is None:
+            self._notify_error(self._t("cannot_resolve_peer"))
+            return
+
+        try:
+            input_peer = messages_controller.getInputPeer(self._as_java_long(target_dialog_id))
+        except Exception:
+            input_peer = None
+        if input_peer is None:
+            self._notify_error(self._t("cannot_resolve_peer"))
+            return
+
+        try:
+            builder.dismiss()
+        except Exception:
+            pass
+
+        self._send_hidden_gift(
+            gift_id=gift_id,
+            target_dialog_id=int(target_dialog_id),
+            input_peer=input_peer,
+            anonymous=bool(anonymous),
+            message_source=form.get("message_input"),
+        )
+
+    def _send_hidden_gift(
+        self,
+        gift_id: int,
+        target_dialog_id: int,
+        input_peer: Any,
+        anonymous: bool,
+        message_source: Any,
+    ):
+        invoice_class = getattr(TLRPC, "TL_inputInvoiceStarGift", None)
+        if invoice_class is None:
+            self._notify_error(self._t("error_with_code", code="TL_inputInvoiceStarGift class missing"))
+            return
+
+        try:
+            invoice = invoice_class()
+            invoice.hide_name = bool(anonymous)
+            invoice.peer = input_peer
+            invoice.gift_id = self._as_java_long(gift_id)
+            text_entities = self._build_text_with_entities(message_source)
+            if text_entities is not None:
+                invoice.flags |= 2
+                invoice.message = text_entities
+        except Exception as e:
+            self._notify_error(self._t("error_with_code", code=str(e)))
+            return
+
+        try:
+            req = TLRPC.TL_payments_getPaymentForm()
+            req.invoice = invoice
+            self._attach_theme_params(req)
+        except Exception as e:
+            self._notify_error(self._t("error_with_code", code=str(e)))
+            return
+
+        self._show_progress(self._t("progress_title"), self._t("progress_text"))
+
+        form_class = getattr(TLRPC, "TL_payments_paymentFormStarGift", None)
+        result_class = getattr(TLRPC, "TL_payments_paymentResult", None)
+
+        def on_form(response: Any, error: Any):
+            if not self._is_payment_form(response, form_class):
+                self._dismiss_progress()
+                err_text = self._extract_error_text(error, self._t("error_no_form"))
+                self._notify_error(self._t("error_with_code", code=err_text))
+                return
+
+            form = response
+            try:
+                req2 = TL_stars.TL_payments_sendStarsForm()
+                req2.form_id = form.form_id
+                req2.invoice = invoice
+            except Exception as e:
+                self._dismiss_progress()
+                self._notify_error(self._t("error_with_code", code=str(e)))
+                return
+
+            def on_send(response2: Any, error2: Any):
+                self._dismiss_progress()
+                if self._is_payment_result(response2, result_class):
+                    self._process_updates(response2)
+                    spent_stars = self._sum_stars_from_form(form)
+                    self._notify_success(
+                        self._t(
+                            "send_success",
+                            gift_id=str(gift_id),
+                            target_id=str(target_dialog_id),
+                            stars=str(spent_stars),
+                        )
+                    )
+                    return
+
+                err_code = self._extract_error_text(error2, self._t("unknown_error"))
+                if err_code == "BALANCE_TOO_LOW":
+                    self._notify_error(self._t("error_balance_low"))
+                elif err_code in ("STARGIFT_USAGE_LIMITED", "STARGIFT_USER_USAGE_LIMITED"):
+                    self._notify_error(self._t("error_usage_limited", code=err_code))
+                else:
+                    self._notify_error(self._t("error_with_code", code=err_code))
+
+            try:
+                send_request(req2, RequestCallback(on_send))
+            except Exception as e:
+                self._dismiss_progress()
+                self._notify_error(self._t("error_with_code", code=str(e)))
+
+        try:
+            send_request(req, RequestCallback(on_form))
+        except Exception as e:
+            self._dismiss_progress()
+            self._notify_error(self._t("error_with_code", code=str(e)))
+
+    def _process_updates(self, payment_result: Any):
+        try:
+            updates = getattr(payment_result, "updates", None)
+            if updates is None:
+                return
+            messages_controller = get_messages_controller()
+            if messages_controller is None:
+                return
+            run_on_queue(lambda: messages_controller.processUpdates(updates, False))
+        except Exception as e:
+            self.log(f"[HiddenGift] processUpdates failed: {e}")
+
+    def _attach_theme_params(self, req: Any):
+        try:
+            fragment = get_last_fragment()
+            resources_provider = None
+            if fragment is not None and hasattr(fragment, "getResourceProvider"):
+                resources_provider = fragment.getResourceProvider()
+
+            BotWebViewSheet = jclass("org.telegram.ui.web.BotWebViewSheet")
+            theme_json = BotWebViewSheet.makeThemeParams(resources_provider)
+            if theme_json is None:
+                return
+
+            data_json = TLRPC.TL_dataJSON()
+            data_json.data = theme_json.toString()
+            req.theme_params = data_json
+            req.flags |= 1
+        except Exception:
+            pass
+
+    def _build_text_with_entities(self, source: Any):
+        raw_text = self._read_text(source)
+        if str(raw_text).strip() == "":
+            return None
+
+        editable = self._read_editable(source)
+        custom_emoji_entities = self._collect_custom_emoji_entities(editable, raw_text)
+
+        parsed = None
+        try:
+            parsed = parse_markdown(raw_text)
+        except SyntaxError:
+            parsed = None
+        except Exception as e:
+            self.log(f"[HiddenGift] parse_markdown failed: {e}")
+            parsed = None
+
+        use_markdown = parsed is not None
+        if parsed is not None and custom_emoji_entities:
+            parsed_text = str(getattr(parsed, "text", "") or "")
+            if parsed_text != str(raw_text):
+                use_markdown = False
+                self.log("[HiddenGift] markdown disabled for message with custom emoji spans")
+
+        text_with_entities = TLRPC.TL_textWithEntities()
+        tl_entities: List[Any] = []
+
+        if use_markdown and parsed is not None:
+            text_with_entities.text = str(getattr(parsed, "text", raw_text) or "")
+            for ent in self._iter_java_items(getattr(parsed, "entities", None)):
+                try:
+                    tl_entities.append(ent.to_tlrpc_object())
+                except Exception:
+                    pass
+        else:
+            text_with_entities.text = str(raw_text)
+
+        custom_entity_class = getattr(TLRPC, "TL_messageEntityCustomEmoji", None)
+        if custom_entity_class is not None:
+            for offset, length, document_id in custom_emoji_entities:
+                if int(length) <= 0 or int(document_id) <= 0:
+                    continue
+                try:
+                    entity = custom_entity_class()
+                    entity.offset = int(offset)
+                    entity.length = int(length)
+                    entity.document_id = self._as_java_long(document_id)
+                    tl_entities.append(entity)
+                except Exception as e:
+                    self.log(f"[HiddenGift] custom emoji entity build failed: {e}")
+        elif custom_emoji_entities:
+            self.log("[HiddenGift] TL_messageEntityCustomEmoji unavailable in runtime")
+
+        try:
+            tl_entities.sort(key=lambda item: int(getattr(item, "offset", 0) or 0))
+        except Exception:
+            pass
+
+        entities = ArrayList()
+        for entity in tl_entities:
+            try:
+                entities.add(entity)
+            except Exception:
+                pass
+        text_with_entities.entities = entities
+        return text_with_entities
+
+    def _read_editable(self, source: Any):
+        if source is None:
+            return None
+        if hasattr(source, "getSpans") and hasattr(source, "getSpanStart"):
+            return source
+        try:
+            if hasattr(source, "getText"):
+                return source.getText()
+        except Exception:
+            return None
+        return None
+
+    def _collect_custom_emoji_entities(self, editable: Any, fallback_text: str) -> List[Tuple[int, int, int]]:
+        if editable is None:
+            return []
+
+        try:
+            text_len = int(editable.length())
+        except Exception:
+            text_len = len(str(fallback_text or ""))
+
+        try:
+            AnimatedEmojiSpan = jclass("org.telegram.ui.Components.AnimatedEmojiSpan")
+            spans = editable.getSpans(0, int(text_len), AnimatedEmojiSpan)
+        except Exception:
+            return []
+
+        result: List[Tuple[int, int, int]] = []
+        seen = set()
+        for span in self._iter_java_items(spans):
+            try:
+                start = int(editable.getSpanStart(span))
+                end = int(editable.getSpanEnd(span))
+            except Exception:
+                continue
+            if start < 0 or end <= start:
+                continue
+            document_id = 0
+            try:
+                document_id = int(span.getDocumentId() or 0)
+            except Exception:
+                try:
+                    document_id = int(getattr(span, "documentId", 0) or 0)
+                except Exception:
+                    document_id = 0
+            if document_id <= 0:
+                continue
+            length = int(end - start)
+            key = (int(start), int(length), int(document_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(key)
+
+        result.sort(key=lambda item: (item[0], item[1], item[2]))
+        return result
+
+    def _iter_java_items(self, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        try:
+            return [item for item in value]
+        except Exception:
+            pass
+
+        items = []
+        try:
+            size = int(value.size())
+            for i in range(size):
+                items.append(value.get(i))
+            return items
+        except Exception:
+            pass
+
+        try:
+            size = int(len(value))
+            for i in range(size):
+                items.append(value[i])
+            return items
+        except Exception:
+            return items
+
+    def _sum_stars_from_form(self, form: Any) -> int:
+        total = 0
+        try:
+            invoice = getattr(form, "invoice", None)
+            prices = getattr(invoice, "prices", None) if invoice is not None else None
+            if prices is None:
+                return 0
+
+            try:
+                size = int(prices.size())
+                for i in range(size):
+                    item = prices.get(i)
+                    total += int(getattr(item, "amount", 0) or 0)
+                return int(total)
+            except Exception:
+                pass
+
+            for item in prices:
+                total += int(getattr(item, "amount", 0) or 0)
+        except Exception:
+            return 0
+        return int(total)
+
+    def _resolve_context_dialog_id(self, context: Any) -> int:
+        try:
+            if context is not None:
+                dialog_id = context.get("dialog_id")
+                parsed = self._to_int(dialog_id)
+                if parsed not in (None, 0):
+                    return int(parsed)
+
+                chat = context.get("chat")
+                if chat is not None:
+                    chat_id = self._to_int(getattr(chat, "id", 0))
+                    if chat_id not in (None, 0):
+                        return -int(chat_id)
+
+                user = context.get("user")
+                if user is not None:
+                    user_id = self._to_int(getattr(user, "id", 0))
+                    if user_id not in (None, 0):
+                        return int(user_id)
+        except Exception:
+            pass
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                if hasattr(fragment, "getDialogId"):
+                    did = self._to_int(fragment.getDialogId())
+                    if did not in (None, 0):
+                        return int(did)
+                did_attr = self._to_int(getattr(fragment, "dialog_id", 0))
+                if did_attr not in (None, 0):
+                    return int(did_attr)
+        except Exception:
+            pass
+        return 0
+
+    def _apply_dialog_style(self, builder: AlertDialogBuilder, activity: Any):
+        try:
+            top_bg = self._theme_color("key_dialogTopBackground")
+            size = self._dp(104)
+            builder.set_top_animation(R.raw.gift, size, True, top_bg)
+        except Exception:
+            try:
+                top_bg = self._theme_color("key_dialogTopBackground")
+                builder.set_top_image(R.drawable.menu_stars_gift, top_bg)
+            except Exception:
+                pass
+        try:
+            builder.set_blurred_background(True)
+        except Exception:
+            pass
+
+    def _show_progress(self, title: str, text: str):
+        def _ui():
+            self._dismiss_progress_now()
+            activity, _ = self._get_ui_context()
+            if activity is None:
+                return
+            try:
+                builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+                builder.set_title(title)
+                builder.set_message(text)
+                builder.show()
+                try:
+                    builder.set_cancelable(False)
+                    builder.set_canceled_on_touch_outside(False)
+                except Exception:
+                    pass
+                self._progress_dialog = builder
+            except Exception as e:
+                self.log(f"[HiddenGift] show progress error: {e}")
+
+        run_on_ui_thread(_ui)
+
+    def _dismiss_progress(self):
+        run_on_ui_thread(self._dismiss_progress_now)
+
+    def _dismiss_progress_now(self):
+        if self._progress_dialog is None:
+            return
+        try:
+            self._progress_dialog.dismiss()
+        except Exception:
+            pass
+        self._progress_dialog = None
+
+    def _notify_success(self, text: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_success(str(text)))
+
+    def _notify_error(self, text: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_error(str(text)))
+
+    def _is_payment_form(self, response: Any, form_class: Any) -> bool:
+        if response is None:
+            return False
+        try:
+            if form_class is not None and isinstance(response, form_class):
+                return True
+        except Exception:
+            pass
+        name = self._get_class_name(response)
+        return ("paymentFormStarGift" in name) or ("paymentFormStars" in name)
+
+    def _is_payment_result(self, response: Any, result_class: Any) -> bool:
+        if response is None:
+            return False
+        try:
+            if result_class is not None and isinstance(response, result_class):
+                return True
+        except Exception:
+            pass
+        return "paymentResult" in self._get_class_name(response)
+
+    def _extract_error_text(self, error: Any, fallback: str) -> str:
+        if error is None:
+            return str(fallback)
+        for key in ("text", "error_message", "message"):
+            try:
+                value = getattr(error, key, None)
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        try:
+            text = str(error)
+            if text:
+                return text
+        except Exception:
+            pass
+        return str(fallback)
+
+    def _get_class_name(self, obj: Any) -> str:
+        if obj is None:
+            return ""
+        try:
+            return str(obj.getClass().getName())
+        except Exception:
+            pass
+        try:
+            return str(obj.__class__.__name__)
+        except Exception:
+            return ""
+
+    def _get_ui_context(self):
+        fragment = None
+        activity = None
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                activity = fragment.getParentActivity()
+        except Exception:
+            activity = None
+        return activity, fragment
+
+    def _next_preview_session(self) -> int:
+        self._preview_session_seq = int(self._preview_session_seq) + 1
+        return int(self._preview_session_seq)
+
+    def _on_form_dismiss(self, form: Dict[str, Any]):
+        try:
+            self._dismiss_message_emoji_picker()
+            session = int(form.get("preview_session", 0) or 0)
+            if session == int(self._active_preview_session):
+                self._active_preview_session = -1
+            for cleanup in list(form.get("_cleanup", [])):
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+            form["_cleanup"] = []
+        except Exception:
+            pass
+
+    def _build_preview_card(self, context: Any) -> Optional[Dict[str, Any]]:
+        try:
+            LinearLayout = jclass("android.widget.LinearLayout")
+            TextView = jclass("android.widget.TextView")
+            FrameLayout = jclass("android.widget.FrameLayout")
+            ImageView = jclass("android.widget.ImageView")
+            ViewGroupLayoutParams = jclass("android.view.ViewGroup$LayoutParams")
+            LinearLayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+            FrameLayoutParams = jclass("android.widget.FrameLayout$LayoutParams")
+            Gravity = jclass("android.view.Gravity")
+
+            root = LinearLayout(context)
+            root.setOrientation(LinearLayout.VERTICAL)
+            root.setPadding(self._dp(14), self._dp(14), self._dp(14), self._dp(14))
+            self._set_view_background(root, self._create_round_drawable("key_dialogBackground", "key_divider", 18, 1))
+
+            section = TextView(context)
+            section.setText(self._t("preview_section"))
+            section.setTextSize(13)
+            try:
+                Typeface = jclass("android.graphics.Typeface")
+                section.setTypeface(Typeface.DEFAULT_BOLD)
+            except Exception:
+                pass
+            self._apply_text_color(section, "key_dialogTextBlack")
+            root.addView(
+                section,
+                LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT),
+            )
+
+            content = LinearLayout(context)
+            content.setOrientation(LinearLayout.HORIZONTAL)
+            try:
+                content.setGravity(Gravity.CENTER_VERTICAL)
+            except Exception:
+                pass
+            content_lp = LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+            content_lp.setMargins(0, self._dp(8), 0, 0)
+            root.addView(content, content_lp)
+
+            icon_wrap = FrameLayout(context)
+            self._set_view_background(icon_wrap, self._create_round_drawable("key_dialogBackgroundGray", "key_divider", 14, 1))
+            icon_lp = LinearLayoutParams(self._dp(76), self._dp(76))
+            icon_lp.rightMargin = self._dp(12)
+            content.addView(icon_wrap, icon_lp)
+
+            preview_anim = ImageView(context)
+            gift_icon_res = 0
+            try:
+                TelegramR = jclass("org.telegram.messenger.R")
+                gift_icon_res = int(getattr(getattr(TelegramR, "drawable", None), "menu_stars_gift", 0) or 0)
+            except Exception:
+                gift_icon_res = 0
+            if gift_icon_res == 0:
+                try:
+                    gift_icon_res = int(getattr(getattr(R, "drawable", None), "menu_stars_gift", 0) or 0)
+                except Exception:
+                    gift_icon_res = 0
+            try:
+                if gift_icon_res:
+                    preview_anim.setImageResource(gift_icon_res)
+            except Exception:
+                pass
+            try:
+                color = self._theme_color("key_windowBackgroundWhiteBlueText2")
+                if color:
+                    preview_anim.setColorFilter(int(color))
+            except Exception:
+                pass
+            icon_wrap.addView(
+                preview_anim,
+                FrameLayoutParams(self._dp(54), self._dp(54), Gravity.CENTER),
+            )
+
+            preview_image = None
+            try:
+                BackupImageView = jclass("org.telegram.ui.Components.BackupImageView")
+                preview_image = BackupImageView(context)
+                try:
+                    preview_image.setRoundRadius(self._dp(12))
+                except Exception:
+                    pass
+                try:
+                    if hasattr(preview_image, "setAspectFit"):
+                        preview_image.setAspectFit(True)
+                except Exception:
+                    pass
+                self._set_view_visible(preview_image, False)
+                icon_wrap.addView(
+                    preview_image,
+                    FrameLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.MATCH_PARENT, Gravity.CENTER),
+                )
+            except Exception:
+                preview_image = None
+
+            text_wrap = LinearLayout(context)
+            text_wrap.setOrientation(LinearLayout.VERTICAL)
+            text_lp = LinearLayoutParams(0, ViewGroupLayoutParams.WRAP_CONTENT, 1.0)
+            content.addView(text_wrap, text_lp)
+
+            preview_title = TextView(context)
+            preview_title.setTextSize(15)
+            try:
+                Typeface = jclass("android.graphics.Typeface")
+                preview_title.setTypeface(Typeface.DEFAULT_BOLD)
+            except Exception:
+                pass
+            self._apply_text_color(preview_title, "key_dialogTextBlack")
+            text_wrap.addView(
+                preview_title,
+                LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT),
+            )
+
+            preview_subtitle = TextView(context)
+            preview_subtitle.setTextSize(12)
+            self._apply_text_color(preview_subtitle, "key_windowBackgroundWhiteGrayText2")
+            subtitle_lp = LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+            subtitle_lp.setMargins(0, self._dp(2), 0, 0)
+            text_wrap.addView(preview_subtitle, subtitle_lp)
+
+            preview_target = TextView(context)
+            preview_target.setTextSize(12)
+            self._apply_text_color(preview_target, "key_windowBackgroundWhiteGrayText")
+            target_lp = LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+            target_lp.setMargins(0, self._dp(8), 0, 0)
+            root.addView(preview_target, target_lp)
+
+            preview_options = TextView(context)
+            preview_options.setTextSize(12)
+            self._apply_text_color(preview_options, "key_windowBackgroundWhiteBlueText2")
+            options_lp = LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+            options_lp.setMargins(0, self._dp(3), 0, 0)
+            root.addView(preview_options, options_lp)
+
+            preview_message = TextView(context)
+            preview_message.setTextSize(12)
+            self._apply_text_color(preview_message, "key_windowBackgroundWhiteGrayText")
+            try:
+                preview_message.setMaxLines(2)
+            except Exception:
+                pass
+            try:
+                TruncateAt = jclass("android.text.TextUtils$TruncateAt")
+                preview_message.setEllipsize(TruncateAt.END)
+            except Exception:
+                pass
+            message_lp = LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+            message_lp.setMargins(0, self._dp(3), 0, 0)
+            root.addView(preview_message, message_lp)
+
+            return {
+                "preview_root": root,
+                "preview_anim": preview_anim,
+                "preview_image": preview_image,
+                "preview_title": preview_title,
+                "preview_subtitle": preview_subtitle,
+                "preview_target": preview_target,
+                "preview_options": preview_options,
+                "preview_message": preview_message,
+            }
+        except Exception as e:
+            self.log(f"[HiddenGift] build preview card error: {e}")
+            return None
+
+    def _attach_preview_listeners(self, form: Dict[str, Any]):
+        cleanup_list = form.get("_cleanup")
+        if not isinstance(cleanup_list, list):
+            cleanup_list = []
+            form["_cleanup"] = cleanup_list
+
+        def on_change():
+            self._refresh_preview(form, allow_remote=True)
+
+        for field_key in ("gift_input", "target_input", "message_input"):
+            cleanup = self._bind_text_watcher(form.get(field_key), on_change)
+            if cleanup is not None:
+                cleanup_list.append(cleanup)
+
+        for switch_key in ("anonymous_switch",):
+            cleanup = self._bind_checked_listener(form.get(switch_key), on_change)
+            if cleanup is not None:
+                cleanup_list.append(cleanup)
+
+    def _bind_text_watcher(self, edit_text: Any, on_change):
+        if edit_text is None:
+            return None
+        try:
+            TextWatcher = jclass("android.text.TextWatcher")
+            plugin = self
+
+            class _Watcher(dynamic_proxy(TextWatcher)):
+                def beforeTextChanged(self, _s, _start, _count, _after):
+                    pass
+
+                def onTextChanged(self, _s, _start, _before, _count):
+                    pass
+
+                def afterTextChanged(self, _s):
+                    try:
+                        on_change()
+                    except Exception as e:
+                        plugin.log(f"[HiddenGift] preview text watcher error: {e}")
+
+            watcher = _Watcher()
+            edit_text.addTextChangedListener(watcher)
+
+            def _cleanup():
+                try:
+                    edit_text.removeTextChangedListener(watcher)
+                except Exception:
+                    pass
+
+            return _cleanup
+        except Exception:
+            return None
+
+    def _bind_checked_listener(self, switch_view: Any, on_change):
+        if switch_view is None:
+            return None
+
+        if hasattr(switch_view, "getCheckBox") and hasattr(switch_view, "isChecked") and hasattr(switch_view, "setChecked"):
+            plugin = self
+            check_box = None
+            try:
+                check_box = switch_view.getCheckBox()
+            except Exception:
+                check_box = None
+
+            listener = None
+            if check_box is not None:
+                try:
+                    ListenerCls = jclass("android.widget.CompoundButton$OnCheckedChangeListener")
+
+                    class _CheckedListener(dynamic_proxy(ListenerCls)):
+                        def onCheckedChanged(self, _button_view, _is_checked):
+                            try:
+                                on_change()
+                            except Exception as e:
+                                plugin.log(f"[HiddenGift] preview switch listener error: {e}")
+
+                    listener = _CheckedListener()
+                    check_box.setOnCheckedChangeListener(listener)
+                except Exception:
+                    listener = None
+
+            def _on_row_click(_view=None):
+                try:
+                    switch_view.setChecked(not bool(switch_view.isChecked()))
+                    on_change()
+                except Exception:
+                    try:
+                        on_change()
+                    except Exception as e:
+                        plugin.log(f"[HiddenGift] preview switch listener error: {e}")
+
+            try:
+                switch_view.setOnClickListener(OnClickListener(_on_row_click))
+            except Exception:
+                pass
+
+            def _cleanup():
+                try:
+                    switch_view.setOnClickListener(None)
+                except Exception:
+                    pass
+                try:
+                    if check_box is not None:
+                        check_box.setOnCheckedChangeListener(None)
+                except Exception:
+                    pass
+
+            return _cleanup
+
+        try:
+            ListenerCls = jclass("android.widget.CompoundButton$OnCheckedChangeListener")
+            plugin = self
+
+            class _CheckedListener(dynamic_proxy(ListenerCls)):
+                def onCheckedChanged(self, _button_view, _is_checked):
+                    try:
+                        on_change()
+                    except Exception as e:
+                        plugin.log(f"[HiddenGift] preview switch listener error: {e}")
+
+            listener = _CheckedListener()
+            switch_view.setOnCheckedChangeListener(listener)
+
+            def _cleanup():
+                try:
+                    switch_view.setOnCheckedChangeListener(None)
+                except Exception:
+                    pass
+
+            return _cleanup
+        except Exception:
+            return None
+
+    def _refresh_preview(self, form: Dict[str, Any], allow_remote: bool):
+        try:
+            session = int(form.get("preview_session", 0) or 0)
+            if session != int(self._active_preview_session):
+                return
+
+            target_raw = self._read_text(form.get("target_input"))
+            message_text = self._read_text(form.get("message_input"))
+            anonymous = self._read_checked(form.get("anonymous_switch"), True)
+
+            self._set_text(form.get("preview_target"), self._build_preview_target_text(target_raw, int(form.get("context_dialog_id", 0) or 0)))
+            self._set_text(form.get("preview_options"), self._build_preview_options_text(anonymous))
+            self._set_text(form.get("preview_message"), self._build_preview_message_text(message_text))
+
+            gift_raw = self._read_text(form.get("gift_input"))
+            gift_id = self._to_int(gift_raw)
+            if gift_id is None:
+                self._apply_preview_fallback(
+                    form,
+                    self._t("preview_invalid_title"),
+                    self._t("preview_invalid_subtitle"),
+                )
+                return
+
+            gift = self._gift_catalog_cache.get(int(gift_id))
+            if gift is not None:
+                self._apply_gift_preview(form, int(gift_id), gift)
+                return
+
+            lookup_state = self._ensure_gift_lookup(int(gift_id))
+            if lookup_state == "resolved":
+                gift2 = self._gift_catalog_cache.get(int(gift_id))
+                if gift2 is not None:
+                    self._apply_gift_preview(form, int(gift_id), gift2)
+                    return
+
+            if self._gift_catalog_loading:
+                self._apply_preview_fallback(
+                    form,
+                    f"Подарок #{gift_id}",
+                    self._t("preview_loading_subtitle"),
+                )
+                return
+
+            if allow_remote and not self._gift_catalog_attempted:
+                self._apply_preview_fallback(
+                    form,
+                    f"Подарок #{gift_id}",
+                    self._t("preview_loading_subtitle"),
+                )
+                self._ensure_gift_catalog(form)
+                return
+
+            self._apply_preview_fallback(
+                form,
+                f"Подарок #{gift_id}",
+                self._t("preview_fallback_subtitle"),
+            )
+        except Exception as e:
+            self.log(f"[HiddenGift] refresh preview error: {e}")
+
+    def _ensure_gift_lookup(self, gift_id: int) -> str:
+        if int(gift_id) in self._gift_catalog_cache:
+            return "resolved"
+
+        controller = self._get_stars_controller()
+        if controller is None:
+            return "unavailable"
+
+        try:
+            gift_sync = controller.getStarGift(self._as_java_long(gift_id))
+            if gift_sync is not None:
+                self._gift_catalog_cache[int(gift_id)] = gift_sync
+                return "resolved"
+        except Exception:
+            pass
+
+        return "unavailable"
+
+    def _get_stars_controller(self):
+        try:
+            StarsController = jclass("org.telegram.ui.Stars.StarsController")
+        except Exception:
+            return None
+        account = self._current_account()
+        try:
+            return StarsController.getInstance(int(account))
+        except Exception:
+            return None
+
+    def _current_account(self) -> int:
+        try:
+            UserConfig = jclass("org.telegram.messenger.UserConfig")
+            selected = int(getattr(UserConfig, "selectedAccount", 0) or 0)
+            if selected >= 0:
+                return selected
+        except Exception:
+            pass
+        try:
+            cfg = get_user_config()
+            if cfg is not None:
+                current = int(getattr(cfg, "currentAccount", 0) or 0)
+                if current >= 0:
+                    return current
+        except Exception:
+            pass
+        return 0
+
+    def _ensure_gift_catalog(self, form: Dict[str, Any]):
+        if self._gift_catalog_loading:
+            return
+        if self._gift_catalog_attempted:
+            return
+        req_class = getattr(TL_stars, "getStarGifts", None)
+        if req_class is None:
+            self._gift_catalog_attempted = True
+            return
+
+        try:
+            req = req_class()
+            req.hash = 0
+        except Exception as e:
+            self._gift_catalog_attempted = True
+            self.log(f"[HiddenGift] build getStarGifts request error: {e}")
+            return
+
+        session = int(form.get("preview_session", 0) or 0)
+        self._gift_catalog_loading = True
+        self._gift_catalog_attempted = True
+
+        def on_catalog(response: Any, _error: Any):
+            parsed: Dict[int, Any] = {}
+            try:
+                for gift in self._extract_catalog_gifts(response):
+                    gift_id = int(getattr(gift, "id", 0) or 0)
+                    if gift_id:
+                        parsed[gift_id] = gift
+            except Exception as e:
+                self.log(f"[HiddenGift] parse catalog error: {e}")
+
+            def _ui():
+                self._gift_catalog_loading = False
+                if parsed:
+                    self._gift_catalog_cache.update(parsed)
+                self.log(f"[HiddenGift] star gifts catalog loaded: {len(parsed)}")
+                if session != int(self._active_preview_session):
+                    return
+                self._refresh_preview(form, allow_remote=False)
+
+            run_on_ui_thread(_ui)
+
+        try:
+            send_request(req, RequestCallback(on_catalog))
+        except Exception as e:
+            self._gift_catalog_loading = False
+            self.log(f"[HiddenGift] getStarGifts request error: {e}")
+
+    def _extract_catalog_gifts(self, response: Any):
+        gifts = getattr(response, "gifts", None) if response is not None else None
+        if gifts is None:
+            return []
+
+        result = []
+        try:
+            size = int(gifts.size())
+            for i in range(size):
+                result.append(gifts.get(i))
+            return result
+        except Exception:
+            pass
+
+        try:
+            for item in gifts:
+                result.append(item)
+        except Exception:
+            pass
+        return result
+
+    def _apply_gift_preview(self, form: Dict[str, Any], gift_id: int, gift: Any):
+        title = str(getattr(gift, "title", "") or "").strip()
+        if not title:
+            title = f"Подарок #{gift_id}"
+
+        stars = int(getattr(gift, "stars", 0) or 0)
+        parts = []
+        if stars > 0:
+            parts.append(self._t("preview_price", stars=str(stars)))
+
+        flags = self._extract_preview_flags(gift)
+        if flags:
+            parts.append(", ".join(flags))
+
+        subtitle = " • ".join(parts) if parts else self._t("preview_fallback_subtitle")
+        self._set_text(form.get("preview_title"), title)
+        self._set_text(form.get("preview_subtitle"), subtitle)
+
+        if not self._show_preview_gift_image(form, gift):
+            self._set_text(form.get("preview_subtitle"), self._t("preview_fallback_subtitle"))
+
+    def _extract_preview_flags(self, gift: Any):
+        flags = []
+        try:
+            if bool(getattr(gift, "limited", False)):
+                flags.append(self._t("preview_flag_limited"))
+            if bool(getattr(gift, "sold_out", False)):
+                flags.append(self._t("preview_flag_sold_out"))
+            if bool(getattr(gift, "require_premium", False)):
+                flags.append(self._t("preview_flag_premium"))
+        except Exception:
+            pass
+        return flags
+
+    def _show_preview_gift_image(self, form: Dict[str, Any], gift: Any) -> bool:
+        image_view = form.get("preview_image")
+        anim_view = form.get("preview_anim")
+        if image_view is None:
+            return False
+        try:
+            StarsIntroActivity = jclass("org.telegram.ui.Stars.StarsIntroActivity")
+            StarsIntroActivity.setGiftImage(image_view.getImageReceiver(), gift, 160)
+            self._set_view_visible(image_view, True)
+            self._set_view_visible(anim_view, False)
+            return True
+        except Exception as e:
+            self.log(f"[HiddenGift] set gift image error: {e}")
+            self._set_view_visible(image_view, False)
+            self._set_view_visible(anim_view, True)
+            return False
+
+    def _apply_preview_fallback(self, form: Dict[str, Any], title: str, subtitle: str):
+        self._set_text(form.get("preview_title"), title)
+        self._set_text(form.get("preview_subtitle"), subtitle)
+
+        image_view = form.get("preview_image")
+        anim_view = form.get("preview_anim")
+        if image_view is not None:
+            try:
+                image_view.clearImage()
+            except Exception:
+                pass
+        self._set_view_visible(image_view, False)
+        self._set_view_visible(anim_view, True)
+        try:
+            if anim_view is not None and hasattr(anim_view, "playAnimation"):
+                anim_view.playAnimation()
+        except Exception:
+            pass
+
+    def _build_preview_target_text(self, target_raw: str, context_dialog_id: int) -> str:
+        raw = str(target_raw or "").strip()
+        if raw == "":
+            if int(context_dialog_id or 0) == 0:
+                target = self._t("preview_target_self")
+            else:
+                title = self._resolve_dialog_title(int(context_dialog_id))
+                if title:
+                    target = f"{title} ({context_dialog_id})"
+                else:
+                    target = self._t("preview_target_dialog", dialog_id=str(context_dialog_id))
+        elif raw == "0":
+            target = self._t("preview_target_self")
+        else:
+            parsed = self._to_int(raw)
+            if parsed is None:
+                target = self._t("target_unknown")
+            else:
+                title = self._resolve_dialog_title(int(parsed))
+                if title:
+                    target = f"{title} ({parsed})"
+                else:
+                    target = self._t("preview_target_dialog", dialog_id=str(parsed))
+        return self._t("preview_target", target=target)
+
+    def _resolve_dialog_title(self, dialog_id: int) -> str:
+        did = int(dialog_id or 0)
+        if did == 0:
+            return ""
+        mc = get_messages_controller()
+        if mc is None:
+            return ""
+        try:
+            if did > 0 and hasattr(mc, "getUser"):
+                user = mc.getUser(int(did))
+                if user is not None:
+                    first = str(getattr(user, "first_name", "") or "").strip()
+                    last = str(getattr(user, "last_name", "") or "").strip()
+                    username = str(getattr(user, "username", "") or "").strip()
+                    title = " ".join([x for x in (first, last) if x]).strip()
+                    if title:
+                        return title
+                    if username:
+                        return f"@{username}"
+            if did < 0 and hasattr(mc, "getChat"):
+                chat = mc.getChat(int(-did))
+                if chat is None and did <= -1000000000000:
+                    channel_chat_id = int(abs(did) - 1000000000000)
+                    if channel_chat_id > 0:
+                        chat = mc.getChat(channel_chat_id)
+                if chat is not None:
+                    return str(getattr(chat, "title", "") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _build_preview_options_text(self, anonymous: bool) -> str:
+        mode = self._t("preview_mode_anonymous") if anonymous else self._t("preview_mode_named")
+        return self._t("preview_option_mode", mode=mode)
+
+    def _build_preview_message_text(self, text: str) -> str:
+        clean = str(text or "").strip()
+        if not clean:
+            return self._t("preview_message_empty")
+        return self._t("preview_message_label", message=self._truncate_text(clean, 70))
+
+    def _truncate_text(self, text: str, limit: int) -> str:
+        value = str(text or "")
+        if len(value) <= int(limit):
+            return value
+        return value[: max(1, int(limit) - 1)].rstrip() + "…"
+
+    def _set_text(self, view: Any, text: str):
+        if view is None:
+            return
+        try:
+            view.setText(str(text))
+        except Exception:
+            pass
+
+    def _set_view_visible(self, view: Any, visible: bool):
+        if view is None:
+            return
+        try:
+            view.setVisibility(0 if visible else 8)
+        except Exception:
+            pass
+
+    def _create_round_drawable(self, fill_key: str, stroke_key: str, radius_dp: int, stroke_dp: int):
+        try:
+            GradientDrawable = jclass("android.graphics.drawable.GradientDrawable")
+            bg = GradientDrawable()
+            bg.setShape(GradientDrawable.RECTANGLE)
+            bg.setCornerRadius(float(self._dp(radius_dp)))
+
+            fill_color = self._theme_color(fill_key)
+            if fill_color:
+                bg.setColor(int(fill_color))
+
+            if stroke_key and int(stroke_dp) > 0:
+                stroke_color = self._theme_color(stroke_key)
+                if stroke_color:
+                    bg.setStroke(self._dp(stroke_dp), int(stroke_color))
+            return bg
+        except Exception:
+            return None
+
+    def _set_view_background(self, view: Any, background: Any):
+        if view is None or background is None:
+            return
+        try:
+            view.setBackground(background)
+        except Exception:
+            pass
+
+    def _build_field_label(self, context: Any, text: str):
+        TextView = jclass("android.widget.TextView")
+        label = TextView(context)
+        label.setText(str(text))
+        label.setTextSize(12)
+        self._apply_text_color(label, "key_windowBackgroundWhiteGrayText2")
+        return label
+
+    def _add_field_card(self, container: Any, context: Any, label_text: str, field: Any):
+        LinearLayout = jclass("android.widget.LinearLayout")
+        ViewGroupLayoutParams = jclass("android.view.ViewGroup$LayoutParams")
+        LayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+
+        card = LinearLayout(context)
+        card.setOrientation(LinearLayout.VERTICAL)
+        card.setPadding(self._dp(12), self._dp(10), self._dp(12), self._dp(10))
+        self._set_view_background(card, self._create_round_drawable("key_dialogBackgroundGray", "key_divider", 14, 1))
+
+        card_lp = LayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+        card_lp.setMargins(0, self._dp(8), 0, 0)
+        container.addView(card, card_lp)
+
+        label = self._build_field_label(context, label_text)
+        card.addView(label, LayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT))
+
+        field_lp = LayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+        field_lp.setMargins(0, self._dp(3), 0, 0)
+        card.addView(field, field_lp)
+        return card
+
+    def _add_message_emoji_action(self, card: Any, context: Any, message_input: Any):
+        if card is None or message_input is None:
+            return
+
+        try:
+            TextView = jclass("android.widget.TextView")
+            TypedValue = jclass("android.util.TypedValue")
+            ViewGroupLayoutParams = jclass("android.view.ViewGroup$LayoutParams")
+            LayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+            Gravity = jclass("android.view.Gravity")
+        except Exception:
+            return
+
+        button = TextView(context)
+        button.setText(str(self._t("message_emoji_button")))
+        try:
+            button.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        except Exception:
+            button.setTextSize(13)
+        try:
+            button.setGravity(int(getattr(Gravity, "CENTER", 17)))
+        except Exception:
+            pass
+        button.setPadding(self._dp(10), self._dp(8), self._dp(10), self._dp(8))
+        self._apply_text_color(button, "key_windowBackgroundWhiteBlueText")
+        self._set_view_background(button, self._create_round_drawable("key_dialogBackground", "key_divider", 10, 1))
+        try:
+            button.setOnClickListener(OnClickListener(lambda _v=None: self._open_message_emoji_picker(message_input)))
+        except Exception:
+            pass
+
+        button_lp = LayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+        button_lp.setMargins(0, self._dp(8), 0, 0)
+        card.addView(button, button_lp)
+
+    def _add_switch_row(self, container: Any, context: Any, switch_view: Any, top_margin_dp: int):
+        ViewGroupLayoutParams = jclass("android.view.ViewGroup$LayoutParams")
+        LinearLayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+        row_lp = LinearLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+        row_lp.setMargins(0, self._dp(top_margin_dp), 0, 0)
+
+        if switch_view is not None and hasattr(switch_view, "setTextAndCheck"):
+            self._set_view_background(switch_view, self._create_round_drawable("key_dialogBackgroundGray", "key_divider", 14, 1))
+            try:
+                switch_view.setDrawCheckRipple(True)
+            except Exception:
+                pass
+            container.addView(switch_view, row_lp)
+            return
+
+        FrameLayout = jclass("android.widget.FrameLayout")
+        FrameLayoutParams = jclass("android.widget.FrameLayout$LayoutParams")
+        Gravity = jclass("android.view.Gravity")
+
+        row = FrameLayout(context)
+        row.setPadding(self._dp(12), self._dp(10), self._dp(12), self._dp(10))
+        self._set_view_background(row, self._create_round_drawable("key_dialogBackgroundGray", "key_divider", 14, 1))
+        container.addView(row, row_lp)
+        row.addView(switch_view, FrameLayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT, Gravity.CENTER_VERTICAL))
+
+    def _create_telegram_toggle(self, context: Any, text: str, checked: bool):
+        try:
+            TextCheckCell = jclass("org.telegram.ui.Cells.TextCheckCell")
+            cell = None
+            try:
+                cell = TextCheckCell(context, 16, True)
+            except Exception:
+                cell = TextCheckCell(context)
+            cell.setTextAndCheck(str(text), bool(checked), False)
+            return cell
+        except Exception:
+            SwitchCls = self._resolve_switch_class()
+            switch_view = SwitchCls(context)
+            switch_view.setText(str(text))
+            switch_view.setChecked(bool(checked))
+            self._apply_text_color(switch_view, "key_dialogTextBlack")
+            return switch_view
+
+    def _create_text_input(self, context: Any, hint: str, value: str, multiline: bool, numeric: bool):
+        InputType = jclass("android.text.InputType")
+        TypedValue = jclass("android.util.TypedValue")
+        edit_text = None
+        try:
+            EditTextBoldCursor = jclass("org.telegram.ui.Components.EditTextBoldCursor")
+            edit_text = EditTextBoldCursor(context)
+            try:
+                edit_text.setBackground(None)
+            except Exception:
+                pass
+            try:
+                edit_text.setLineColors(
+                    self._theme_color("key_dialogInputField"),
+                    self._theme_color("key_dialogInputFieldActivated"),
+                    self._theme_color("key_text_RedBold"),
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if edit_text is None:
+            EditText = jclass("android.widget.EditText")
+            edit_text = EditText(context)
+
+        try:
+            edit_text.setHint(str(hint))
+        except Exception:
+            pass
+        try:
+            edit_text.setText(str(value or ""))
+        except Exception:
+            pass
+        try:
+            self._apply_text_color(edit_text, "key_dialogTextBlack")
+        except Exception:
+            pass
+        try:
+            edit_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        except Exception:
+            pass
+        try:
+            edit_text.setPadding(0, 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            hint_color = self._theme_color("key_dialogTextHint")
+            if hint_color:
+                edit_text.setHintTextColor(hint_color)
+        except Exception:
+            pass
+
+        if numeric:
+            try:
+                edit_text.setInputType(int(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED))
+            except Exception:
+                pass
+            try:
+                edit_text.setSingleLine(True)
+            except Exception:
+                pass
+        elif multiline:
+            try:
+                edit_text.setInputType(int(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE))
+            except Exception:
+                pass
+            try:
+                edit_text.setSingleLine(False)
+                edit_text.setMinLines(1)
+                edit_text.setMaxLines(3)
+            except Exception:
+                pass
+        else:
+            try:
+                edit_text.setInputType(int(InputType.TYPE_CLASS_TEXT))
+            except Exception:
+                pass
+            try:
+                edit_text.setSingleLine(True)
+            except Exception:
+                pass
+
+        return edit_text
+
+    def _open_message_emoji_picker(self, message_input: Any):
+        if message_input is None:
+            self._notify_error(self._t("message_emoji_open_error"))
+            return
+
+        activity, fragment = self._get_ui_context()
+        if activity is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        try:
+            EmojiBottomSheet = jclass("org.telegram.ui.Stories.recorder.EmojiBottomSheet")
+            Callback3Return = jclass("org.telegram.messenger.Utilities$Callback3Return")
+        except Exception:
+            self._notify_error(self._t("message_emoji_unavailable"))
+            return
+
+        self._dismiss_message_emoji_picker()
+        resources_provider = None
+        if fragment is not None:
+            try:
+                resources_provider = fragment.getResourceProvider()
+            except Exception:
+                resources_provider = None
+
+        plugin = self
+
+        class _DocumentSelected(dynamic_proxy(Callback3Return)):
+            def run(self, _parent_object, document, is_gif):
+                try:
+                    inserted = plugin._insert_custom_emoji_into_input(message_input, document, bool(is_gif))
+                    if not inserted:
+                        plugin._notify_error(plugin._t("message_emoji_invalid"))
+                    return bool(inserted)
+                except Exception as e:
+                    plugin.log(f"[HiddenGift] emoji picker callback error: {e}")
+                    plugin._notify_error(plugin._t("message_emoji_insert_error"))
+                    return False
+
+        callback = _DocumentSelected()
+
+        try:
+            picker = EmojiBottomSheet(activity, False, resources_provider, False)
+        except Exception:
+            try:
+                picker = EmojiBottomSheet(activity, False, resources_provider)
+            except Exception as e:
+                self.log(f"[HiddenGift] emoji picker init error: {e}")
+                self._notify_error(self._t("message_emoji_open_error"))
+                return
+
+        try:
+            picker.whenDocumentSelected(callback)
+        except Exception as e:
+            self.log(f"[HiddenGift] emoji picker setup error: {e}")
+            self._notify_error(self._t("message_emoji_open_error"))
+            return
+
+        self._message_emoji_picker_dialog_ref = picker
+        self._message_emoji_picker_delegate_ref = callback
+        self._message_emoji_picker_dismiss_ref = None
+
+        try:
+            DismissListener = jclass("android.content.DialogInterface$OnDismissListener")
+
+            class _Dismiss(dynamic_proxy(DismissListener)):
+                def onDismiss(self, _dialog):
+                    plugin._on_message_emoji_picker_dismiss()
+
+            dismiss_listener = _Dismiss()
+            picker.setOnDismissListener(dismiss_listener)
+            self._message_emoji_picker_dismiss_ref = dismiss_listener
+        except Exception:
+            self._message_emoji_picker_dismiss_ref = None
+
+        shown = False
+        if fragment is not None and hasattr(fragment, "showDialog"):
+            try:
+                fragment.showDialog(picker)
+                shown = True
+            except Exception:
+                shown = False
+
+        if not shown:
+            try:
+                picker.show()
+                shown = True
+            except Exception as e:
+                self.log(f"[HiddenGift] emoji picker show error: {e}")
+                shown = False
+
+        if not shown:
+            self._on_message_emoji_picker_dismiss()
+            self._notify_error(self._t("message_emoji_open_error"))
+
+    def _on_message_emoji_picker_dismiss(self):
+        self._message_emoji_picker_dialog_ref = None
+        self._message_emoji_picker_delegate_ref = None
+        self._message_emoji_picker_dismiss_ref = None
+
+    def _dismiss_message_emoji_picker(self):
+        dialog = self._message_emoji_picker_dialog_ref
+        self._on_message_emoji_picker_dismiss()
+        if dialog is None:
+            return
+        try:
+            dialog.dismiss()
+        except Exception:
+            pass
+
+    def _insert_custom_emoji_into_input(self, edit_text: Any, document: Any, is_gif: bool) -> bool:
+        if edit_text is None or document is None or bool(is_gif):
+            return False
+
+        try:
+            if bool(MessageObject.isGifDocument(document)):
+                return False
+        except Exception:
+            pass
+
+        doc_id = 0
+        try:
+            doc_id = int(getattr(document, "id", 0) or 0)
+        except Exception:
+            doc_id = 0
+        if doc_id <= 0:
+            return False
+
+        try:
+            if not bool(MessageObject.isAnimatedEmoji(document)):
+                return False
+        except Exception:
+            pass
+
+        symbol = self._extract_message_emoji_symbol(document)
+        if not symbol:
+            symbol = "🙂"
+
+        editable = self._read_editable(edit_text)
+        if editable is None:
+            return False
+
+        try:
+            start = int(edit_text.getSelectionStart())
+        except Exception:
+            start = -1
+        try:
+            end = int(edit_text.getSelectionEnd())
+        except Exception:
+            end = start
+        if start < 0:
+            start = max(0, int(end))
+        if end < 0:
+            end = int(start)
+        if start > end:
+            start, end = end, start
+
+        try:
+            if start != end:
+                editable.delete(start, end)
+            insert_at = int(start)
+        except Exception:
+            insert_at = max(0, int(start))
+
+        try:
+            SpannableString = jclass("android.text.SpannableString")
+            Spanned = jclass("android.text.Spanned")
+            AnimatedEmojiSpan = jclass("org.telegram.ui.Components.AnimatedEmojiSpan")
+        except Exception as e:
+            self.log(f"[HiddenGift] emoji span classes unavailable: {e}")
+            return False
+
+        span_text = SpannableString(symbol)
+        try:
+            metrics = edit_text.getPaint().getFontMetricsInt()
+        except Exception:
+            metrics = None
+
+        span = None
+        try:
+            if metrics is not None:
+                span = AnimatedEmojiSpan(document, metrics)
+            else:
+                span = AnimatedEmojiSpan(document)
+        except Exception:
+            try:
+                if metrics is not None:
+                    span = AnimatedEmojiSpan(self._as_java_long(doc_id), metrics)
+                else:
+                    span = AnimatedEmojiSpan(self._as_java_long(doc_id))
+            except Exception:
+                span = None
+
+        if span is None:
+            return False
+
+        try:
+            span.fromEmojiKeyboard = True
+        except Exception:
+            pass
+        try:
+            AnimatedEmojiDrawable = jclass("org.telegram.ui.Components.AnimatedEmojiDrawable")
+            cache_type = getattr(AnimatedEmojiDrawable, "CACHE_TYPE_ALERT_PREVIEW", None)
+            if cache_type is not None:
+                span.cacheType = int(cache_type)
+        except Exception:
+            pass
+
+        try:
+            flags = int(getattr(Spanned, "SPAN_EXCLUSIVE_EXCLUSIVE", 33))
+            span_text.setSpan(span, 0, int(span_text.length()), flags)
+        except Exception:
+            return False
+
+        try:
+            editable.insert(int(insert_at), span_text)
+            pos = int(insert_at) + int(span_text.length())
+            edit_text.setSelection(pos, pos)
+            return True
+        except Exception as e:
+            self.log(f"[HiddenGift] insert custom emoji error: {e}")
+            return False
+
+    def _extract_message_emoji_symbol(self, document: Any) -> str:
+        alt = self._extract_document_alt_emoji(document)
+        if alt:
+            return alt
+
+        emoji = ""
+        try:
+            emoji = str(MessageObject.findAnimatedEmojiEmoticon(document, "") or "").strip()
+        except Exception:
+            try:
+                emoji = str(MessageObject.findAnimatedEmojiEmoticon(document) or "").strip()
+            except Exception:
+                emoji = ""
+        if emoji and not emoji.startswith("animated_"):
+            return emoji
+        return ""
+
+    def _extract_document_alt_emoji(self, document: Any) -> str:
+        attrs = getattr(document, "attributes", None)
+        if attrs is None:
+            return ""
+
+        for attr in self._iter_java_items(attrs):
+            try:
+                alt = str(getattr(attr, "alt", "") or "").strip()
+                if alt:
+                    return alt
+            except Exception:
+                continue
+        return ""
+
+    def _resolve_switch_class(self):
+        try:
+            return jclass("androidx.appcompat.widget.SwitchCompat")
+        except Exception:
+            return jclass("android.widget.Switch")
+
+    def _apply_text_color(self, text_view: Any, theme_key_name: str):
+        color = self._theme_color(theme_key_name)
+        if color:
+            text_view.setTextColor(color)
+
+    def _theme_color(self, key_name: str) -> int:
+        try:
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            key = getattr(Theme, key_name, None)
+            if key is None:
+                return 0
+            return int(Theme.getColor(int(key)))
+        except Exception:
+            return 0
+
+    def _dp(self, value: int) -> int:
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            return int(AndroidUtilities.dp(float(value)))
+        except Exception:
+            return int(value)
+
+    def _read_text(self, edit_text: Any) -> str:
+        if edit_text is None:
+            return ""
+        try:
+            return str(edit_text.getText().toString())
+        except Exception:
+            pass
+        try:
+            return str(edit_text.getText())
+        except Exception:
+            return ""
+
+    def _read_checked(self, switch_view: Any, default: bool) -> bool:
+        if switch_view is None:
+            return bool(default)
+        try:
+            return bool(switch_view.isChecked())
+        except Exception:
+            return bool(default)
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        try:
+            text = str(value).strip()
+            if text == "":
+                return None
+            return int(text)
+        except Exception:
+            return None
+
+    def _as_java_long(self, value: Any):
+        try:
+            Long = jclass("java.lang.Long")
+            return Long.valueOf(str(int(value)))
+        except Exception:
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+    def _t(self, key: str, **kwargs) -> str:
+        text = _TEXTS.get(key, key)
+        try:
+            return text.format(**kwargs) if kwargs else text
+        except Exception:
+            return text
