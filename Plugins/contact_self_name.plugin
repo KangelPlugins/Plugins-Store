@@ -1,0 +1,436 @@
+__id__ = 'contact_self_name'
+__name__ = 'Contact Self Name'
+__description__ = 'Показывает самоназвание сохранённого контакта по нажатию на имя в профиле. Требуются публичный username и интернет.'
+__author__ = '@engiPlugins'
+__version__ = '1.0.0'
+__app_version__ = '>=12.5.1'
+__sdk_version__ = '>=1.4.0'
+import html
+import re
+from threading import Thread
+from urllib.request import Request, urlopen
+from android.view import HapticFeedbackConstants, View
+from android_utils import OnClickListener, copy_to_clipboard, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from java import dynamic_proxy, jint, jlong
+from java.lang import System
+from org.telegram.messenger import MessagesController, UserConfig
+from ui.bulletin import BulletinHelper
+
+class NameLongClickListener(dynamic_proxy(View.OnLongClickListener)):
+
+    def __init__(self, plugin, profile):
+        super().__init__()
+        self.plugin = plugin
+        self.profile = profile
+
+    def onLongClick(self, view):
+        if self.plugin is None or self.profile is None:
+            return False
+        return self.plugin._copy_visible_name(self.profile, view)
+
+    def dispose(self):
+        self.plugin = None
+        self.profile = None
+
+class ProfileUpdateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin._bind_profile(param.thisObject)
+
+class ProfileDestroyHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._detach_profile(param.thisObject, restore=True)
+
+class ContactSelfNamePlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._active = True
+        self._states = {}
+        self._name_cache = {}
+        self._fetching = set()
+
+    def on_plugin_load(self):
+        self._active = True
+        profile_class = find_class('org.telegram.ui.ProfileActivity')
+        if profile_class is None:
+            return
+        self.hook_all_methods(profile_class, 'updateProfileData', ProfileUpdateHook(self))
+        self.hook_all_methods(profile_class, 'onFragmentDestroy', ProfileDestroyHook(self))
+
+    def on_plugin_unload(self):
+        self._active = False
+        for state in list(self._states.values()):
+            self._detach_state(state, restore=True)
+        self._states.clear()
+        self._name_cache.clear()
+        self._fetching.clear()
+
+    def _profile_key(self, profile):
+        return int(System.identityHashCode(profile))
+
+    def _profile_identity(self, profile):
+        user_id = get_private_field(profile, 'userId')
+        if user_id is None or int(user_id) <= 0:
+            return None
+        account = get_private_field(profile, 'currentAccount')
+        if account is None:
+            account = UserConfig.selectedAccount
+        return (int(account), int(user_id))
+
+    def _messages_controller(self, profile, account):
+        try:
+            return profile.getMessagesController()
+        except Exception:
+            return MessagesController.getInstance(jint(account))
+
+    def _contact_data(self, profile):
+        identity = self._profile_identity(profile)
+        if identity is None:
+            return None
+        account, user_id = identity
+        controller = self._messages_controller(profile, account)
+        user = controller.getUser(jlong(user_id))
+        if user is None:
+            return None
+        try:
+            first_name = str(user.first_name or '').strip()
+        except Exception:
+            first_name = str(get_private_field(user, 'first_name') or '').strip()
+        try:
+            last_name = str(user.last_name or '').strip()
+        except Exception:
+            last_name = str(get_private_field(user, 'last_name') or '').strip()
+        try:
+            username = str(user.username or '').strip().lstrip('@')
+        except Exception:
+            username = str(get_private_field(user, 'username') or '').strip().lstrip('@')
+        try:
+            is_contact = bool(user.contact)
+        except Exception:
+            is_contact = bool(get_private_field(user, 'contact'))
+        cached_name = ' '.join((part for part in (first_name, last_name) if part)).strip()
+        return (identity, cached_name, username, is_contact)
+
+    def _name_views(self, profile):
+        result = []
+        views = get_private_field(profile, 'nameTextView')
+        if views is None:
+            return result
+        try:
+            for view in views:
+                if view is not None:
+                    result.append(view)
+        except Exception:
+            try:
+                for index in range(2):
+                    view = views[index]
+                    if view is not None:
+                        result.append(view)
+            except Exception:
+                pass
+        return result
+
+    def _visible_name(self, views):
+        fallback = ''
+        for view in views:
+            try:
+                text = str(view.getText() or '').strip()
+                if not text:
+                    continue
+                if bool(view.isShown()):
+                    return text
+                if not fallback:
+                    fallback = text
+            except Exception:
+                pass
+        return fallback
+
+    def _normalize(self, text):
+        return ' '.join(str(text or '').split()).casefold()
+
+    def _bind_profile(self, profile):
+        if not self._active or profile is None:
+            return
+        try:
+            data = self._contact_data(profile)
+            if data is None:
+                return
+            identity, cached_name, username, is_contact = data
+            if not is_contact:
+                self._detach_profile(profile, restore=True)
+                return
+            views = self._name_views(profile)
+            displayed = self._visible_name(views)
+            if not views or not displayed:
+                return
+            username_key = username.casefold()
+            public_name = self._name_cache.get(username_key) if username_key else None
+            key = self._profile_key(profile)
+            state = self._states.get(key)
+            if state is None or state.get('profile') is not profile:
+                state = {'profile': profile, 'identity': identity, 'saved_name': displayed, 'cached_name': cached_name, 'username': username, 'self_name': public_name, 'showing_self': False, 'animating': False, 'views': [], 'long_listeners': []}
+                self._states[key] = state
+            else:
+                state['identity'] = identity
+                state['cached_name'] = cached_name
+                state['username'] = username
+                if public_name:
+                    state['self_name'] = public_name
+                if not state['showing_self']:
+                    state['saved_name'] = displayed
+            self._detach_view_listeners(state)
+            state['views'] = views
+            state['long_listeners'] = []
+            for view in views:
+                view.setClickable(True)
+                view.setOnClickListener(OnClickListener(lambda clicked, p=profile: self._toggle_name(p)))
+                long_listener = NameLongClickListener(self, profile)
+                state['long_listeners'].append(long_listener)
+                view.setOnLongClickListener(long_listener)
+            if state['showing_self'] and state.get('self_name'):
+                self._set_name_text(state, state['self_name'])
+        except Exception as error:
+            pass
+
+    def _set_name_text(self, state, text):
+        for view in list(state.get('views', [])):
+            try:
+                if not bool(view.isAttachedToWindow()):
+                    continue
+                view.setText(text)
+                view.requestLayout()
+                view.invalidate()
+                parent = view.getParent()
+                if parent is not None:
+                    parent.requestLayout()
+                    parent.invalidate()
+            except Exception:
+                pass
+
+    def _force_profile_recenter(self, profile):
+        list_view = get_private_field(profile, 'listView')
+        if list_view is None:
+            return False
+        try:
+            if bool(list_view.canScrollVertically(jint(1))):
+                delta = 1
+            elif bool(list_view.canScrollVertically(jint(-1))):
+                delta = -1
+            else:
+                return False
+            list_view.scrollBy(jint(0), jint(delta))
+            list_view.scrollBy(jint(0), jint(-delta))
+            list_view.invalidate()
+            return True
+        except Exception as error:
+            return False
+
+    def _toggle_name(self, profile):
+        if not self._active:
+            return
+        state = self._states.get(self._profile_key(profile))
+        if state is None or state.get('animating'):
+            return
+        if not state.get('self_name'):
+            self._request_public_name(profile, state)
+            return
+        if self._normalize(state['saved_name']) == self._normalize(state['self_name']):
+            BulletinHelper.show_info('Самоназвание совпадает с именем контакта', profile)
+            return
+        show_self = not state['showing_self']
+        target = state['self_name'] if show_self else state['saved_name']
+        attached = []
+        for view in list(state.get('views', [])):
+            try:
+                if bool(view.isAttachedToWindow()):
+                    attached.append(view)
+            except Exception:
+                pass
+        if not attached:
+            return
+        active_view = None
+        active_alpha = -1.0
+        for view in attached:
+            try:
+                alpha = float(view.getAlpha())
+                if bool(view.isShown()) and alpha > active_alpha:
+                    active_view = view
+                    active_alpha = alpha
+            except Exception:
+                pass
+        if active_view is None or active_alpha <= 0.01:
+            state['showing_self'] = show_self
+            self._set_name_text(state, target)
+            return
+        state['animating'] = True
+        state['animation_view'] = active_view
+        state['animation_alpha'] = active_alpha
+        try:
+            active_view.animate().cancel()
+            active_view.animate().alpha(0.0).setDuration(80).start()
+        except Exception:
+            state['animating'] = False
+            state['showing_self'] = show_self
+            self._set_name_text(state, target)
+            return
+
+        def swap():
+            if not self._active or self._states.get(self._profile_key(profile)) is not state:
+                return
+            try:
+                state['showing_self'] = show_self
+                self._set_name_text(state, target)
+                self._force_profile_recenter(profile)
+                view = state.get('animation_view')
+                original_alpha = float(state.get('animation_alpha', 1.0))
+                if view is None or not bool(view.isAttachedToWindow()):
+                    state['animating'] = False
+                    state['animation_view'] = None
+                    state['animation_alpha'] = None
+                    return
+                view.setAlpha(0.0)
+                view.animate().cancel()
+
+                def fade_in():
+                    if not self._active or self._states.get(self._profile_key(profile)) is not state:
+                        return
+                    try:
+                        current_view = state.get('animation_view')
+                        if current_view is not None and bool(current_view.isAttachedToWindow()):
+                            current_view.animate().cancel()
+                            current_view.animate().alpha(original_alpha).setDuration(120).start()
+                    except Exception as error:
+                        pass
+                    finally:
+                        state['animating'] = False
+                        state['animation_view'] = None
+                        state['animation_alpha'] = None
+                run_on_ui_thread(fade_in, 32)
+            except Exception as error:
+                state['animating'] = False
+                state['animation_view'] = None
+                state['animation_alpha'] = None
+        run_on_ui_thread(swap, 80)
+
+    def _parse_public_name(self, page):
+        patterns = ('<div[^>]+class="[^"]*tgme_page_title[^"]*"[^>]*>\\s*<span[^>]*>(.*?)</span>', '<meta[^>]+property="og:title"[^>]+content="([^"]+)"', '<meta[^>]+content="([^"]+)"[^>]+property="og:title"')
+        for pattern in patterns:
+            match = re.search(pattern, page, re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            value = re.sub('<[^>]+>', '', match.group(1))
+            value = ' '.join(html.unescape(value).split()).strip()
+            if value and (not value.lower().startswith('telegram:')):
+                return value
+        return None
+
+    def _request_public_name(self, profile, state):
+        username = str(state.get('username') or '').strip()
+        if not username or re.fullmatch(r'[A-Za-z0-9_]{3,64}', username) is None:
+            BulletinHelper.show_info('У контакта нет публичного username', profile)
+            return
+        username_key = username.casefold()
+        if username_key in self._fetching:
+            BulletinHelper.show_info('Самоназвание уже загружается', profile)
+            return
+        self._fetching.add(username_key)
+        BulletinHelper.show_info('Получаю самоназвание…', profile)
+
+        def worker():
+            public_name = None
+            try:
+                request = Request('https://t.me/%s' % username, headers={'User-Agent': 'Mozilla/5.0 (Android) ContactSelfName/1.0', 'Accept-Language': 'ru,en;q=0.8'})
+                with urlopen(request, timeout=8) as response:
+                    if int(response.getcode()) != 200:
+                        raise RuntimeError('unexpected HTTP status')
+                    page = response.read(524288).decode('utf-8', 'replace')
+                public_name = self._parse_public_name(page)
+                if not public_name:
+                    raise RuntimeError('public profile name not found')
+            except Exception as error:
+                pass
+
+            def finish():
+                self._fetching.discard(username_key)
+                if not self._active:
+                    return
+                current = self._states.get(self._profile_key(profile))
+                if current is not state or current.get('username', '').casefold() != username_key:
+                    return
+                if public_name:
+                    self._name_cache[username_key] = public_name
+                    state['self_name'] = public_name
+                    self._toggle_name(profile)
+                else:
+                    BulletinHelper.show_error('Не удалось получить самоназвание', profile)
+            run_on_ui_thread(finish)
+        try:
+            Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._fetching.discard(username_key)
+            BulletinHelper.show_error('Не удалось запустить загрузку', profile)
+
+    def _copy_visible_name(self, profile, view=None):
+        state = self._states.get(self._profile_key(profile))
+        if state is None:
+            return False
+        text = state.get('self_name') if state['showing_self'] else state['saved_name']
+        if not text:
+            return False
+        copy_to_clipboard(text)
+        if view is not None:
+            try:
+                view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            except Exception:
+                pass
+        BulletinHelper.show_success('Имя скопировано', profile)
+        return True
+
+    def _detach_view_listeners(self, state):
+        for view in list(state.get('views', [])):
+            try:
+                view.setOnClickListener(None)
+                view.setOnLongClickListener(None)
+            except Exception:
+                pass
+        for listener in list(state.get('long_listeners', [])):
+            try:
+                listener.dispose()
+            except Exception:
+                pass
+        state['long_listeners'] = []
+
+    def _detach_state(self, state, restore):
+        self._detach_view_listeners(state)
+        animation_view = state.get('animation_view')
+        if animation_view is not None:
+            try:
+                animation_view.animate().cancel()
+                original_alpha = state.get('animation_alpha')
+                if original_alpha is not None:
+                    animation_view.setAlpha(float(original_alpha))
+            except Exception:
+                pass
+        if restore and state.get('showing_self'):
+            self._set_name_text(state, state.get('saved_name', ''))
+        state['views'] = []
+        state['animating'] = False
+        state['animation_view'] = None
+        state['animation_alpha'] = None
+
+    def _detach_profile(self, profile, restore):
+        if profile is None:
+            return
+        state = self._states.pop(self._profile_key(profile), None)
+        if state is not None:
+            self._detach_state(state, restore)
