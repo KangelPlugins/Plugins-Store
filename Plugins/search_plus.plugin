@@ -1,0 +1,1842 @@
+import os, re, threading, traceback, time
+
+from android.view import Gravity, View
+from android.widget import EditText, LinearLayout
+from java import dynamic_proxy, jclass
+from java.lang import Class as JClass, Long, String as JString
+from java.util import ArrayList
+
+from org.telegram.messenger import AndroidUtilities, UserConfig
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui.ActionBar import Theme
+from org.telegram.ui.Components import AnimatedTextView, LayoutHelper
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
+from client_utils import get_last_fragment, get_messages_controller, send_request
+from hook_utils import find_class
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+__id__ = "search_plus"
+__name__ = "Search+"
+__author__ = "@zxtoichi"
+__icon__ = "UtyaDuckFull/17"
+__app_version__ = ">=12.5.1"
+__version__ = "1.0"
+__description__ = """Поиск пользователей по ID/телефону/@username/ссылке t.me — там, где Telegram это не умеет.
+
+**Функции:**
+1. Поиск по ID в глобальном поиске.
+2. Поиск по ID в поиске внутри чата (@id).
+3. Поиск по ID в чёрном списке чата (⋮ → Настройки → Разрешения → Чёрный список → Исключить).
+4. Поиск по ID при упоминании (@ в чате).
+5. Разблокировка по ID (⋮ → Разблокировать по ID) — ввод ID, телефона, @username или ссылки t.me/..."""
+
+global plugin_instance
+plugin_instance = None
+
+
+def slog(message, error=None):
+    try:
+        if error:
+            log(f"[SearchPlus] {message} | ERROR: {error}")
+            tb = traceback.format_exc()
+            for line in tb.splitlines():
+                log(f"[SearchPlus] TB | {line}")
+    except Exception:
+        pass
+
+
+class InputParser:
+    LINK_RE = re.compile(r'(?:https?://)?t(?:elegram)?\.me/([a-zA-Z][a-zA-Z0-9_]{3,31})', re.IGNORECASE)
+    USERNAME_RE = re.compile(r'^@?([a-zA-Z][a-zA-Z0-9_]{3,31})$')
+    ID_RE = re.compile(r'^-?\d{3,20}$')
+    PHONE_RE = re.compile(r'^\+?(\d{7,15})$')
+
+    @staticmethod
+    def parse(text):
+        text = (text or "").strip()
+        if not text:
+            return None
+        m = InputParser.LINK_RE.search(text)
+        if m:
+            return ("username", m.group(1))
+        if text.startswith("+"):
+            m = InputParser.PHONE_RE.match(text)
+            if m:
+                return ("phone", m.group(1))
+        if text.startswith("@"):
+            stripped = text.lstrip("@")
+            if InputParser.ID_RE.match(stripped):
+                return ("id", stripped)
+            if InputParser.PHONE_RE.match(stripped) and not stripped.startswith("0"):
+                return ("phone", stripped)
+        m = InputParser.USERNAME_RE.match(text)
+        if m and not text.lstrip("@").isdigit():
+            return ("username", m.group(1))
+        if InputParser.ID_RE.match(text):
+            return ("id", text)
+        if InputParser.PHONE_RE.match(text) and not text.startswith("0"):
+            return ("phone", text.lstrip("+"))
+        return None
+
+
+class ResolveHelper:
+    @staticmethod
+    def resolve_username(username, callback):
+        try:
+            req_cls = getattr(TLRPC, "TL_contacts_resolve" + "Username")
+            req = req_cls()
+            req.username = username
+            send_request(req, callback)
+        except Exception as e:
+            slog("resolve_username failed", e)
+            callback(None, e)
+
+    @staticmethod
+    def resolve_phone(phone, callback):
+        try:
+            req_cls = getattr(TLRPC, "TL_contacts_resolve" + "Phone")
+            req = req_cls()
+            req.phone = phone
+            send_request(req, callback)
+        except Exception as e:
+            slog("resolve_phone failed", e)
+            callback(None, e)
+
+    @staticmethod
+    def resolve_id(id_str, callback):
+        try:
+            mc = get_messages_controller()
+            try:
+                uid = int(id_str)
+            except Exception:
+                callback(None, Exception("bad id"))
+                return
+            user = mc.getUser(uid)
+            if user and not isinstance(user, TLRPC.TL_userEmpty):
+                callback(user, None)
+                return
+            chat = mc.getChat(uid)
+            if chat and not isinstance(chat, TLRPC.TL_chatEmpty):
+                callback(chat, None)
+                return
+            callback(None, Exception("not in cache"))
+        except Exception as e:
+            slog("resolve_id failed", e)
+            callback(None, e)
+
+    @staticmethod
+    def open_profile(obj):
+        try:
+            frag = get_last_fragment()
+            if not frag:
+                BulletinHelper.show_error("Нет фрагмента")
+                return
+            profile_cls = find_class("org.telegram.ui.ProfileActivity")
+            if not profile_cls:
+                BulletinHelper.show_error("ProfileActivity не найден")
+                return
+            uid = int(getattr(obj, "id", 0))
+            profile = None
+            for ctor_try in (
+                lambda: profile_cls.getConstructor(Long.TYPE).newInstance(Long(uid)),
+                lambda: profile_cls.getConstructor(Long.TYPE, find_class("org.telegram.ui.ActionBar.BaseFragment")).newInstance(Long(uid), None),
+            ):
+                try:
+                    profile = ctor_try()
+                    break
+                except Exception:
+                    continue
+            if profile is None:
+                BulletinHelper.show_error("Не удалось создать профиль")
+                return
+            frag.presentFragment(profile)
+        except Exception as e:
+            slog("open_profile failed", e)
+            BulletinHelper.show_error("Не удалось открыть профиль")
+
+
+class IdSearchDialog:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def show(self, prefill=""):
+        try:
+            frag = get_last_fragment()
+            ctx = frag.getParentActivity() if frag else None
+            if not ctx:
+                from org.telegram.messenger import ApplicationLoader
+                ctx = ApplicationLoader.applicationContext
+
+            builder = AlertDialogBuilder(ctx)
+            builder.set_title("Поиск по ID / телефону / @username")
+
+            input = EditText(ctx)
+            input.setHint("ID, +7..., @username, t.me/...")
+            if prefill:
+                input.setText(JString(prefill))
+            pad = AndroidUtilities.dp(16)
+            container = LinearLayout(ctx)
+            container.setOrientation(LinearLayout.VERTICAL)
+            container.setPadding(pad, pad, pad, pad)
+            container.addView(input, LayoutHelper.createLinear(-1, -2))
+            builder.set_view(container)
+
+            builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+            plugin = self.plugin
+
+            def on_positive(dialog, which):
+                text = str(input.getText().toString())
+                plugin._do_id_search(text)
+
+            builder.set_positive_button("Найти", on_positive)
+            builder.show()
+            input.requestFocus()
+        except Exception as e:
+            slog("IdSearchDialog.show failed", e)
+            BulletinHelper.show_error("Ошибка диалога поиска")
+
+
+class UnblockDialog:
+    def __init__(self, plugin, frag, chat):
+        self.plugin = plugin
+        self.frag = frag
+        self.chat = chat
+
+    def show(self):
+        try:
+            ctx = self.frag.getParentActivity() if self.frag else None
+            if not ctx:
+                from org.telegram.messenger import ApplicationLoader
+                ctx = ApplicationLoader.applicationContext
+
+            builder = AlertDialogBuilder(ctx)
+            builder.set_title("Разблокировать по ID")
+
+            input = EditText(ctx)
+            input.setHint("ID, +7..., @username, t.me/...")
+            input.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+            input.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            pad = AndroidUtilities.dp(16)
+            container = LinearLayout(ctx)
+            container.setOrientation(LinearLayout.VERTICAL)
+            container.setPadding(pad, pad, pad, pad)
+            container.addView(input, LayoutHelper.createLinear(-1, -2))
+            builder.set_view(container)
+
+            builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+            plugin = self.plugin
+            chat = self.chat
+            frag = self.frag
+
+            def on_positive(dialog, which):
+                text = str(input.getText().toString())
+                plugin._do_unblock(text, chat, frag)
+
+            builder.set_positive_button("Разблокировать", on_positive)
+            builder.show()
+            input.requestFocus()
+        except Exception as e:
+            slog("UnblockDialog.show failed", e)
+            BulletinHelper.show_error("Ошибка диалога")
+
+
+class MediaTypeFilter:
+    TYPES = [
+        ("Все типы", None),
+        ("Фото/Видео", "TL_inputMessagesFilterPhotoVideo"),
+        ("Фото", "TL_inputMessagesFilterPhotos"),
+        ("Видео", "TL_inputMessagesFilterVideo"),
+        ("Файлы", "TL_inputMessagesFilterDocument"),
+        ("Ссылки", "TL_inputMessagesFilterUrl"),
+        ("Аудио", "TL_inputMessagesFilterMusic"),
+        ("Голосовые", "TL_inputMessagesFilterRoundVoice"),
+        ("Гифки", "TL_inputMessagesFilterGif"),
+    ]
+
+    @staticmethod
+    def filter_class_name_for(idx):
+        try:
+            return MediaTypeFilter.TYPES[int(idx)][1]
+        except Exception as e:
+            slog("filter_class_name_for failed", e)
+            return None
+
+    @staticmethod
+    def create_filter(idx):
+        try:
+            cls_name = MediaTypeFilter.filter_class_name_for(idx)
+            if cls_name is None:
+                return None
+            cls = getattr(TLRPC, cls_name, None)
+            if cls is None:
+                return None
+            return cls()
+        except Exception as e:
+            slog("create_filter failed", e)
+            return None
+
+
+class SearchPlusPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hooks = []
+        self._current_media_filter_idx = 0
+        self._type_button = None
+        self.client_filter_pending = False
+        self.client_filter_type = None
+
+    def on_plugin_load(self):
+        global plugin_instance
+        plugin_instance = self
+        try:
+            self._hooks = []
+            self._mentions_debounce_token = 0
+            self._register_menu_items()
+            self._hook_global_search()
+            self._hook_chat_search_by_id()
+            self._hook_inject_type_button()
+            self._hook_send_request()
+            self._hook_mentions_adapter()
+            self._hook_users_block_search()
+            self._hook_server_search()
+            self._hook_notification_center()
+            slog("Search+ loaded")
+        except Exception as e:
+            slog("on_plugin_load failed", e)
+
+    def on_plugin_unload(self):
+        try:
+            for h in self._hooks:
+                try:
+                    self.unhook_method(h)
+                except Exception:
+                    pass
+            self._hooks.clear()
+        except Exception as e:
+            slog("on_plugin_unload failed", e)
+
+    def _register_menu_items(self):
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Разблокировать по ID",
+                icon="msg_reactions",
+                on_click=self._menu_unblock_by_id
+            ))
+        except Exception as e:
+            slog("register unblock menu failed", e)
+
+    def _menu_search_by_id(self, ctx):
+        try:
+            IdSearchDialog(self).show()
+        except Exception as e:
+            slog("_menu_search_by_id failed", e)
+            BulletinHelper.show_error("Ошибка")
+
+    def _menu_media_type(self, ctx):
+        try:
+            self.show_media_type_picker()
+        except Exception as e:
+            slog("_menu_media_type failed", e)
+            BulletinHelper.show_error("Ошибка")
+
+    def _menu_unblock_by_id(self, ctx):
+        try:
+            frag = get_last_fragment()
+            if not frag:
+                BulletinHelper.show_error("Нет фрагмента")
+                return
+            ca_cls = JClass.forName("org.telegram.ui.ChatActivity")
+            if not ca_cls.isInstance(frag):
+                BulletinHelper.show_error("Откройте чат/канал")
+                return
+            current_chat = frag.getCurrentChat()
+            if not current_chat:
+                BulletinHelper.show_error("Это не групповой чат")
+                return
+            UnblockDialog(self, frag, current_chat).show()
+        except Exception as e:
+            slog("_menu_unblock_by_id failed", e)
+            BulletinHelper.show_error("Ошибка")
+
+    def _do_unblock(self, text, chat, frag):
+        try:
+            parsed = InputParser.parse(text)
+            if not parsed:
+                BulletinHelper.show_error("Не распознано. Введите ID, телефон, @username или ссылку")
+                return
+            kind, value = parsed
+            mc = get_messages_controller()
+            slog(f"unblock: kind={kind} value={value}")
+
+            if kind == "id":
+                try:
+                    uid = int(value)
+                except Exception:
+                    BulletinHelper.show_error("Некорректный ID")
+                    return
+                user = mc.getUser(uid)
+                if user and not isinstance(user, TLRPC.TL_userEmpty):
+                    slog(f"unblock: user found in cache id={uid}")
+                    self._send_unblock(chat, user, mc)
+                    return
+                slog(f"unblock: user not in cache, searching banned list id={uid}")
+                self._find_banned_user(chat, uid, mc)
+            elif kind == "phone":
+                def on_done(response, error):
+                    try:
+                        if error or not response:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error("Пользователь не найден"))
+                            return
+                        user = None
+                        if hasattr(response, "users") and not response.users.isEmpty():
+                            user = response.users.get(0)
+                        elif isinstance(response, TLRPC.User):
+                            user = response
+                        if user is None:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error("Пользователь не найден"))
+                            return
+                        final_user = user
+                        run_on_ui_thread(lambda: self._send_unblock(chat, final_user, mc))
+                    except Exception as e:
+                        slog("_do_unblock phone on_done failed", e)
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка"))
+                ResolveHelper.resolve_phone(value, on_done)
+            elif kind == "username":
+                def on_done(response, error):
+                    try:
+                        if error or not response:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error("Пользователь не найден"))
+                            return
+                        user = None
+                        if hasattr(response, "users") and not response.users.isEmpty():
+                            user = response.users.get(0)
+                        elif isinstance(response, TLRPC.User):
+                            user = response
+                        if user is None:
+                            run_on_ui_thread(lambda: BulletinHelper.show_error("Пользователь не найден"))
+                            return
+                        final_user = user
+                        run_on_ui_thread(lambda: self._send_unblock(chat, final_user, mc))
+                    except Exception as e:
+                        slog("_do_unblock username on_done failed", e)
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка"))
+                ResolveHelper.resolve_username(value, on_done)
+        except Exception as e:
+            slog("_do_unblock failed", e)
+            BulletinHelper.show_error("Ошибка")
+
+    def _find_banned_user(self, chat, uid, mc):
+        try:
+            input_channel = mc.getInputChannel(chat)
+            req = TLRPC.TL_channels_getParticipants()
+            req.channel = input_channel
+            filt = TLRPC.TL_channelParticipantsBanned()
+            filt.q = ""
+            req.filter = filt
+            req.offset = 0
+            req.limit = 200
+            from java.lang import Long as JLong
+            req.hash = JLong.valueOf(0)
+
+            def on_response(response, error):
+                try:
+                    if error or not response:
+                        slog(f"unblock: getParticipants error={error}")
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось получить список забаненных"))
+                        return
+                    slog(f"unblock: getParticipants response type={type(response).__name__}")
+                    found_user = None
+                    if hasattr(response, "participants"):
+                        slog(f"unblock: participants count={response.participants.size()}")
+                        for i in range(response.participants.size()):
+                            p = response.participants.get(i)
+                            p_uid = 0
+                            peer = getattr(p, "peer", None)
+                            if peer is not None:
+                                p_uid = int(peer.user_id) if hasattr(peer, "user_id") else 0
+                            if p_uid == 0:
+                                p_uid = int(p.user_id) if hasattr(p, "user_id") else 0
+                            slog(f"unblock: participant[{i}] uid={p_uid} type={type(p).__name__}")
+                            if p_uid == uid:
+                                if hasattr(response, "users"):
+                                    for j in range(response.users.size()):
+                                        u = response.users.get(j)
+                                        if int(u.id) == uid:
+                                            found_user = u
+                                            break
+                                break
+                    if found_user is None:
+                        slog(f"unblock: user {uid} not found in banned list")
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Пользователь не найден в списке забаненных"))
+                        return
+                    slog(f"unblock: found banned user id={uid}")
+                    final_user = found_user
+                    run_on_ui_thread(lambda: self._send_unblock(chat, final_user, mc))
+                except Exception as e:
+                    slog("_find_banned_user on_response failed", e)
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка"))
+
+            send_request(req, on_response)
+            slog("unblock: getParticipants request sent")
+        except Exception as e:
+            slog("_find_banned_user failed", e)
+            BulletinHelper.show_error("Ошибка поиска забаненных")
+
+    def _send_unblock(self, chat, user, mc):
+        try:
+            input_channel = mc.getInputChannel(chat)
+            input_peer = TLRPC.TL_inputPeerUser()
+            input_peer.user_id = int(user.id)
+            input_peer.access_hash = int(user.access_hash)
+            req = TLRPC.TL_channels_editBanned()
+            req.channel = input_channel
+            req.participant = input_peer
+            req.banned_rights = TLRPC.TL_chatBannedRights()
+            req.banned_rights.flags = 0
+            req.banned_rights.until_date = 0
+
+            def on_response(response, error):
+                try:
+                    if error:
+                        slog("unblock error", error)
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка разблокировки"))
+                    else:
+                        run_on_ui_thread(lambda: BulletinHelper.show_success("Разблокирован"))
+                except Exception as e:
+                    slog("unblock on_response failed", e)
+
+            send_request(req, on_response)
+            slog("unblock request sent")
+        except Exception as e:
+            slog("_send_unblock failed", e)
+            BulletinHelper.show_error("Ошибка разблокировки")
+
+    def _do_id_search(self, text):
+        parsed = InputParser.parse(text)
+        if not parsed:
+            BulletinHelper.show_error("Не распознано. Введите ID, телефон, @username или ссылку")
+            return
+        kind, value = parsed
+        if kind == "id":
+            ResolveHelper.resolve_id(value, self._on_resolve_done)
+        elif kind == "phone":
+            ResolveHelper.resolve_phone(value, self._on_resolve_response)
+        elif kind == "username":
+            ResolveHelper.resolve_username(value, self._on_resolve_response)
+
+    def _on_resolve_response(self, response, error):
+        self._on_resolve_done(response, error)
+
+    def _on_resolve_done(self, response, error):
+        def run():
+            try:
+                if error or not response:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Не найдено"))
+                    return
+                obj = None
+                if hasattr(response, "users") and not response.users.isEmpty():
+                    obj = response.users.get(0)
+                elif hasattr(response, "chats") and not response.chats.isEmpty():
+                    obj = response.chats.get(0)
+                elif isinstance(response, (TLRPC.User, TLRPC.Chat)):
+                    obj = response
+                if obj is None:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Не найдено"))
+                    return
+                final_obj = obj
+                run_on_ui_thread(lambda: ResolveHelper.open_profile(final_obj))
+            except Exception as e:
+                slog("_on_resolve_done failed", e)
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка обработки"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _hook_global_search(self):
+        try:
+            try:
+                da_cls = JClass.forName("org.telegram.ui.DialogsActivity")
+            except Exception:
+                slog("DialogsActivity not found")
+                return
+            for m in da_cls.getDeclaredMethods():
+                if m.getName() == "search" and len(m.getParameterTypes()) == 2:
+                    m.setAccessible(True)
+                    self._hooks.append(self.hook_method(m, GlobalSearchHook(self)))
+                    slog("hooked DialogsActivity.search")
+        except Exception as e:
+            slog("_hook_global_search failed", e)
+
+    def _hook_chat_search_by_id(self):
+        try:
+            try:
+                ca_cls = JClass.forName("org.telegram.ui.ChatActivity")
+            except Exception:
+                slog("ChatActivity not found")
+                return
+            for m in ca_cls.getDeclaredMethods():
+                if m.getName() == "openSearchWithText" and len(m.getParameterTypes()) == 1:
+                    ptype = m.getParameterTypes()[0].getName()
+                    if ptype == "java.lang.String":
+                        m.setAccessible(True)
+                        self._hooks.append(self.hook_method(m, ChatSearchByIdHook(self)))
+                        slog("hooked ChatActivity.openSearchWithText(String)")
+        except Exception as e:
+            slog("_hook_chat_search_by_id failed", e)
+
+    def _hook_inject_type_button(self):
+        try:
+            try:
+                ca_cls = JClass.forName("org.telegram.ui.ChatActivity")
+            except Exception:
+                slog("ChatActivity not found")
+                return
+            for m in ca_cls.getDeclaredMethods():
+                if m.getName() == "createSearchContainer" and len(m.getParameterTypes()) == 0:
+                    m.setAccessible(True)
+                    self._hooks.append(self.hook_method(m, InjectTypeButtonHook(self)))
+                    slog("hooked ChatActivity.createSearchContainer")
+        except Exception as e:
+            slog("_hook_inject_type_button failed", e)
+
+    def _hook_send_request(self):
+        try:
+            try:
+                cm_cls = JClass.forName("org.telegram.tgnet.ConnectionsManager")
+            except Exception:
+                slog("ConnectionsManager not found")
+                return
+            for m in cm_cls.getDeclaredMethods():
+                if m.getName() != "sendRequest":
+                    continue
+                params = m.getParameterTypes()
+                if len(params) != 3:
+                    continue
+                if params[0].getName() != "org.telegram.tgnet.TLObject":
+                    continue
+                if params[1].getName() != "org.telegram.tgnet.RequestDelegate":
+                    continue
+                if params[2].getName() != "int":
+                    continue
+                m.setAccessible(True)
+                self._hooks.append(self.hook_method(m, SendRequestHook(self)))
+                slog("hooked ConnectionsManager.sendRequest(TLObject, RequestDelegate, int)")
+                return
+            slog("sendRequest(TLObject, RequestDelegate, int) not found")
+        except Exception as e:
+            slog("_hook_send_request failed", e)
+
+    def _hook_mentions_adapter(self):
+        try:
+            try:
+                ma_cls = JClass.forName("org.telegram.ui.Adapters.MentionsAdapter")
+            except Exception:
+                slog("MentionsAdapter not found")
+                return
+            for m in ma_cls.getDeclaredMethods():
+                if m.getName() != "searchUsernameOrHashtag":
+                    continue
+                params = m.getParameterTypes()
+                if len(params) != 5:
+                    continue
+                if params[0].getName() != "java.lang.CharSequence":
+                    continue
+                if params[1].getName() != "int":
+                    continue
+                if params[2].getName() != "java.util.ArrayList":
+                    continue
+                if params[3].getName() != "boolean":
+                    continue
+                if params[4].getName() != "boolean":
+                    continue
+                m.setAccessible(True)
+                self._hooks.append(self.hook_method(m, MentionsSearchHook(self)))
+                slog("hooked MentionsAdapter.searchUsernameOrHashtag")
+                return
+            slog("MentionsAdapter.searchUsernameOrHashtag not found")
+        except Exception as e:
+            slog("_hook_mentions_adapter failed", e)
+
+    def _hook_users_block_search(self):
+        try:
+            targets = [
+                "org.telegram.ui.UsersSelectActivity$GroupCreateAdapter",
+                "org.telegram.ui.GroupCreateActivity$GroupCreateAdapter",
+            ]
+            for cls_name in targets:
+                try:
+                    cls = JClass.forName(cls_name)
+                except Exception as e:
+                    slog(f"{cls_name} not found: {e}")
+                    continue
+                hooked = False
+                for m in cls.getDeclaredMethods():
+                    if m.getName() != "searchDialogs":
+                        continue
+                    params = m.getParameterTypes()
+                    if len(params) != 1:
+                        continue
+                    if params[0].getName() != "java.lang.String":
+                        continue
+                    m.setAccessible(True)
+                    self._hooks.append(self.hook_method(m, UsersBlockSearchHook(self)))
+                    slog(f"hooked {cls_name}.searchDialogs")
+                    hooked = True
+                    break
+                if not hooked:
+                    slog(f"{cls_name}.searchDialogs not found")
+        except Exception as e:
+            slog("_hook_users_block_search failed", e)
+
+    def _hook_diag_search(self):
+        try:
+            diag_targets = [
+                ("org.telegram.ui.Adapters.SearchAdapterHelper", "queryServerSearch"),
+                ("org.telegram.ui.Adapters.SearchAdapter", "searchDialogs"),
+                ("org.telegram.ui.Adapters.SearchAdapter", "processSearch"),
+                ("org.telegram.ui.GroupCreateActivity", "createView"),
+                ("org.telegram.ui.UsersSelectActivity", "createView"),
+                ("org.telegram.ui.ChatRightsEditActivity", "createView"),
+            ]
+            for cls_name, meth_name in diag_targets:
+                try:
+                    cls = JClass.forName(cls_name)
+                except Exception:
+                    slog(f"DIAG: {cls_name} not found")
+                    continue
+                for m in cls.getDeclaredMethods():
+                    if m.getName() != meth_name:
+                        continue
+                    m.setAccessible(True)
+                    self._hooks.append(self.hook_method(m, DiagSearchHook(self, cls_name, meth_name)))
+                    slog(f"DIAG hooked {cls_name}.{meth_name}")
+        except Exception as e:
+            slog("_hook_diag_search failed", e)
+
+    def _hook_server_search(self):
+        try:
+            try:
+                sah_cls = JClass.forName("org.telegram.ui.Adapters.SearchAdapterHelper")
+            except Exception as e:
+                slog(f"SearchAdapterHelper not found: {e}")
+                return
+            for m in sah_cls.getDeclaredMethods():
+                if m.getName() != "queryServerSearch":
+                    continue
+                params = m.getParameterTypes()
+                if len(params) != 12:
+                    continue
+                if params[0].getName() != "java.lang.String":
+                    continue
+                m.setAccessible(True)
+                self._hooks.append(self.hook_method(m, ServerSearchHook(self)))
+                slog("hooked SearchAdapterHelper.queryServerSearch(12)")
+                return
+            slog("SearchAdapterHelper.queryServerSearch(12) not found")
+        except Exception as e:
+            slog("_hook_server_search failed", e)
+
+    def _hook_notification_center(self):
+        try:
+            try:
+                nc_cls = JClass.forName("org.telegram.messenger.NotificationCenter")
+            except Exception:
+                slog("NotificationCenter not found")
+                return
+            target = None
+            for m in nc_cls.getDeclaredMethods():
+                if m.getName() != "postNotificationName":
+                    continue
+                params = m.getParameterTypes()
+                if len(params) != 2:
+                    continue
+                if params[0].getName() != "int":
+                    continue
+                if params[1].getName() != "[Ljava.lang.Object;":
+                    continue
+                target = m
+                break
+            if target is None:
+                slog("NotificationCenter.postNotificationName(int, Object[]) not found")
+                return
+            target.setAccessible(True)
+            self._hooks.append(self.hook_method(target, PostNotificationHook(self)))
+            slog("hooked NotificationCenter.postNotificationName(int, Object[])")
+        except Exception as e:
+            slog("_hook_notification_center failed", e)
+
+    def show_media_type_picker(self):
+        try:
+            frag = get_last_fragment()
+            ctx = frag.getParentActivity() if frag else None
+            if not ctx:
+                from org.telegram.messenger import ApplicationLoader
+                ctx = ApplicationLoader.applicationContext
+            names = [t[0] for t in MediaTypeFilter.TYPES]
+            builder = AlertDialogBuilder(ctx)
+            builder.set_title("Тип сообщений")
+            plugin = self
+
+            def on_item(dialog, which):
+                try:
+                    idx = int(which)
+                    plugin._set_media_filter(idx)
+                except Exception as e:
+                    slog("type on_click failed", e)
+
+            builder.set_items(names, on_item)
+            builder.set_negative_button("Отмена", lambda d, w: d.dismiss())
+            builder.show()
+        except Exception as e:
+            slog("show_media_type_picker failed", e)
+            BulletinHelper.show_error("Ошибка выбора типа")
+
+    def _set_media_filter(self, idx):
+        try:
+            self._current_media_filter_idx = int(idx)
+            name = MediaTypeFilter.TYPES[idx][0]
+            slog(f"media filter set: idx={idx} name={name}")
+            if self._type_button is not None:
+                label = name + " \u25be" if idx != 0 else "\u0422\u0438\u043f \u25be"
+                try:
+                    self._type_button.setText(JString(label))
+                except Exception as e:
+                    slog("update type button text failed", e)
+            try:
+                BulletinHelper.show_info(f"Фильтр: {name}")
+            except Exception:
+                pass
+            self._restart_chat_search()
+        except Exception as e:
+            slog("_set_media_filter failed", e)
+
+    def _restart_chat_search(self):
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                slog("restart search: no fragment")
+                return
+            fc = frag.getClass()
+            q_field = fc.getDeclaredField("searchingQuery")
+            q_field.setAccessible(True)
+            query = q_field.get(frag)
+            query_str = ""
+            if query is not None:
+                query_str = str(query)
+            user_msg = None
+            try:
+                u_field = fc.getDeclaredField("searchingUserMessages")
+                u_field.setAccessible(True)
+                user_msg = u_field.get(frag)
+            except Exception:
+                pass
+            try:
+                mdc = frag.getMediaDataController()
+                if mdc is not None:
+                    mdc_cls = mdc.getClass()
+                    from java.lang.reflect import Array as JArray
+                    try:
+                        er_field = mdc_cls.getDeclaredField("messagesSearchEndReached")
+                        er_field.setAccessible(True)
+                        er_arr = er_field.get(mdc)
+                        if er_arr is not None:
+                            n = JArray.getLength(er_arr)
+                            for i in range(n):
+                                JArray.setBoolean(er_arr, i, False)
+                            slog(f"reset endReached: n={n}")
+                    except Exception as e:
+                        slog("reset endReached failed", e)
+                    try:
+                        srm_field = mdc_cls.getDeclaredField("searchResultMessages")
+                        srm_field.setAccessible(True)
+                        srm = srm_field.get(mdc)
+                        if srm is not None:
+                            sz_before = srm.size()
+                            srm.clear()
+                            sz_after = srm.size()
+                            slog(f"cleared searchResultMessages: before={sz_before} after={sz_after} mdc={mdc.hashCode()}")
+                    except Exception as e:
+                        slog("clear searchResultMessages failed", e)
+                    try:
+                        lmd_field = mdc_cls.getDeclaredField("lastMergeDialogId")
+                        lmd_field.setAccessible(True)
+                        from java.lang import Long as JLong
+                        lmd_field.setLong(mdc, JLong.valueOf(-999))
+                        ld_field = mdc_cls.getDeclaredField("lastDialogId")
+                        ld_field.setAccessible(True)
+                        ld_field.setLong(mdc, JLong.valueOf(-999))
+                        slog("reset lastMergeDialogId/lastDialogId")
+                    except Exception as e:
+                        slog("reset dialogIds failed", e)
+            except Exception as e:
+                slog("mdc reset failed", e)
+            open_method = None
+            for m in fc.getDeclaredMethods():
+                if m.getName() != "openSearchWithText":
+                    continue
+                params = m.getParameterTypes()
+                if len(params) != 1:
+                    continue
+                open_method = m
+                break
+            if open_method is None:
+                slog("restart search: openSearchWithText not found")
+                return
+            open_method.setAccessible(True)
+            from java.lang import String as JString
+            open_method.invoke(frag, JString(query_str))
+            slog(f"restart search: openSearchWithText invoked query='{query_str}' user={'yes' if user_msg is not None else 'no'}")
+        except Exception as e:
+            slog("restart search failed", e)
+
+    def get_active_media_filter(self):
+        try:
+            idx = self._current_media_filter_idx
+            if idx == 0:
+                return None
+            return MediaTypeFilter.create_filter(idx)
+        except Exception as e:
+            slog("get_active_media_filter failed", e)
+            return None
+
+
+class GlobalSearchHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            query = None
+            for a in args:
+                if isinstance(a, str):
+                    query = a
+                    break
+            if not query:
+                return
+            parsed = InputParser.parse(query)
+            if not parsed:
+                return
+            kind, value = parsed
+            if kind == "id":
+                return
+            plugin = self.plugin
+            def on_done(response, error):
+                plugin._on_resolve_response(response, error)
+            if kind == "phone":
+                ResolveHelper.resolve_phone(value, on_done)
+            elif kind == "username":
+                ResolveHelper.resolve_username(value, on_done)
+            slog(f"global search intercepted: {kind}={value}")
+        except Exception as e:
+            slog("GlobalSearchHook before failed", e)
+
+
+class ChatSearchByIdHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            query = None
+            for a in args:
+                if isinstance(a, str):
+                    query = a
+                    break
+            if not query:
+                return
+            parsed = InputParser.parse(query)
+            if not parsed:
+                return
+            kind, value = parsed
+            slog(f"chat search by id: {kind}={value}")
+            this = param.thisObject
+            if this is None:
+                return
+            plugin = self.plugin
+            def on_done(response, error):
+                try:
+                    if error or not response:
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не найдено"))
+                        return
+                    obj = None
+                    if hasattr(response, "users") and not response.users.isEmpty():
+                        obj = response.users.get(0)
+                    elif hasattr(response, "chats") and not response.chats.isEmpty():
+                        obj = response.chats.get(0)
+                    elif isinstance(response, (TLRPC.User, TLRPC.Chat)):
+                        obj = response
+                    if obj is None:
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не найдено"))
+                        return
+                    final_obj = obj
+                    def open_in_chat():
+                        try:
+                            if isinstance(final_obj, TLRPC.User):
+                                this.openSearchWithUser(final_obj)
+                                slog("openSearchWithUser called")
+                            elif isinstance(final_obj, TLRPC.Chat):
+                                this.openSearchWithChat(final_obj)
+                                slog("openSearchWithChat called")
+                        except Exception as e:
+                            slog("open_in_chat failed", e)
+                    run_on_ui_thread(open_in_chat)
+                except Exception as e:
+                    slog("ChatSearchByIdHook on_done failed", e)
+            if kind == "id":
+                ResolveHelper.resolve_id(value, on_done)
+            elif kind == "phone":
+                ResolveHelper.resolve_phone(value, on_done)
+            elif kind == "username":
+                ResolveHelper.resolve_username(value, on_done)
+            param.setResult(None)
+        except Exception as e:
+            slog("ChatSearchByIdHook before failed", e)
+
+
+class InjectTypeButtonHook(MethodHook):
+    TAG_KEY = "search_plus_type_btn"
+
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            this = param.thisObject
+            if this is None:
+                return
+            sc_field = this.getClass().getDeclaredField("searchContainer")
+            sc_field.setAccessible(True)
+            search_container = sc_field.get(this)
+            if search_container is None:
+                slog("searchContainer is null")
+                return
+            tag = search_container.getTag()
+            if tag is not None and str(tag) == InjectTypeButtonHook.TAG_KEY:
+                return
+            ctx = search_container.getContext()
+            from android_utils import OnClickListener
+            btn = AnimatedTextView(ctx, True, True, True)
+            btn.setText(JString("\u0422\u0438\u043f \u25be"))
+            btn.setTextSize(float(AndroidUtilities.dp(13)))
+            btn.setGravity(5)
+            btn.setTypeface(AndroidUtilities.bold())
+            try:
+                color = this.getThemedColor(Theme.key_windowBackgroundWhiteBlueText2)
+                btn.setTextColor(color)
+            except Exception:
+                btn.setTextColor(-0xD19501)
+            pad = AndroidUtilities.dp(13)
+            btn.setPadding(pad, 0, pad, 0)
+            btn.setAlpha(0.5)
+            btn.setClickable(False)
+            plugin = self.plugin
+            btn.setOnClickListener(OnClickListener(lambda v: plugin.show_media_type_picker()))
+            init_margin = int(AndroidUtilities.dp(72))
+            lp = LayoutHelper.createFrame(-2, -1, 21, 0, 0, init_margin, 0)
+            search_container.addView(btn, lp)
+            search_container.setTag(JString(InjectTypeButtonHook.TAG_KEY))
+            plugin._type_button = btn
+            try:
+                exp_field = this.getClass().getDeclaredField("searchExpandList")
+                exp_field.setAccessible(True)
+                exp_btn = exp_field.get(this)
+            except Exception:
+                exp_btn = None
+            try:
+                sc_field2 = this.getClass().getDeclaredField("searchContainer")
+                sc_field2.setAccessible(True)
+                sc_obj = sc_field2.get(this)
+            except Exception:
+                sc_obj = None
+
+            def reposition(b=btn, exp=exp_btn, sc=sc_obj):
+                try:
+                    if exp is None:
+                        return
+                    ex = int(exp.getX())
+                    ew = int(exp.getWidth())
+                    if ex <= 0 and ew <= 0:
+                        return
+                    sc_w = 0
+                    if sc is not None:
+                        try:
+                            sc_w = int(sc.getWidth())
+                        except Exception:
+                            pass
+                    if sc_w <= 0:
+                        sc_w = int(AndroidUtilities.displaySize.x)
+                    if ex > 0:
+                        rm = sc_w - ex + int(AndroidUtilities.dp(8))
+                    else:
+                        rm = int(AndroidUtilities.dp(72))
+                    if rm < 0:
+                        rm = int(AndroidUtilities.dp(72))
+                    blp = b.getLayoutParams()
+                    blp_cls = blp.getClass()
+                    rm_field = None
+                    while blp_cls is not None:
+                        try:
+                            rm_field = blp_cls.getDeclaredField("rightMargin")
+                            break
+                        except Exception:
+                            blp_cls = blp_cls.getSuperclass()
+                    if rm_field is not None:
+                        rm_field.setAccessible(True)
+                        rm_field.setInt(blp, rm)
+                        b.setLayoutParams(blp)
+                        slog(f"type button repositioned rightMargin={rm}px (sc_w={sc_w} exp_x={ex} exp_w={ew})")
+                except Exception as e:
+                    slog("reposition failed", e)
+            run_on_ui_thread(reposition, 300)
+            run_on_ui_thread(reposition, 800)
+            slog("type button injected (gravity 21, expandList-based rightMargin)")
+        except Exception as e:
+            slog("InjectTypeButtonHook after failed", e)
+
+
+class SendRequestHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) < 1:
+                return
+            req = args[0]
+            if req is None:
+                return
+            try:
+                req_class_name = req.getClass().getName()
+            except Exception:
+                req_class_name = str(type(req))
+            if "messages_search" not in str(req_class_name).lower():
+                return
+            slog(f"sendRequest: req class={req_class_name}")
+            active_filter = self.plugin.get_active_media_filter()
+            if active_filter is None:
+                slog("sendRequest: no active filter")
+                return
+            slog(f"sendRequest: active filter={active_filter.getClass().getName()}")
+            try:
+                fid = req.getClass().getDeclaredField("from_id")
+                fid.setAccessible(True)
+                from_id_val = fid.get(req)
+            except Exception:
+                from_id_val = None
+            if from_id_val is not None:
+                self.plugin.client_filter_pending = True
+                self.plugin.client_filter_type = active_filter
+                try:
+                    lmf = req.getClass().getDeclaredField("limit")
+                    lmf.setAccessible(True)
+                    lmf.setInt(req, 100)
+                    slog("sendRequest: from_id present + active filter -> client-side filter mode (keep Empty filter, limit=100)")
+                except Exception as e:
+                    slog("sendRequest: set limit failed", e)
+                return
+            try:
+                f = req.getClass().getDeclaredField("filter")
+                f.setAccessible(True)
+                current_filter = f.get(req)
+                slog(f"sendRequest: current filter={current_filter.getClass().getName() if current_filter else 'null'}")
+                filter_replaced = False
+                if current_filter is None:
+                    f.set(req, active_filter)
+                    filter_replaced = True
+                    slog("sendRequest: set filter (was null)")
+                else:
+                    cur_name = current_filter.getClass().getName()
+                    if "Empty" in cur_name or "empty" in cur_name:
+                        f.set(req, active_filter)
+                        filter_replaced = True
+                        slog("sendRequest: replaced empty filter with active")
+            except Exception as e:
+                slog("sendRequest: filter replace failed", e)
+        except Exception as e:
+            slog("SendRequestHook before failed", e)
+
+
+class PostNotificationHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self._notif_id = None
+
+    def _get_notif_id(self):
+        if self._notif_id is not None:
+            return self._notif_id
+        try:
+            nc_cls = JClass.forName("org.telegram.messenger.NotificationCenter")
+            f = nc_cls.getDeclaredField("chatSearchResultsAvailable")
+            f.setAccessible(True)
+            self._notif_id = f.getInt(None)
+        except Exception:
+            self._notif_id = -1
+        return self._notif_id
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.client_filter_pending:
+                return
+            args = param.args
+            if args is None or len(args) < 2:
+                return
+            notif_id = args[0]
+            if notif_id is None:
+                return
+            try:
+                nid = int(notif_id)
+            except Exception:
+                return
+            target_id = self._get_notif_id()
+            if nid != target_id:
+                return
+            obj_arr = args[1]
+            _do_client_filter(self.plugin, obj_arr)
+        except Exception as e:
+            slog("PostNotificationHook before failed", e)
+            self.plugin.client_filter_pending = False
+
+
+_MO_BOOL_METHODS = None
+
+def _get_mo_bool_methods():
+    global _MO_BOOL_METHODS
+    if _MO_BOOL_METHODS is not None:
+        return _MO_BOOL_METHODS
+    _MO_BOOL_METHODS = {}
+    try:
+        mo_cls = JClass.forName("org.telegram.messenger.MessageObject")
+        for m in mo_cls.getDeclaredMethods():
+            name = m.getName()
+            if name not in ("isPhoto", "isVideo", "isMusic", "isVoice", "isDocument", "isGif", "isSticker", "isRoundVideo"):
+                continue
+            params = m.getParameterTypes()
+            if len(params) != 0:
+                continue
+            m.setAccessible(True)
+            _MO_BOOL_METHODS[name] = m
+    except Exception as e:
+        slog("get_mo_bool_methods failed", e)
+    return _MO_BOOL_METHODS
+
+def _msg_matches_filter(msg, filter_type):
+    try:
+        methods = _get_mo_bool_methods()
+        ft_name = filter_type.getClass().getName()
+        def call(nm):
+            mm = methods.get(nm)
+            if mm is None:
+                return False
+            return bool(mm.invoke(msg, None))
+        if "PhotoVideo" in ft_name:
+            return call("isPhoto") or call("isVideo")
+        if "Photos" in ft_name:
+            return call("isPhoto")
+        if "Video" in ft_name:
+            return call("isVideo")
+        if "Document" in ft_name:
+            return call("isDocument")
+        if "Music" in ft_name:
+            return call("isMusic")
+        if "RoundVoice" in ft_name:
+            return call("isVoice") or call("isRoundVideo")
+        if "Gif" in ft_name:
+            return call("isGif")
+        return False
+    except Exception:
+        return False
+
+def _do_client_filter(plugin, obj_arr=None):
+    try:
+        if not plugin.client_filter_pending:
+            return
+        frag = get_last_fragment()
+        if frag is None:
+            plugin.client_filter_pending = False
+            return
+        mdc = frag.getMediaDataController()
+        if mdc is None:
+            plugin.client_filter_pending = False
+            return
+        mdc_cls = mdc.getClass()
+        srm_f = mdc_cls.getDeclaredField("searchResultMessages")
+        srm_f.setAccessible(True)
+        srm = srm_f.get(mdc)
+        if srm is None:
+            plugin.client_filter_pending = False
+            return
+        size = srm.size()
+        filter_type = plugin.client_filter_type
+        removed = 0
+        i = size - 1
+        while i >= 0:
+            msg = srm.get(i)
+            if not _msg_matches_filter(msg, filter_type):
+                srm.remove(i)
+                removed += 1
+            i -= 1
+        plugin.client_filter_pending = False
+        remaining = srm.size()
+        slog(f"client filter: size={size} removed={removed} remaining={remaining}")
+        try:
+            msc_f = mdc_cls.getDeclaredField("messagesSearchCount")
+            msc_f.setAccessible(True)
+            msc_arr = msc_f.get(mdc)
+            if msc_arr is not None:
+                from java.lang.reflect import Array as JArray
+                n = JArray.getLength(msc_arr)
+                for k in range(n):
+                    JArray.setInt(msc_arr, k, remaining)
+                slog(f"client filter: messagesSearchCount set to {remaining} (n={n})")
+        except Exception as e:
+            slog("client filter: messagesSearchCount update failed", e)
+        if obj_arr is not None:
+            try:
+                from java.lang.reflect import Array as JArray
+                from java.lang import Integer as JInteger
+                arr_len = JArray.getLength(obj_arr)
+                if arr_len > 5:
+                    jint = JInteger(int(remaining))
+                    JArray.set(obj_arr, 5, jint)
+                    slog(f"client filter: notif args[5] searchCount set to {remaining} class={jint.getClass().getName()}")
+                if arr_len > 1 and remaining > 0:
+                    try:
+                        first_msg = srm.get(0)
+                        if first_msg is not None:
+                            mo_cls = JClass.forName("org.telegram.messenger.MessageObject")
+                            mid_f = mo_cls.getDeclaredField("getId")
+                            mid_f.setAccessible(True)
+                            mid_val = mid_f.invoke(first_msg, None)
+                            slog(f"client filter: first remaining msg id={mid_val} class={mid_val.getClass().getName()}")
+                            jmid = JInteger(int(mid_val))
+                            JArray.set(obj_arr, 1, jmid)
+                            JArray.set(obj_arr, 2, jmid)
+                            slog(f"client filter: notif args[1,2] messageId set to {int(mid_val)}")
+                    except Exception as e:
+                        slog("client filter: args[1,2] update failed", e)
+            except Exception as e:
+                slog("client filter: notif args update failed", e)
+        try:
+            adapter_f = frag.getClass().getDeclaredField("messagesSearchAdapter")
+            adapter_f.setAccessible(True)
+            adapter = adapter_f.get(frag)
+            if adapter is not None:
+                adapter.notifyDataSetChanged()
+                slog("client filter: adapter refreshed")
+        except Exception as e:
+            slog("client filter: adapter refresh failed", e)
+    except Exception as e:
+        slog("do_client_filter failed", e)
+        plugin.client_filter_pending = False
+
+def _schedule_client_filter(plugin, delay_ms=1500):
+    try:
+        def cb():
+            _do_client_filter(plugin)
+        run_on_ui_thread(cb, delay_ms)
+    except Exception as e:
+        slog("schedule_client_filter failed", e)
+
+
+class MentionsSearchHook(MethodHook):
+    DEBOUNCE_MS = 300
+
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def _get_field(self, obj, name):
+        f = obj.getClass().getDeclaredField(name)
+        f.setAccessible(True)
+        return f.get(obj)
+
+    def _invoke_direct(self, adapter, method_name, arg_types, args):
+        cls = adapter.getClass()
+        for m in cls.getDeclaredMethods():
+            if m.getName() != method_name:
+                continue
+            params = m.getParameterTypes()
+            if len(params) != len(arg_types):
+                continue
+            ok = True
+            for i, t in enumerate(arg_types):
+                if params[i].getName() != t:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            m.setAccessible(True)
+            return m.invoke(adapter, *args)
+        return None
+
+    def before_hooked_method(self, param):
+        try:
+            this = param.thisObject
+            if this is None:
+                return
+            args = param.args
+            if args is None or len(args) < 1:
+                return
+            cs = args[0]
+            if cs is None:
+                return
+            text = str(cs.toString()) if hasattr(cs, "toString") else str(cs)
+            parsed = InputParser.parse(text)
+            if not parsed:
+                return
+            kind, value = parsed
+            if kind not in ("id", "phone"):
+                return
+            slog(f"mentions: before cancel original text='{text}' kind={kind} value={value}")
+            param.setResult(None)
+            token = int(time.time() * 1000)
+            self.plugin._mentions_debounce_token = token
+            plugin = self.plugin
+            adapter = this
+
+            def run_delayed():
+                try:
+                    if plugin._mentions_debounce_token != token:
+                        slog("mentions: stale token, abort")
+                        return
+                    slog(f"mentions: debounce fired, resolve kind={kind} value={value}")
+                    self._resolve_and_inject(adapter, kind, value, text)
+                except Exception as e:
+                    slog("MentionsSearchHook run_delayed failed", e)
+
+            run_on_ui_thread(run_delayed, MentionsSearchHook.DEBOUNCE_MS)
+        except Exception as e:
+            slog("MentionsSearchHook before failed", e)
+
+    def _resolve_and_inject(self, adapter, kind, value, text):
+        def on_done(response, error):
+            try:
+                slog(f"mentions: on_done response={response} error={error}")
+                if error or not response:
+                    slog(f"mentions: on_done abort error={error}")
+                    return
+                obj = None
+                if hasattr(response, "users") and not response.users.isEmpty():
+                    obj = response.users.get(0)
+                elif hasattr(response, "chats") and not response.chats.isEmpty():
+                    obj = response.chats.get(0)
+                elif isinstance(response, (TLRPC.User, TLRPC.Chat)):
+                    obj = response
+                slog(f"mentions: on_done obj={obj} type={type(obj).__name__ if obj else 'null'}")
+                if obj is None:
+                    slog("mentions: on_done obj is null")
+                    return
+                slog("mentions: on_done -> inject_result")
+                run_on_ui_thread(lambda: self._inject_result(adapter, obj))
+            except Exception as e:
+                slog("MentionsSearchHook on_done failed", e)
+
+        if kind == "id":
+            ResolveHelper.resolve_id(value, on_done)
+        elif kind == "phone":
+            ResolveHelper.resolve_phone(value, on_done)
+
+    def _inject_result(self, adapter, obj):
+        try:
+            slog(f"mentions: _inject_result start obj={type(obj).__name__}")
+            LongSparseArray = jclass("androidx.collection.LongSparseArray")
+            result_list = ArrayList()
+            result_map = LongSparseArray()
+            slog("mentions: list+map created")
+            if isinstance(obj, TLRPC.User):
+                slog("mentions: calling addUserResult")
+                self._invoke_direct(
+                    adapter, "addUserResult",
+                    ["java.util.ArrayList", "androidx.collection.LongSparseArray", "org.telegram.tgnet.TLRPC$User"],
+                    [result_list, result_map, obj],
+                )
+            elif isinstance(obj, TLRPC.Chat):
+                slog("mentions: calling addChatResult")
+                self._invoke_direct(
+                    adapter, "addChatResult",
+                    ["java.util.ArrayList", "androidx.collection.LongSparseArray", "org.telegram.tgnet.TLRPC$Chat"],
+                    [result_list, result_map, obj],
+                )
+            slog(f"mentions: list size after add={result_list.size()}")
+            try:
+                allow_bots = self._get_field(adapter, "allowBots")
+                allow_chats = self._get_field(adapter, "allowChats")
+                slog(f"mentions: allowBots={allow_bots} allowChats={allow_chats}")
+            except Exception as e:
+                slog("mentions: allowBots/allowChats get failed", e)
+            slog("mentions: calling showUsersResult")
+            self._invoke_direct(
+                adapter, "showUsersResult",
+                ["java.util.ArrayList", "androidx.collection.LongSparseArray", "boolean"],
+                [result_list, result_map, True],
+            )
+            try:
+                sru = self._get_field(adapter, "searchResultUsernames")
+                slog(f"mentions: searchResultUsernames={sru} size={sru.size() if sru else 'null'}")
+            except Exception as e:
+                slog("mentions: searchResultUsernames get failed", e)
+            slog(f"mentions: injected result for {type(obj).__name__}")
+        except Exception as e:
+            slog("MentionsSearchHook _inject_result failed", e)
+
+
+class UsersBlockSearchHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            adapter = param.thisObject
+            args = param.args
+            if not args or len(args) < 1:
+                return
+            query = args[0]
+            if not query or len(str(query).strip()) == 0:
+                return
+            query_str = str(query).strip()
+            slog(f"UsersBlockSearch: query={query_str}")
+            parsed = InputParser.parse(query_str)
+            if not parsed:
+                return
+            kind, value = parsed
+            slog(f"UsersBlockSearch: parsed kind={kind} value={value}")
+            param.setResult(None)
+            self._resolve_and_update(adapter, kind, value)
+        except Exception as e:
+            slog("UsersBlockSearchHook before failed", e)
+
+    def _resolve_and_update(self, adapter, kind, value):
+        def on_done(response, error):
+            try:
+                slog(f"UsersBlockSearch: on_done response={response} error={error}")
+                if error or not response:
+                    slog(f"UsersBlockSearch: error={error}")
+                    run_on_ui_thread(lambda: self._show_empty(adapter))
+                    return
+                obj = None
+                if hasattr(response, "users") and not response.users.isEmpty():
+                    obj = response.users.get(0)
+                elif hasattr(response, "chats") and not response.chats.isEmpty():
+                    obj = response.chats.get(0)
+                elif isinstance(response, (TLRPC.User, TLRPC.Chat)):
+                    obj = response
+                slog(f"UsersBlockSearch: obj={obj} type={type(obj).__name__ if obj else 'null'}")
+                if obj is None:
+                    slog("UsersBlockSearch: obj null")
+                    run_on_ui_thread(lambda: self._show_empty(adapter))
+                    return
+                run_on_ui_thread(lambda: self._update_results(adapter, obj))
+            except Exception as e:
+                slog("UsersBlockSearchHook on_done failed", e)
+
+        if kind == "id":
+            ResolveHelper.resolve_id(value, on_done)
+        elif kind == "phone":
+            ResolveHelper.resolve_phone(value, on_done)
+        elif kind == "username":
+            ResolveHelper.resolve_username(value, on_done)
+
+    def _update_results(self, adapter, obj):
+        try:
+            slog("UsersBlockSearch: _update_results start")
+            result_list = ArrayList()
+            result_names = ArrayList()
+            result_list.add(obj)
+            try:
+                from org.telegram.messenger import UserObject
+                if isinstance(obj, TLRPC.User):
+                    name = UserObject.getUserName(obj)
+                elif isinstance(obj, TLRPC.Chat):
+                    name = getattr(obj, "title", "") or ""
+                else:
+                    name = ""
+                result_names.add(JString(name) if name else None)
+            except Exception as e:
+                slog("UsersBlockSearch: name build failed", e)
+                result_names.add(None)
+            slog(f"UsersBlockSearch: result_list size={result_list.size()}")
+            try:
+                cls = adapter.getClass()
+                slog(f"UsersBlockSearch: adapter class={cls.getName()}")
+                searching_field = None
+                for f in cls.getDeclaredFields():
+                    if f.getName() == "searching":
+                        searching_field = f
+                        break
+                if searching_field:
+                    searching_field.setAccessible(True)
+                    searching_field.setBoolean(adapter, True)
+                    slog("UsersBlockSearch: searching=true")
+                upd_method = None
+                for m in cls.getDeclaredMethods():
+                    if m.getName() == "updateSearchResults":
+                        params = m.getParameterTypes()
+                        if len(params) == 2 and params[0].getName() == "java.util.ArrayList" and params[1].getName() == "java.util.ArrayList":
+                            upd_method = m
+                            break
+                if upd_method:
+                    upd_method.setAccessible(True)
+                    upd_method.invoke(adapter, result_list, result_names)
+                    slog("UsersBlockSearch: updateSearchResults called")
+                else:
+                    slog("UsersBlockSearch: updateSearchResults not found")
+            except Exception as e:
+                slog("UsersBlockSearch: invoke updateSearchResults failed", e)
+        except Exception as e:
+            slog("UsersBlockSearchHook _update_results failed", e)
+
+    def _show_empty(self, adapter):
+        try:
+            slog("UsersBlockSearch: _show_empty")
+            result_list = ArrayList()
+            result_names = ArrayList()
+            try:
+                cls = adapter.getClass()
+                searching_field = None
+                for f in cls.getDeclaredFields():
+                    if f.getName() == "searching":
+                        searching_field = f
+                        break
+                if searching_field:
+                    searching_field.setAccessible(True)
+                    searching_field.setBoolean(adapter, True)
+                upd_method = None
+                for m in cls.getDeclaredMethods():
+                    if m.getName() == "updateSearchResults":
+                        params = m.getParameterTypes()
+                        if len(params) == 2 and params[0].getName() == "java.util.ArrayList" and params[1].getName() == "java.util.ArrayList":
+                            upd_method = m
+                            break
+                if upd_method:
+                    upd_method.setAccessible(True)
+                    upd_method.invoke(adapter, result_list, result_names)
+                    slog("UsersBlockSearch: empty updateSearchResults called")
+                else:
+                    slog("UsersBlockSearch: updateSearchResults not found (empty)")
+            except Exception as e:
+                slog("UsersBlockSearch: invoke updateSearchResults (empty) failed", e)
+        except Exception as e:
+            slog("UsersBlockSearchHook _show_empty failed", e)
+
+
+class ServerSearchHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def _get_field(self, obj, name):
+        f = obj.getClass().getDeclaredField(name)
+        f.setAccessible(True)
+        return f.get(obj)
+
+    def _invoke_direct(self, helper, method_name, arg_types, args):
+        cls = helper.getClass()
+        for m in cls.getDeclaredMethods():
+            if m.getName() != method_name:
+                continue
+            params = m.getParameterTypes()
+            if len(params) != len(arg_types):
+                continue
+            ok = True
+            for i, t in enumerate(arg_types):
+                if params[i].getName() != t:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            m.setAccessible(True)
+            return m.invoke(helper, *args)
+        return None
+
+    def before_hooked_method(self, param):
+        try:
+            helper = param.thisObject
+            helper_cls_name = helper.getClass().getName()
+            if "SearchAdapterHelper" not in helper_cls_name:
+                return
+            args = param.args
+            if not args or len(args) < 1:
+                return
+            query = args[0]
+            if not query or len(str(query).strip()) == 0:
+                return
+            query_str = str(query).strip()
+            slog(f"ServerSearch: query={query_str}")
+            parsed = InputParser.parse(query_str)
+            if not parsed:
+                slog(f"ServerSearch: not parsed query={query_str}")
+                return
+            kind, value = parsed
+            slog(f"ServerSearch: parsed kind={kind} value={value}")
+            if kind == "id":
+                try:
+                    uid = int(value)
+                except Exception:
+                    return
+                mc = get_messages_controller()
+                user = mc.getUser(uid)
+                if user and not isinstance(user, TLRPC.TL_userEmpty):
+                    param.setResult(None)
+                    self._resolve_and_inject(helper, kind, value)
+                else:
+                    slog(f"ServerSearch: id={uid} not in cache, letting original search proceed")
+            else:
+                param.setResult(None)
+                self._resolve_and_inject(helper, kind, value)
+        except Exception as e:
+            slog("ServerSearchHook before failed", e)
+
+    def _resolve_and_inject(self, helper, kind, value):
+        def on_done(response, error):
+            try:
+                slog(f"ServerSearch: on_done response={response} error={error}")
+                if error or not response:
+                    slog(f"ServerSearch: error={error}")
+                    return
+                obj = None
+                if hasattr(response, "users") and not response.users.isEmpty():
+                    obj = response.users.get(0)
+                elif hasattr(response, "chats") and not response.chats.isEmpty():
+                    obj = response.chats.get(0)
+                elif isinstance(response, (TLRPC.User, TLRPC.Chat)):
+                    obj = response
+                slog(f"ServerSearch: obj={obj} type={type(obj).__name__ if obj else 'null'}")
+                if obj is None:
+                    slog("ServerSearch: obj null")
+                    return
+                run_on_ui_thread(lambda: self._inject(helper, obj))
+            except Exception as e:
+                slog("ServerSearchHook on_done failed", e)
+
+        if kind == "id":
+            ResolveHelper.resolve_id(value, on_done)
+        elif kind == "phone":
+            ResolveHelper.resolve_phone(value, on_done)
+        elif kind == "username":
+            ResolveHelper.resolve_username(value, on_done)
+
+    def _inject(self, helper, obj):
+        try:
+            slog(f"ServerSearch: _inject start obj={type(obj).__name__}")
+            global_search = self._get_field(helper, "globalSearch")
+            global_map = self._get_field(helper, "globalSearchMap")
+            slog(f"ServerSearch: globalSearch={global_search} map={global_map}")
+            if global_search is None or global_map is None:
+                slog("ServerSearch: globalSearch or map is null")
+                return
+            from java.lang import Long as JLong
+            from java.lang import Integer as JInteger
+            obj_id = JLong.valueOf(0)
+            if isinstance(obj, TLRPC.User):
+                obj_id = JLong.valueOf(int(obj.id))
+            elif isinstance(obj, TLRPC.Chat):
+                obj_id = JLong.valueOf(int(obj.id))
+            slog(f"ServerSearch: obj_id={obj_id}")
+            self._invoke_direct(
+                helper, "addUniqueObject",
+                ["java.util.ArrayList", "androidx.collection.LongSparseArray", "org.telegram.tgnet.TLObject", "long"],
+                [global_search, global_map, obj, obj_id],
+            )
+            slog(f"ServerSearch: addUniqueObject done, globalSearch size={global_search.size()}")
+            delegate = self._get_field(helper, "delegate")
+            slog(f"ServerSearch: delegate={delegate}")
+            if delegate is not None:
+                try:
+                    from java.util import ArrayList as JArrayList
+                    empty = JArrayList()
+                    self._invoke_direct(
+                        helper, "mergeResults",
+                        ["java.util.ArrayList"],
+                        [empty],
+                    )
+                    slog("ServerSearch: mergeResults(empty) called")
+                except Exception as e:
+                    slog("ServerSearch: mergeResults failed", e)
+                try:
+                    pending = self._get_field(helper, "pendingRequestIds")
+                    if pending is not None:
+                        pending.clear()
+                        slog("ServerSearch: pendingRequestIds cleared")
+                except Exception as e:
+                    slog("ServerSearch: clear pending failed", e)
+                try:
+                    dcls = delegate.getClass()
+                    adapter = None
+                    for df in dcls.getDeclaredFields():
+                        if df.getName() == "f$0":
+                            df.setAccessible(True)
+                            adapter = df.get(delegate)
+                            break
+                    slog(f"ServerSearch: adapter={adapter}")
+                    if adapter is not None:
+                        acls = adapter.getClass()
+                        activity = None
+                        for af in acls.getDeclaredFields():
+                            if af.getName() == "this$0":
+                                af.setAccessible(True)
+                                activity = af.get(adapter)
+                                break
+                        slog(f"ServerSearch: activity={activity}")
+                        if activity is not None:
+                            act_cls = activity.getClass()
+                            for sf in act_cls.getDeclaredFields():
+                                if sf.getName() == "searching":
+                                    sf.setAccessible(True)
+                                    sf.setBoolean(activity, True)
+                                    slog("ServerSearch: searching=true")
+                                    break
+                    for dm in dcls.getDeclaredMethods():
+                        if dm.getName() != "onDataSetChanged":
+                            continue
+                        params = dm.getParameterTypes()
+                        if len(params) != 1:
+                            continue
+                        if params[0].getName() != "int":
+                            continue
+                        dm.setAccessible(True)
+                        dm.invoke(delegate, [JInteger(0)])
+                        slog("ServerSearch: onDataSetChanged(0) called")
+                        break
+                    if adapter is not None:
+                        acls2 = adapter.getClass()
+                        for am in acls2.getDeclaredMethods():
+                            if am.getName() != "notifyDataSetChanged":
+                                continue
+                            am.setAccessible(True)
+                            am.invoke(adapter, [])
+                            slog("ServerSearch: adapter.notifyDataSetChanged() called")
+                            break
+                except Exception as e:
+                    slog("ServerSearch: onDataSetChanged failed", e)
+        except Exception as e:
+            slog("ServerSearchHook _inject failed", e)
+
+
+class DiagSearchHook(MethodHook):
+    def __init__(self, plugin, cls_name, meth_name):
+        super().__init__()
+        self.plugin = plugin
+        self.cls_name = cls_name
+        self.meth_name = meth_name
+
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            tag = f"{self.cls_name.split('.')[-1]}.{self.meth_name}"
+            if args and len(args) >= 1:
+                slog(f"DIAG CALL {tag} args[0]={str(args[0])[:60]} argc={len(args)}")
+            else:
+                slog(f"DIAG CALL {tag} argc={len(args) if args else 0}")
+        except Exception as e:
+            slog("DiagSearchHook before failed", e)
