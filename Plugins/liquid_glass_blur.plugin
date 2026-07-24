@@ -1,0 +1,437 @@
+from __future__ import annotations
+
+from typing import Any
+
+from android.os import Looper
+from android.view import WindowManagerGlobal
+from com.exteragram.messenger.preferences.components import AltSeekbar
+from java import dynamic_proxy
+from java.lang import Float as JFloat
+from java.lang import System
+from java.lang.ref import WeakReference
+from java.util.concurrent import CountDownLatch, TimeUnit
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+from org.telegram.messenger.utils import RenderNodeEffects
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from ui.settings import Custom, Divider, Selector
+
+__id__ = "liquid_glass_blur"
+__name__ = "Liquid Glass Blur"
+__description__ = "Настройка силы блюра для всех элементов с эффектом Liquid Glass."
+__author__ = "@itsbodyq"
+__version__ = "1.0"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.5.1"
+
+SETTING_KEY = "blur_strength_percent"
+FALLBACK_SETTING_KEY = "blur_strength_selector"
+DEFAULT_PERCENT = 100
+MIN_PERCENT = 0
+MAX_PERCENT = 200
+FALLBACK_STEP = 5
+GLASS_BLUR_DP = 1.66
+BLUR_SIGMA_SCALE = 0.57735
+
+SUPPRESSOR_CLASS = (
+    "org.telegram.ui.Components.blur3.DownscaleScrollableNoiseSuppressor"
+)
+DRAW_GLASS = -2
+DRAW_FROSTED_GLASS = -3
+DRAW_FROSTED_GLASS_NO_SATURATION = -4
+LABEL_OFFSET_DP = 6
+INFO_TEXT = "Стандартный уровень блюра Liquid Glass — 100%."
+
+
+def normalize_percent(value: Any) -> int:
+    try:
+        percent = int(round(float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_PERCENT
+    return max(MIN_PERCENT, min(MAX_PERCENT, percent))
+
+
+class BlurDragListener(dynamic_proxy(AltSeekbar.OnDrag)):
+    def __init__(self, plugin: LiquidGlassBlurPlugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def run(self, value: float):
+        if not self.plugin._programmatic_slider_update:
+            self.plugin._set_percent_live(value)
+
+
+class SuppressorConstructorHook(MethodHook):
+    def __init__(self, plugin: LiquidGlassBlurPlugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any):
+        self.plugin._track_suppressor(param.thisObject)
+
+
+class SuppressorDrawHook(MethodHook):
+    def __init__(self, plugin: LiquidGlassBlurPlugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any):
+        self.plugin._before_suppressor_draw(param)
+
+
+class LiquidGlassBlurPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._initialize_runtime_state()
+        self._install_blur_hooks()
+        self._invalidate_windows()
+
+    def _initialize_runtime_state(self):
+        self._percent = normalize_percent(
+            self.get_setting(SETTING_KEY, DEFAULT_PERCENT)
+        )
+        self._tracked_suppressors: dict[int, Any] = {}
+        self._suppressor_draw_modes: dict[int, int] = {}
+        self._suppressor_effect_states: dict[int, tuple[Any, int, int]] = {}
+        self._node_effect_states: dict[int, tuple[Any, int, int, int]] = {}
+        self._ui_listeners: list[Any] = []
+        self._programmatic_slider_update = False
+        self._slider_uses_fraction: bool | None = None
+
+    def _ensure_runtime_state(self):
+        if not hasattr(self, "_percent"):
+            self._initialize_runtime_state()
+
+    def on_plugin_unload(self):
+        self._ensure_runtime_state()
+        self._percent = DEFAULT_PERCENT
+        self._apply_to_all_tracked(force_default=True)
+        self._invalidate_windows()
+        self._ui_listeners.clear()
+        self._suppressor_effect_states.clear()
+        self._node_effect_states.clear()
+
+    def create_settings(self) -> list[Any]:
+        self._ensure_runtime_state()
+        self._ui_listeners.clear()
+        stored_percent = normalize_percent(
+            self.get_setting(SETTING_KEY, DEFAULT_PERCENT)
+        )
+        if stored_percent != self._percent:
+            self._percent = stored_percent
+            self._apply_to_all_tracked()
+            self._invalidate_windows()
+
+        return [
+            self._create_strength_setting(),
+            Divider(text=INFO_TEXT),
+        ]
+
+    def _create_strength_setting(self):
+        try:
+            slider = self._run_on_ui_thread_and_wait(self._build_slider_view)
+            return Custom(view=slider)
+        except Exception as error:
+            self.log(f"Liquid Glass Blur: native slider unavailable: {error}")
+            values = list(range(MIN_PERCENT, MAX_PERCENT + 1, FALLBACK_STEP))
+            default_index = min(
+                range(len(values)),
+                key=lambda index: abs(values[index] - self._percent),
+            )
+            return Selector(
+                key=FALLBACK_SETTING_KEY,
+                text="Сила блюра",
+                default=default_index,
+                items=[f"{value}%" for value in values],
+                on_change=self._on_fallback_strength_changed,
+            )
+
+    def _build_slider_view(self):
+        listener = BlurDragListener(self)
+        slider = AltSeekbar(
+            ApplicationLoader.applicationContext,
+            listener,
+            MIN_PERCENT,
+            MAX_PERCENT,
+            "Сила блюра",
+            "Без блюра",
+            f"{MAX_PERCENT}%",
+        )
+        self._set_slider_percent(slider, self._percent)
+        self._adjust_slider_labels(slider)
+        self._ui_listeners.append(listener)
+        return slider
+
+    def _run_on_ui_thread_and_wait(self, callback: Any):
+        if Looper.myLooper() == Looper.getMainLooper():
+            return callback()
+
+        result: list[Any] = []
+        errors: list[Exception] = []
+        latch = CountDownLatch(1)
+
+        def create_view():
+            try:
+                result.append(callback())
+            except Exception as error:
+                errors.append(error)
+            finally:
+                latch.countDown()
+
+        run_on_ui_thread(create_view)
+        completed = bool(getattr(latch, "await")(3, TimeUnit.SECONDS))
+        if not completed:
+            raise RuntimeError("timed out while creating the settings view")
+        if errors:
+            raise errors[0]
+        if not result:
+            raise RuntimeError("settings view creation returned no view")
+        return result[0]
+
+    def _on_fallback_strength_changed(self, index: int):
+        self._set_percent_live(int(index) * FALLBACK_STEP)
+
+    def _set_slider_percent(self, slider: Any, percent: Any):
+        normalized = normalize_percent(percent)
+        if self._slider_uses_fraction is None:
+            self._programmatic_slider_update = True
+            try:
+                slider.setProgress(1.0)
+                current = float(get_private_field(slider, "currentValue"))
+                self._slider_uses_fraction = (
+                    abs(current - MAX_PERCENT) < abs(current - 1.0)
+                )
+            except Exception:
+                self._slider_uses_fraction = False
+            finally:
+                self._programmatic_slider_update = False
+
+        value = (
+            self._slider_progress(normalized)
+            if self._slider_uses_fraction
+            else float(normalized)
+        )
+        self._programmatic_slider_update = True
+        try:
+            slider.setProgress(value)
+        finally:
+            self._programmatic_slider_update = False
+
+    @staticmethod
+    def _slider_progress(percent: Any) -> float:
+        return (
+            normalize_percent(percent) - MIN_PERCENT
+        ) / (MAX_PERCENT - MIN_PERCENT)
+
+    @staticmethod
+    def _adjust_slider_labels(slider: Any):
+        offset = AndroidUtilities.dp(LABEL_OFFSET_DP)
+        parents: list[Any] = []
+        for field_name in ("leftTextView", "rightTextView"):
+            try:
+                label = get_private_field(slider, field_name)
+                label.setTranslationY(float(offset))
+                label.setTranslationZ(float(AndroidUtilities.dp(1)))
+                label.bringToFront()
+                parent = label.getParent()
+                if parent is not None and parent not in parents:
+                    parents.append(parent)
+            except Exception:
+                continue
+
+        slider.setClipChildren(False)
+        slider.setClipToPadding(False)
+        for parent in parents:
+            parent.setClipChildren(False)
+            parent.setClipToPadding(False)
+            parent.setTranslationZ(float(AndroidUtilities.dp(1)))
+            parent.bringToFront()
+
+    def _install_blur_hooks(self):
+        suppressor_class = find_class(SUPPRESSOR_CLASS)
+        if suppressor_class is None:
+            self.log("Liquid Glass Blur: Telegram blur3 classes are unavailable")
+            return
+
+        self.hook_all_constructors(
+            suppressor_class,
+            SuppressorConstructorHook(self),
+        )
+        for method_name in ("draw", "drawInline"):
+            self.hook_all_methods(
+                suppressor_class,
+                method_name,
+                SuppressorDrawHook(self),
+            )
+
+    def _before_suppressor_draw(self, param: Any):
+        if len(param.args) < 2:
+            return
+
+        try:
+            suppressor = param.thisObject
+            if not self._is_liquid_glass_suppressor(suppressor):
+                return
+
+            draw_mode = int(param.args[1])
+            if draw_mode not in {
+                DRAW_GLASS,
+                DRAW_FROSTED_GLASS,
+                DRAW_FROSTED_GLASS_NO_SATURATION,
+            }:
+                return
+
+            self._track_suppressor(suppressor)
+            identity = int(System.identityHashCode(suppressor))
+            self._suppressor_draw_modes[identity] = draw_mode
+            percent = (
+                self._percent
+                if draw_mode == DRAW_GLASS
+                else DEFAULT_PERCENT
+            )
+            self._apply_to_suppressor(suppressor, percent)
+        except Exception as error:
+            self.log(f"Liquid Glass Blur: draw hook failed: {error}")
+
+    def _is_liquid_glass_suppressor(self, suppressor: Any) -> bool:
+        if suppressor is None:
+            return False
+        try:
+            return bool(suppressor.isLiquidGlassEnabled)
+        except Exception:
+            return False
+
+    def _track_suppressor(self, suppressor: Any):
+        if not self._is_liquid_glass_suppressor(suppressor):
+            return
+
+        identity = int(System.identityHashCode(suppressor))
+        reference = self._tracked_suppressors.get(identity)
+        if reference is not None and reference.get() == suppressor:
+            return
+        self._tracked_suppressors[identity] = WeakReference(suppressor)
+
+    def _apply_to_all_tracked(self, force_default: bool = False):
+        dead: list[int] = []
+        for identity, reference in self._tracked_suppressors.items():
+            suppressor = reference.get()
+            if suppressor is None:
+                dead.append(identity)
+                continue
+            draw_mode = self._suppressor_draw_modes.get(identity)
+            percent = (
+                self._percent
+                if not force_default and draw_mode == DRAW_GLASS
+                else DEFAULT_PERCENT
+            )
+            self._apply_to_suppressor(suppressor, percent)
+        for identity in dead:
+            self._tracked_suppressors.pop(identity, None)
+            self._suppressor_draw_modes.pop(identity, None)
+            self._suppressor_effect_states.pop(identity, None)
+
+    def _apply_to_suppressor(self, suppressor: Any, percent: int):
+        if not self._is_liquid_glass_suppressor(suppressor):
+            return
+
+        try:
+            parts = get_private_field(suppressor, "rectRenderNodes")
+            part_count = int(parts.size())
+            identity = int(System.identityHashCode(suppressor))
+            normalized_percent = normalize_percent(percent)
+            cached = self._suppressor_effect_states.get(identity)
+            if (
+                cached is not None
+                and cached[0].get() == suppressor
+                and cached[1:] == (normalized_percent, part_count)
+            ):
+                return
+
+            for index in range(part_count):
+                part = parts.get(index)
+                glass_node = get_private_field(part, "renderNodesForGlass")
+                if glass_node is not None:
+                    self._set_glass_blur_effect(glass_node, normalized_percent)
+            self._suppressor_effect_states[identity] = (
+                WeakReference(suppressor),
+                normalized_percent,
+                part_count,
+            )
+        except Exception as error:
+            self.log(f"Liquid Glass Blur: refresh failed: {error}")
+
+    def _set_glass_blur_effect(self, glass_node: Any, percent: int):
+        from android.graphics import RenderEffect, Shader
+
+        normalized_percent = normalize_percent(percent)
+        scale_x = max(1, int(get_private_field(glass_node, "scaleX")))
+        scale_y = max(1, int(get_private_field(glass_node, "scaleY")))
+        identity = int(System.identityHashCode(glass_node))
+        state = (normalized_percent, scale_x, scale_y)
+        cached = self._node_effect_states.get(identity)
+        if (
+            cached is not None
+            and cached[0].get() == glass_node
+            and cached[1:] == state
+        ):
+            return
+
+        saturation_effect = RenderNodeEffects.getSaturationX2RenderEffect()
+        if normalized_percent == 0:
+            glass_node.setPrimaryEffect(saturation_effect)
+        else:
+            source_radius = float(AndroidUtilities.dpf2(GLASS_BLUR_DP))
+            base_radius_x = self._default_downscaled_radius(source_radius, scale_x)
+            base_radius_y = self._default_downscaled_radius(source_radius, scale_y)
+            factor = normalized_percent / DEFAULT_PERCENT
+            blur_effect = RenderEffect.createBlurEffect(
+                JFloat.valueOf(base_radius_x * factor),
+                JFloat.valueOf(base_radius_y * factor),
+                Shader.TileMode.CLAMP,
+            )
+            glass_node.setPrimaryEffect(
+                RenderEffect.createChainEffect(
+                    blur_effect,
+                    saturation_effect,
+                )
+            )
+        self._node_effect_states[identity] = (WeakReference(glass_node), *state)
+
+    @staticmethod
+    def _default_downscaled_radius(radius: float, scale: int) -> float:
+        sigma = BLUR_SIGMA_SCALE * radius + 0.5 if radius > 0 else 0.0
+        downscaled_sigma = sigma / max(1, scale)
+        converted_radius = (
+            (downscaled_sigma - 0.5) / BLUR_SIGMA_SCALE
+            if downscaled_sigma > 0.5
+            else 0.0
+        )
+        return max(1.0, converted_radius)
+
+    def _set_percent_live(self, value: Any):
+        percent = normalize_percent(value)
+        if percent == self._percent:
+            return
+
+        self._percent = percent
+        self.set_setting(SETTING_KEY, percent)
+        self._apply_to_all_tracked()
+        self._invalidate_windows()
+
+    def _invalidate_windows(self):
+        def invalidate():
+            try:
+                views = get_private_field(
+                    WindowManagerGlobal.getInstance(),
+                    "mViews",
+                )
+                for index in range(views.size()):
+                    view = views.get(index)
+                    if view is not None:
+                        view.postInvalidateOnAnimation()
+            except Exception as error:
+                self.log(f"Liquid Glass Blur: window invalidation failed: {error}")
+
+        if Looper.myLooper() == Looper.getMainLooper():
+            invalidate()
+        else:
+            run_on_ui_thread(invalidate)
