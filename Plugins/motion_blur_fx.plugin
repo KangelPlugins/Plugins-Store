@@ -1,0 +1,366 @@
+"""
+Motion Blur — exteraGram plugin
+--------------------------------
+Applies a velocity-based blur effect while the UI is in motion: chat/dialog
+list scrolling, ViewPager-style swiping, and popup menu open/close.
+
+HOW IT WORKS (please read before relying on this):
+The exteraGram plugin SDK does not expose a dedicated "animation" or
+"motion" API. This plugin uses the SDK's documented Xposed-style method
+hooking (see https://plugins.exteragram.app/docs/xposed-hooking) to
+intercept real Android/AndroidX methods:
+
+  - androidx.recyclerview.widget.RecyclerView#onScrolled / onScrollStateChanged
+    -> covers chat list scrolling and dialog (chat list) scrolling.
+  - androidx.viewpager.widget.ViewPager#onPageScrolled
+    -> covers swiping between pages (e.g. media galleries, tabbed screens).
+  - android.widget.PopupWindow#showAsDropDown / dismiss
+    -> covers popup-style menus (Telegram's ActionBarPopupWindow extends
+       PopupWindow), approximating "opening/closing menus".
+
+The actual blur is Android's native RenderEffect.createBlurEffect(), which
+requires Android 12 / API 31 or newer. On older Android versions the
+plugin detects this at load time, disables itself safely, and tells the
+user why in the settings screen instead of crashing or silently failing.
+
+This is a best-effort visual approximation, not a guaranteed universal
+"motion blur every animation" effect — the SDK does not expose a hook for
+arbitrary/general-purpose animations (custom transitions, fragment
+open/close animations, etc.), only for the specific classes above.
+"""
+
+from typing import Any, List
+
+from android.graphics import RenderEffect, Shader
+from android.os import Build
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+__id__ = "motion_blur_fx"
+__name__ = "Motion Blur"
+__description__ = (
+    "Adds a customizable motion blur effect to chat scrolling, swiping, "
+    "and popup menus. Requires Android 12+ (API 31) for the real blur "
+    "effect; the plugin disables itself safely on older versions."
+)
+__author__ = "@winrar738"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.8.1"
+__sdk_version__ = ">=1.4.3.10"
+
+# Blur intensity presets: "sigma" (blur radius in px-ish units) at max speed.
+# Index 0 = effectively off.
+BLUR_INTENSITY_LEVELS = [0.0, 6.0, 12.0, 20.0]
+BLUR_INTENSITY_LABELS = ["Off", "Low", "Medium", "High"]
+
+# "Trail length" controls how much the blur smooths/persists across quick,
+# consecutive scroll events (a decay factor applied between motion frames).
+# Higher = blur lingers longer between frames before catching up to the
+# new, lower target radius.
+TRAIL_DECAY_LEVELS = [0.15, 0.35, 0.6]  # Short, Medium, Long
+TRAIL_LENGTH_LABELS = ["Short", "Medium", "Long"]
+
+MIN_SUPPORTED_SDK = 31  # Android 12
+
+
+class _ScrollBlurHook(MethodHook):
+    """Applies blur while a RecyclerView (chat/dialog list) is scrolling."""
+
+    def __init__(self, plugin: "MotionBlurPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.is_effect_ready():
+            return
+        if not self.plugin.get_setting("enable_scroll", True):
+            return
+
+        view = param.thisObject
+        # onScrolled(int dx, int dy) or onScrolled(int dx, int dy, int[] consumed)
+        dy = param.args[1] if len(param.args) > 1 else 0
+        self.plugin.apply_motion_blur(view, dy)
+
+
+class _ScrollStateHook(MethodHook):
+    """Clears the blur once scrolling settles (RecyclerView SCROLL_STATE_IDLE)."""
+
+    SCROLL_STATE_IDLE = 0
+
+    def __init__(self, plugin: "MotionBlurPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin.is_effect_ready():
+            return
+        if not self.plugin.get_setting("enable_scroll", True):
+            return
+
+        state = param.args[0]
+        if state == self.SCROLL_STATE_IDLE:
+            self.plugin.clear_motion_blur(param.thisObject)
+
+
+class _SwipeBlurHook(MethodHook):
+    """Applies blur while a ViewPager is mid-swipe."""
+
+    def __init__(self, plugin: "MotionBlurPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.is_effect_ready():
+            return
+        if not self.plugin.get_setting("enable_swipe", True):
+            return
+
+        view = param.thisObject
+        # onPageScrolled(int position, float positionOffset, int positionOffsetPixels)
+        offset_pixels = param.args[2] if len(param.args) > 2 else 0
+        self.plugin.apply_motion_blur(view, offset_pixels)
+
+    def after_hooked_method(self, param):
+        # ViewPager doesn't give us a clean "settled" callback the way
+        # RecyclerView does, so fade quickly on every call where the
+        # reported movement is effectively zero.
+        if not self.plugin.is_effect_ready():
+            return
+        offset_pixels = param.args[2] if len(param.args) > 2 else 0
+        if offset_pixels == 0:
+            self.plugin.clear_motion_blur(param.thisObject)
+
+
+class _MenuShowHook(MethodHook):
+    """Applies a light static blur to a popup menu's content when it opens."""
+
+    def __init__(self, plugin: "MotionBlurPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.is_effect_ready():
+            return
+        if not self.plugin.get_setting("enable_menu", True):
+            return
+
+        try:
+            content_view = param.thisObject.getContentView()
+            if content_view:
+                self.plugin.apply_motion_blur(content_view, 40)
+        except Exception as exc:  # defensive: popup internals can vary
+            self.plugin.log(f"Motion Blur: menu show hook failed: {exc}")
+
+
+class _MenuDismissHook(MethodHook):
+    """Clears the blur when a popup menu is dismissed."""
+
+    def __init__(self, plugin: "MotionBlurPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.is_effect_ready():
+            return
+        try:
+            content_view = param.thisObject.getContentView()
+            if content_view:
+                self.plugin.clear_motion_blur(content_view)
+        except Exception as exc:
+            self.plugin.log(f"Motion Blur: menu dismiss hook failed: {exc}")
+
+
+class MotionBlurPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._sdk_supported = Build.VERSION.SDK_INT >= MIN_SUPPORTED_SDK
+        self._last_radius = {}  # id(view) -> last applied radius, for trail smoothing
+        self._hook_handles = []
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+
+    def on_plugin_load(self):
+        if not self._sdk_supported:
+            self.log(
+                f"Motion Blur: device API level {Build.VERSION.SDK_INT} is below "
+                f"{MIN_SUPPORTED_SDK} (Android 12). The blur effect needs "
+                "RenderEffect, which does not exist on older Android, so the "
+                "plugin will stay loaded but inactive."
+            )
+            return
+
+        try:
+            self._install_hooks()
+            self.log("Motion Blur: hooks installed successfully.")
+        except Exception as exc:
+            self.log(f"Motion Blur: failed to install hooks: {exc}")
+
+    def on_plugin_unload(self):
+        # Hooks are removed automatically by the SDK on unload, but we
+        # clear our local bookkeeping to avoid holding view references.
+        self._last_radius.clear()
+        self.log("Motion Blur: unloaded.")
+
+    def _install_hooks(self):
+        RecyclerViewClass = find_class("androidx.recyclerview.widget.RecyclerView")
+        if RecyclerViewClass:
+            scrolled_unhooks = self.hook_all_methods(
+                RecyclerViewClass, "onScrolled", _ScrollBlurHook(self)
+            )
+            state_unhooks = self.hook_all_methods(
+                RecyclerViewClass, "onScrollStateChanged", _ScrollStateHook(self)
+            )
+            self._hook_handles += (scrolled_unhooks or []) + (state_unhooks or [])
+        else:
+            self.log("Motion Blur: RecyclerView class not found, scroll blur disabled.")
+
+        ViewPagerClass = find_class("androidx.viewpager.widget.ViewPager")
+        if ViewPagerClass:
+            swipe_unhooks = self.hook_all_methods(
+                ViewPagerClass, "onPageScrolled", _SwipeBlurHook(self)
+            )
+            self._hook_handles += swipe_unhooks or []
+        else:
+            self.log("Motion Blur: ViewPager class not found, swipe blur disabled.")
+
+        PopupWindowClass = find_class("android.widget.PopupWindow")
+        if PopupWindowClass:
+            show_unhooks = self.hook_all_methods(
+                PopupWindowClass, "showAsDropDown", _MenuShowHook(self)
+            )
+            dismiss_unhooks = self.hook_all_methods(
+                PopupWindowClass, "dismiss", _MenuDismissHook(self)
+            )
+            self._hook_handles += (show_unhooks or []) + (dismiss_unhooks or [])
+        else:
+            self.log("Motion Blur: PopupWindow class not found, menu blur disabled.")
+
+    # ------------------------------------------------------------------ #
+    # Blur application
+    # ------------------------------------------------------------------ #
+
+    def is_effect_ready(self) -> bool:
+        return self._sdk_supported and self.get_setting("enabled", True)
+
+    def apply_motion_blur(self, view, raw_delta: int):
+        max_radius = BLUR_INTENSITY_LEVELS[self.get_setting("blur_intensity", 2)]
+        if max_radius <= 0:
+            return
+
+        decay = TRAIL_DECAY_LEVELS[self.get_setting("trail_length", 1)]
+        speed = min(abs(raw_delta), 60) / 60.0
+        target_radius = max(0.1, max_radius * speed)
+
+        key = id(view)
+        previous = self._last_radius.get(key, 0.0)
+        # Blend toward the target so short pauses in fast motion don't
+        # cause the blur to visibly "pop" — this is the trail-length knob.
+        radius = previous + (target_radius - previous) * (1.0 - decay)
+        self._last_radius[key] = radius
+
+        try:
+            effect = RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP)
+            view.setRenderEffect(effect)
+        except Exception as exc:
+            self.log(f"Motion Blur: could not apply RenderEffect: {exc}")
+
+    def clear_motion_blur(self, view):
+        key = id(view)
+        self._last_radius.pop(key, None)
+        try:
+            view.setRenderEffect(None)
+        except Exception as exc:
+            self.log(f"Motion Blur: could not clear RenderEffect: {exc}")
+
+    # ------------------------------------------------------------------ #
+    # Settings screen
+    # ------------------------------------------------------------------ #
+
+    def create_settings(self) -> List[Any]:
+        settings: List[Any] = [Header(text="Motion Blur")]
+
+        if not self._sdk_supported:
+            settings.append(
+                Text(
+                    text=(
+                        f"Your device is on API {Build.VERSION.SDK_INT}. "
+                        f"This effect requires Android 12 (API {MIN_SUPPORTED_SDK}) "
+                        "or newer, so it is currently inactive."
+                    ),
+                    red=True,
+                )
+            )
+            settings.append(Divider())
+
+        settings.append(
+            Switch(
+                key="enabled",
+                text="Enable Motion Blur",
+                default=True,
+                subtext="Master switch for the whole effect.",
+                icon="msg_blur_reactions",
+            )
+        )
+
+        settings.append(Divider())
+        settings.append(Header(text="Blur Parameters"))
+        settings.append(
+            Selector(
+                key="blur_intensity",
+                text="Blur Intensity",
+                default=2,
+                items=BLUR_INTENSITY_LABELS,
+                icon="msg_photo_settings",
+            )
+        )
+        settings.append(
+            Selector(
+                key="trail_length",
+                text="Trail Length",
+                default=1,
+                items=TRAIL_LENGTH_LABELS,
+                icon="msg_timer",
+            )
+        )
+
+        settings.append(Divider())
+        settings.append(Header(text="Apply Effect To"))
+        settings.append(
+            Switch(
+                key="enable_scroll",
+                text="Scrolling",
+                default=True,
+                subtext="Chat list and message list scrolling.",
+            )
+        )
+        settings.append(
+            Switch(
+                key="enable_swipe",
+                text="Swiping",
+                default=True,
+                subtext="Swiping between pages (e.g. media viewers, tabs).",
+            )
+        )
+        settings.append(
+            Switch(
+                key="enable_menu",
+                text="Menus",
+                default=True,
+                subtext="Popup menus (context menus, dropdowns).",
+            )
+        )
+
+        settings.append(Divider())
+        settings.append(
+            Text(
+                text=(
+                    "This effect hooks internal Android/AndroidX view classes "
+                    "to approximate motion blur. It is not an officially "
+                    "documented SDK feature, so behavior may vary between "
+                    "exteraGram versions."
+                ),
+                subtext="Read this before reporting visual glitches.",
+            )
+        )
+
+        return settings
