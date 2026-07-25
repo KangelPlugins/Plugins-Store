@@ -1,0 +1,885 @@
+import os
+import queue
+import socket
+import threading
+import time
+import weakref
+from typing import Any, Callable, Dict, List, Optional
+
+from android.content import Context, Intent, IntentFilter
+from android.net import ConnectivityManager, NetworkCapabilities, TrafficStats
+from android.os import Process, SystemClock
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from java import dynamic_proxy, jint
+
+__id__ = "pill_stack_plus"
+__name__ = "Pill Stack Plus"
+__description__ = "Добавляет дополнительные виджеты в Pill Stack\n\nBETA версия, возможны ошибки и баги. Если вы нашли баг, пожалуйста, сообщите о нём разработчику @Exorned"
+__author__ = "@Exorned, @ExerealPlugins"
+__version__ = "0.0.1 BETA"
+__icon__ = "ExerealPlugins/4"
+__min_version__ = "12.5.1"
+
+TAG_KEY = jint(0x50534C50)
+BASE_PILL_ID = 42000
+WIDGET_TITLE_PREFIX = "🧩 "
+TELEGRAM_DC_PORT = 443
+TELEGRAM_DC_IPS = {
+    1: "149.154.175.53",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130",
+}
+
+
+def _argb(hex_color: str) -> int:
+    value = int(hex_color.replace("#", ""), 16) | 0xFF000000
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+class WidgetDef:
+    def __init__(
+        self,
+        key: str,
+        pill_id: int,
+        title: str,
+        icon_name: str,
+        color1: int,
+        color2: int,
+        compute: Callable[["PillStackPlusPlugin"], Any],
+        render: Callable[["PillStackPlusPlugin", Any, Any], None],
+        update_interval: int = 15,
+        on_click: Optional[Callable[["PillStackPlusPlugin", "WidgetDef", Any], None]] = None,
+        extra_settings: Optional[Callable[["PillStackPlusPlugin", "WidgetDef"], List[Any]]] = None,
+        extra_menu_actions: Optional[Callable[["PillStackPlusPlugin", "WidgetDef", Any], List[Any]]] = None,
+    ):
+        self.key = key
+        self.pill_id = pill_id
+        self.title = title
+        self.icon_name = icon_name
+        self.color1 = color1
+        self.color2 = color2
+        self.compute = compute
+        self.render = render
+        self.update_interval = update_interval
+        self.on_click = on_click
+        self.extra_settings = extra_settings
+        self.extra_menu_actions = extra_menu_actions
+        self.icon_res: int = 0
+
+# 1. Скорость сети
+
+def _format_speed(bytes_per_sec: float) -> str:
+    if bytes_per_sec < 1024:
+        return f"{bytes_per_sec:.0f} B/s"
+    kb = bytes_per_sec / 1024
+    if kb < 1024:
+        return f"{kb:.0f} KB/s"
+    return f"{kb / 1024:.1f} MB/s"
+
+
+def _compute_network_speed(plugin: "PillStackPlusPlugin"):
+    rx = TrafficStats.getTotalRxBytes()
+    tx = TrafficStats.getTotalTxBytes()
+    now = time.time()
+    prev = plugin.state.get("network_speed")
+    plugin.state["network_speed"] = (rx, tx, now)
+    if not prev or rx < 0 or tx < 0:
+        return (0, 0)
+    prev_rx, prev_tx, prev_time = prev
+    dt = max(now - prev_time, 0.001)
+    down = max((rx - prev_rx) / dt, 0)
+    up = max((tx - prev_tx) / dt, 0)
+    return (down, up)
+
+
+def _render_network_speed(plugin: "PillStackPlusPlugin", pill, data):
+    down, up = data
+    plugin.set_pill_text(pill, f"↓{_format_speed(down)} ↑{_format_speed(up)}")
+
+
+# 2. Пинг Telegram
+
+def _get_current_dc_id(plugin: "PillStackPlusPlugin") -> int:
+    try:
+        UserConfig = find_class("org.telegram.messenger.UserConfig")
+        ConnectionsManager = find_class("org.telegram.messenger.ConnectionsManager")
+        account = int(UserConfig.selectedAccount)
+        cm = ConnectionsManager.getInstance(jint(account))
+        dc_id = int(cm.getCurrentDatacenterId())
+        if dc_id in TELEGRAM_DC_IPS:
+            return dc_id
+    except Exception as e:
+        plugin.log(f"ошибка определения DC: {e}")
+    return 2
+
+
+def _compute_telegram_ping(plugin: "PillStackPlusPlugin"):
+    dc_id = _get_current_dc_id(plugin)
+    ip = TELEGRAM_DC_IPS[dc_id]
+    start = time.time()
+    try:
+        with socket.create_connection((ip, TELEGRAM_DC_PORT), timeout=3):
+            pass
+        ping_ms = int((time.time() - start) * 1000)
+    except Exception as e:
+        plugin.state["telegram_ping_error"] = str(e)
+        return None
+    plugin.state["telegram_ping_error"] = None
+    return (dc_id, ping_ms)
+
+
+def _render_telegram_ping(plugin: "PillStackPlusPlugin", pill, data):
+    if not data:
+        error = plugin.state.get("telegram_ping_error")
+        plugin.set_pill_text(pill, f"Ошибка: {error}"[:40] if error else "N/A")
+        return
+    dc_id, ping_ms = data
+    plugin.set_pill_text(pill, f"DC{dc_id}: {ping_ms} ms")
+
+
+# 3. Температура батареи
+
+def _compute_battery_temp(plugin: "PillStackPlusPlugin"):
+    try:
+        ctx = plugin.ApplicationLoader.applicationContext
+        battery_status = ctx.registerReceiver(None, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if not battery_status:
+            return None
+        temp_tenths = battery_status.getIntExtra("temperature", -1)
+        return temp_tenths / 10.0 if temp_tenths >= 0 else None
+    except Exception:
+        return None
+
+
+def _render_battery_temp(plugin: "PillStackPlusPlugin", pill, data):
+    plugin.set_pill_text(pill, f"{data:.1f}°C" if data is not None else "N/A")
+
+
+# 4. Загрузка CPU
+
+def _read_cpu_times():
+    with open("/proc/stat", "r") as f:
+        line = f.readline()
+    values = list(map(int, line.split()[1:]))
+    idle = values[3] + values[4]
+    total = sum(values)
+    return total, idle
+
+
+def _compute_cpu_usage(plugin: "PillStackPlusPlugin"):
+    try:
+        total, idle = _read_cpu_times()
+        prev = plugin.state.get("cpu_usage_proc")
+        plugin.state["cpu_usage_proc"] = (total, idle)
+        if prev:
+            total_delta = total - prev[0]
+            idle_delta = idle - prev[1]
+            if total_delta > 0:
+                return max(0.0, min(100.0, (1 - idle_delta / total_delta) * 100))
+    except Exception:
+        pass
+
+    try:
+        cpu_time = Process.getElapsedCpuTime()
+        now_ms = time.time() * 1000
+        prev = plugin.state.get("cpu_usage_fallback")
+        plugin.state["cpu_usage_fallback"] = (cpu_time, now_ms)
+        if prev:
+            cpu_delta = cpu_time - prev[0]
+            wall_delta = now_ms - prev[1]
+            if wall_delta > 0:
+                return max(0.0, min(100.0, (cpu_delta / wall_delta) * 100))
+    except Exception:
+        pass
+    return None
+
+
+def _render_cpu_usage(plugin: "PillStackPlusPlugin", pill, data):
+    plugin.set_pill_text(pill, f"{data:.0f}%" if data is not None else "N/A")
+
+
+# 5. Непрочитанные сообщения
+
+def _compute_unread_count(plugin: "PillStackPlusPlugin"):
+    try:
+        from client_utils import get_messages_controller
+        controller = get_messages_controller()
+        dialogs = get_private_field(controller, "allDialogs")
+        if not dialogs:
+            return None
+        total = 0
+        for i in range(dialogs.size()):
+            dialog = dialogs.get(i)
+            if dialog is None:
+                continue
+            try:
+                total += int(controller.getDialogUnreadCount(dialog))
+            except Exception:
+                total += int(dialog.unread_count)
+        return total
+    except Exception as e:
+        plugin.log(f"ошибка подсчёта непрочитанных: {e}")
+        return None
+
+
+def _render_unread_count(plugin: "PillStackPlusPlugin", pill, data):
+    plugin.set_pill_text(pill, str(data) if data is not None else "N/A")
+
+
+# 6. Размер кэша Telegram
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _compute_cache_size(plugin: "PillStackPlusPlugin"):
+    try:
+        ctx = plugin.ApplicationLoader.applicationContext
+        return _dir_size(ctx.getCacheDir().getAbsolutePath()) + _dir_size(ctx.getFilesDir().getAbsolutePath())
+    except Exception:
+        return None
+
+
+def _render_cache_size(plugin: "PillStackPlusPlugin", pill, data):
+    if data is None:
+        plugin.set_pill_text(pill, "N/A")
+        return
+    mb = data / (1024 * 1024)
+    plugin.set_pill_text(pill, f"{mb:.0f} MB" if mb < 1024 else f"{mb / 1024:.2f} GB")
+
+
+# 7. Счётчик
+
+def _compute_counter(plugin: "PillStackPlusPlugin"):
+    return int(plugin.get_setting("counter_value", 0))
+
+
+def _render_counter(plugin: "PillStackPlusPlugin", pill, data):
+    plugin.set_pill_text(pill, f"👆 {data}")
+
+
+def _on_click_counter(plugin: "PillStackPlusPlugin", widget: "WidgetDef", pill):
+    value = int(plugin.get_setting("counter_value", 0)) + 1
+    plugin.set_setting("counter_value", value)
+    plugin.set_pill_text(pill, f"👆 {value}")
+
+
+def _counter_extra_settings(plugin: "PillStackPlusPlugin", widget: WidgetDef) -> List[Any]:
+    from ui.settings import Text
+
+    def _reset(_view):
+        plugin.set_setting("counter_value", 0)
+        plugin.force_update_all(widget, manual=True)
+
+    return [Text(text="Сбросить счётчик", icon="msg_delete", on_click=_reset)]
+
+
+def _counter_menu_actions(plugin: "PillStackPlusPlugin", widget: WidgetDef, pill) -> List[Any]:
+    def _reset():
+        plugin.set_setting("counter_value", 0)
+        plugin.force_update_all(widget, manual=True)
+
+    return [("Сбросить счётчик", "msg_delete", _reset)]
+
+
+# 8. Аптайм устройства
+
+def _compute_device_uptime(plugin: "PillStackPlusPlugin"):
+    return SystemClock.elapsedRealtime() / 1000
+
+
+def _render_device_uptime(plugin: "PillStackPlusPlugin", pill, data):
+    hours = int(data // 3600)
+    minutes = int((data % 3600) // 60)
+    plugin.set_pill_text(pill, f"{hours}ч {minutes}м")
+
+
+# 9. IP-адрес локальный/внешний
+
+def _get_local_ip():
+    try:
+        NetworkInterface = find_class("java.net.NetworkInterface")
+        interfaces = NetworkInterface.getNetworkInterfaces()
+        while interfaces.hasMoreElements():
+            iface = interfaces.nextElement()
+            if iface.isLoopback() or not iface.isUp():
+                continue
+            addresses = iface.getInetAddresses()
+            while addresses.hasMoreElements():
+                addr = addresses.nextElement()
+                ip = addr.getHostAddress()
+                if ip and ":" not in ip:
+                    return ip
+    except Exception:
+        pass
+    return None
+
+
+def _get_external_ip():
+    try:
+        import urllib.request as urllib2
+        req = urllib2.Request("https://api.ipify.org", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib2.urlopen(req, timeout=4) as resp:
+            return resp.read().decode("utf-8").strip()
+    except Exception:
+        return None
+
+
+def _compute_ip_address(plugin: "PillStackPlusPlugin"):
+    local_ip = _get_local_ip()
+    state = plugin.state.setdefault("ip_address", {"external": None, "last_fetch": 0})
+    now = time.time()
+    if now - state["last_fetch"] > 300:
+        state["external"] = _get_external_ip()
+        state["last_fetch"] = now
+    return (local_ip, state["external"])
+
+
+def _render_ip_address(plugin: "PillStackPlusPlugin", pill, data):
+    local_ip, external_ip = data
+    mode = plugin.state.get("ip_display_mode", "local")
+    if mode == "external":
+        plugin.set_pill_text(pill, f"🌍 {external_ip or '…'}")
+    else:
+        plugin.set_pill_text(pill, f"🏠 {local_ip or 'N/A'}")
+
+
+def _on_click_ip(plugin: "PillStackPlusPlugin", widget: "WidgetDef", pill):
+    current_mode = plugin.state.get("ip_display_mode", "local")
+    new_mode = "external" if current_mode == "local" else "local"
+    plugin.state["ip_display_mode"] = new_mode
+
+    cached = plugin.last_data.get(widget.pill_id)
+    if cached is not None:
+        widget.render(plugin, pill, cached)
+
+    if new_mode == "external":
+        state = plugin.state.get("ip_address", {})
+        if not state.get("external"):
+            plugin.force_update_all(widget, manual=True)
+
+
+# 10. Статус VPN
+
+def _compute_vpn_status(plugin: "PillStackPlusPlugin"):
+    try:
+        ctx = plugin.ApplicationLoader.applicationContext
+        cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE)
+        network = cm.getActiveNetwork()
+        if not network:
+            return False
+        capabilities = cm.getNetworkCapabilities(network)
+        if not capabilities:
+            return False
+        return bool(capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+    except Exception:
+        return None
+
+
+def _render_vpn_status(plugin: "PillStackPlusPlugin", pill, data):
+    if data is None:
+        plugin.set_pill_text(pill, "N/A")
+    else:
+        plugin.set_pill_text(pill, "VPN: Вкл" if data else "VPN: Выкл")
+
+
+# 11. Мировые часы
+
+def _compute_world_clock(plugin: "PillStackPlusPlugin"):
+    try:
+        Calendar = find_class("java.util.Calendar")
+        TimeZone = find_class("java.util.TimeZone")
+        tz_id = plugin.get_setting("world_clock_tz", "Europe/Moscow")
+        tz = TimeZone.getTimeZone(tz_id)
+        cal = Calendar.getInstance(tz)
+        hour = int(cal.get(Calendar.HOUR_OF_DAY))
+        minute = int(cal.get(Calendar.MINUTE))
+        return (tz_id, hour, minute)
+    except Exception as e:
+        plugin.log(f"ошибка мировых часов: {e}")
+        return None
+
+
+def _render_world_clock(plugin: "PillStackPlusPlugin", pill, data):
+    if not data:
+        plugin.set_pill_text(pill, "N/A")
+        return
+    tz_id, hour, minute = data
+    city = tz_id.split("/")[-1].replace("_", " ")
+    plugin.set_pill_text(pill, f"{city} {hour:02d}:{minute:02d}")
+
+
+WORLD_CLOCK_TIMEZONES = [
+    ("Москва", "Europe/Moscow"),
+    ("Киев", "Europe/Kyiv"),
+    ("Лондон", "Europe/London"),
+    ("Берлин", "Europe/Berlin"),
+    ("Стамбул", "Europe/Istanbul"),
+    ("Дубай", "Asia/Dubai"),
+    ("Алматы", "Asia/Almaty"),
+    ("Нью-Дели", "Asia/Kolkata"),
+    ("Пекин", "Asia/Shanghai"),
+    ("Токио", "Asia/Tokyo"),
+    ("Сидней", "Australia/Sydney"),
+    ("Нью-Йорк", "America/New_York"),
+    ("Лос-Анджелес", "America/Los_Angeles"),
+]
+
+
+def _world_clock_default_index(plugin: "PillStackPlusPlugin") -> int:
+    current_tz = plugin.get_setting("world_clock_tz", "Europe/Moscow")
+    for i, (_label, tz_id) in enumerate(WORLD_CLOCK_TIMEZONES):
+        if tz_id == current_tz:
+            return i
+    return 0
+
+
+def _on_world_clock_tz_change(plugin: "PillStackPlusPlugin", widget: "WidgetDef", new_index):
+    try:
+        tz_id = WORLD_CLOCK_TIMEZONES[int(new_index)][1]
+    except (IndexError, ValueError):
+        return
+    plugin.set_setting("world_clock_tz", tz_id)
+    plugin.force_update_all(widget, manual=True)
+
+
+def _world_clock_extra_settings(plugin: "PillStackPlusPlugin", widget: "WidgetDef") -> List[Any]:
+    from ui.settings import Selector
+
+    return [
+        Selector(
+            key="world_clock_tz_index",
+            text="Часовой пояс",
+            default=_world_clock_default_index(plugin),
+            items=[label for label, _tz_id in WORLD_CLOCK_TIMEZONES],
+            icon="msg_calendar2",
+            on_change=lambda idx, p=plugin, w=widget: _on_world_clock_tz_change(p, w, idx),
+        )
+    ]
+
+
+# 12. Версия приложения / номер сборки
+
+def _compute_app_version(plugin: "PillStackPlusPlugin"):
+    try:
+        ctx = plugin.ApplicationLoader.applicationContext
+        pkg = ctx.getPackageName()
+        info = ctx.getPackageManager().getPackageInfo(pkg, 0)
+        return (str(info.versionName), int(info.versionCode))
+    except Exception as e:
+        plugin.log(f"ошибка получения версии приложения: {e}")
+        return None
+
+
+def _render_app_version(plugin: "PillStackPlusPlugin", pill, data):
+    if not data:
+        plugin.set_pill_text(pill, "N/A")
+        return
+    version_name, version_code = data
+    plugin.set_pill_text(pill, f"v{version_name} ({version_code})")
+
+
+# 13. @ExerealPlugins
+
+def _compute_channel_promo(plugin: "PillStackPlusPlugin"):
+    return None
+
+
+def _render_channel_promo(plugin: "PillStackPlusPlugin", pill, data):
+    plugin.set_pill_text(pill, "@ExerealPlugins")
+
+
+def _on_click_channel_promo(plugin: "PillStackPlusPlugin", widget: "WidgetDef", pill):
+    from client_utils import get_last_fragment, get_messages_controller
+    run_on_ui_thread(
+        lambda: get_messages_controller().openByUserName(
+            "ExerealPlugins", get_last_fragment(), 1
+        )
+    )
+
+
+WIDGETS: List[WidgetDef] = [
+    WidgetDef("network_speed", BASE_PILL_ID + 1, WIDGET_TITLE_PREFIX + "Скорость сети", "msg_data_usage", _argb("#2196F3"), _argb("#1565C0"), _compute_network_speed, _render_network_speed, update_interval=1),
+    WidgetDef("telegram_ping", BASE_PILL_ID + 2, WIDGET_TITLE_PREFIX + "Пинг Telegram", "msg_online", _argb("#29B6F6"), _argb("#0277BD"), _compute_telegram_ping, _render_telegram_ping, update_interval=15),
+    WidgetDef("battery_temp", BASE_PILL_ID + 3, WIDGET_TITLE_PREFIX + "Температура батареи", "msg_battery", _argb("#FF7043"), _argb("#D84315"), _compute_battery_temp, _render_battery_temp, update_interval=20),
+    WidgetDef("cpu_usage", BASE_PILL_ID + 4, WIDGET_TITLE_PREFIX + "Загрузка CPU", "msg_devices", _argb("#7E57C2"), _argb("#4527A0"), _compute_cpu_usage, _render_cpu_usage, update_interval=5),
+    WidgetDef("unread_count", BASE_PILL_ID + 5, WIDGET_TITLE_PREFIX + "Непрочитанные", "msg_unread", _argb("#EF5350"), _argb("#C62828"), _compute_unread_count, _render_unread_count, update_interval=10),
+    WidgetDef("cache_size", BASE_PILL_ID + 6, WIDGET_TITLE_PREFIX + "Кэш Telegram", "msg_storage_usage", _argb("#66BB6A"), _argb("#2E7D32"), _compute_cache_size, _render_cache_size, update_interval=60),
+    WidgetDef("counter", BASE_PILL_ID + 7, WIDGET_TITLE_PREFIX + "Счётчик", "msg_reactions2", _argb("#EC407A"), _argb("#AD1457"), _compute_counter, _render_counter, update_interval=3600, on_click=_on_click_counter, extra_settings=_counter_extra_settings, extra_menu_actions=_counter_menu_actions),
+    WidgetDef("device_uptime", BASE_PILL_ID + 8, WIDGET_TITLE_PREFIX + "Аптайм устройства", "msg_pin_time", _argb("#26A69A"), _argb("#00695C"), _compute_device_uptime, _render_device_uptime, update_interval=30),
+    WidgetDef("ip_address", BASE_PILL_ID + 9, WIDGET_TITLE_PREFIX + "IP-адрес", "msg_language", _argb("#5C6BC0"), _argb("#283593"), _compute_ip_address, _render_ip_address, update_interval=30, on_click=_on_click_ip),
+    WidgetDef("vpn_status", BASE_PILL_ID + 10, WIDGET_TITLE_PREFIX + "VPN", "msg_secret", _argb("#43A047"), _argb("#1B5E20"), _compute_vpn_status, _render_vpn_status, update_interval=10),
+    WidgetDef("world_clock", BASE_PILL_ID + 11, WIDGET_TITLE_PREFIX + "Мировые часы", "msg_calendar2", _argb("#FFB300"), _argb("#FF8F00"), _compute_world_clock, _render_world_clock, update_interval=30, extra_settings=_world_clock_extra_settings),
+    WidgetDef("app_version", BASE_PILL_ID + 12, WIDGET_TITLE_PREFIX + "Версия приложения", "msg_info", _argb("#78909C"), _argb("#455A64"), _compute_app_version, _render_app_version, update_interval=3600),
+    WidgetDef("channel_promo", BASE_PILL_ID + 13, WIDGET_TITLE_PREFIX + "Канал ExerealPlugins", "msg_channel", _argb("#D15AA5"), _argb("#BD137E"), _compute_channel_promo, _render_channel_promo, update_interval=3600, on_click=_on_click_channel_promo),
+]
+
+
+class PillStackPlusPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.state: Dict[str, Any] = {}
+        self.last_data: Dict[int, Any] = {}
+        self.widgets_by_id: Dict[int, WidgetDef] = {w.pill_id: w for w in WIDGETS}
+        self.active_pills: Dict[int, "weakref.WeakSet"] = {w.pill_id: weakref.WeakSet() for w in WIDGETS}
+        self._creating_id: Optional[int] = None
+        self._registered_ids: set = set()
+        self._tickers: set = set()
+        self._creator_refs: List[Any] = []
+        self._menu_runnable_refs: List[Any] = []
+        self._work_queue: "queue.Queue" = queue.Queue()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
+
+        self.AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
+        self.PillRegistry = find_class("com.exteragram.messenger.pillstack.core.PillRegistry")
+        self.PillInfo = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillInfo")
+        self.PillCreator = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator")
+        self.PillStackConfig = find_class("com.exteragram.messenger.pillstack.core.PillStackConfig")
+        self.WeatherPill = find_class("com.exteragram.messenger.pillstack.ui.pills.weather.WeatherPill")
+        self.ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
+
+    def on_plugin_load(self):
+        if not self.PillRegistry:
+            self.log("PillRegistry не найден")
+            return
+        try:
+            self._install_dispatch_hooks()
+            for widget in WIDGETS:
+                widget.update_interval = int(self.get_setting(f"interval_{widget.key}", widget.update_interval))
+                self._register_widget(widget)
+                if not self.get_setting(f"activated_once_{widget.key}", False):
+                    run_on_ui_thread(lambda w=widget: self._activate_widget(w))
+                    self.set_setting(f"activated_once_{widget.key}", True)
+        except Exception as e:
+            self.log(f"ошибка загрузки Pill Stack Plus: {e}")
+
+    def _register_widget(self, widget: WidgetDef):
+        if widget.pill_id in self._registered_ids:
+            return
+        ctx = self.ApplicationLoader.applicationContext
+        res = ctx.getResources()
+        pkg = ctx.getPackageName()
+        icon_res = res.getIdentifier(widget.icon_name, "drawable", pkg)
+        if icon_res == 0:
+            icon_res = res.getIdentifier("msg_info", "drawable", pkg)
+        if icon_res == 0:
+            icon_res = res.getIdentifier("msg_settings", "drawable", pkg)
+        widget.icon_res = icon_res
+        plugin_ref = self
+
+        class Creator(dynamic_proxy(self.PillCreator)):
+            def __init__(self, w: WidgetDef):
+                super().__init__()
+                self.w = w
+
+            def create(self, context, resources_provider):
+                try:
+                    plugin_ref._creating_id = self.w.pill_id
+                    pill = plugin_ref.WeatherPill(context, resources_provider)
+                    plugin_ref._creating_id = None
+                    pill.setTag(TAG_KEY, jint(self.w.pill_id))
+                    plugin_ref.active_pills[self.w.pill_id].add(pill)
+                    plugin_ref.set_pill_appearance(pill, self.w)
+                    plugin_ref.set_pill_icon(pill, self.w.icon_res)
+                    if self.w.pill_id in plugin_ref.last_data:
+                        cached = plugin_ref.last_data[self.w.pill_id]
+                        run_on_ui_thread(lambda p=pill, w=self.w, d=cached: w.render(plugin_ref, p, d))
+                    plugin_ref.ensure_ticker(self.w)
+                    return pill
+                except Exception as e:
+                    plugin_ref._creating_id = None
+                    plugin_ref.log(f"ошибка создания {self.w.key}: {e}")
+                    return None
+
+        creator = Creator(widget)
+        self._creator_refs.append(creator)
+        pill_info = self.PillInfo(
+            jint(widget.pill_id), widget.title, jint(icon_res),
+            jint(widget.color1), jint(widget.color2), creator,
+        )
+        self._creator_refs.append(pill_info)
+        self.PillRegistry.register(pill_info)
+        self._registered_ids.add(widget.pill_id)
+
+    def _activate_widget(self, widget: WidgetDef):
+        if not self.PillStackConfig:
+            return
+        active = self.PillStackConfig.activePills
+        already = any(int(active.get(i)) == widget.pill_id for i in range(active.size()))
+        if not already:
+            active.add(jint(widget.pill_id))
+            self.PillStackConfig.savePillsLayout()
+            run_on_ui_thread(self.PillStackConfig.notifySettingsChanged)
+
+    def _install_dispatch_hooks(self):
+        plugin_ref = self
+
+        def resolve_widget(this_obj) -> Optional[WidgetDef]:
+            tag = this_obj.getTag(TAG_KEY)
+            if tag is not None:
+                return plugin_ref.widgets_by_id.get(int(tag))
+            if plugin_ref._creating_id is not None:
+                this_obj.setTag(TAG_KEY, jint(plugin_ref._creating_id))
+                return plugin_ref.widgets_by_id.get(plugin_ref._creating_id)
+            return None
+
+        class GetIdHook(MethodHook):
+            def before_hooked_method(self, param):
+                widget = resolve_widget(param.thisObject)
+                if widget:
+                    param.setResult(jint(widget.pill_id))
+
+        class InteractionHook(MethodHook):
+            def before_hooked_method(self, param):
+                widget = resolve_widget(param.thisObject)
+                if not widget:
+                    return
+                name = param.method.getName()
+                if name == "onPillClicked":
+                    if widget.on_click:
+                        widget.on_click(plugin_ref, widget, param.thisObject)
+                    else:
+                        plugin_ref.force_update_all(widget, manual=True)
+                    param.setResult(None)
+                elif name == "onPillLongClicked":
+                    plugin_ref.show_pill_menu(param.thisObject, widget)
+                    param.setResult(True)
+                elif name in ("onUpdateData", "setData"):
+                    param.setResult(None)
+
+        self.hook_all_methods(self.WeatherPill, "getPillId", GetIdHook())
+        self.hook_all_methods(self.WeatherPill, "onPillClicked", InteractionHook())
+        self.hook_all_methods(self.WeatherPill, "onPillLongClicked", InteractionHook())
+        self.hook_all_methods(self.WeatherPill, "onUpdateData", InteractionHook())
+        self.hook_all_methods(self.WeatherPill, "setData", InteractionHook())
+
+    def ensure_ticker(self, widget: WidgetDef):
+        if widget.pill_id in self._tickers:
+            return
+        self._tickers.add(widget.pill_id)
+
+        def tick():
+            self.force_update_all(widget)
+            run_on_ui_thread(tick, delay=widget.update_interval * 1000)
+
+        self.force_update_all(widget)
+        run_on_ui_thread(tick, delay=widget.update_interval * 1000)
+
+    def _worker_loop(self):
+        while True:
+            widget = self._work_queue.get()
+            self._compute_and_apply(widget)
+            self._work_queue.task_done()
+
+    def _compute_and_apply(self, widget: WidgetDef):
+        try:
+            data = widget.compute(self)
+        except Exception as e:
+            self.log(f"ошибка вычисления {widget.key}: {e}")
+            return
+        self.last_data[widget.pill_id] = data
+
+        def apply():
+            for pill in list(self.active_pills.get(widget.pill_id, ())):
+                self.set_pill_appearance(pill, widget)
+                self.set_pill_icon(pill, widget.icon_res)
+                widget.render(self, pill, data)
+
+        run_on_ui_thread(apply)
+
+    def force_update_all(self, widget: WidgetDef, manual: bool = False):
+        if manual:
+            threading.Thread(target=lambda: self._compute_and_apply(widget), daemon=True).start()
+        else:
+            self._work_queue.put(widget)
+
+    def set_pill_appearance(self, pill, widget: WidgetDef):
+        try:
+            layout = get_private_field(pill, "layout")
+            if layout:
+                from android.graphics.drawable import GradientDrawable
+                drawable = GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    [jint(widget.color1), jint(widget.color2)],
+                )
+                drawable.setShape(GradientDrawable.RECTANGLE)
+                drawable.setCornerRadius(float(self.AndroidUtilities.dp(100)))
+                layout.setBackground(drawable)
+            tv = get_private_field(pill, "textView")
+            if tv:
+                from android.graphics import Color
+                tv.setTextColor(Color.WHITE)
+        except Exception as e:
+            self.log(f"ошибка стилизации пилюли: {e}")
+
+    def set_pill_icon(self, pill, icon_res: int):
+        if not icon_res:
+            return
+        try:
+            iv = get_private_field(pill, "iconView")
+            if not iv:
+                return
+            iv.setVisibility(jint(0))
+            try:
+                iv.setImageResource(jint(icon_res))
+            except Exception:
+                ctx = self.ApplicationLoader.applicationContext
+                drawable = ctx.getResources().getDrawable(jint(icon_res))
+                iv.setImageDrawable(drawable)
+            from android.graphics import Color, PorterDuff
+            iv.setColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN)
+        except Exception as e:
+            self.log(f"не удалось установить иконку пилюли: {e}")
+
+    def set_pill_text(self, pill, text: str):
+        try:
+            pill.stopLoading()
+            tv = get_private_field(pill, "textView")
+            if tv:
+                tv.setText(text)
+            iv = get_private_field(pill, "iconView")
+            if iv:
+                iv.setVisibility(jint(0))
+        except Exception as e:
+            self.log(f"ошибка отрисовки: {e}")
+
+    def show_pill_menu(self, pill, widget: WidgetDef):
+        try:
+            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+            fragment = LaunchActivity.getSafeLastFragment()
+            if not fragment:
+                return
+            ItemOptions = find_class("org.telegram.ui.Components.ItemOptions")
+            ctx = self.ApplicationLoader.applicationContext
+            res = ctx.getResources()
+            pkg = ctx.getPackageName()
+            icon_refresh = res.getIdentifier("msg_retry", "drawable", pkg)
+            options = ItemOptions.makeOptions(fragment, pill)
+            plugin_ref = self
+
+            class RefreshRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def run(self):
+                    plugin_ref.force_update_all(widget, manual=True)
+
+            class PluginSettingsRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def run(self):
+                    try:
+                        from com.exteragram.messenger.plugins import PluginsController
+                        PluginSettingsActivity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+                        java_plugin = PluginsController.getInstance().plugins.get(plugin_ref.id)
+                        if java_plugin:
+                            from client_utils import get_last_fragment
+                            get_last_fragment().presentFragment(PluginSettingsActivity(java_plugin))
+                    except Exception as e:
+                        plugin_ref.log(f"ошибка открытия настроек плагина: {e}")
+
+            class PillStackSettingsRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def run(self):
+                    try:
+                        PillStackPreferencesActivity = find_class(
+                            "com.exteragram.messenger.pillstack.ui.PillStackPreferencesActivity"
+                        )
+                        from client_utils import get_last_fragment
+                        get_last_fragment().presentFragment(PillStackPreferencesActivity())
+                    except Exception as e:
+                        plugin_ref.log(f"ошибка открытия настроек Pill Stack: {e}")
+
+            icon_settings = res.getIdentifier("msg_settings", "drawable", pkg)
+            refresh_runnable = RefreshRunnable()
+            plugin_settings_runnable = PluginSettingsRunnable()
+            pill_stack_settings_runnable = PillStackSettingsRunnable()
+            menu_refs = [refresh_runnable, plugin_settings_runnable, pill_stack_settings_runnable]
+            options.add(jint(icon_refresh), f"Обновить: {widget.title}", refresh_runnable)
+
+            if widget.extra_menu_actions:
+                Runnable = find_class("java.lang.Runnable")
+                for label, icon_name, callback in widget.extra_menu_actions(self, widget, pill):
+                    icon_extra = res.getIdentifier(icon_name, "drawable", pkg) or icon_refresh
+
+                    class ExtraActionRunnable(dynamic_proxy(Runnable)):
+                        def __init__(self, cb):
+                            super().__init__()
+                            self.cb = cb
+
+                        def run(self):
+                            self.cb()
+
+                    extra_runnable = ExtraActionRunnable(callback)
+                    menu_refs.append(extra_runnable)
+                    options.add(jint(icon_extra), label, extra_runnable)
+
+            options.addGap()
+            options.add(jint(icon_settings), "Настройки виджета", plugin_settings_runnable)
+            options.add(jint(icon_settings), "Настройки Pill Stack", pill_stack_settings_runnable)
+            self._menu_runnable_refs = menu_refs
+            options.setDrawScrim(False).setDimAlpha(jint(0)).show()
+        except Exception as e:
+            self.log(f"ошибка меню: {e}")
+
+    def create_settings(self) -> List[Any]:
+        from ui.settings import Divider, Header, Text
+
+        items: List[Any] = [Header(text="Pill Stack Plus")]
+        for widget in WIDGETS:
+            items.append(
+                Text(
+                    text=widget.title,
+                    icon=widget.icon_name,
+                    create_sub_fragment=lambda w=widget: self._widget_settings_page(w),
+                )
+            )
+        items.append(Divider())
+        items.append(Header(text="Связь с разработчиком"))
+        items.append(
+            Text(
+                text="Написать @Exorned",
+                icon="msg_info",
+                on_click=self._contact_dev,
+            )
+        )
+        return items
+
+    def _contact_dev(self, _view):
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/Exorned"))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            self.ApplicationLoader.applicationContext.startActivity(intent)
+        except Exception as e:
+            self.log(f"ошибка открытия ссылки на разработчика: {e}")
+
+    def _widget_settings_page(self, widget: WidgetDef) -> List[Any]:
+        from ui.settings import Header, Input
+
+        items: List[Any] = [
+            Header(text=widget.title),
+            Input(
+                key=f"interval_{widget.key}",
+                text="Интервал обновления (сек)",
+                default=str(widget.update_interval),
+                on_change=lambda v, w=widget: self._on_interval_change(w, v),
+            ),
+        ]
+        if widget.extra_settings:
+            items.extend(widget.extra_settings(self, widget))
+        return items
+
+    def _on_interval_change(self, widget: WidgetDef, value: str):
+        try:
+            interval = max(1, int(value))
+        except ValueError:
+            return
+        widget.update_interval = interval
+        self.set_setting(f"interval_{widget.key}", interval)
