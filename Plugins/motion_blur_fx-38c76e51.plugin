@@ -1,0 +1,389 @@
+# -*- coding: utf-8 -*-
+"""
+Motion Blur v1.1 для exteraGram.
+Компактный файл: парсер метаданных exteraGram обрезает файл на 20000
+символах перед ast.parse(), поэтому длинные комментарии не выношу сюда.
+Параметры - через Selector (список значений), т.к. самодельный SeekBar
+через Custom/SimpleSettingFactory ронял отрисовку экрана настроек.
+"""
+
+from typing import Any, List
+
+from android.graphics import RenderEffect, Shader
+from android.os import Build
+from android_utils import run_on_ui_thread
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+__id__ = "motion_blur_fx"
+__name__ = "Motion Blur"
+__description__ = "Направленное размытие в движении: скролл, свайпы, меню, свайп папок. Android 12+."
+__author__ = "@winrar738"
+__version__ = "1.1"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.10"
+
+MIN_SDK = 31
+INT_MIN, INT_MAX, INT_STEP, INT_DEF = 0, 30, 1, 8
+TRAIL_MIN, TRAIL_MAX, TRAIL_STEP, TRAIL_DEF = 0, 95, 5, 30
+FADE_MIN, FADE_MAX, FADE_STEP_VAL, FADE_DEF = 0, 1000, 50, 200
+PERP_RATIO, PERP_MAX = 0.12, 2.0
+FADE_STEP_MS = 20
+RADIUS_EPS = 0.2
+IDLE_TIMEOUT_MS = 140  # watchdog: авто-очистка, если не было движения дольше этого
+
+AXIS_Y, AXIS_X, AXIS_NONE = "y", "x", None
+LOC_CHAT, LOC_DIALOGS, LOC_ARCHIVE, LOC_OTHER = "chat", "dialogs", "archive", "other"
+
+
+def _items(mn, mx, step, suffix=""):
+    return [f"{v}{suffix}" for v in range(mn, mx + 1, step)]
+
+
+def _idx(value, mn, step):
+    return int(round((value - mn) / step))
+
+
+def _val(index, mn, step):
+    return mn + index * step
+
+
+INT_ITEMS = _items(INT_MIN, INT_MAX, INT_STEP)
+TRAIL_ITEMS = _items(TRAIL_MIN, TRAIL_MAX, TRAIL_STEP, "%")
+FADE_ITEMS = _items(FADE_MIN, FADE_MAX, FADE_STEP_VAL, " мс")
+INT_DEF_IDX = _idx(INT_DEF, INT_MIN, INT_STEP)
+TRAIL_DEF_IDX = _idx(TRAIL_DEF, TRAIL_MIN, TRAIL_STEP)
+FADE_DEF_IDX = _idx(FADE_DEF, FADE_MIN, FADE_STEP_VAL)
+
+
+def _classify(view) -> str:
+    try:
+        adapter = view.getAdapter()
+        if adapter is None:
+            return LOC_OTHER
+        name = str(adapter.getClass().getName())
+    except Exception:
+        return LOC_OTHER
+    if "ChatActivity" in name or "ChatAdapter" in name:
+        return LOC_CHAT
+    if "Dialogs" in name:
+        for g in ("getFolderId", "getDialogsType", "isArchive"):
+            try:
+                fn = getattr(adapter, g, None)
+                if fn is None:
+                    continue
+                r = fn()
+                if isinstance(r, bool) and r:
+                    return LOC_ARCHIVE
+                if isinstance(r, int) and r != 0:
+                    return LOC_ARCHIVE
+            except Exception:
+                continue
+        return LOC_DIALOGS
+    return LOC_OTHER
+
+
+class _ScrollBlurHook(MethodHook):
+    def __init__(self, p): self.p = p
+
+    def before_hooked_method(self, param):
+        if not self.p.ready() or not self.p.c_scroll:
+            return
+        view = param.thisObject
+        if not self.p.location_ok(view):
+            return
+        dy = param.args[1] if len(param.args) > 1 else 0
+        self.p.apply_blur(view, dy, AXIS_Y)
+
+
+class _ScrollStateHook(MethodHook):
+    IDLE = 0
+
+    def __init__(self, p): self.p = p
+
+    def after_hooked_method(self, param):
+        if not self.p.ready() or not self.p.c_scroll:
+            return
+        if param.args[0] == self.IDLE:
+            self.p.fade_out(param.thisObject)
+
+
+class _SwipeBlurHook(MethodHook):
+    def __init__(self, p): self.p = p
+
+    def before_hooked_method(self, param):
+        if not self.p.ready() or not self.p.c_swipe:
+            return
+        off = param.args[2] if len(param.args) > 2 else 0
+        self.p.apply_blur(param.thisObject, off, AXIS_X)
+
+    def after_hooked_method(self, param):
+        if not self.p.ready():
+            return
+        off = param.args[2] if len(param.args) > 2 else 0
+        if off == 0:
+            self.p.fade_out(param.thisObject)
+
+
+class _FolderSwipeHook(MethodHook):
+    DOWN, UP, MOVE, CANCEL = 0, 1, 2, 3
+
+    def __init__(self, p):
+        self.p = p
+        self.last_x = {}
+
+    def before_hooked_method(self, param):
+        if not self.p.ready() or not self.p.c_main_swipe:
+            return
+        view = param.thisObject
+        ev = param.args[0]
+        try:
+            action = ev.getActionMasked()
+            x = ev.getRawX()
+        except Exception:
+            return
+        key = id(view)
+        if action == self.DOWN:
+            self.last_x[key] = x
+        elif action == self.MOVE:
+            prev = self.last_x.get(key, x)
+            self.last_x[key] = x
+            self.p.apply_blur(view, x - prev, AXIS_X)
+        elif action in (self.UP, self.CANCEL):
+            self.last_x.pop(key, None)
+            self.p.fade_out(view)
+
+
+class _MenuShowHook(MethodHook):
+    def __init__(self, p): self.p = p
+
+    def before_hooked_method(self, param):
+        if not self.p.ready() or not self.p.c_menu:
+            return
+        try:
+            cv = param.thisObject.getContentView()
+            if cv:
+                self.p.apply_blur(cv, 40, AXIS_NONE)
+        except Exception as e:
+            self.p.log(f"Motion Blur: menu show hook: {e}")
+
+
+class _MenuDismissHook(MethodHook):
+    def __init__(self, p): self.p = p
+
+    def before_hooked_method(self, param):
+        if not self.p.ready():
+            return
+        try:
+            cv = param.thisObject.getContentView()
+            if cv:
+                self.p.fade_out(cv)
+        except Exception as e:
+            self.p.log(f"Motion Blur: menu dismiss hook: {e}")
+
+
+class MotionBlurPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.sdk_ok = Build.VERSION.SDK_INT >= MIN_SDK
+        self.radius, self.axis, self.loc_cache, self.fading, self.tok = {}, {}, {}, set(), {}
+        self.c_enabled = True
+        self.c_intensity = INT_DEF
+        self.c_trail = TRAIL_DEF / 100.0
+        self.c_fade_ms = FADE_DEF
+        self.c_scroll = self.c_swipe = self.c_menu = self.c_main_swipe = True
+        self.c_loc_chat = self.c_loc_dialogs = self.c_loc_archive = True
+
+    def on_plugin_load(self):
+        self.refresh()
+        if not self.sdk_ok:
+            self.log(f"Motion Blur: API {Build.VERSION.SDK_INT} < {MIN_SDK}, эффект неактивен.")
+            return
+        try:
+            self._install()
+            self.log("Motion Blur: хуки установлены.")
+        except Exception as e:
+            self.log(f"Motion Blur: ошибка установки хуков: {e}")
+
+    def on_plugin_unload(self):
+        self.radius.clear(); self.axis.clear(); self.loc_cache.clear(); self.fading.clear(); self.tok.clear()
+
+    def refresh(self):
+        g = self.get_setting
+        self.c_enabled = g("enabled", True)
+        self.c_intensity = _val(g("blur_intensity_idx", INT_DEF_IDX), INT_MIN, INT_STEP)
+        self.c_trail = _val(g("trail_length_idx", TRAIL_DEF_IDX), TRAIL_MIN, TRAIL_STEP) / 100.0
+        self.c_fade_ms = _val(g("fade_ms_idx", FADE_DEF_IDX), FADE_MIN, FADE_STEP_VAL)
+        self.c_scroll = g("enable_scroll", True)
+        self.c_swipe = g("enable_swipe", True)
+        self.c_menu = g("enable_menu", True)
+        self.c_main_swipe = g("enable_main_swipe", True)
+        self.c_loc_chat = g("loc_enable_chat", True)
+        self.c_loc_dialogs = g("loc_enable_dialogs", True)
+        self.c_loc_archive = g("loc_enable_archive", True)
+
+    def _install(self):
+        rv = find_class("androidx.recyclerview.widget.RecyclerView")
+        if rv:
+            self.hook_all_methods(rv, "onScrolled", _ScrollBlurHook(self))
+            self.hook_all_methods(rv, "onScrollStateChanged", _ScrollStateHook(self))
+        vp = find_class("androidx.viewpager.widget.ViewPager")
+        if vp:
+            self.hook_all_methods(vp, "onPageScrolled", _SwipeBlurHook(self))
+        fp = find_class("org.telegram.ui.Components.ViewPagerFixed")
+        if fp:
+            self.hook_all_methods(fp, "onTouchEvent", _FolderSwipeHook(self))
+        else:
+            self.log("Motion Blur: ViewPagerFixed не найден, свайп папок отключён.")
+        pw = find_class("android.widget.PopupWindow")
+        if pw:
+            self.hook_all_methods(pw, "showAsDropDown", _MenuShowHook(self))
+            self.hook_all_methods(pw, "dismiss", _MenuDismissHook(self))
+
+    def location_ok(self, view) -> bool:
+        key = id(view)
+        loc = self.loc_cache.get(key)
+        if loc is None:
+            loc = _classify(view)
+            if len(self.loc_cache) > 128:
+                self.loc_cache.clear()
+            self.loc_cache[key] = loc
+        if loc == LOC_CHAT:
+            return self.c_loc_chat
+        if loc == LOC_DIALOGS:
+            return self.c_loc_dialogs
+        if loc == LOC_ARCHIVE:
+            return self.c_loc_archive
+        return True
+
+    def ready(self) -> bool:
+        return self.sdk_ok and self.c_enabled
+
+    def apply_blur(self, view, raw_delta, axis):
+        if self.c_intensity <= 0:
+            return
+        key = id(view)
+        self.fading.discard(key)
+        self.tok[key] = self.tok.get(key, 0) + 1
+        my_tok = self.tok[key]
+        run_on_ui_thread(lambda: self._watchdog(view, key, my_tok), IDLE_TIMEOUT_MS)
+
+        speed = min(abs(raw_delta), 60) / 60.0
+        target = self.c_intensity * speed
+        prev = self.radius.get(key, 0.0)
+        r = prev + (target - prev) * (1.0 - self.c_trail)
+        if prev != 0.0 and abs(r - prev) < RADIUS_EPS:
+            return
+        self.radius[key] = r
+        self.axis[key] = axis
+        if r < 0.1:
+            return
+        self._set_blur(view, r, axis)
+        if len(self.radius) > 256:
+            self.radius.clear(); self.axis.clear()
+
+    def _watchdog(self, view, key, my_tok):
+        if self.tok.get(key) == my_tok:
+            self.fade_out(view)
+
+    def fade_out(self, view):
+        key = id(view)
+        cur = self.radius.get(key, 0.0)
+        axis = self.axis.get(key, AXIS_NONE)
+        if cur <= 0.1 or self.c_fade_ms <= 0:
+            self.radius.pop(key, None); self.axis.pop(key, None); self.fading.discard(key)
+            self._clear_blur(view)
+            return
+        steps = max(1, self.c_fade_ms // FADE_STEP_MS)
+        step_amount = cur / steps
+        self.fading.add(key)
+        self._fade_step(view, key, cur, axis, step_amount)
+
+    def _fade_step(self, view, key, r, axis, step_amount):
+        if key not in self.fading:
+            return
+        r -= step_amount
+        if r <= 0.5:
+            self.radius.pop(key, None); self.axis.pop(key, None); self.fading.discard(key)
+            self._clear_blur(view)
+            return
+        self.radius[key] = r
+        self._set_blur(view, r, axis)
+        run_on_ui_thread(lambda: self._fade_step(view, key, r, axis, step_amount), FADE_STEP_MS)
+
+    def _set_blur(self, view, r, axis):
+        perp = max(0.05, min(r * PERP_RATIO, PERP_MAX))
+        rx, ry = (perp, r) if axis == AXIS_Y else (r, perp) if axis == AXIS_X else (r, r)
+        try:
+            view.setRenderEffect(RenderEffect.createBlurEffect(rx, ry, Shader.TileMode.CLAMP))
+        except Exception as e:
+            self.log(f"Motion Blur: RenderEffect: {e}")
+
+    def _clear_blur(self, view):
+        try:
+            view.setRenderEffect(None)
+        except Exception as e:
+            self.log(f"Motion Blur: clear RenderEffect: {e}")
+
+    def _on_change(self, *_a):
+        self.refresh()
+
+    def _create_locations_page(self) -> List[Any]:
+        return [
+            Header(text="Места применения"),
+            Switch(key="loc_enable_chat", text="Экран переписки", default=True,
+                   subtext="Сообщения внутри открытого чата.", on_change=self._on_change),
+            Switch(key="loc_enable_dialogs", text="Список чатов", default=True,
+                   subtext="Главный экран со списком диалогов.", on_change=self._on_change),
+            Switch(key="loc_enable_archive", text="Архив", default=True,
+                   subtext="Экспериментально: архив и список чатов используют один экран.",
+                   on_change=self._on_change),
+        ]
+
+    def _noop_click(self, view):
+        pass
+
+    def create_settings(self) -> List[Any]:
+        try:
+            return self._build_settings()
+        except Exception as e:
+            self.log(f"Motion Blur: ошибка построения настроек: {e}")
+            return [
+                Header(text="Motion Blur (запасной режим)"),
+                Text(text=f"Ошибка: {e}"),
+                Switch(key="enabled", text="Включить Motion Blur", default=True, on_change=self._on_change),
+            ]
+
+    def _build_settings(self) -> List[Any]:
+        s: List[Any] = [Header(text="Motion Blur")]
+        if not self.sdk_ok:
+            s.append(Text(text=f"API {Build.VERSION.SDK_INT} < {MIN_SDK}, эффект неактивен.", red=True))
+            s.append(Divider())
+        s.append(Switch(key="enabled", text="Включить Motion Blur", default=True,
+                         subtext="Общий выключатель.", on_change=self._on_change))
+        s.append(Divider())
+        s.append(Header(text="Параметры размытия"))
+        s.append(Selector(key="blur_intensity_idx", text="Интенсивность",
+                           default=INT_DEF_IDX, items=INT_ITEMS, on_change=self._on_change))
+        s.append(Selector(key="trail_length_idx", text="Длина следа",
+                           default=TRAIL_DEF_IDX, items=TRAIL_ITEMS, on_change=self._on_change))
+        s.append(Selector(key="fade_ms_idx", text="Время исчезновения",
+                           default=FADE_DEF_IDX, items=FADE_ITEMS, on_change=self._on_change))
+        s.append(Divider())
+        s.append(Header(text="Применять эффект к"))
+        s.append(Switch(key="enable_scroll", text="Скролл", default=True,
+                         subtext="Списки чатов и сообщений.", on_change=self._on_change))
+        s.append(Switch(key="enable_swipe", text="Свайпы", default=True,
+                         subtext="Медиа-просмотрщик, вкладки.", on_change=self._on_change))
+        s.append(Switch(key="enable_main_swipe", text="Свайп в главном меню", default=True,
+                         subtext="Свайп между папками на главном экране.", on_change=self._on_change))
+        s.append(Switch(key="enable_menu", text="Меню", default=True,
+                         subtext="Всплывающие меню.", on_change=self._on_change))
+        s.append(Divider())
+        s.append(Text(text="Выбрать конкретные места", icon="msg_folders",
+                      subtext="Чат, список чатов, архив по отдельности.",
+                      on_click=self._noop_click, create_sub_fragment=self._create_locations_page))
+        return s
