@@ -1,0 +1,1456 @@
+__id__ = 'contact_self_name'
+__name__ = 'Contact Self Name'
+__description__ = 'Показывает самоназвание контакта и может локально подменять его имя в интерфейсе. Требуются публичный username и интернет.'
+__author__ = '@engiPlugins'
+__version__ = '1.1.2'
+__app_version__ = '>=12.5.1'
+__sdk_version__ = '>=1.4.0'
+import html
+import json
+import re
+from threading import Thread
+from urllib.request import Request, urlopen
+from android.view import HapticFeedbackConstants, MotionEvent, View
+from android_utils import OnClickListener, copy_to_clipboard, run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, set_private_field
+from java import dynamic_proxy, jint, jlong
+from java.lang import System
+from org.telegram.messenger import MessagesController, NotificationCenter, UserConfig
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch
+
+
+OVERRIDES_KEY = 'contact_self_name_overrides_v1'
+LOCAL_MODE_KEY = 'contact_self_name_local_mode_v1'
+
+
+class NameLongClickListener(dynamic_proxy(View.OnLongClickListener)):
+
+    def __init__(self, plugin, profile):
+        super().__init__()
+        self.plugin = plugin
+        self.profile = profile
+
+    def onLongClick(self, view):
+        if self.plugin is None or self.profile is None:
+            return False
+        return self.plugin._handle_name_long_click(self.profile, view)
+
+    def dispose(self):
+        self.plugin = None
+        self.profile = None
+
+
+class NameTouchFilterListener(dynamic_proxy(View.OnTouchListener)):
+
+    def __init__(self, plugin, profile):
+        super().__init__()
+        self.plugin = plugin
+        self.profile = profile
+        self.view = None
+        self.tracking = False
+        self.armed = False
+
+    def onTouch(self, view, event):
+        if self.plugin is None or self.profile is None:
+            return False
+        self.view = view
+        try:
+            action = int(event.getActionMasked())
+        except Exception:
+            action = int(event.getAction()) & 255
+        if action == MotionEvent.ACTION_DOWN:
+            self.tracking = True
+            if self.plugin._profile_photo_expanded(self.profile):
+                self.armed = False
+            else:
+                self.armed = bool(
+                    self.plugin._is_name_touch_inside(view, event)
+                )
+        elif action == MotionEvent.ACTION_MOVE:
+            if self.tracking and self.armed:
+                self.armed = bool(self.plugin._is_name_touch_inside(view, event))
+        elif action == MotionEvent.ACTION_UP:
+            if self.tracking and self.armed:
+                self.armed = bool(self.plugin._is_name_touch_inside(view, event))
+        elif action == MotionEvent.ACTION_CANCEL:
+            self.tracking = False
+            self.armed = False
+        return False
+
+    def _same_view(self, view):
+        if self.view is view:
+            return True
+        if self.view is None or view is None:
+            return False
+        try:
+            return int(System.identityHashCode(self.view)) == int(
+                System.identityHashCode(view)
+            )
+        except Exception:
+            return False
+
+    def consume_click(self, view):
+        if not self._same_view(view) or not self.tracking:
+            return None
+        result = bool(self.armed)
+        self.tracking = False
+        self.armed = False
+        return result
+
+    def accepts_long_click(self, view):
+        return self._same_view(view) and self.tracking and self.armed
+
+    def dispose(self):
+        self.plugin = None
+        self.profile = None
+        self.view = None
+        self.tracking = False
+        self.armed = False
+
+
+class ProfileUpdateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin._bind_profile(param.thisObject)
+
+class ProfileDestroyHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._handle_profile_destroy(param.thisObject)
+
+class ChatTitleHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._apply_chat_header(param.thisObject)
+        except Exception:
+            pass
+
+
+class DialogUpdateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._before_dialog_update(param.thisObject, param)
+
+
+class DialogNameLayoutHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._before_dialog_name_layout(param.thisObject)
+
+    def after_hooked_method(self, param):
+        self.plugin._after_dialog_name_layout(param.thisObject)
+
+
+class SurfaceNameHook(MethodHook):
+
+    def __init__(self, plugin, kind):
+        self.plugin = plugin
+        self.kind = kind
+
+    def before_hooked_method(self, param):
+        self.plugin._before_surface_name(self.kind, param.thisObject, param)
+
+    def after_hooked_method(self, param):
+        self.plugin._after_surface_name(self.kind, param.thisObject)
+
+
+class ContactSelfNamePlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._active = True
+        self._states = {}
+        self._name_cache = {}
+        self._fetching = set()
+        self._overrides = {}
+        self._override_cache = {}
+        self._dialog_name_stacks = {}
+        self._dialog_user_cache = {}
+        self._dialog_refresh_targets = set()
+        self._dialog_forced_cells = {}
+        self._surface_name_stacks = {}
+        self._surface_refresh_targets = set()
+        self._local_mode_cache = False
+        self._account_key_cache = {}
+
+    def on_plugin_load(self):
+        self._active = True
+        self._local_mode_cache = bool(self.get_setting(LOCAL_MODE_KEY, False))
+        self._account_key_cache = {}
+        self._load_overrides()
+        profile_class = find_class('org.telegram.ui.ProfileActivity')
+        avatar_class = find_class('org.telegram.ui.Components.ChatAvatarContainer')
+        dialog_cell_class = find_class('org.telegram.ui.Cells.DialogCell')
+        surface_specs = (
+            ('org.telegram.ui.Cells.UserCell', 'update', 'user_cell'),
+            ('org.telegram.ui.Cells.UserCell2', 'update', 'user_cell'),
+            ('org.telegram.ui.Cells.GroupCreateUserCell', 'update', 'group_cell'),
+            ('org.telegram.ui.Cells.ManageChatUserCell', 'update', 'manage_cell'),
+            ('org.telegram.ui.Cells.ProfileSearchCell', 'buildLayout', 'profile_search_layout'),
+            ('org.telegram.ui.Cells.ProfileSearchCell', 'update', 'profile_search_update'),
+            ('org.telegram.ui.Cells.ShareDialogCell', 'setDialog', 'share_cell'),
+        )
+        profile_hooks = title_hooks = dialog_hooks = surface_hooks = 0
+        if profile_class is not None:
+            profile_hooks += len(self.hook_all_methods(
+                profile_class, 'updateProfileData', ProfileUpdateHook(self)
+            ) or [])
+            profile_hooks += len(self.hook_all_methods(
+                profile_class, 'onFragmentDestroy', ProfileDestroyHook(self)
+            ) or [])
+        if avatar_class is not None:
+            title_hooks = len(self.hook_all_methods(
+                avatar_class, 'setTitle', ChatTitleHook(self)
+            ) or [])
+        if dialog_cell_class is not None:
+            dialog_hooks += len(self.hook_all_methods(
+                dialog_cell_class, 'update', DialogUpdateHook(self)
+            ) or [])
+            dialog_hooks += len(self.hook_all_methods(
+                dialog_cell_class, 'buildLayout', DialogNameLayoutHook(self)
+            ) or [])
+        for class_name, method_name, kind in surface_specs:
+            surface_class = find_class(class_name)
+            if surface_class is None:
+                continue
+            surface_hooks += len(self.hook_all_methods(
+                surface_class, method_name, SurfaceNameHook(self, kind)
+            ) or [])
+        if self._local_mode_enabled() and self._overrides:
+            run_on_ui_thread(self._refresh_loaded_overrides, 600)
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._restore_all_dialog_names()
+        self._restore_all_surface_names()
+        for state in list(self._states.values()):
+            self._detach_state(state, restore=True)
+        self._states.clear()
+        self._name_cache.clear()
+        self._fetching.clear()
+        self._override_cache.clear()
+        self._dialog_name_stacks.clear()
+        self._dialog_user_cache.clear()
+        self._dialog_refresh_targets.clear()
+        self._dialog_forced_cells.clear()
+        self._surface_name_stacks.clear()
+        self._surface_refresh_targets.clear()
+        self._account_key_cache.clear()
+        self._local_mode_cache = False
+
+    def _load_overrides(self):
+        try:
+            raw = self.get_setting(OVERRIDES_KEY, '{}')
+            data = json.loads(str(raw or '{}'))
+            self._overrides = {
+                str(key): str(value)
+                for key, value in data.items()
+                if isinstance(key, str) and isinstance(value, str) and value.strip()
+            }
+        except Exception:
+            self._overrides = {}
+
+    def _save_overrides(self):
+        self.set_setting(
+            OVERRIDES_KEY,
+            json.dumps(
+                self._overrides,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ),
+        )
+
+    def _account_key(self, account):
+        account = int(account)
+        cached = self._account_key_cache.get(account)
+        if cached is not None and str(cached).startswith('user_'):
+            return cached
+        try:
+            client_id = int(UserConfig.getInstance(account).getClientUserId())
+        except Exception:
+            client_id = 0
+        if client_id:
+            result = 'user_%s' % client_id
+            self._account_key_cache[account] = result
+            return result
+        if cached is not None:
+            return cached
+        result = 'slot_%s' % account
+        self._account_key_cache[account] = result
+        return result
+
+    def _override_key(self, identity):
+        account, user_id = identity
+        return '%s:contact_%s' % (self._account_key(account), int(user_id))
+
+    def _local_mode_enabled(self):
+        return bool(self._local_mode_cache)
+
+    def _override_for(self, identity):
+        if identity is None or not self._local_mode_enabled():
+            return None
+        cached = self._override_cache.get(identity)
+        if cached is not None:
+            return cached or None
+        value = self._overrides.get(self._override_key(identity))
+        self._override_cache[identity] = value or False
+        return value
+
+    def _mark_surface_refresh(self, identity):
+        if identity is not None:
+            self._surface_refresh_targets.add(tuple(identity))
+
+    def _set_override(self, identity, name):
+        self._mark_surface_refresh(identity)
+        value = str(name)
+        self._overrides[self._override_key(identity)] = value
+        self._override_cache[identity] = value
+        self._save_overrides()
+
+    def _delete_override(self, identity):
+        self._mark_surface_refresh(identity)
+        self._override_cache.pop(identity, None)
+        key = self._override_key(identity)
+        if key in self._overrides:
+            del self._overrides[key]
+            self._save_overrides()
+
+    def _notify_dialog_names_changed(self, account=None):
+        accounts = []
+        if account is not None:
+            accounts.append(int(account))
+        else:
+            try:
+                count = int(UserConfig.MAX_ACCOUNT_COUNT)
+            except Exception:
+                count = 4
+            accounts.extend(range(max(1, count)))
+        for current_account in accounts:
+            center = NotificationCenter.getInstance(jint(current_account))
+            update_ok = reload_ok = False
+            try:
+                center.postNotificationName(
+                    NotificationCenter.updateInterfaces,
+                    jint(MessagesController.UPDATE_MASK_NAME),
+                )
+                update_ok = True
+            except Exception as error:
+                pass
+            try:
+                center.postNotificationName(NotificationCenter.dialogsNeedReload)
+                reload_ok = True
+            except Exception as error:
+                pass
+        refreshed = set(self._surface_refresh_targets)
+        if refreshed:
+            def clear_surface_targets():
+                self._surface_refresh_targets.difference_update(refreshed)
+            run_on_ui_thread(clear_surface_targets, 1200)
+
+    def _override_identities(self):
+        result = set()
+        try:
+            count = int(UserConfig.MAX_ACCOUNT_COUNT)
+        except Exception:
+            count = 4
+        for account in range(max(1, count)):
+            prefix = '%s:contact_' % self._account_key(account)
+            for key in self._overrides:
+                if not key.startswith(prefix):
+                    continue
+                try:
+                    result.add((account, int(key[len(prefix):])))
+                except Exception:
+                    pass
+        return result
+
+    def _refresh_loaded_overrides(self):
+        if not self._active or not self._local_mode_enabled():
+            return
+        identities = self._override_identities()
+        if not identities:
+            return
+        self._dialog_refresh_targets.update(identities)
+        self._surface_refresh_targets.update(identities)
+        self._notify_dialog_names_changed()
+
+    def _on_local_mode_change(self, enabled):
+        self._local_mode_cache = bool(enabled)
+        if not self._local_mode_cache:
+            removed_identities = self._override_identities()
+            self._dialog_refresh_targets.update(removed_identities)
+            self._surface_refresh_targets.update(removed_identities)
+            self._overrides.clear()
+            self._save_overrides()
+            for state in list(self._states.values()):
+                if state.get('showing_self'):
+                    state['showing_self'] = False
+                    state['local_override'] = False
+                    self._set_name_text(state, state.get('saved_name', ''))
+            self._notify_dialog_names_changed()
+            BulletinHelper.show_info('Локальные подмены удалены')
+        else:
+            BulletinHelper.show_info('Локальная подмена включена')
+
+    def create_settings(self):
+        return [
+            Header(text='Режим нажатия'),
+            Switch(
+                key=LOCAL_MODE_KEY,
+                text='Локально заменять имя',
+                default=False,
+                subtext=(
+                    'Выключено — имя показывается временно. '
+                    'Включено — подмена сохраняется локально.'
+                ),
+                icon='msg_edit',
+                on_change=self._on_local_mode_change,
+            ),
+            Divider(
+                text=(
+                    'Telegram-контакт и имя на других устройствах не изменяются. '
+                    'Подмена работает в профиле, чатах, поиске, контактах, '
+                    'списках участников и окнах выбора получателя.'
+                )
+            ),
+        ]
+
+    def _profile_key(self, profile):
+        return int(System.identityHashCode(profile))
+
+    def _profile_identity(self, profile):
+        user_id = get_private_field(profile, 'userId')
+        if user_id is None or int(user_id) <= 0:
+            return None
+        account = get_private_field(profile, 'currentAccount')
+        if account is None:
+            account = UserConfig.selectedAccount
+        return (int(account), int(user_id))
+
+    def _messages_controller(self, profile, account):
+        try:
+            return profile.getMessagesController()
+        except Exception:
+            return MessagesController.getInstance(jint(account))
+
+    def _contact_data(self, profile):
+        identity = self._profile_identity(profile)
+        if identity is None:
+            return None
+        account, user_id = identity
+        controller = self._messages_controller(profile, account)
+        user = controller.getUser(jlong(user_id))
+        if user is None:
+            return None
+        try:
+            first_name = str(user.first_name or '').strip()
+        except Exception:
+            first_name = str(get_private_field(user, 'first_name') or '').strip()
+        try:
+            last_name = str(user.last_name or '').strip()
+        except Exception:
+            last_name = str(get_private_field(user, 'last_name') or '').strip()
+        try:
+            username = str(user.username or '').strip().lstrip('@')
+        except Exception:
+            username = str(get_private_field(user, 'username') or '').strip().lstrip('@')
+        try:
+            is_contact = bool(user.contact)
+        except Exception:
+            is_contact = bool(get_private_field(user, 'contact'))
+        cached_name = ' '.join((part for part in (first_name, last_name) if part)).strip()
+        return (identity, cached_name, username, is_contact)
+
+    def _name_views(self, profile):
+        result = []
+        views = get_private_field(profile, 'nameTextView')
+        if views is None:
+            return result
+        try:
+            for view in views:
+                if view is not None:
+                    result.append(view)
+        except Exception:
+            try:
+                for index in range(2):
+                    view = views[index]
+                    if view is not None:
+                        result.append(view)
+            except Exception:
+                pass
+        return result
+
+    def _visible_name(self, views):
+        fallback = ''
+        for view in views:
+            try:
+                text = str(view.getText() or '').strip()
+                if not text:
+                    continue
+                if bool(view.isShown()):
+                    return text
+                if not fallback:
+                    fallback = text
+            except Exception:
+                pass
+        return fallback
+
+    def _normalize(self, text):
+        return ' '.join(str(text or '').split()).casefold()
+
+    def _bind_profile(self, profile):
+        if not self._active or profile is None:
+            return
+        try:
+            data = self._contact_data(profile)
+            if data is None:
+                return
+            identity, cached_name, username, is_contact = data
+            if not is_contact:
+                self._detach_profile(profile, restore=True)
+                return
+            views = self._name_views(profile)
+            displayed = self._visible_name(views)
+            if not views or not displayed:
+                return
+            override = self._override_for(identity)
+            username_key = username.casefold()
+            public_name = override or (
+                self._name_cache.get(username_key) if username_key else None
+            )
+            key = self._profile_key(profile)
+            state = self._states.get(key)
+            created_state = state is None or state.get('profile') is not profile
+            if created_state:
+                state = {
+                    'profile': profile,
+                    'identity': identity,
+                    'saved_name': cached_name or displayed,
+                    'cached_name': cached_name,
+                    'username': username,
+                    'self_name': public_name,
+                    'showing_self': bool(override),
+                    'local_override': bool(override),
+                    'animating': False,
+                    'views': [],
+                    'long_listeners': [],
+                    'touch_listeners': [],
+                }
+                self._states[key] = state
+            else:
+                state['identity'] = identity
+                state['cached_name'] = cached_name
+                state['username'] = username
+                if override:
+                    state['self_name'] = override
+                    state['showing_self'] = True
+                    state['local_override'] = True
+                else:
+                    if public_name:
+                        state['self_name'] = public_name
+                    if state.get('local_override'):
+                        state['showing_self'] = False
+                        state['local_override'] = False
+                    if not state['showing_self']:
+                        state['saved_name'] = cached_name or displayed
+            binding = (identity, override or public_name, tuple(id(view) for view in views))
+            if not created_state and state.get('binding') == binding:
+                if state['showing_self'] and state.get('self_name'):
+                    self._set_name_text(state, state['self_name'])
+                return
+            self._detach_view_listeners(state)
+            state['binding'] = binding
+            state['views'] = views
+            state['long_listeners'] = []
+            state['touch_listeners'] = []
+            for view in views:
+                view.setClickable(True)
+                touch_listener = NameTouchFilterListener(self, profile)
+                state['touch_listeners'].append(touch_listener)
+                view.setOnTouchListener(touch_listener)
+                view.setOnClickListener(
+                    OnClickListener(
+                        lambda clicked, p=profile: self._handle_name_click(p, clicked)
+                    )
+                )
+                long_listener = NameLongClickListener(self, profile)
+                state['long_listeners'].append(long_listener)
+                view.setOnLongClickListener(long_listener)
+            if state['showing_self'] and state.get('self_name'):
+                self._set_name_text(state, state['self_name'])
+                if created_state:
+                    self._schedule_initial_profile_recenter(profile, state)
+        except Exception:
+            pass
+
+    def _schedule_initial_profile_recenter(self, profile, state):
+        if state.get('initial_recenter_pending'):
+            return
+        state['initial_recenter_pending'] = True
+        # The first Telegram layout was measured using the saved contact name.
+        # Recalculate once immediately, then once more after opening settles.
+        self._force_profile_recenter(profile)
+        settle = {'last': None, 'stable': 0, 'tries': 0}
+
+        def check_geometry():
+            current = self._states.get(self._profile_key(profile))
+            if not self._active or current is not state:
+                return
+            geometry = []
+            pending = False
+            for item in list(state.get('views', [])):
+                try:
+                    if not bool(item.isAttachedToWindow()):
+                        continue
+                    parent = item.getParent()
+                    item_pending = bool(item.isLayoutRequested())
+                    if parent is not None:
+                        try:
+                            item_pending = item_pending or bool(parent.isLayoutRequested())
+                        except Exception:
+                            pass
+                    pending = pending or item_pending
+                    geometry.append((
+                        int(System.identityHashCode(item)),
+                        int(item.getLeft()),
+                        int(item.getTop()),
+                        int(item.getRight()),
+                        int(item.getBottom()),
+                        round(float(item.getTranslationX()), 3),
+                        round(float(item.getTranslationY()), 3),
+                    ))
+                except Exception:
+                    pass
+            snapshot = tuple(geometry)
+            moving = self._profile_geometry_moving(profile)
+            settle['tries'] += 1
+            if snapshot and snapshot == settle['last'] and not pending and not moving:
+                settle['stable'] += 1
+            else:
+                settle['last'] = snapshot
+                settle['stable'] = 0
+            if settle['stable'] >= 3 or settle['tries'] >= 32:
+                self._force_profile_recenter(profile)
+                state['initial_recenter_pending'] = False
+            else:
+                run_on_ui_thread(check_geometry, 16)
+
+        run_on_ui_thread(check_geometry, 16)
+
+    def _profile_photo_expanded(self, profile):
+        if profile is None:
+            return False
+        try:
+            return bool(get_private_field(profile, 'isPulledDown'))
+        except Exception:
+            return False
+
+    def _touch_listener_for(self, state, view):
+        try:
+            view_key = int(System.identityHashCode(view))
+        except Exception:
+            view_key = None
+        for listener in list(state.get('touch_listeners', [])):
+            if listener.view is view:
+                return listener
+            if view_key is not None and listener.view is not None:
+                try:
+                    if int(System.identityHashCode(listener.view)) == view_key:
+                        return listener
+                except Exception:
+                    pass
+        return None
+
+    def _is_name_touch_inside(self, view, event):
+        try:
+            x = float(event.getX())
+            y = float(event.getY())
+            view_width = float(view.getWidth())
+            view_height = float(view.getHeight())
+            if view_width <= 0 or view_height <= 0:
+                return False
+
+            try:
+                density = float(view.getResources().getDisplayMetrics().density)
+            except Exception:
+                density = 1.0
+            tolerance = max(4.0, 6.0 * density)
+
+            text_left = text_right = text_top = text_bottom = None
+            layout = None
+            try:
+                layout = view.getLayout()
+            except Exception:
+                layout = None
+
+            # SimpleTextView draws its StaticLayout at layoutX/layoutY.
+            # MotionEvent coordinates are already local to the transformed view,
+            # so these are the exact bounds in both collapsed and expanded modes.
+            if layout is not None:
+                try:
+                    line_count = int(layout.getLineCount())
+                    if line_count > 0:
+                        layout_x = float(view.getLayoutX())
+                        layout_y = float(view.getLayoutY())
+                        text_left = min(
+                            layout_x + float(layout.getLineLeft(index))
+                            for index in range(line_count)
+                        )
+                        text_right = max(
+                            layout_x + float(layout.getLineRight(index))
+                            for index in range(line_count)
+                        )
+                        text_top = layout_y + float(layout.getLineTop(0))
+                        text_bottom = layout_y + float(
+                            layout.getLineBottom(line_count - 1)
+                        )
+                except Exception:
+                    text_left = text_right = text_top = text_bottom = None
+
+            if text_left is None or text_right is None:
+                try:
+                    text_width = float(view.getTextWidth())
+                except Exception:
+                    text_width = float(
+                        view.getPaint().measureText(str(view.getText() or ''))
+                    )
+                try:
+                    text_height = float(view.getTextHeight())
+                except Exception:
+                    metrics = view.getPaint().getFontMetrics()
+                    text_height = float(metrics.descent - metrics.ascent)
+                text_left = (view_width - text_width) / 2.0
+                text_right = text_left + text_width
+                text_top = (view_height - text_height) / 2.0
+                text_bottom = text_top + text_height
+
+            inside = (
+                text_left - tolerance <= x <= text_right + tolerance
+                and text_top - tolerance <= y <= text_bottom + tolerance
+            )
+            self._last_name_hit = (
+                round(x, 1),
+                round(y, 1),
+                round(text_left, 1),
+                round(text_right, 1),
+                round(text_top, 1),
+                round(text_bottom, 1),
+                bool(inside),
+            )
+            return bool(inside)
+        except Exception as error:
+            return False
+
+    def _profile_geometry_moving(self, profile):
+        try:
+            animator = get_private_field(profile, 'expandAnimator')
+            if animator is not None and bool(animator.isRunning()):
+                return True
+        except Exception:
+            pass
+        try:
+            list_view = get_private_field(profile, 'listView')
+            if list_view is not None and int(list_view.getScrollState()) != 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _toggle_name_when_profile_stable(self, profile):
+        state = self._states.get(self._profile_key(profile))
+        if state is None or state.get('pending_toggle'):
+            return
+        state['pending_toggle'] = True
+        settle = {'last': None, 'stable': 0, 'tries': 0}
+
+        def check_geometry():
+            current = self._states.get(self._profile_key(profile))
+            if not self._active or current is not state:
+                return
+            if self._profile_photo_expanded(profile):
+                state['pending_toggle'] = False
+                return
+            geometry = []
+            pending = False
+            for item in list(state.get('views', [])):
+                try:
+                    if not bool(item.isAttachedToWindow()) or not bool(item.isShown()):
+                        continue
+                    parent = item.getParent()
+                    item_pending = bool(item.isLayoutRequested())
+                    if parent is not None:
+                        try:
+                            item_pending = item_pending or bool(parent.isLayoutRequested())
+                        except Exception:
+                            pass
+                    pending = pending or item_pending
+                    geometry.append((
+                        int(System.identityHashCode(item)),
+                        int(item.getLeft()),
+                        int(item.getTop()),
+                        int(item.getRight()),
+                        int(item.getBottom()),
+                        round(float(item.getTranslationX()), 3),
+                        round(float(item.getTranslationY()), 3),
+                    ))
+                except Exception:
+                    pass
+            snapshot = tuple(geometry)
+            moving = self._profile_geometry_moving(profile)
+            settle['tries'] += 1
+            if snapshot and snapshot == settle['last'] and not pending and not moving:
+                settle['stable'] += 1
+            else:
+                settle['last'] = snapshot
+                settle['stable'] = 0
+            if settle['stable'] >= 3:
+                state['pending_toggle'] = False
+                self._toggle_name(profile)
+            elif settle['tries'] >= 32:
+                state['pending_toggle'] = False
+            else:
+                run_on_ui_thread(check_geometry, 16)
+
+        run_on_ui_thread(check_geometry, 16)
+
+    def _handle_name_click(self, profile, view):
+        state = self._states.get(self._profile_key(profile))
+        if state is None:
+            return
+        listener = self._touch_listener_for(state, view)
+        accepted = listener.consume_click(view) if listener is not None else None
+        if accepted is not True:
+            reason = 'outside text' if accepted is False else 'without tracked touch'
+            return
+        self._toggle_name_when_profile_stable(profile)
+
+    def _handle_name_long_click(self, profile, view):
+        state = self._states.get(self._profile_key(profile))
+        if state is None:
+            return False
+        listener = self._touch_listener_for(state, view)
+        if listener is None or not listener.accepts_long_click(view):
+            return False
+        return self._copy_visible_name(profile, view)
+
+    def _set_name_text(self, state, text):
+        for view in list(state.get('views', [])):
+            try:
+                if not bool(view.isAttachedToWindow()):
+                    continue
+                view.setText(text)
+                view.requestLayout()
+                view.invalidate()
+                parent = view.getParent()
+                if parent is not None:
+                    parent.requestLayout()
+                    parent.invalidate()
+            except Exception:
+                pass
+
+    def _force_profile_recenter(self, profile):
+        list_view = get_private_field(profile, 'listView')
+        if list_view is None:
+            return False
+        try:
+            if bool(list_view.canScrollVertically(jint(1))):
+                delta = 1
+            elif bool(list_view.canScrollVertically(jint(-1))):
+                delta = -1
+            else:
+                return False
+            list_view.scrollBy(jint(0), jint(delta))
+            list_view.scrollBy(jint(0), jint(-delta))
+            list_view.invalidate()
+            return True
+        except Exception as error:
+            return False
+
+    def _toggle_name(self, profile):
+        if not self._active:
+            return
+        state = self._states.get(self._profile_key(profile))
+        if state is None or state.get('animating'):
+            return
+        if not state.get('self_name'):
+            self._request_public_name(profile, state)
+            return
+        if self._normalize(state['saved_name']) == self._normalize(state['self_name']):
+            BulletinHelper.show_info('Самоназвание совпадает с именем контакта', profile)
+            return
+        if self._local_mode_enabled():
+            has_override = self._override_for(state.get('identity')) is not None
+            show_self = not has_override
+            if show_self:
+                self._set_override(state['identity'], state['self_name'])
+            else:
+                self._delete_override(state['identity'])
+            state['local_override'] = show_self
+            self._dialog_refresh_targets.add(tuple(state['identity']))
+        else:
+            show_self = not state['showing_self']
+        target = state['self_name'] if show_self else state['saved_name']
+
+        animated_views = []
+        for view in list(state.get('views', [])):
+            try:
+                if not bool(view.isAttachedToWindow()) or not bool(view.isShown()):
+                    continue
+                alpha = float(view.getAlpha())
+                if alpha > 0.01:
+                    animated_views.append((view, alpha))
+            except Exception:
+                pass
+        if not animated_views:
+            state['showing_self'] = show_self
+            self._set_name_text(state, target)
+            self._force_profile_recenter(profile)
+            return
+
+        state['animating'] = True
+        state['animation_views'] = animated_views
+        try:
+            for view, original_alpha in animated_views:
+                view.animate().cancel()
+                view.animate().alpha(0.0).setDuration(80).start()
+        except Exception as error:
+            for view, original_alpha in animated_views:
+                try:
+                    view.animate().cancel()
+                    view.setAlpha(float(original_alpha))
+                except Exception:
+                    pass
+            state['animating'] = False
+            state['animation_views'] = []
+            state['showing_self'] = show_self
+            self._set_name_text(state, target)
+            self._force_profile_recenter(profile)
+            return
+
+        def swap_hidden():
+            if not self._active or self._states.get(self._profile_key(profile)) is not state:
+                return
+            try:
+                current_views = list(state.get('animation_views', []))
+                for view, original_alpha in current_views:
+                    try:
+                        view.animate().cancel()
+                        view.setAlpha(0.0)
+                    except Exception:
+                        pass
+                state['showing_self'] = show_self
+                self._set_name_text(state, target)
+                self._force_profile_recenter(profile)
+
+                settle = {'last': None, 'stable': 0, 'tries': 0}
+
+                def geometry_snapshot(views):
+                    values = []
+                    layout_pending = False
+                    for view, original_alpha in views:
+                        try:
+                            if not bool(view.isAttachedToWindow()):
+                                continue
+                            parent = view.getParent()
+                            pending = bool(view.isLayoutRequested())
+                            if parent is not None:
+                                try:
+                                    pending = pending or bool(parent.isLayoutRequested())
+                                except Exception:
+                                    pass
+                            layout_pending = layout_pending or pending
+                            values.append((
+                                int(System.identityHashCode(view)),
+                                int(view.getLeft()),
+                                int(view.getTop()),
+                                int(view.getRight()),
+                                int(view.getBottom()),
+                                int(view.getMeasuredWidth()),
+                                int(view.getMeasuredHeight()),
+                                round(float(view.getX()), 3),
+                                round(float(view.getY()), 3),
+                                round(float(view.getTranslationX()), 3),
+                                round(float(view.getTranslationY()), 3),
+                            ))
+                        except Exception:
+                            pass
+                    return tuple(values), layout_pending
+
+                def start_fade_in(reason):
+                    if not self._active or self._states.get(self._profile_key(profile)) is not state:
+                        return
+                    current_views = list(state.get('animation_views', []))
+                    for view, original_alpha in current_views:
+                        try:
+                            if bool(view.isAttachedToWindow()):
+                                view.animate().cancel()
+                                view.setAlpha(0.0)
+                                view.animate().alpha(float(original_alpha)).setDuration(120).start()
+                        except Exception:
+                            pass
+
+                    def finish_animation():
+                        if self._states.get(self._profile_key(profile)) is not state:
+                            return
+                        state['animating'] = False
+                        state['animation_views'] = []
+                    run_on_ui_thread(finish_animation, 130)
+
+                def wait_for_stable_layout():
+                    if not self._active or self._states.get(self._profile_key(profile)) is not state:
+                        return
+                    current_views = list(state.get('animation_views', []))
+                    geometry, pending = geometry_snapshot(current_views)
+                    settle['tries'] += 1
+                    if geometry and geometry == settle['last'] and not pending:
+                        settle['stable'] += 1
+                    else:
+                        settle['last'] = geometry
+                        settle['stable'] = 0
+                    if settle['stable'] >= 3:
+                        start_fade_in('settled')
+                    elif settle['tries'] >= 32:
+                        start_fade_in('timeout')
+                    else:
+                        run_on_ui_thread(wait_for_stable_layout, 16)
+
+                run_on_ui_thread(wait_for_stable_layout, 16)
+            except Exception as error:
+                for view, original_alpha in list(state.get('animation_views', [])):
+                    try:
+                        view.animate().cancel()
+                        view.setAlpha(float(original_alpha))
+                    except Exception:
+                        pass
+                state['animating'] = False
+                state['animation_views'] = []
+        run_on_ui_thread(swap_hidden, 88)
+
+    def _parse_public_name(self, page):
+        patterns = ('<div[^>]+class="[^"]*tgme_page_title[^"]*"[^>]*>\\s*<span[^>]*>(.*?)</span>', '<meta[^>]+property="og:title"[^>]+content="([^"]+)"', '<meta[^>]+content="([^"]+)"[^>]+property="og:title"')
+        for pattern in patterns:
+            match = re.search(pattern, page, re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            value = re.sub('<[^>]+>', '', match.group(1))
+            value = ' '.join(html.unescape(value).split()).strip()
+            if value and (not value.lower().startswith('telegram:')):
+                return value
+        return None
+
+    def _request_public_name(self, profile, state):
+        username = str(state.get('username') or '').strip()
+        if not username or re.fullmatch(r'[A-Za-z0-9_]{3,64}', username) is None:
+            BulletinHelper.show_info('У контакта нет публичного username', profile)
+            return
+        username_key = username.casefold()
+        if username_key in self._fetching:
+            BulletinHelper.show_info('Самоназвание уже загружается', profile)
+            return
+        self._fetching.add(username_key)
+        BulletinHelper.show_info('Получаю самоназвание…', profile)
+
+        def worker():
+            public_name = None
+            try:
+                request = Request('https://t.me/%s' % username, headers={'User-Agent': 'Mozilla/5.0 (Android) ContactSelfName/1.0', 'Accept-Language': 'ru,en;q=0.8'})
+                with urlopen(request, timeout=8) as response:
+                    if int(response.getcode()) != 200:
+                        raise RuntimeError('unexpected HTTP status')
+                    page = response.read(524288).decode('utf-8', 'replace')
+                public_name = self._parse_public_name(page)
+                if not public_name:
+                    raise RuntimeError('public profile name not found')
+            except Exception as error:
+                pass
+
+            def finish():
+                self._fetching.discard(username_key)
+                if not self._active:
+                    return
+                current = self._states.get(self._profile_key(profile))
+                if current is not state or current.get('username', '').casefold() != username_key:
+                    return
+                if public_name:
+                    self._name_cache[username_key] = public_name
+                    state['self_name'] = public_name
+                    self._toggle_name(profile)
+                else:
+                    BulletinHelper.show_error('Не удалось получить самоназвание', profile)
+            run_on_ui_thread(finish)
+        try:
+            Thread(target=worker, daemon=True).start()
+        except Exception:
+            self._fetching.discard(username_key)
+            BulletinHelper.show_error('Не удалось запустить загрузку', profile)
+
+    def _copy_visible_name(self, profile, view=None):
+        state = self._states.get(self._profile_key(profile))
+        if state is None:
+            return False
+        text = state.get('self_name') if state['showing_self'] else state['saved_name']
+        if not text:
+            return False
+        copy_to_clipboard(text)
+        if view is not None:
+            try:
+                view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            except Exception:
+                pass
+        BulletinHelper.show_success('Имя скопировано', profile)
+        return True
+
+    def _surface_account(self, cell):
+        account = get_private_field(cell, 'currentAccount')
+        if account is None:
+            account = UserConfig.selectedAccount
+        return int(account)
+
+    def _looks_like_user(self, value):
+        if value is None:
+            return False
+        try:
+            if get_private_field(value, 'bot') is not None:
+                return int(get_private_field(value, 'id') or 0) > 0
+        except Exception:
+            pass
+        return False
+
+    def _surface_user(self, kind, cell):
+        if kind.startswith('profile_search') or kind == 'share_cell':
+            user = get_private_field(cell, 'user')
+            return user if self._looks_like_user(user) else None
+        user = get_private_field(cell, 'currentObject')
+        return user if self._looks_like_user(user) else None
+
+    def _surface_identity_and_user(self, kind, cell):
+        user = self._surface_user(kind, cell)
+        if user is None:
+            return None, None
+        user_id = get_private_field(user, 'id')
+        if user_id is None or int(user_id) <= 0:
+            return None, user
+        return (self._surface_account(cell), int(user_id)), user
+
+    def _surface_identity(self, kind, cell):
+        return self._surface_identity_and_user(kind, cell)[0]
+
+    def _surface_original_name(self, cell, user):
+        current_name = get_private_field(cell, 'currentName')
+        if current_name is not None and str(current_name).strip():
+            return current_name
+        first_name = str(get_private_field(user, 'first_name') or '').strip()
+        last_name = str(get_private_field(user, 'last_name') or '').strip()
+        return ' '.join(part for part in (first_name, last_name) if part).strip()
+
+    def _push_surface_frame(self, cell, frame):
+        key = int(System.identityHashCode(cell))
+        self._surface_name_stacks.setdefault(key, []).append(frame)
+
+    def _pop_surface_frame(self, cell):
+        key = int(System.identityHashCode(cell))
+        stack = self._surface_name_stacks.get(key)
+        if not stack:
+            return None
+        frame = stack.pop()
+        if not stack:
+            self._surface_name_stacks.pop(key, None)
+        return frame
+
+    def _restore_surface_frame(self, frame):
+        if frame is None:
+            return
+        try:
+            frame_type = frame[0]
+            if frame_type == 'field':
+                set_private_field(frame[1], frame[2], frame[3])
+            elif frame_type == 'arg':
+                frame[1].args[frame[2]] = frame[3]
+        except Exception:
+            pass
+
+    def _before_surface_name(self, kind, cell, param):
+        frame = None
+        if not self._active or (
+            not self._local_mode_enabled() and not self._surface_refresh_targets
+        ):
+            return
+        if (
+            kind in ('user_cell', 'group_cell', 'manage_cell', 'profile_search_update')
+            and not self._surface_refresh_targets
+        ):
+            return
+        try:
+            if kind == 'share_cell':
+                uid = int(param.args[0])
+                if uid > 0:
+                    identity = (self._surface_account(cell), uid)
+                    override = self._override_for(identity)
+                    if override and len(param.args) > 2:
+                        old_name = param.args[2]
+                        param.args[2] = override
+                        frame = ('arg', param, 2, old_name)
+            elif kind == 'profile_search_layout':
+                identity = self._surface_identity(kind, cell)
+                override = self._override_for(identity)
+                if override:
+                    old_name = get_private_field(cell, 'currentName')
+                    set_private_field(cell, 'currentName', override)
+                    frame = ('field', cell, 'currentName', old_name)
+            elif kind in ('user_cell', 'group_cell', 'manage_cell', 'profile_search_update'):
+                identity = self._surface_identity(kind, cell)
+                if identity in self._surface_refresh_targets and param.args:
+                    param.args[0] = jint(0)
+        except Exception as error:
+            pass
+        self._push_surface_frame(cell, frame)
+
+    def _after_surface_name(self, kind, cell):
+        frame = self._pop_surface_frame(cell)
+        self._restore_surface_frame(frame)
+        if not self._active or (
+            not self._local_mode_enabled() and not self._surface_refresh_targets
+        ):
+            return
+        try:
+            if kind in ('user_cell', 'group_cell', 'manage_cell'):
+                identity, user = self._surface_identity_and_user(kind, cell)
+                if identity is None:
+                    return
+                override = self._override_for(identity)
+                if not override and identity not in self._surface_refresh_targets:
+                    return
+                text = override or self._surface_original_name(cell, user)
+                name_view = get_private_field(cell, 'nameTextView')
+                if name_view is not None and text and str(name_view.getText() or '') != str(text):
+                    name_view.setText(text)
+                    name_view.requestLayout()
+                    name_view.invalidate()
+                    cell.invalidate()
+            elif kind == 'profile_search_update':
+                identity = self._surface_identity(kind, cell)
+                override = self._override_for(identity)
+                if not override and identity not in self._surface_refresh_targets:
+                    return
+                if int(cell.getMeasuredWidth()) > 0:
+                    cell.buildLayout()
+                    cell.requestLayout()
+                    cell.invalidate()
+        except Exception as error:
+            pass
+
+    def _restore_all_surface_names(self):
+        for stack in list(self._surface_name_stacks.values()):
+            while stack:
+                self._restore_surface_frame(stack.pop())
+        self._surface_name_stacks.clear()
+
+    def _apply_chat_header(self, container):
+        if not self._active or not self._local_mode_enabled():
+            return
+        fragment = get_private_field(container, 'parentFragment')
+        if fragment is None:
+            return
+        try:
+            user = fragment.getCurrentUser()
+        except Exception:
+            user = None
+        if user is None or int(user.id) <= 0:
+            return
+        account = get_private_field(container, 'currentAccount')
+        if account is None:
+            account = UserConfig.selectedAccount
+        override = self._override_for((int(account), int(user.id)))
+        if not override:
+            return
+        try:
+            title = container.getTitleTextView()
+        except Exception:
+            title = get_private_field(container, 'titleTextView')
+        if title is not None and str(title.getText() or '') != str(override):
+            title.setText(override)
+            title.requestLayout()
+            title.invalidate()
+
+    def _dialog_identity(self, cell):
+        dialog_id = get_private_field(cell, 'currentDialogId')
+        if dialog_id is None or int(dialog_id) <= 0:
+            return None
+        account = get_private_field(cell, 'currentAccount')
+        if account is None:
+            account = UserConfig.selectedAccount
+        return int(account), int(dialog_id)
+
+    def _set_user_name_fields(self, user, first_name, last_name):
+        try:
+            user.first_name = first_name
+            user.last_name = last_name
+        except Exception:
+            set_private_field(user, 'first_name', first_name)
+            set_private_field(user, 'last_name', last_name)
+
+    def _before_dialog_update(self, cell, param):
+        # Normal name substitution happens in buildLayout. update() only
+        # needs forcing when a local override was changed or removed.
+        if not self._active or not self._dialog_refresh_targets:
+            return
+        try:
+            identity = self._dialog_identity(cell)
+            if identity not in self._dialog_refresh_targets:
+                return
+            helper = get_private_field(cell, 'updateHelper')
+            if helper is not None:
+                set_private_field(helper, 'lastDrawnDialogId', jlong(-1))
+            if param.args:
+                param.args[0] = jint(0)
+        except Exception:
+            pass
+
+    def _dialog_user(self, identity):
+        if identity is None:
+            return None
+        user = self._dialog_user_cache.get(identity)
+        if user is not None:
+            return user
+        account, user_id = identity
+        user = MessagesController.getInstance(jint(account)).getUser(jlong(user_id))
+        if user is not None:
+            if len(self._dialog_user_cache) >= 256:
+                self._dialog_user_cache.pop(next(iter(self._dialog_user_cache)), None)
+            self._dialog_user_cache[identity] = user
+        return user
+
+    def _before_dialog_name_layout(self, cell):
+        if not self._active or (
+            not self._local_mode_enabled() and not self._dialog_refresh_targets
+        ):
+            return
+        try:
+            identity = self._dialog_identity(cell)
+            refreshing = identity in self._dialog_refresh_targets
+            override = self._override_for(identity)
+            if not override and not refreshing:
+                return
+
+            key = int(System.identityHashCode(cell))
+            stack = self._dialog_name_stacks.setdefault(key, [])
+            frame = None
+            if refreshing:
+                helper = get_private_field(cell, 'updateHelper')
+                if helper is not None:
+                    set_private_field(helper, 'lastDrawnDialogId', jlong(-1))
+                    self._dialog_forced_cells[key] = identity
+            if override:
+                user = self._dialog_user(identity)
+                if user is not None:
+                    first_name = str(user.first_name or '')
+                    last_name = str(user.last_name or '')
+                    self._set_user_name_fields(user, override, '')
+                    frame = (user, first_name, last_name)
+            stack.append(frame)
+        except Exception:
+            pass
+
+    def _after_dialog_name_layout(self, cell):
+        key = int(System.identityHashCode(cell))
+        stack = self._dialog_name_stacks.get(key)
+        if not stack:
+            return
+        frame = stack.pop()
+        if not stack:
+            self._dialog_name_stacks.pop(key, None)
+        if frame is not None:
+            user, first_name, last_name = frame
+            try:
+                self._set_user_name_fields(user, first_name, last_name)
+            except Exception:
+                pass
+        identity = self._dialog_forced_cells.pop(key, None)
+        if identity is not None:
+            self._dialog_refresh_targets.discard(identity)
+
+    def _restore_all_dialog_names(self):
+        for stack in list(self._dialog_name_stacks.values()):
+            for frame in reversed(stack):
+                if frame is None:
+                    continue
+                user, first_name, last_name = frame
+                try:
+                    self._set_user_name_fields(user, first_name, last_name)
+                except Exception:
+                    pass
+
+    def _detach_view_listeners(self, state):
+        for view in list(state.get('views', [])):
+            try:
+                view.setOnTouchListener(None)
+                view.setOnClickListener(None)
+                view.setOnLongClickListener(None)
+            except Exception:
+                pass
+        for listener in list(state.get('long_listeners', [])):
+            try:
+                listener.dispose()
+            except Exception:
+                pass
+        for listener in list(state.get('touch_listeners', [])):
+            try:
+                listener.dispose()
+            except Exception:
+                pass
+        state['long_listeners'] = []
+        state['touch_listeners'] = []
+
+    def _detach_state(self, state, restore):
+        self._detach_view_listeners(state)
+        for view, original_alpha in list(state.get('animation_views', [])):
+            try:
+                view.animate().cancel()
+                view.setAlpha(float(original_alpha))
+            except Exception:
+                pass
+        if restore and state.get('showing_self'):
+            self._set_name_text(state, state.get('saved_name', ''))
+        state['views'] = []
+        state['animating'] = False
+        state['animation_views'] = []
+
+    def _handle_profile_destroy(self, profile):
+        identity = self._profile_identity(profile)
+        self._detach_profile(profile, restore=True)
+        if identity is not None and self._local_mode_enabled():
+            account, user_id = identity
+            self._dialog_refresh_targets.add(tuple(identity))
+            self._surface_refresh_targets.add(tuple(identity))
+            run_on_ui_thread(
+                lambda current_account=account: self._notify_dialog_names_changed(
+                    current_account
+                ),
+                120,
+            )
+
+    def _detach_profile(self, profile, restore):
+        if profile is None:
+            return
+        state = self._states.pop(self._profile_key(profile), None)
+        if state is not None:
+            self._detach_state(state, restore)
