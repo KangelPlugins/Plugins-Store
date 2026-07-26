@@ -1,0 +1,636 @@
+from typing import Any, List
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Divider, Text
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment, send_message, send_audio
+from android_utils import log, run_on_ui_thread
+from org.telegram.messenger import ApplicationLoader, AndroidUtilities, UserConfig
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui import ChatActivity
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from android.view import Gravity
+from android.widget import LinearLayout, EditText, Toast
+from android.media import MediaRecorder, MediaMetadataRetriever
+from android.content import Intent
+from android.net import Uri
+from android.os import Build, Bundle
+from java.io import File, FileOutputStream, FileInputStream
+from java.lang import Long, Integer
+from java.util import ArrayList
+import json
+import os
+import time
+
+__id__ = "voice_collector"
+__name__ = "Voice Collector"
+__description__ = "Сохранение войсов/mp3 в библиотеку. И отправка в виде голосовых сообщений"
+__author__ = "@HzzzPlugins -> @exoseo"
+__version__ = "0.9.3"
+__icon__ = "UtyaDuckFull/8"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+
+class AudioCollectorPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self._recorder = None
+        self._recording_path = None
+        self._pending_add_name = None
+        self._welcome_shown = False
+        self._ensure_dir()
+
+    def _ensure_dir(self):
+        d = self._get_dir()
+        if not d.exists():
+            d.mkdirs()
+
+    def _get_dir(self):
+        ctx = ApplicationLoader.applicationContext
+        return File(ctx.getExternalFilesDir(None), "AudioCollector")
+
+    def _get_library(self):
+        try:
+            lib_path = File(self._get_dir(), "library.json")
+            if not lib_path.exists():
+                return []
+            with open(lib_path.getAbsolutePath(), "r") as f:
+                return json.loads(f.read())
+        except Exception:
+            return []
+
+    def _save_library(self, library):
+        try:
+            lib_path = File(self._get_dir(), "library.json")
+            with open(lib_path.getAbsolutePath(), "w") as f:
+                f.write(json.dumps(library))
+            self.set_setting("_library_ts", int(time.time()), reload_settings=True)
+        except Exception as e:
+            log(f"AudioCollector save_library error: {e}")
+
+    def _resolve_peer_id(self, peer):
+        if isinstance(peer, int):
+            return peer
+        if hasattr(peer, "user_id"):
+            return peer.user_id
+        if hasattr(peer, "channel_id"):
+            return -peer.channel_id
+        if hasattr(peer, "chat_id"):
+            return -peer.chat_id
+        return None
+
+    def _get_duration(self, path):
+        try:
+            retriever = MediaMetadataRetriever()
+            retriever.setDataSource(path)
+            dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            retriever.release()
+            return int(dur) // 1000 if dur else 0
+        except Exception:
+            return 0
+
+    def _get_mime_type(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".mp3":
+            return "audio/mpeg"
+        if ext == ".wav":
+            return "audio/wav"
+        if ext == ".ogg":
+            return "audio/ogg"
+        return "audio/mpeg"
+
+    def _send_voice(self, peer_id, path, reply_to_msg=None):
+        try:
+            duration = self._get_duration(path)
+            f = File(path)
+            mime = self._get_mime_type(path)
+
+            doc = TLRPC.TL_document()
+            doc.id = 0
+            doc.access_hash = 0
+            doc.file_reference = bytearray(0)
+            doc.date = int(time.time())
+            doc.mime_type = mime
+            doc.size = int(f.length())
+            doc.dc_id = 0
+            doc.attributes = ArrayList()
+
+            attr = TLRPC.TL_documentAttributeAudio()
+            attr.voice = True
+            attr.duration = duration
+            doc.attributes.add(attr)
+
+            send_message({
+                "peer": peer_id,
+                "path": path,
+                "document": doc,
+                "replyToMsg": reply_to_msg,
+            })
+        except Exception as e:
+            log(f"AudioCollector _send_voice error: {e}, falling back to send_audio")
+            try:
+                send_audio(peer_id, path, replyToMsg=reply_to_msg)
+            except Exception as e2:
+                log(f"AudioCollector send_audio fallback error: {e2}")
+
+    def _get_document_path(self, account, reply_to_msg):
+        try:
+            msg = reply_to_msg.messageOwner if hasattr(reply_to_msg, "messageOwner") else reply_to_msg
+            if msg is None:
+                return None
+
+            attach_path = getattr(msg, "attachPath", None)
+            if attach_path and File(attach_path).exists():
+                return attach_path
+
+            media = getattr(msg, "media", None)
+            if media is None:
+                return None
+
+            document = getattr(media, "document", None)
+            if document is None:
+                return None
+
+            try:
+                from org.telegram.messenger import FileLoader
+                file_loader = FileLoader.getInstance(account)
+                if file_loader:
+                    path = file_loader.getPathToAttach(document, None, False)
+                    if path and File(str(path)).exists():
+                        return str(path)
+            except Exception as e:
+                log(f"AudioCollector FileLoader error: {e}")
+
+            try:
+                from org.telegram.messenger import FileLoader
+                file_loader = FileLoader.getInstance(account)
+                if file_loader:
+                    path = file_loader.getPathToAttach(document, None, True)
+                    if path and File(str(path)).exists():
+                        return str(path)
+            except Exception:
+                pass
+
+            file_name = None
+            attrs = getattr(document, "attributes", None)
+            if attrs:
+                for attr in attrs:
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        file_name = attr.file_name
+                        break
+
+            if file_name:
+                ctx = ApplicationLoader.applicationContext
+                for sub in ["Telegram/Telegram Audio", "Telegram/Telegram Documents", "Telegram/Telegram Voice"]:
+                    guess = File(ctx.getExternalFilesDir(None), sub + "/" + file_name)
+                    if guess.exists():
+                        return guess.getAbsolutePath()
+
+        except Exception as e:
+            log(f"AudioCollector get_document_path error: {e}")
+        return None
+
+    def _extract_file_name(self, document):
+        try:
+            attrs = getattr(document, "attributes", None)
+            if attrs:
+                for attr in attrs:
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        return attr.file_name
+            mime = getattr(document, "mime_type", "")
+            if "ogg" in mime or "opus" in mime:
+                return "voice.ogg"
+            if "mp3" in mime or "mpeg" in mime:
+                return "audio.mp3"
+            if "wav" in mime:
+                return "audio.wav"
+        except Exception:
+            pass
+        return "audio.bin"
+
+    def _copy_file_to_library(self, src_path, suggested_name):
+        try:
+            ext = os.path.splitext(suggested_name)[1].lower()
+            if not ext:
+                ext = ".mp3"
+            base = os.path.splitext(suggested_name)[0] if "." in suggested_name else suggested_name
+            if not base:
+                base = "audio"
+            dest_name = f"{base}_{int(time.time())}{ext}"
+            dest = File(self._get_dir(), dest_name)
+
+            inp = FileInputStream(File(src_path))
+            out = FileOutputStream(dest)
+            buf = bytearray(8192)
+            while True:
+                n = inp.read(buf)
+                if n <= 0:
+                    break
+                out.write(buf, 0, n)
+            inp.close()
+            out.close()
+            return dest.getAbsolutePath()
+        except Exception as e:
+            log(f"AudioCollector copy_file error: {e}")
+            return None
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+
+        text = params.message.strip()
+
+        if text == ".gs add":
+            return self._handle_gs_add(account, params)
+
+        if text != ".gs":
+            return HookResult()
+
+        peer_id = self._resolve_peer_id(getattr(params, "peer", None))
+        reply_to_msg = getattr(params, "replyToMsg", None)
+
+        if peer_id is None:
+            return HookResult()
+
+        library = self._get_library()
+        if not library:
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        def show_library():
+            try:
+                activity = get_last_fragment().getParentActivity()
+                if not activity:
+                    return
+
+                builder = AlertDialogBuilder(activity)
+                builder.set_title("Библиотека аудио")
+
+                items = [a["name"] for a in library]
+
+                def on_item_click(bld, which):
+                    bld.dismiss()
+                    audio = library[which]
+                    path = audio.get("path", "")
+                    if path and File(path).exists():
+                        self._send_voice(peer_id, path, reply_to_msg)
+                    else:
+                        log("AudioCollector: file not found")
+
+                builder.set_items(items, on_item_click)
+                builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+                builder.show()
+            except Exception as e:
+                log(f"AudioCollector show_library error: {e}")
+
+        run_on_ui_thread(show_library)
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _handle_gs_add(self, account: int, params: Any) -> HookResult:
+        try:
+            reply_to_msg = getattr(params, "replyToMsg", None)
+            if reply_to_msg is None:
+                run_on_ui_thread(lambda: Toast.makeText(
+                    ApplicationLoader.applicationContext,
+                    "Ответь реплаем на аудио", Toast.LENGTH_SHORT
+                ).show())
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            src_path = self._get_document_path(account, reply_to_msg)
+            if not src_path:
+                run_on_ui_thread(lambda: Toast.makeText(
+                    ApplicationLoader.applicationContext,
+                    "Файл не найден локально. Попробуй ещё раз", Toast.LENGTH_SHORT
+                ).show())
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            msg = reply_to_msg.messageOwner if hasattr(reply_to_msg, "messageOwner") else reply_to_msg
+            media = getattr(msg, "media", None) if msg else None
+            document = getattr(media, "document", None) if media else None
+            suggested_name = self._extract_file_name(document) if document else os.path.basename(src_path)
+
+            dest_path = self._copy_file_to_library(src_path, suggested_name)
+            if not dest_path:
+                run_on_ui_thread(lambda: Toast.makeText(
+                    ApplicationLoader.applicationContext,
+                    "Ошибка копирования файла", Toast.LENGTH_SHORT
+                ).show())
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            self._pending_add_name = os.path.splitext(os.path.basename(dest_path))[0]
+            run_on_ui_thread(lambda: self._show_name_dialog(dest_path))
+
+        except Exception as e:
+            log(f"AudioCollector _handle_gs_add error: {e}")
+            run_on_ui_thread(lambda: Toast.makeText(
+                ApplicationLoader.applicationContext,
+                "Ошибка: %s" % str(e), Toast.LENGTH_SHORT
+            ).show())
+
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _on_add_audio_click(self, view):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Добавить mp3/wav")
+            builder.set_message(
+                "Чтобы добавить mp3/wav,кинь его в чат и ответь реплаем «.gs add»"
+                " | По размеру желательно до минуты,иначе отправляется как аудио"
+            )
+
+            def on_saved_messages(bld, which):
+                bld.dismiss()
+                self._open_saved_messages()
+
+            def on_cancel(bld, which):
+                bld.dismiss()
+
+            builder.set_positive_button("Перейти в избранное", on_saved_messages)
+            builder.set_negative_button("Отмена", on_cancel)
+            builder.show()
+
+        except Exception as e:
+            log(f"AudioCollector add audio dialog error: {e}")
+
+    def _open_saved_messages(self):
+        try:
+            current_account = UserConfig.selectedAccount
+            user_id = UserConfig.getInstance(current_account).getClientUserId()
+
+            fragment = get_last_fragment()
+            if fragment:
+                args = Bundle()
+                try:
+                    args.putLong("user_id", user_id)
+                except Exception:
+                    args.putInt("user_id", int(user_id))
+
+                fragment.presentFragment(ChatActivity(args))
+                return
+        except Exception as e:
+            log(f"AudioCollector open_saved_messages fragment error: {e}")
+
+        try:
+            current_account = UserConfig.selectedAccount
+            user_id = UserConfig.getInstance(current_account).getClientUserId()
+            context = ApplicationLoader.applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(f"tg://openmessage?user_id={user_id}"))
+            intent.setPackage(context.getPackageName())
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        except Exception as e2:
+            log(f"AudioCollector open_saved_messages intent error: {e2}")
+
+    def _show_name_dialog(self, path):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setGravity(Gravity.CENTER_HORIZONTAL)
+            layout.setPadding(
+                AndroidUtilities.dp(24),
+                AndroidUtilities.dp(16),
+                AndroidUtilities.dp(24),
+                AndroidUtilities.dp(16),
+            )
+
+            edit = EditText(activity)
+            edit.setText(self._pending_add_name or "голосовуха")
+            layout.addView(edit, -1, -2)
+
+            def on_save(bld, which):
+                name = str(edit.getText()).strip()
+                if not name:
+                    name = "audio"
+                library = self._get_library()
+                library.append({"name": name, "path": path})
+                self._save_library(library)
+                bld.dismiss()
+                ctx = ApplicationLoader.applicationContext
+                Toast.makeText(ctx, "Аудио добавлено!", Toast.LENGTH_SHORT).show()
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Название аудио")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", on_save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+
+        except Exception as e:
+            log(f"AudioCollector name dialog error: {e}")
+
+    def _on_record_click(self, view):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+
+            if self._recorder is not None:
+                try:
+                    self._recorder.stop()
+                    self._recorder.release()
+                except Exception:
+                    pass
+                self._recorder = None
+
+                if self._recording_path and File(self._recording_path).exists():
+                    self._pending_add_name = "запись_%d" % int(time.time())
+                    self._show_name_dialog(self._recording_path)
+                self._recording_path = None
+                return
+
+            plugin_dir = self._get_dir()
+            self._recording_path = os.path.join(
+                plugin_dir.getAbsolutePath(), "voice_%d.ogg" % int(time.time())
+            )
+
+            self._recorder = MediaRecorder()
+            self._recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+
+            if Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q:
+                self._recorder.setOutputFormat(MediaRecorder.OutputFormat.OGG)
+                self._recorder.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
+            else:
+                self._recorder.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                self._recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+
+            self._recorder.setOutputFile(self._recording_path)
+            self._recorder.prepare()
+            self._recorder.start()
+
+        except Exception as e:
+            log(f"AudioCollector record error: {e}")
+            self._recorder = None
+
+    def _on_audio_item_click(self, view, index):
+        try:
+            library = self._get_library()
+            if index >= len(library):
+                return
+
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+
+            audio = library[index]
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(audio["name"])
+
+            def on_action_click(bld, which):
+                bld.dismiss()
+                if which == 0:
+                    self._show_rename_dialog(index)
+                elif which == 1:
+                    library.pop(index)
+                    self._save_library(library)
+
+            builder.set_items(["Переименовать", "Удалить"], on_action_click)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+
+        except Exception as e:
+            log(f"AudioCollector item click error: {e}")
+
+    def _show_rename_dialog(self, index):
+        try:
+            activity = get_last_fragment().getParentActivity()
+            if not activity:
+                return
+
+            library = self._get_library()
+            if index >= len(library):
+                return
+
+            layout = LinearLayout(activity)
+            layout.setOrientation(LinearLayout.VERTICAL)
+            layout.setGravity(Gravity.CENTER_HORIZONTAL)
+            layout.setPadding(
+                AndroidUtilities.dp(24),
+                AndroidUtilities.dp(16),
+                AndroidUtilities.dp(24),
+                AndroidUtilities.dp(16),
+            )
+
+            edit = EditText(activity)
+            edit.setText(library[index]["name"])
+            layout.addView(edit, -1, -2)
+
+            def on_save(bld, which):
+                new_name = str(edit.getText()).strip()
+                if new_name:
+                    library[index]["name"] = new_name
+                    self._save_library(library)
+                bld.dismiss()
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Переименовать")
+            builder.set_view(layout)
+            builder.set_positive_button("Сохранить", on_save)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+
+        except Exception as e:
+            log(f"AudioCollector rename error: {e}")
+
+    def _open_tg_link(self, username: str):
+        try:
+            context = ApplicationLoader.applicationContext
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(f"tg://resolve?domain={username}"))
+            intent.setPackage(context.getPackageName())
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        except Exception as e:
+            log(f"AudioCollector open tg link error: {e}")
+
+    def _show_welcome_dialog(self):
+        try:
+            current_fragment = get_last_fragment()
+            if not current_fragment:
+                return
+            activity = current_fragment.getParentActivity()
+            if not activity:
+                return
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(__name__)
+            builder.set_message("⚠️ Ты скачал прекрасный невероятно полезный плагин!")
+
+            def on_hide(bld, which):
+                self.set_setting("welcome_shown", True)
+                bld.dismiss()
+
+            def on_channel(bld, which):
+                self.set_setting("welcome_shown", True)
+                self._open_tg_link("HzzzPlugins")
+                bld.dismiss()
+
+            builder.set_positive_button("Залет в такой же крутой канал 💅", on_channel)
+            builder.set_negative_button("Скрыть", on_hide)
+            builder.show()
+        except Exception as e:
+            log(f"AudioCollector welcome dialog error: {e}")
+
+    def create_settings(self) -> List[Any]:
+        if not self._welcome_shown and not self.get_setting("welcome_shown", False):
+            self._welcome_shown = True
+            run_on_ui_thread(self._show_welcome_dialog)
+
+        library = self._get_library()
+        settings = [
+            Header(text="Voice Collector"),
+        ]
+
+        if library:
+            for i, audio in enumerate(library, 1):
+                settings.append(
+                    Text(
+                        text=f"{i}. {audio['name']}",
+                        subtext="переименовать/удалить",
+                        on_click=lambda v, idx=i-1: self._on_audio_item_click(v, idx),
+                    )
+                )
+        else:
+            settings.append(Text(text="Библиотека пуста", icon="msg_info"))
+
+        settings.append(Divider(text="ᅠ"))
+
+        settings.append(
+            Text(
+                text="Добавить mp3/wav",
+                on_click=self._on_add_audio_click,
+            )
+        )
+
+        record_text = "Остановить запись" if self._recorder is not None else "Записать голосом"
+        settings.append(
+            Text(
+                text=record_text,
+                icon="msg_mic",
+                on_click=self._on_record_click,
+            )
+        )
+
+        settings.append(Divider(text="ᅠ"))
+        settings.append(Divider(text="Использование: .gs в чате | Можно кидать в том числе и реплаем"))
+
+        settings.append(
+            Text(
+                text="Канал: @HzzzPlugins",
+                on_click=lambda v: self._open_tg_link("HzzzPlugins"),
+            )
+        )
+        settings.append(
+            Text(
+                text="Сделал: @exoseo",
+                on_click=lambda v: self._open_tg_link("exoseo"),
+            )
+        )
+
+        return settings
