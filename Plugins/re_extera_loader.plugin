@@ -3,7 +3,7 @@ __id__ = "re_extera_loader"
 __name__ = "aartzz's re:extera"
 __description__ = "Actively maintained FOSS fork. Enable ghost mode, save deleted messages and more!"
 __author__ = "@shiawasez | @shikaatuxplugins \noriginal author: @bleizixPlugins\nFOSS recovery by @fossSquad & @migor1103"
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 __icon__ = "myadestes_1_amashiro_natsuki_plus_nacho_neko/30"
 __min_version__ = "12.8.1"
 
@@ -711,8 +711,21 @@ class Plugin(BasePlugin):
 
     def _on_copy_logs(self):
         try:
-            log_text = "\n".join(self._logs) if self._logs else "No logs"
-            AndroidUtilities.addToClipboard(log_text)
+            java_logs = ""
+            if self.loader and self.loader.dex_main_class:
+                try:
+                    get_logs_method = self.loader.dex_main_class.getMethod("getLogs")
+                    java_logs = str(get_logs_method.invoke(None))
+                except Exception as e:
+                    self.log(f"Failed to fetch Java logs: {e}")
+                    
+            plugin_logs = "\n".join(self._logs) if self._logs else "No plugin logs"
+            
+            full_logs = "=== Loader Logs ===\n" + plugin_logs
+            if java_logs:
+                full_logs += "\n\n=== Hook Logs ===\n" + java_logs
+                
+            AndroidUtilities.addToClipboard(full_logs)
             BulletinHelper.show_info(_localize("logs_copied"), get_last_fragment())
         except Exception as e:
             self.log(f"Error copying logs: {e}")
