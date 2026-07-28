@@ -1,0 +1,2497 @@
+"""
+ozonsearch — плагин для exteraGram
+поиск товаров на Ozon (цена, скидка, рейтинг, отзывы, ссылка)
+сделан @RapFurBitches для 420Corp / 420Studio
+канал разработчика: @ccsFM
+
+ВАЖНО ПРО ИСТОЧНИК ДАННЫХ:
+ у Ozon нет публичного API. Плагин работает с тем же JSON, который
+ запрашивает сайт (entrypoint-api / composer-api), а при неудаче парсит
+ data-state из HTML. Ozon активно защищается от ботов, поэтому:
+  - запросы идут через одну сессию с cookie-jar и «прогревом» главной
+  - есть 5 стратегий получения данных с ретраями
+  - в настройках можно вставить свои cookie из браузера (Сеть и доступ)
+  - при блокировке плагин присылает понятную ошибку + ссылку на поиск
+
+v1.0.0:
+ - .ozon <запрос> + фильтры (до/от цены, сортировки, оценка, отзывы)
+ - каскад стратегий получения данных, cookie-сессия, кэш выдачи
+ - устойчивый извлекатель товаров (deep-walk по JSON, а не хрупкие пути)
+ - слайдеры в настройках, предпросмотр карточки, логи и сырой ответ в dev
+"""
+
+from typing import Any, List
+
+import os
+import io
+import re
+import gc
+import ssl
+import zlib
+import json
+import time
+import inspect
+import weakref
+import threading
+import traceback
+import urllib.request
+import urllib.parse
+import urllib.error
+import http.cookiejar
+from html import unescape as html_unescape
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, AppEvent
+from ui.settings import Header, Input, Switch, Divider, Text, Selector
+from ui.bulletin import BulletinHelper
+from client_utils import send_message, get_last_fragment
+from android_utils import run_on_ui_thread, log
+
+__id__ = "ozonsearch_ozon_420"
+__name__ = "OzonSearch"
+__description__ = ("Поиск товаров на Ozon прямо в чате: .ozon [запрос] — название, цена, "
+                   "скидка, рейтинг, отзывы и ссылка. Фильтры: до/от цены, дешёвые, "
+                   "дорогие, новинки, скидки, оценка N, отзывов N")
+__author__ = "@RapFurBitches"
+__version__ = "1.0.0"
+# пак-иконка: известный рабочий пак (как в anisearch). Если хочешь свою —
+# поменяй на любой существующий пак, при отсутствии клиент просто нарисует дефолт
+__icon__ = "Animasha26/22"
+__min_version__ = "12.1.1"
+
+SDK_INFO = "1.4.3.3"
+
+OZON_BASE = "https://www.ozon.ru"
+DEFAULT_CMD = ".ozon"
+
+UA_MOBILE = ("Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+UA_DESKTOP = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# порядок важен: сначала «дешёвые» JSON-эндпоинты, HTML — последний резерв
+API_ENDPOINTS = (
+    ("api-entry-www", "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"),
+    ("api-comp-www", "https://www.ozon.ru/api/composer-api.bx/page/json/v2"),
+    ("api-entry-alt", "https://api.ozon.ru/entrypoint-api.bx/page/json/v2"),
+    ("api-comp-alt", "https://api.ozon.ru/composer-api.bx/page/json/v2"),
+)
+
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = True
+SSL_CONTEXT.verify_mode = ssl.CERT_REQUIRED
+
+SEPARATORS = [
+    "━━━━━━━━━━━━━━━",
+    "┅┅┅┅┅┅┅┅┅┅┅┅┅",
+    "═══════════════",
+    "• • • • • • • • •",
+    "",
+]
+
+SORT_VALUES = [None, "price", "price_desc", "new", "rating", "discount"]
+
+# ── диапазоны слайдеров: (min, max, step, default) ──────────────────
+R_COUNT = (1, 15, 1, 5)        # товаров в ответе
+R_TITLE = (30, 140, 5, 70)     # длина названия, символы
+R_RATE = (0, 50, 5, 0)         # мин. оценка ×10 (0 = любая)
+R_REVIEWS = (0, 100, 5, 0)     # мин. число отзывов
+R_PAGES = (1, 5, 1, 2)         # страниц выдачи максимум
+R_TIMEOUT = (5, 40, 1, 15)     # таймаут запроса, секунды
+R_TRIES = (1, 4, 1, 2)         # попыток на стратегию
+R_CACHE = (0, 30, 1, 5)        # TTL кэша выдачи, минуты
+
+MAX_LOG_ENTRIES = 150
+MAX_LOG_SHOWN = 60
+MAX_DIALOG_CHARS = 9000
+LOG_CHUNK = 700
+RAW_LIMIT = 40000            # сколько символов сырого ответа держим для dev
+HTML_LIMIT = 3 * 1024 * 1024  # верхний предел чтения HTML-страницы
+WARM_TTL = 900.0             # как часто «прогревать» сессию, секунды
+CACHE_MAX = 20
+
+_RATE_LOCK = threading.Lock()
+_LAST_REQ_TS = [0.0]
+_MIN_INTERVAL = 0.8   # Ozon не любит частые запросы: ~1.2 req/sec максимум
+
+# ── совместимость UI (перенесено из anisearch, поведение то же) ─────
+
+_ITEM_KW_CACHE = {}
+_ANY = "__any__"
+
+SLIDER_CLS = None
+SLIDER_NAME = None
+try:
+    import ui.settings as _ui_settings_mod
+    for _cand_name in ("Slider", "SliderSetting", "SliderInput", "SeekBar", "Range"):
+        _cand = getattr(_ui_settings_mod, _cand_name, None)
+        if _cand is not None:
+            SLIDER_CLS = _cand
+            SLIDER_NAME = _cand_name
+            break
+except Exception:
+    SLIDER_CLS = None
+
+def _item_allowed(cls):
+    """set имён kwargs, которые принимает конструктор элемента настроек,
+    или None если определить не удалось. Состав полей у Switch/Text/
+    Selector/Slider различается между версиями SDK — один лишний kwarg
+    рушит всю страницу настроек с TypeError."""
+    cached = _ITEM_KW_CACHE.get(cls)
+    if cached is not None:
+        return None if cached == _ANY else cached
+
+    names = set()
+    fields = getattr(cls, "__dataclass_fields__", None)
+    if isinstance(fields, dict):
+        names.update(fields.keys())
+
+    var_kw = False
+    try:
+        sig = inspect.signature(cls.__init__)
+        for name, p in sig.parameters.items():
+            if name == "self":
+                continue
+            if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
+                var_kw = True
+                continue
+            names.add(name)
+    except Exception:
+        pass
+
+    if not names or (var_kw and not fields):
+        _ITEM_KW_CACHE[cls] = _ANY
+        return None
+    _ITEM_KW_CACHE[cls] = names
+    return names
+
+# ── сеть: низкий уровень ───────────────────────────────────────────
+
+class OzonError(Exception):
+    pass
+
+class OzonBlocked(OzonError):
+    """антибот / 403 / 429 / отдали HTML-заглушку вместо данных"""
+
+class OzonUnavailable(OzonError):
+    """сеть, таймаут, 5xx, битый ответ"""
+
+def _throttle():
+    with _RATE_LOCK:
+        now = time.time()
+        wait = _MIN_INTERVAL - (now - _LAST_REQ_TS[0])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQ_TS[0] = time.time()
+
+def _read_text(resp, limit=None):
+    """Читает ответ и сам разжимает gzip/deflate по магическим байтам.
+    Заголовкам не доверяем: при частичном чтении (limit) поток обрезан,
+    поэтому decompressobj — он терпит усечение и отдаёт что успел."""
+    raw = resp.read(limit) if limit else resp.read()
+    if not raw:
+        return ""
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = zlib.decompressobj(47).decompress(raw)
+        except Exception:
+            pass
+    else:
+        enc = ""
+        try:
+            enc = (resp.headers.get("Content-Encoding") or "").lower()
+        except Exception:
+            pass
+        if "deflate" in enc:
+            for wbits in (15, -15):
+                try:
+                    raw = zlib.decompressobj(wbits).decompress(raw)
+                    break
+                except Exception:
+                    continue
+    return raw.decode("utf-8", "replace")
+
+DATA_STATE_ID_RE = re.compile(r'id="state-([^"]+)"[^>]*?data-state="(.*?)"', re.S)
+DATA_STATE_RE = re.compile(r'data-state="(.*?)"', re.S)
+
+def _states_from_html(html):
+    """SSR-версия страницы Ozon хранит состояние виджетов в data-state="{...}".
+    Приводим её к тому же виду, что и JSON API, чтобы извлекатель был один."""
+    states = {}
+    pairs = DATA_STATE_ID_RE.findall(html or "")
+    if pairs:
+        for key, raw in pairs:
+            s = html_unescape(raw)
+            if s.strip()[:1] not in "{[":
+                continue
+            try:
+                states[key] = json.loads(s)
+            except Exception:
+                continue
+    if not states:
+        for i, raw in enumerate(DATA_STATE_RE.findall(html or "")):
+            s = html_unescape(raw)
+            if s.strip()[:1] not in "{[":
+                continue
+            try:
+                states["html-{}".format(i)] = json.loads(s)
+            except Exception:
+                continue
+    return {"widgetStates": states}
+
+class OzonSession:
+    """Одна долгая сессия: cookie-jar + прогрев главной страницы.
+    Без cookie антибот отдаёт заглушку почти всегда, поэтому это не
+    «красивость», а условие работоспособности."""
+
+    def __init__(self, logger):
+        self._log = logger
+        self._lock = threading.Lock()
+        self._opener = None
+        self._warm_ts = 0.0
+        self.last_raw = ""
+        self.last_strategy = ""
+        self.last_status = ""
+
+    def reset(self):
+        with self._lock:
+            self._opener = None
+            self._warm_ts = 0.0
+        self._log("сессия и cookie сброшены")
+
+    def _get_opener(self):
+        with self._lock:
+            if self._opener is None:
+                jar = http.cookiejar.CookieJar()
+                self._opener = urllib.request.build_opener(
+                    urllib.request.HTTPCookieProcessor(jar),
+                    urllib.request.HTTPSHandler(context=SSL_CONTEXT),
+                )
+            return self._opener
+
+    def _remember(self, text, strategy):
+        self.last_raw = (text or "")[:RAW_LIMIT]
+        self.last_strategy = strategy
+
+    @staticmethod
+    def _base_headers(ua, cookie):
+        h = {
+            "User-Agent": ua,
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        if cookie:
+            h["Cookie"] = cookie
+        return h
+
+    def _api_headers(self, ua, cookie, page_url):
+        h = self._base_headers(ua, cookie)
+        h.update({
+            "Accept": "application/json, text/plain, */*",
+            "Referer": OZON_BASE + page_url,
+            "Origin": OZON_BASE,
+            "x-o3-app-name": "dweb_client",
+            "x-o3-app-version": "release-2-0",
+            "x-o3-page-type": "search",
+            "x-requested-with": "XMLHttpRequest",
+        })
+        return h
+
+    def _html_headers(self, ua, cookie):
+        h = self._base_headers(ua, cookie)
+        h.update({
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "image/avif,image/webp,*/*;q=0.8"),
+            "Upgrade-Insecure-Requests": "1",
+            "Referer": OZON_BASE + "/",
+        })
+        return h
+
+    def _open(self, url, headers, timeout, limit=None):
+        _throttle()
+        req = urllib.request.Request(url, headers=headers)
+        resp = None
+        try:
+            resp = self._get_opener().open(req, timeout=timeout)
+            self.last_status = "HTTP {}".format(getattr(resp, "status", "?"))
+            return _read_text(resp, limit)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = _read_text(e, 4096)
+            except Exception:
+                pass
+            self.last_status = "HTTP {}".format(e.code)
+            if e.code in (401, 403, 429, 503):
+                raise OzonBlocked("HTTP {} · {}".format(e.code, body[:180].replace("\n", " ")))
+            raise OzonUnavailable("HTTP {} · {}".format(e.code, body[:180].replace("\n", " ")))
+        except urllib.error.URLError as e:
+            self.last_status = "URLError"
+            raise OzonUnavailable("URLError: {}".format(getattr(e, "reason", e)))
+        except OzonError:
+            raise
+        except Exception as e:
+            self.last_status = type(e).__name__
+            raise OzonUnavailable("{}: {}".format(type(e).__name__, e))
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+    def warm_up(self, ua, cookie, timeout):
+        if time.time() - self._warm_ts < WARM_TTL:
+            return
+        try:
+            self._open(OZON_BASE + "/", self._html_headers(ua, cookie), timeout, limit=65536)
+            self._warm_ts = time.time()
+            self._log("прогрев сессии ok")
+        except Exception as e:
+            self._log("прогрев не удался: {}".format(e), level="WARN")
+
+    def fetch_page(self, page_url, ua, cookie, timeout, tries, allow_html=True):
+        """Каскад стратегий. Возвращает (data, strategy_name).
+        Бросает OzonBlocked/OzonUnavailable, если не сработало ничего."""
+        blocked = 0
+        last_err = None
+
+        for name, base in API_ENDPOINTS:
+            url = "{}?url={}".format(base, urllib.parse.quote(page_url, safe=""))
+            for attempt in range(max(1, tries)):
+                try:
+                    text = self._open(url, self._api_headers(ua, cookie, page_url), timeout)
+                except OzonBlocked as e:
+                    last_err = e
+                    blocked += 1
+                    break
+                except OzonUnavailable as e:
+                    last_err = e
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                if not text.strip():
+                    last_err = OzonUnavailable("пустой ответ")
+                    continue
+                if text.lstrip()[:1] not in "{[":
+                    # вместо JSON приехала HTML-заглушка антибота
+                    self._remember(text, name + " (антибот)")
+                    last_err = OzonBlocked("не JSON от {}".format(name))
+                    blocked += 1
+                    break
+                try:
+                    data = json.loads(text)
+                except Exception as e:
+                    last_err = OzonUnavailable("битый JSON: {}".format(e))
+                    continue
+                self._remember(text, name)
+                return data, name
+
+        if allow_html:
+            url = OZON_BASE + page_url
+            for attempt in range(max(1, tries)):
+                try:
+                    html = self._open(url, self._html_headers(ua, cookie), timeout,
+                                      limit=HTML_LIMIT)
+                except OzonBlocked as e:
+                    last_err = e
+                    blocked += 1
+                    break
+                except OzonUnavailable as e:
+                    last_err = e
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                data = _states_from_html(html)
+                if data.get("widgetStates"):
+                    self._remember(html, "html")
+                    return data, "html"
+                self._remember(html, "html (без data-state)")
+                last_err = OzonBlocked("HTML без состояния виджетов")
+                break
+
+        if blocked or isinstance(last_err, OzonBlocked):
+            raise OzonBlocked(str(last_err or "антибот"))
+        raise OzonUnavailable(str(last_err or "нет ответа"))
+
+# ── извлечение товаров из произвольного JSON ───────────────────────
+
+PRICE_RE = re.compile(r"(\d[\d\s\u00a0\u2009\u202f]{0,15})\s*(?:₽|руб)", re.I)
+RATING_STR_RE = re.compile(r"^([0-5](?:[.,]\d)?)$")
+REVIEWS_RE = re.compile(r"(\d[\d\s\u00a0]*)\s*(?:отзыв\w*|review)", re.I)
+PRODUCT_LINK_RE = re.compile(r"/product/([A-Za-z0-9\-_%.]+)")
+DIGITS_RE = re.compile(r"\d{5,}")
+
+SKIP_KEYS = {
+    "link", "deeplink", "weblink", "url", "src", "image", "images", "img",
+    "icon", "id", "sku", "type", "component", "stateid", "vwpid", "action",
+    "trackinginfo", "celltrackinginfo", "style", "textstyle", "theme",
+    "color", "background", "align", "font", "tag", "test", "testinfo",
+    "params", "gradient", "colorname",
+}
+
+BAD_TITLE_BITS = (
+    "₽", "отзыв", "в корзину", "доставка", "рассрочка", "ozon карта",
+    "с картой", "картой ozon", "осталось", "реклам", "хит", "бестселлер",
+    "спецпредложение", "промокод", "смотреть все", "premium", "бонус",
+    "кэшбэк", "кешбэк", "быстрая", "самовывоз", "в наличии", "аналог",
+)
+
+def _iter_dicts(node, depth=0):
+    if depth > 30:
+        return
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                for d in _iter_dicts(v, depth + 1):
+                    yield d
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, (dict, list)):
+                for d in _iter_dicts(v, depth + 1):
+                    yield d
+
+def _collect_strings(node, out=None, depth=0, limit=250):
+    if out is None:
+        out = []
+    if len(out) >= limit or depth > 12:
+        return out
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if str(k).lower() in SKIP_KEYS:
+                continue
+            if isinstance(v, str):
+                s = v.strip()
+                if s and len(s) <= 300 and s[:1] not in "{[#" \
+                        and not s.startswith(("http", "/", "ozon://", "data:")):
+                    out.append(s)
+            elif isinstance(v, (dict, list)):
+                _collect_strings(v, out, depth + 1, limit)
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, (dict, list, str)):
+                if isinstance(v, str):
+                    s = v.strip()
+                    if s and len(s) <= 300 and s[:1] not in "{[#" \
+                            and not s.startswith(("http", "/", "ozon://", "data:")):
+                        out.append(s)
+                else:
+                    _collect_strings(v, out, depth + 1, limit)
+    return out
+
+def _price_to_int(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = int(value)
+        return v if 0 < v < 100000000 else None
+    if not isinstance(value, str):
+        return None
+    m = PRICE_RE.search(value)
+    chunk = m.group(1) if m else value
+    digits = re.sub(r"\D", "", chunk)
+    if not digits or len(digits) > 9:
+        return None
+    v = int(digits)
+    return v if 0 < v < 100000000 else None
+
+def _fmt_money(value):
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return "?"
+    return "{:,}".format(n).replace(",", " ") + " ₽"
+
+def _node_link(node):
+    for key in ("link", "deepLink", "webLink", "url"):
+        v = node.get(key)
+        if isinstance(v, str) and "/product/" in v:
+            return v
+    a = node.get("action")
+    if isinstance(a, dict):
+        for key in ("link", "deepLink", "url"):
+            v = a.get(key)
+            if isinstance(v, str) and "/product/" in v:
+                return v
+    return None
+
+def _slug_title(slug):
+    s = slug
+    s = re.sub(r"-?\d{5,}$", "", s)
+    try:
+        s = urllib.parse.unquote(s)
+    except Exception:
+        pass
+    s = s.replace("-", " ").replace("_", " ").strip()
+    if not s:
+        return None
+    return s[:1].upper() + s[1:]
+
+def _pick_title(strings, fallback):
+    best, best_score = None, -1
+    for s in strings:
+        if len(s) < 8:
+            continue
+        low = s.lower()
+        if any(bit in low for bit in BAD_TITLE_BITS):
+            continue
+        if not re.search(r"[A-Za-zА-Яа-яЁё]", s):
+            continue
+        score = min(len(s), 160)
+        if s.isupper() and len(s) < 24:
+            score -= 25
+        if score > best_score:
+            best, best_score = s, score
+    if best:
+        return best, False
+    return fallback, True
+
+def _prices_from_node(node, strings):
+    cur = old = None
+    # 1) структурный priceV2 (основной формат тайлов)
+    for d in _iter_dicts(node):
+        pv = d.get("priceV2")
+        if isinstance(pv, dict) and isinstance(pv.get("price"), list):
+            for p in pv["price"]:
+                if not isinstance(p, dict):
+                    continue
+                val = _price_to_int(p.get("text") or p.get("price"))
+                if val is None:
+                    continue
+                style = str(p.get("textStyle") or p.get("style") or "").upper()
+                if "ORIGINAL" in style or "CROSS" in style or "OLD" in style:
+                    if old is None:
+                        old = val
+                elif cur is None:
+                    cur = val
+            if cur is not None:
+                break
+    # 2) плоские ключи (встречается в html-состояниях)
+    if cur is None:
+        for d in _iter_dicts(node):
+            for k, v in d.items():
+                if not isinstance(v, (str, int, float)):
+                    continue
+                lk = str(k).lower()
+                if cur is None and lk in ("price", "cardprice", "finalprice", "priceint"):
+                    cur = _price_to_int(v)
+                elif old is None and lk in ("originalprice", "oldprice", "priceoriginal",
+                                            "basicprice", "crossprice"):
+                    old = _price_to_int(v)
+            if cur is not None and old is not None:
+                break
+    # 3) последний резерв: регулярка по всем строкам узла
+    if cur is None:
+        found = []
+        for s in strings:
+            for m in PRICE_RE.finditer(s):
+                v = _price_to_int(m.group(0))
+                if v:
+                    found.append(v)
+        if found:
+            cur = found[0]
+            bigger = [v for v in found[1:] if v > cur]
+            if bigger and old is None:
+                old = min(bigger)
+    if cur and old and old <= cur:
+        old = None
+    return cur, old
+
+def _rating_from_strings(strings):
+    rating = reviews = None
+    for s in strings:
+        if rating is None:
+            m = RATING_STR_RE.match(s.strip())
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", "."))
+                except ValueError:
+                    val = 0.0
+                if 0.0 < val <= 5.0:
+                    rating = val
+                    continue
+        if reviews is None:
+            m = REVIEWS_RE.search(s)
+            if m:
+                digits = re.sub(r"\D", "", m.group(1))
+                if digits:
+                    reviews = int(digits)
+    return rating, reviews
+
+def _is_ad(node):
+    for d in _iter_dicts(node):
+        for k, v in d.items():
+            lk = str(k).lower()
+            if v is True and ("isadv" in lk or "advertis" in lk or lk in ("isad", "adv")):
+                return True
+            if isinstance(v, str) and "реклам" in v.lower():
+                return True
+    return False
+
+def _relevant_states(data):
+    """widgetStates: значения часто приходят строками с JSON внутри.
+    Сначала берём виджеты выдачи, иначе — весь ответ целиком."""
+    objs = []
+    ws = data.get("widgetStates") if isinstance(data, dict) else None
+    if isinstance(ws, dict):
+        for k, v in ws.items():
+            obj = v
+            if isinstance(v, str):
+                if v.strip()[:1] not in "{[":
+                    continue
+                try:
+                    obj = json.loads(v)
+                except Exception:
+                    continue
+            if isinstance(obj, (dict, list)):
+                objs.append((str(k), obj))
+    preferred = [(k, v) for k, v in objs
+                 if re.search(r"(searchResults|tileGrid|resultsV2|skuGrid|shelf)", k, re.I)]
+    if preferred:
+        return preferred
+    if objs:
+        return objs
+    return [("root", data)]
+
+def extract_products(data):
+    """Deep-walk: ищем любые узлы со ссылкой на /product/ и собираем из них
+    поля. Так парсер не ломается от очередного редизайна виджетов Ozon."""
+    items = {}
+    order = []
+    for _, obj in _relevant_states(data):
+        for node in _iter_dicts(obj):
+            link = _node_link(node)
+            if not link:
+                continue
+            m = PRODUCT_LINK_RE.search(link)
+            if not m:
+                continue
+            slug = m.group(1)
+            ids = DIGITS_RE.findall(slug)
+            pid = ids[-1] if ids else slug
+            strings = _collect_strings(node)
+            title, from_slug = _pick_title(strings, _slug_title(slug) or pid)
+            price, old_price = _prices_from_node(node, strings)
+            rating, reviews = _rating_from_strings(strings)
+            fresh = {
+                "id": pid,
+                "slug": slug,
+                "title": title,
+                "title_from_slug": from_slug,
+                "price": price,
+                "old_price": old_price,
+                "rating": rating,
+                "reviews": reviews,
+                "is_ad": _is_ad(node),
+            }
+            old = items.get(pid)
+            if old is None:
+                items[pid] = fresh
+                order.append(pid)
+                continue
+            # вложенные узлы того же товара: добираем недостающее
+            for key in ("price", "old_price", "rating", "reviews"):
+                if not old.get(key) and fresh.get(key):
+                    old[key] = fresh[key]
+            if old.get("title_from_slug") and not fresh["title_from_slug"]:
+                old["title"] = fresh["title"]
+                old["title_from_slug"] = False
+            old["is_ad"] = old.get("is_ad") or fresh["is_ad"]
+    return [items[pid] for pid in order]
+
+# ── разбор пользовательского запроса ───────────────────────────────
+
+class ParsedQuery:
+    def __init__(self):
+        self.text = ""
+        self.price_min = None
+        self.price_max = None
+        self.sort = None
+        self.sort_label_key = None
+        self.min_rating = None
+        self.min_reviews = None
+
+SORT_WORDS = {
+    "дешёвые": ("price", "sort_cheap"), "дешевые": ("price", "sort_cheap"),
+    "дешево": ("price", "sort_cheap"), "дешёво": ("price", "sort_cheap"),
+    "подешевле": ("price", "sort_cheap"), "cheap": ("price", "sort_cheap"),
+    "дорогие": ("price_desc", "sort_expensive"), "подороже": ("price_desc", "sort_expensive"),
+    "новинки": ("new", "sort_new"), "новые": ("new", "sort_new"), "new": ("new", "sort_new"),
+    "рейтинг": ("rating", "sort_rating"), "рейтингу": ("rating", "sort_rating"),
+    "скидки": ("discount", "sort_discount"), "скидкой": ("discount", "sort_discount"),
+    "популярные": (None, "sort_relevance"), "популярное": (None, "sort_relevance"),
+}
+
+NUM_TOKEN_RE = re.compile(r"^(\d+(?:[.,]\d+)?)\s*(к|k|тыс|т)?$", re.I)
+RANGE_TOKEN_RE = re.compile(r"^(\d+)\s*[-–—]\s*(\d+)$")
+
+def _to_amount(token):
+    t = token.replace("\u00a0", "").replace(" ", "").lower()
+    m = NUM_TOKEN_RE.match(t)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    if m.group(2):
+        val *= 1000
+    val = int(round(val))
+    return val if 0 < val < 100000000 else None
+
+def parse_query(raw_text):
+    p = ParsedQuery()
+    if not raw_text:
+        return p
+    tokens = raw_text.split()
+    used = [False] * len(tokens)
+
+    def nxt_amount(i):
+        for j in range(i + 1, min(i + 3, len(tokens))):
+            if used[j]:
+                continue
+            val = _to_amount(tokens[j])
+            if val is not None:
+                used[j] = True
+                return val
+            return None
+        return None
+
+    for i, tok in enumerate(tokens):
+        if used[i]:
+            continue
+        low = tok.lower().replace("ё", "е")
+
+        if low in ("до", "макс", "максимум", "<", "<=", "until"):
+            val = nxt_amount(i)
+            if val is not None:
+                p.price_max = val
+                used[i] = True
+                continue
+        if low in ("от", "мин", "минимум", ">", ">=", "from"):
+            val = nxt_amount(i)
+            if val is not None:
+                p.price_min = val
+                used[i] = True
+                continue
+        if low.startswith("<") and len(low) > 1:
+            val = _to_amount(low[1:].lstrip("="))
+            if val is not None:
+                p.price_max = val
+                used[i] = True
+                continue
+        if low.startswith(">") and len(low) > 1:
+            val = _to_amount(low[1:].lstrip("="))
+            if val is not None:
+                p.price_min = val
+                used[i] = True
+                continue
+
+        m = RANGE_TOKEN_RE.match(low)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a and b and a < b and b > 100:
+                p.price_min, p.price_max = a, b
+                used[i] = True
+                continue
+
+        if low in ("оценка", "оценкой", "звезд", "звёзд", "rating"):
+            for j in range(i + 1, min(i + 3, len(tokens))):
+                if used[j]:
+                    continue
+                try:
+                    val = float(tokens[j].replace(",", "."))
+                except ValueError:
+                    break
+                if 0 < val <= 5:
+                    p.min_rating = val
+                    used[i] = used[j] = True
+                break
+            if used[i]:
+                continue
+
+        if low in ("отзывов", "отзывы", "отзыва", "reviews"):
+            for j in range(i + 1, min(i + 3, len(tokens))):
+                if used[j]:
+                    continue
+                digits = re.sub(r"\D", "", tokens[j])
+                if digits:
+                    p.min_reviews = int(digits)
+                    used[i] = used[j] = True
+                break
+            if used[i]:
+                continue
+
+        # "сортировка" как служебное слово перед ключом сортировки
+        if low in ("сортировка", "сортировать", "sort"):
+            used[i] = True
+            continue
+
+        if low in SORT_WORDS:
+            p.sort, p.sort_label_key = SORT_WORDS[low]
+            used[i] = True
+            continue
+
+    p.text = " ".join(tokens[i] for i in range(len(tokens)) if not used[i]).strip()
+    return p
+
+def build_page_url(parsed, page, default_sort, extra_params):
+    params = [("text", parsed.text)]
+    sort = parsed.sort or default_sort
+    if sort:
+        params.append(("sorting", sort))
+    if parsed.price_min or parsed.price_max:
+        lo = parsed.price_min or 0
+        hi = parsed.price_max or 99999999
+        params.append(("currency_price", "{}.000-{}.000".format(lo, hi)))
+    if page > 1:
+        params.append(("page", str(page)))
+    params.append(("from_global", "true"))
+    query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    extra = (extra_params or "").strip().lstrip("&?")
+    if extra:
+        query = query + "&" + extra
+    return "/search/?" + query
+
+def _plural_ru(n, one, few, many):
+    n = abs(int(n)) % 100
+    if 11 <= n <= 14:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+# ── образец для предпросмотра (без сети) ──────────────────────────
+
+SAMPLE_ITEMS = [
+    {"id": "1234567", "slug": "google-pixel-9a-8-128gb-blue-1234567",
+     "title": "Google Pixel 9a 8/128 ГБ (Синий)", "price": 28990, "old_price": 31490,
+     "rating": 4.9, "reviews": 12, "is_ad": False, "title_from_slug": False},
+    {"id": "2345678", "slug": "smartfon-pixel-9a-12-256gb-blue-2345678",
+     "title": "Смартфон Pixel 9a 12/256 ГБ Blue", "price": 29500, "old_price": None,
+     "rating": 4.8, "reviews": 45, "is_ad": True, "title_from_slug": False},
+    {"id": "3456789", "slug": "google-pixel-9a-sea-3456789",
+     "title": "Google Pixel 9a Sea (Голубой/Синий)", "price": 27400, "old_price": 29900,
+     "rating": 4.7, "reviews": 8, "is_ad": False, "title_from_slug": False},
+]
+
+STRINGS = {
+    "ru": {
+        "loaded": "OzonSearch загружен ✅",
+        "usage": ("Использование: {cmd} запрос [фильтры]\n"
+                  "Пример: {cmd} Google Pixel 9a до 30000\n\n"
+                  "Фильтры: до N · от N · N-N · дешёвые · дорогие · новинки · "
+                  "рейтинг · скидки · оценка 4.5 · отзывов 10"),
+        "searching": "🔎 ищу на Ozon…",
+        "not_found": "😔 по запросу «{}» ничего не нашлось",
+        "not_found_hint": "попробуй смягчить фильтры или упростить запрос",
+        "err_blocked": "🛡 Ozon включил защиту от ботов и не отдал данные",
+        "err_blocked_hint": ("Что сделать: подождать пару минут, включить прогрев сессии "
+                            "или вставить свои cookie из браузера — "
+                            "Настройки → OzonSearch → 🌐 Сеть и доступ"),
+        "err_net": "❌ не удалось получить ответ от Ozon, проверь интернет",
+        "err_open": "🛒 Открыть поиск вручную: {}",
+        "head": "🔍 Результаты по запросу «{}»{}:",
+        "all_link": "🛒 Все результаты: {}",
+        "f_to": "до {}", "f_from": "от {}", "f_range": "{} — {}",
+        "f_rating": "оценка {}+", "f_reviews": "отзывов {}+",
+        "was": "было {}",
+        "ad": "реклама",
+        "sort_relevance": "популярные", "sort_cheap": "сначала дешёвые",
+        "sort_expensive": "сначала дорогие", "sort_new": "новинки",
+        "sort_rating": "по рейтингу", "sort_discount": "по скидке",
+        "reviews_one": "отзыв", "reviews_few": "отзыва", "reviews_many": "отзывов",
+        "link_word": "ссылка",
+        "shown_fewer": "ℹ️ подошло только {} из {} — фильтры срезали остальное",
+
+        "s_title": "OzonSearch",
+        "s_preview": "👁 Предпросмотр выдачи",
+        "s_preview_sub": "Как ответ будет выглядеть с текущими настройками",
+        "s_preview_title": "Предпросмотр .ozon",
+        "s_cmds": "Команда",
+        "s_cmd": "Команда поиска",
+        "s_cmd_sub": "По умолчанию: .ozon",
+        "s_lang": "Язык / Language",
+        "s_cmds_hint": ("Отправь команду в любом чате — сообщение не уйдёт собеседнику, "
+                        "вместо него плагин пришлёт результаты поиска."),
+
+        "s_sections": "Разделы",
+        "s_out_p": "🧾 Выдача и оформление",
+        "s_out_p_s": "Количество, названия, цены, ссылки, эмодзи",
+        "s_filters_p": "🔎 Поиск и фильтры",
+        "s_filters_p_s": "Сортировка, оценка, отзывы, реклама, страницы",
+        "s_net_p": "🌐 Сеть и доступ",
+        "s_net_p_s": "Таймаут, попытки, cookie, User-Agent, кэш",
+        "s_notify_p": "🔔 Уведомления",
+        "s_notify_p_s": "Всплывающие окна о поиске и ошибках",
+        "s_about_p": "ℹ️ О плагине",
+        "s_about_p_s": "Версия, автор, источник данных",
+        "s_dev_p": "🛠 Для разработчиков",
+        "s_dev_p_s": "Логи, сырой ответ, диагностика",
+
+        "s_out_head": "Выдача",
+        "s_count": "Товаров в ответе",
+        "s_title_len": "Длина названия",
+        "s_unit_chars": " симв.",
+        "s_title_hint": "Название обрезается по последнему целому слову.",
+        "s_show_position": "Нумеровать позиции",
+        "s_price_head": "Цена",
+        "s_show_old": "Показывать старую цену",
+        "s_show_discount": "Показывать процент скидки",
+        "s_rating_head": "Рейтинг",
+        "s_show_rating": "Показывать оценку",
+        "s_show_reviews": "Показывать число отзывов",
+        "s_links_head": "Ссылки",
+        "s_link_style": "Формат ссылки",
+        "s_link_style_hint": ("Вариант «ссылка (markdown)» короче, но зависит от того, "
+                             "разбирает ли клиент markdown при отправке. "
+                             "Не отображается как ссылка — переключи на полную."),
+        "s_all_link": "Ссылка на всю выдачу в конце",
+        "s_look_head": "Оформление",
+        "s_use_emoji": "Использовать эмодзи",
+        "s_use_emoji_sub": "🔍 💰 ★ 🔗 в заголовке и строках",
+        "s_sep": "Разделитель между товарами",
+        "s_sep_hint": "Последний вариант — просто пустая строка, как в примере.",
+
+        "s_filters_head": "Поиск",
+        "s_sort_default": "Сортировка по умолчанию",
+        "s_sort_default_sub": "Слово-фильтр в запросе всегда важнее этой настройки",
+        "s_local_sort": "Пересортировать локально",
+        "s_local_sort_sub": "Применяется к уже полученным товарам",
+        "s_pages": "Максимум страниц выдачи",
+        "s_pages_hint": "Больше страниц — больше шансов набрать нужное число товаров "
+                        "после фильтров, но запрос дольше.",
+        "s_quality_head": "Отбор",
+        "s_min_rating": "Минимальная оценка",
+        "s_min_rating_any": "любая",
+        "s_min_reviews": "Минимум отзывов",
+        "s_min_reviews_any": "не важно",
+        "s_unit_reviews": " отз.",
+        "s_hide_ads": "Скрывать рекламные товары",
+        "s_hide_ads_sub": "Определяется по метке рекламы в карточке",
+        "s_mark_ads": "Помечать рекламу, если не скрыта",
+        "s_require_price": "Скрывать товары без цены",
+        "s_cheat": "Шпаргалка по фильтрам",
+        "s_cheat_text": ("Фильтры пишутся вперемешку с запросом, в любом порядке:\n\n"
+                         "• до 30000 / <30000 — верхняя граница цены\n"
+                         "• от 10000 / >10000 — нижняя граница\n"
+                         "• 10000-30000 — диапазон\n"
+                         "• 30к — сокращение тысяч\n"
+                         "• дешёвые / дорогие / новинки / рейтинг / скидки — сортировка\n"
+                         "• оценка 4.5 — минимальная оценка\n"
+                         "• отзывов 10 — минимум отзывов\n"
+                         "• всё остальное уходит в текст запроса\n\n"
+                         "Пример: {cmd} наушники беспроводные до 5000 рейтинг отзывов 50"),
+
+        "s_net_head": "Сеть",
+        "s_timeout": "Таймаут запроса",
+        "s_unit_sec": " с",
+        "s_tries": "Попыток на стратегию",
+        "s_cache": "Кэш выдачи",
+        "s_unit_min": " мин",
+        "s_cache_hint": "Повторный такой же запрос берётся из памяти. 0 — кэш выключен.",
+        "s_cache_clear": "🗑 Очистить кэш выдачи",
+        "s_cache_clear_sub": "Сейчас в кэше: {} запрос(ов)",
+        "s_cache_cleared": "Кэш выдачи очищен ✅",
+        "s_access_head": "Доступ",
+        "s_warm_up": "Прогревать сессию",
+        "s_warm_up_sub": "Сначала открыть главную ozon.ru, чтобы получить cookie",
+        "s_ua": "User-Agent",
+        "s_ua_hint": "Мобильный обычно проходит лучше. Свой — из поля ниже.",
+        "s_ua_custom": "Свой User-Agent",
+        "s_cookie": "Cookie из браузера",
+        "s_cookie_sub": "Вставь строку Cookie целиком, если Ozon упирается в антибот",
+        "s_cookie_hint": ("Как взять: браузер → ozon.ru → DevTools → Network → любой запрос → "
+                          "Request Headers → Cookie. Данные хранятся только в настройках плагина "
+                          "на твоём устройстве."),
+        "s_extra": "Доп. параметры поиска",
+        "s_extra_sub": "Дописываются в URL как есть, например: category=15621",
+        "s_session_reset": "♻️ Сбросить сессию и cookie",
+        "s_session_reset_sub": "Начать с чистого cookie-jar",
+        "s_session_reset_ok": "Сессия сброшена ✅",
+
+        "s_notify_head": "Уведомления",
+        "s_notify_searching": "Уведомление во время поиска",
+        "s_notify_searching_sub": "Показывает 🔎 пока идёт запрос к Ozon",
+        "s_notify_errors_bulletin": "Ошибки всплывающим окном",
+        "s_notify_errors_bulletin_sub": "Иначе ошибка приходит сообщением в чат",
+        "s_send_link_on_error": "При ошибке присылать ссылку на поиск",
+        "s_send_link_on_error_sub": "Чтобы результат можно было открыть вручную",
+
+        "s_dev_header": "Диагностика",
+        "s_dev_info": "О рантайме",
+        "s_dev_ping": "🌐 Тест доступности Ozon",
+        "s_dev_ping_sub": "Пробует все стратегии и замеряет задержку",
+        "s_dev_ping_ok": "Ozon отвечает: {} мс, стратегия {}, товаров {} ✅",
+        "s_dev_ping_blocked": "Ozon включил антибот 🛡 — нужны cookie",
+        "s_dev_ping_fail": "Ozon недоступен ❌",
+        "s_dev_last": "Последний запрос",
+        "s_dev_last_sub": "стратегия: {} · статус: {}",
+        "s_dev_raw": "📦 Сырой ответ последнего запроса",
+        "s_dev_raw_sub": "Первые {} символов · открыть и скопировать",
+        "s_dev_raw_empty": "Сырого ответа пока нет — сделай хотя бы один поиск",
+        "s_dev_logs": "Логи",
+        "s_dev_logs_sub": "{} записей за текущую сессию плагина",
+        "s_dev_errors": "Ошибки",
+        "s_dev_errors_sub": "{} ошибок за текущую сессию плагина",
+        "s_dev_clear": "🗑 Очистить логи",
+        "s_dev_cleared": "Логи очищены ✅",
+        "s_dev_empty": "Пока пусто — ничего не залогировано в этой сессии",
+        "s_dev_more": "… и ещё {{}} записей (показаны только последние {})".format(MAX_LOG_SHOWN),
+        "s_dev_tap_hint": "Нажми на запись, чтобы открыть её целиком и скопировать",
+        "s_dev_copy_all": "📋 Скопировать все логи",
+        "s_dev_copy_all_sub": "Полный текст со всеми traceback'ами в буфер обмена",
+        "s_dev_copy_err": "📋 Скопировать только ошибки",
+        "s_dev_open_full": "🖥 Открыть в полном окне",
+        "s_dev_open_full_sub": "Диалог с прокруткой и кнопкой «Копировать»",
+        "s_dev_full_page": "📄 Полный текст (страницей)",
+        "s_dev_full_page_sub": "Если диалог не открывается",
+        "s_dev_copied": "Скопировано в буфер обмена ✅",
+        "s_dev_copy_fail": "Не удалось скопировать ❌",
+        "s_dev_entry": "Запись лога",
+        "s_dev_dlg_copy": "Копировать",
+        "s_dev_dlg_close": "Закрыть",
+        "s_dev_truncated": "\n\n… текст обрезан, полностью — по кнопке «Копировать»",
+        "s_dev_reset": "♻️ Сбросить настройки",
+        "s_dev_reset_sub": "Вернуть все параметры к значениям по умолчанию",
+        "s_dev_reset_q": "Сбросить все настройки OzonSearch к значениям по умолчанию?",
+        "s_dev_reset_ok": "Настройки сброшены ✅ — закрой и открой раздел",
+        "s_dev_reset_yes": "Сбросить",
+        "s_dev_ui_mode": "Режим числовых настроек",
+        "s_dev_ui_slider": "слайдеры (Slider из SDK)",
+        "s_dev_ui_input": "поля ввода (Slider недоступен в этой сборке)",
+
+        "s_page_error_head": "⚠️ Ошибка загрузки раздела",
+        "s_page_error_text": "Не удалось построить эту страницу настроек",
+        "s_page_error_hint": "Подробности (traceback) записаны в «Для разработчиков» → «Логи»",
+        "s_about_lines": ("OzonSearch v{}\nРазработчик: @RapFurBitches\n"
+                          "Канал разработчика: @ccsFM\n\n"
+                          "Источник данных: публичная выдача ozon.ru (официального API нет).\n"
+                          "Плагин ничего не покупает и не авторизуется — только читает выдачу "
+                          "поиска и форматирует её в сообщение.\n"
+                          "Если Ozon отвечает антиботом — это ожидаемо, помогает вставка cookie "
+                          "в разделе «Сеть и доступ»."),
+    },
+    "en": {
+        "loaded": "OzonSearch loaded ✅",
+        "usage": ("Usage: {cmd} query [filters]\n"
+                  "Example: {cmd} Google Pixel 9a до 30000\n\n"
+                  "Filters: до N · от N · N-N · дешёвые · дорогие · новинки · "
+                  "рейтинг · скидки · оценка 4.5 · отзывов 10"),
+        "searching": "🔎 searching on Ozon…",
+        "not_found": "😔 nothing found for \"{}\"",
+        "not_found_hint": "try loosening the filters or simplifying the query",
+        "err_blocked": "🛡 Ozon anti-bot kicked in and returned no data",
+        "err_blocked_hint": ("What to do: wait a couple of minutes, enable session warm-up "
+                            "or paste your browser cookie — "
+                            "Settings → OzonSearch → 🌐 Network & access"),
+        "err_net": "❌ couldn't reach Ozon, check your internet",
+        "err_open": "🛒 Open the search manually: {}",
+        "head": "🔍 Results for \"{}\"{}:",
+        "all_link": "🛒 All results: {}",
+        "f_to": "up to {}", "f_from": "from {}", "f_range": "{} — {}",
+        "f_rating": "rating {}+", "f_reviews": "{}+ reviews",
+        "was": "was {}",
+        "ad": "ad",
+        "sort_relevance": "popular", "sort_cheap": "cheapest first",
+        "sort_expensive": "priciest first", "sort_new": "new",
+        "sort_rating": "by rating", "sort_discount": "by discount",
+        "reviews_one": "review", "reviews_few": "reviews", "reviews_many": "reviews",
+        "link_word": "link",
+        "shown_fewer": "ℹ️ only {} of {} matched — filters cut the rest",
+
+        "s_title": "OzonSearch",
+        "s_preview": "👁 Output preview",
+        "s_preview_sub": "How the reply looks with your current settings",
+        "s_preview_title": ".ozon preview",
+        "s_cmds": "Command",
+        "s_cmd": "Search command",
+        "s_cmd_sub": "Default: .ozon",
+        "s_lang": "Language / Язык",
+        "s_cmds_hint": ("Send the command in any chat — your message won't be delivered, "
+                        "the plugin replies with search results instead."),
+
+        "s_sections": "Sections",
+        "s_out_p": "🧾 Output & appearance",
+        "s_out_p_s": "Count, titles, prices, links, emoji",
+        "s_filters_p": "🔎 Search & filters",
+        "s_filters_p_s": "Sorting, rating, reviews, ads, pages",
+        "s_net_p": "🌐 Network & access",
+        "s_net_p_s": "Timeout, retries, cookie, User-Agent, cache",
+        "s_notify_p": "🔔 Notifications",
+        "s_notify_p_s": "Popups for searching and errors",
+        "s_about_p": "ℹ️ About",
+        "s_about_p_s": "Version, author, data source",
+        "s_dev_p": "🛠 For developers",
+        "s_dev_p_s": "Logs, raw response, diagnostics",
+
+        "s_out_head": "Output",
+        "s_count": "Items per reply",
+        "s_title_len": "Title length",
+        "s_unit_chars": " chars",
+        "s_title_hint": "Titles are cut at the last whole word.",
+        "s_show_position": "Number the positions",
+        "s_price_head": "Price",
+        "s_show_old": "Show the old price",
+        "s_show_discount": "Show discount percent",
+        "s_rating_head": "Rating",
+        "s_show_rating": "Show rating",
+        "s_show_reviews": "Show review count",
+        "s_links_head": "Links",
+        "s_link_style": "Link format",
+        "s_link_style_hint": ("The \"link (markdown)\" option is shorter but depends on the "
+                             "client parsing markdown on send. If it shows as plain text, "
+                             "switch back to the full URL."),
+        "s_all_link": "Full-results link at the end",
+        "s_look_head": "Appearance",
+        "s_use_emoji": "Use emoji",
+        "s_use_emoji_sub": "🔍 💰 ★ 🔗 in the header and rows",
+        "s_sep": "Separator between items",
+        "s_sep_hint": "The last option is just a blank line, like in the sample.",
+
+        "s_filters_head": "Search",
+        "s_sort_default": "Default sorting",
+        "s_sort_default_sub": "A sorting word in the query always wins over this",
+        "s_local_sort": "Re-sort locally",
+        "s_local_sort_sub": "Applied to the items already fetched",
+        "s_pages": "Max result pages",
+        "s_pages_hint": "More pages means a better chance to fill the list after filters, "
+                        "but a slower request.",
+        "s_quality_head": "Selection",
+        "s_min_rating": "Minimum rating",
+        "s_min_rating_any": "any",
+        "s_min_reviews": "Minimum reviews",
+        "s_min_reviews_any": "any",
+        "s_unit_reviews": " rev.",
+        "s_hide_ads": "Hide sponsored items",
+        "s_hide_ads_sub": "Detected by the ad label inside the card",
+        "s_mark_ads": "Mark ads when not hidden",
+        "s_require_price": "Hide items without a price",
+        "s_cheat": "Filter cheat sheet",
+        "s_cheat_text": ("Filters are mixed into the query, in any order:\n\n"
+                         "• до 30000 / <30000 — max price\n"
+                         "• от 10000 / >10000 — min price\n"
+                         "• 10000-30000 — range\n"
+                         "• 30к — thousands shorthand\n"
+                         "• дешёвые / дорогие / новинки / рейтинг / скидки — sorting\n"
+                         "• оценка 4.5 — minimum rating\n"
+                         "• отзывов 10 — minimum reviews\n"
+                         "• everything else becomes the text query\n\n"
+                         "Example: {cmd} наушники беспроводные до 5000 рейтинг отзывов 50"),
+
+        "s_net_head": "Network",
+        "s_timeout": "Request timeout",
+        "s_unit_sec": " s",
+        "s_tries": "Retries per strategy",
+        "s_cache": "Results cache",
+        "s_unit_min": " min",
+        "s_cache_hint": "An identical repeat query is served from memory. 0 disables the cache.",
+        "s_cache_clear": "🗑 Clear results cache",
+        "s_cache_clear_sub": "Currently cached: {} query(ies)",
+        "s_cache_cleared": "Results cache cleared ✅",
+        "s_access_head": "Access",
+        "s_warm_up": "Warm up the session",
+        "s_warm_up_sub": "Opens ozon.ru first to obtain cookies",
+        "s_ua": "User-Agent",
+        "s_ua_hint": "Mobile usually gets through better. Custom comes from the field below.",
+        "s_ua_custom": "Custom User-Agent",
+        "s_cookie": "Browser cookie",
+        "s_cookie_sub": "Paste the whole Cookie header if Ozon keeps blocking",
+        "s_cookie_hint": ("How to get it: browser → ozon.ru → DevTools → Network → any request → "
+                          "Request Headers → Cookie. It is stored only in the plugin settings "
+                          "on your device."),
+        "s_extra": "Extra search parameters",
+        "s_extra_sub": "Appended to the URL as-is, e.g. category=15621",
+        "s_session_reset": "♻️ Reset session and cookies",
+        "s_session_reset_sub": "Start with a clean cookie jar",
+        "s_session_reset_ok": "Session reset ✅",
+
+        "s_notify_head": "Notifications",
+        "s_notify_searching": "Popup while searching",
+        "s_notify_searching_sub": "Shows 🔎 during the Ozon request",
+        "s_notify_errors_bulletin": "Errors as popup",
+        "s_notify_errors_bulletin_sub": "Otherwise errors arrive as a chat message",
+        "s_send_link_on_error": "Send a search link on error",
+        "s_send_link_on_error_sub": "So the results can still be opened manually",
+
+        "s_dev_header": "Diagnostics",
+        "s_dev_info": "Runtime",
+        "s_dev_ping": "🌐 Test Ozon availability",
+        "s_dev_ping_sub": "Tries every strategy and measures latency",
+        "s_dev_ping_ok": "Ozon responded in {} ms, strategy {}, items {} ✅",
+        "s_dev_ping_blocked": "Ozon anti-bot 🛡 — cookies needed",
+        "s_dev_ping_fail": "Ozon is unreachable ❌",
+        "s_dev_last": "Last request",
+        "s_dev_last_sub": "strategy: {} · status: {}",
+        "s_dev_raw": "📦 Raw last response",
+        "s_dev_raw_sub": "First {} chars · open and copy",
+        "s_dev_raw_empty": "No raw response yet — run at least one search",
+        "s_dev_logs": "Logs",
+        "s_dev_logs_sub": "{} entries this plugin session",
+        "s_dev_errors": "Errors",
+        "s_dev_errors_sub": "{} errors this plugin session",
+        "s_dev_clear": "🗑 Clear logs",
+        "s_dev_cleared": "Logs cleared ✅",
+        "s_dev_empty": "Nothing logged yet in this session",
+        "s_dev_more": "… and {{}} more entries (showing the last {} only)".format(MAX_LOG_SHOWN),
+        "s_dev_tap_hint": "Tap an entry to open it in full and copy it",
+        "s_dev_copy_all": "📋 Copy all logs",
+        "s_dev_copy_all_sub": "Full text with all tracebacks to the clipboard",
+        "s_dev_copy_err": "📋 Copy errors only",
+        "s_dev_open_full": "🖥 Open in full window",
+        "s_dev_open_full_sub": "Scrollable dialog with a Copy button",
+        "s_dev_full_page": "📄 Full text (as a page)",
+        "s_dev_full_page_sub": "In case the dialog won't open",
+        "s_dev_copied": "Copied to clipboard ✅",
+        "s_dev_copy_fail": "Copy failed ❌",
+        "s_dev_entry": "Log entry",
+        "s_dev_dlg_copy": "Copy",
+        "s_dev_dlg_close": "Close",
+        "s_dev_truncated": "\n\n… text truncated, use \"Copy\" for the full version",
+        "s_dev_reset": "♻️ Reset settings",
+        "s_dev_reset_sub": "Restore every option to its default value",
+        "s_dev_reset_q": "Reset all OzonSearch settings to defaults?",
+        "s_dev_reset_ok": "Settings reset ✅ — reopen this section",
+        "s_dev_reset_yes": "Reset",
+        "s_dev_ui_mode": "Numeric settings mode",
+        "s_dev_ui_slider": "sliders (SDK Slider)",
+        "s_dev_ui_input": "text inputs (Slider unavailable in this build)",
+
+        "s_page_error_head": "⚠️ Failed to load section",
+        "s_page_error_text": "Could not build this settings page",
+        "s_page_error_hint": "Details (traceback) were logged under \"For developers\" → \"Logs\"",
+        "s_about_lines": ("OzonSearch v{}\nDeveloper: @RapFurBitches\n"
+                          "Developer channel: @ccsFM\n\n"
+                          "Data source: the public ozon.ru search output (there is no official API).\n"
+                          "The plugin never buys or signs in — it only reads the search page and "
+                          "formats it into a message.\n"
+                          "Anti-bot answers are expected; pasting a cookie in \"Network & access\" "
+                          "helps."),
+    },
+}
+
+DEFAULTS = {
+    "lang": 0,
+    "cmd_search": DEFAULT_CMD,
+    "count_n": R_COUNT[3],
+    "title_len": R_TITLE[3],
+    "show_position": True,
+    "show_old_price": True,
+    "show_discount": True,
+    "show_rating": True,
+    "show_reviews": True,
+    "link_style": 0,
+    "show_all_link": True,
+    "use_emoji": True,
+    "sep_style": 4,
+    "sort_default": 0,
+    "local_sort": 0,
+    "pages_n": R_PAGES[3],
+    "min_rating_x10": R_RATE[3],
+    "min_reviews_n": R_REVIEWS[3],
+    "hide_ads": True,
+    "mark_ads": True,
+    "require_price": True,
+    "net_timeout": R_TIMEOUT[3],
+    "net_tries": R_TRIES[3],
+    "cache_min": R_CACHE[3],
+    "warm_up": True,
+    "ua_mode": 0,
+    "ua_custom": "",
+    "cookie": "",
+    "extra_params": "",
+    "notify_searching": False,
+    "notify_errors_bulletin": False,
+    "send_link_on_error": True,
+}
+
+# ── плагин ─────────────────────────────────────────────────────────
+
+class OzonSearchPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._alive = True
+        self._bg_threads = weakref.WeakSet()
+        self._log_buffer = []
+        self._log_lock = threading.RLock()
+        self._cache = {}
+        self._cache_lock = threading.Lock()
+        self._kw_warned = set()
+        self._slider_kwargs = None
+        self._slider_ok = SLIDER_CLS is not None
+        self._session = OzonSession(self._plog)
+
+    # ── локализация ────────────────────────────────────────────────
+
+    def _lang(self):
+        try:
+            idx = int(self.get_setting("lang", 0) or 0)
+        except (TypeError, ValueError):
+            idx = 0
+        return "en" if idx == 1 else "ru"
+
+    def tr(self, key):
+        lang = self._lang()
+        return STRINGS[lang].get(key) or STRINGS["ru"].get(key) or key
+
+    def _sep(self):
+        idx = self._int("sep_style", 0, len(SEPARATORS) - 1, DEFAULTS["sep_style"])
+        return SEPARATORS[idx]
+
+    def _ui(self, fn):
+        if not self._alive:
+            return
+        run_on_ui_thread(fn)
+
+    def _spawn(self, target, args=()):
+        """Фоновый поток со слабой ссылкой + перехват необработанных
+        исключений (иначе поток тихо умирает без следа в логах)."""
+        def runner(*a):
+            try:
+                target(*a)
+            except Exception as e:
+                self._plog("Необработанное исключение в потоке {}: {}\n{}".format(
+                    getattr(target, "__name__", str(target)), e, traceback.format_exc()),
+                    level="ERROR")
+        t = threading.Thread(target=runner, args=args, daemon=True)
+        self._bg_threads.add(t)
+        t.start()
+        return t
+
+    def _plog(self, msg, level="INFO"):
+        try:
+            log("[OzonSearch] {}".format(msg))
+        except Exception:
+            pass
+        entry = {"ts": time.time(), "level": level, "msg": str(msg)}
+        with self._log_lock:
+            self._log_buffer.append(entry)
+            overflow = len(self._log_buffer) - MAX_LOG_ENTRIES
+            if overflow > 0:
+                del self._log_buffer[:overflow]
+
+    # ── чтение настроек ───────────────────────────────────────────
+
+    def _bool(self, key, default=False):
+        value = self.get_setting(key, default)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        t = str(value).strip().lower()
+        if t in ("1", "true", "yes", "on"):
+            return True
+        if t in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    def _int(self, key, lo, hi, default):
+        """Числовая настройка с зажимом в диапазон. Работает и когда значение
+        пришло от слайдера (int), и когда от поля ввода (строка) — поэтому
+        фолбэк Slider→Input не ломает семантику сохранённого значения."""
+        raw = self.get_setting(key, default)
+        try:
+            val = float(str(raw).strip().replace(",", "."))
+        except (TypeError, ValueError):
+            val = float(default)
+        if val != val:  # nan
+            val = float(default)
+        val = int(round(val))
+        if val < lo:
+            val = lo
+        if val > hi:
+            val = hi
+        return val
+
+    def _str(self, key, default=""):
+        v = self.get_setting(key, default)
+        return (str(v) if v is not None else default).strip()
+
+    def _timeout(self):
+        return self._int("net_timeout", R_TIMEOUT[0], R_TIMEOUT[1], R_TIMEOUT[3])
+
+    def _ua(self):
+        mode = self._int("ua_mode", 0, 2, 0)
+        if mode == 2:
+            custom = self._str("ua_custom")
+            if custom:
+                return custom
+            return UA_MOBILE
+        return UA_DESKTOP if mode == 1 else UA_MOBILE
+
+    # ── безопасное создание UI-элементов ──────────────────────────
+
+    def _supports(self, cls, kw):
+        allowed = _item_allowed(cls)
+        return allowed is None or kw in allowed
+
+    def _warn_kwargs(self, cls, dropped):
+        key = (getattr(cls, "__name__", str(cls)), tuple(sorted(dropped)))
+        if key in self._kw_warned:
+            return
+        self._kw_warned.add(key)
+        self._plog("{} не поддерживает kwargs {} в этой сборке SDK — "
+                   "они проигнорированы".format(getattr(cls, "__name__", cls),
+                                                sorted(dropped)), level="WARN")
+
+    def _it(self, cls, **kwargs):
+        """Создаёт элемент настроек, отбрасывая kwargs, которых нет в этой
+        версии SDK (именно из-за такого kwarg разделы падают целиком)."""
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        allowed = _item_allowed(cls)
+        if allowed is not None:
+            if "text" not in allowed:
+                allowed = None
+            elif any(c in kwargs and c not in allowed for c in ("key", "items")):
+                allowed = None
+        if allowed is not None:
+            dropped = [k for k in kwargs if k not in allowed]
+            if dropped:
+                for k in dropped:
+                    kwargs.pop(k, None)
+                self._warn_kwargs(cls, dropped)
+        try:
+            return cls(**kwargs)
+        except TypeError:
+            for opt in ("subtext", "icon", "red", "accent", "on_click",
+                        "create_sub_fragment", "default"):
+                if opt not in kwargs:
+                    continue
+                kwargs.pop(opt, None)
+                try:
+                    item = cls(**kwargs)
+                    self._warn_kwargs(cls, [opt])
+                    return item
+                except TypeError:
+                    continue
+            self._plog("Не удалось создать {} с {}".format(
+                getattr(cls, "__name__", cls), list(kwargs)), level="ERROR")
+            try:
+                return Text(text=str(kwargs.get("text", "?")))
+            except Exception:
+                return Header(text=str(kwargs.get("text", "?")))
+
+    def _hint(self, text):
+        return self._it(Divider, text=text)
+
+    def _sel(self, key, text, items, default=0, subtext=None, icon=None):
+        """Selector + пояснение. Selector в части сборок SDK не принимает
+        subtext — подпись уезжает в Divider под ним."""
+        base = {"key": key, "text": text, "items": items, "default": default}
+        if icon and self._supports(Selector, "icon"):
+            base["icon"] = icon
+        if subtext and self._supports(Selector, "subtext"):
+            try:
+                return [Selector(**dict(base, subtext=subtext))]
+            except TypeError:
+                pass
+        out = [self._it(Selector, **base)]
+        if subtext:
+            out.append(self._hint(subtext))
+        return out
+
+    def _slider(self, key, label, rng, unit="", hint=None, icon=None, fmt=None):
+        """Полоска-регулятор. Текущее значение вписано в заголовок пункта,
+        чтобы оно читалось даже если сборка не рисует бабл с цифрой.
+        Если Slider недоступен — деградируем до числового поля, сохраняя
+        ровно то же значение (не индекс), так что _int() не ломается."""
+        lo, hi, step, default = rng
+        cur = self._int(key, lo, hi, default)
+        shown = fmt(cur) if fmt else "{}{}".format(cur, unit)
+        text = "{} — {}".format(label, shown)
+
+        if SLIDER_CLS is not None:
+            base = {"key": key, "text": text, "default": default}
+            if icon and self._supports(SLIDER_CLS, "icon"):
+                base["icon"] = icon
+            sub_ok = bool(hint) and self._supports(SLIDER_CLS, "subtext")
+            if sub_ok:
+                base["subtext"] = hint
+
+            variants = []
+            if self._slider_kwargs:
+                variants.append(self._slider_kwargs)
+            variants += [
+                {"min_value": lo, "max_value": hi, "step": step},
+                {"min_value": lo, "max_value": hi},
+                {"min": lo, "max": hi, "step": step},
+                {"min": lo, "max": hi},
+                {"minimum": lo, "maximum": hi, "step": step},
+                {"min_value": lo, "max_value": hi, "step_size": step},
+            ]
+            allowed = _item_allowed(SLIDER_CLS)
+            for cand in variants:
+                if allowed is not None and not all(k in allowed for k in cand):
+                    continue
+                try:
+                    item = SLIDER_CLS(**dict(base, **cand))
+                except TypeError:
+                    continue
+                self._slider_kwargs = cand   # запоминаем рабочую схему имён
+                rows = [item]
+                if hint and not sub_ok:
+                    rows.append(self._hint(hint))
+                return rows
+            self._slider_ok = False
+            self._plog("{} не удалось собрать ни с одной схемой min/max — "
+                       "переключаюсь на числовые поля".format(SLIDER_NAME), level="WARN")
+
+        range_hint = "{}…{}{}".format(lo, hi, unit)
+        sub = "{} · {}".format(range_hint, hint) if hint else range_hint
+        return [self._it(Input, key=key, text=label, default=str(default),
+                         subtext=sub, icon=icon)]
+
+    def _safe_page(self, builder):
+        try:
+            return builder()
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._plog("Ошибка построения страницы настроек ({}): {}\n{}".format(
+                getattr(builder, "__name__", "?"), e, tb), level="ERROR")
+            return [
+                self._it(Header, text=self.tr("s_page_error_head")),
+                self._it(Text, text=self.tr("s_page_error_text"), subtext=str(e),
+                         icon="msg_error", red=True),
+                self._it(Text, text=self.tr("s_page_error_hint"), icon="msg_info"),
+                self._it(Text, text=self.tr("s_dev_copy_all"), icon="msg_copy",
+                         on_click=lambda view, t=tb: self._copy_and_notify(t)),
+            ]
+
+    # ── буфер обмена / диалоги ────────────────────────────────────
+
+    def _copy_text(self, text):
+        if not text:
+            return False
+        try:
+            from android_utils import copy_to_clipboard as _sdk_copy
+            _sdk_copy(text)
+            return True
+        except Exception:
+            pass
+        try:
+            from java import jclass
+            au = jclass("org.telegram.messenger.AndroidUtilities")
+            au.addToClipboard(text)
+            return True
+        except Exception:
+            pass
+        try:
+            from java import jclass
+            app_loader = jclass("org.telegram.messenger.ApplicationLoader")
+            clip_data = jclass("android.content.ClipData")
+            ctx = app_loader.applicationContext
+            cm = ctx.getSystemService("clipboard")
+            cm.setPrimaryClip(clip_data.newPlainText("OzonSearch", text))
+            return True
+        except Exception as e:
+            self._plog("clipboard fail: {}".format(e), level="ERROR")
+        return False
+
+    def _copy_and_notify(self, text):
+        ok = self._copy_text(text)
+        frag = get_last_fragment()
+        if ok:
+            done = getattr(BulletinHelper, "show_copied_to_clipboard", None)
+            if callable(done):
+                try:
+                    done(frag)
+                    return True
+                except Exception:
+                    pass
+            BulletinHelper.show_info(self.tr("s_dev_copied"), frag)
+        else:
+            BulletinHelper.show_error(self.tr("s_dev_copy_fail"), frag)
+        return ok
+
+    @staticmethod
+    def _invoke(obj, names, *args):
+        for n in names:
+            fn = getattr(obj, n, None)
+            if callable(fn):
+                return fn(*args)
+        raise AttributeError("none of {} on {}".format(names, type(obj)))
+
+    def _activity(self):
+        try:
+            return get_last_fragment().getParentActivity()
+        except Exception:
+            return None
+
+    def _show_text_dialog(self, title, body):
+        """Полное окно: скроллящийся диалог + кнопка «Копировать».
+        Если диалог собрать не удалось — молча копируем в буфер."""
+        def run():
+            activity = self._activity()
+            if activity is None:
+                self._copy_and_notify(body)
+                return
+            shown = body
+            if len(shown) > MAX_DIALOG_CHARS:
+                shown = shown[:MAX_DIALOG_CHARS] + self.tr("s_dev_truncated")
+            try:
+                from ui.alert import AlertDialogBuilder
+                b = AlertDialogBuilder(activity)
+                self._invoke(b, ["set_title", "setTitle"], title)
+                self._invoke(b, ["set_message", "setMessage"], shown)
+
+                def on_copy(*_a):
+                    self._copy_and_notify(body)
+                    try:
+                        self._invoke(b, ["dismiss"])
+                    except Exception:
+                        pass
+
+                def on_close(*_a):
+                    try:
+                        self._invoke(b, ["dismiss"])
+                    except Exception:
+                        pass
+
+                self._invoke(b, ["set_positive_button", "setPositiveButton"],
+                             self.tr("s_dev_dlg_copy"), on_copy)
+                self._invoke(b, ["set_negative_button", "setNegativeButton"],
+                             self.tr("s_dev_dlg_close"), on_close)
+                self._invoke(b, ["show"])
+            except Exception as e:
+                self._plog("dialog fail: {}\n{}".format(e, traceback.format_exc()),
+                           level="ERROR")
+                self._copy_and_notify(body)
+        self._ui(run)
+
+    def _confirm(self, message, yes_label, on_yes):
+        def run():
+            activity = self._activity()
+            if activity is None:
+                on_yes()
+                return
+            try:
+                from ui.alert import AlertDialogBuilder
+                b = AlertDialogBuilder(activity)
+                self._invoke(b, ["set_title", "setTitle"], __name__)
+                self._invoke(b, ["set_message", "setMessage"], message)
+
+                def yes(*_a):
+                    try:
+                        self._invoke(b, ["dismiss"])
+                    except Exception:
+                        pass
+                    on_yes()
+
+                self._invoke(b, ["set_positive_button", "setPositiveButton"], yes_label, yes)
+                self._invoke(b, ["set_negative_button", "setNegativeButton"],
+                             self.tr("s_dev_dlg_close"),
+                             lambda *_a: self._invoke(b, ["dismiss"]))
+                self._invoke(b, ["show"])
+            except Exception as e:
+                self._plog("confirm dialog fail: {}".format(e), level="ERROR")
+                on_yes()
+        self._ui(run)
+
+    # ── жизненный цикл ────────────────────────────────────────────
+
+    def on_plugin_load(self):
+        self._alive = True
+        self.add_on_send_message_hook()
+        self._plog("OzonSearch v{} loaded · slider={} · hook registered".format(
+            __version__, SLIDER_NAME or "none"))
+        self._ui(lambda: BulletinHelper.show_success(self.tr("loaded"), get_last_fragment()))
+
+    def on_plugin_unload(self):
+        self._alive = False
+        with self._cache_lock:
+            self._cache.clear()
+        try:
+            self._session.reset()
+        except Exception:
+            pass
+        self._bg_threads.clear()
+        gc.collect()
+        self._plog("OzonSearch unloaded")
+
+    def on_app_event(self, event_type: AppEvent):
+        pass
+
+    # ── хук команд ───────────────────────────────────────────────
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if not isinstance(getattr(params, "message", None), str):
+                return HookResult()
+
+            raw = params.message.strip()
+            if not raw:
+                return HookResult()
+            parts = raw.split(" ", 1)
+            first = parts[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+
+            cmd = (self._str("cmd_search", DEFAULT_CMD) or DEFAULT_CMD).lower()
+            if cmd and first == cmd:
+                peer = getattr(params, "peer", None)
+                self._spawn(self._run_search, args=(peer, arg))
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            return HookResult()
+        finally:
+            del params
+
+    # ── отправка ────────────────────────────────────────────────
+
+    def _send(self, peer, text):
+        try:
+            return send_message({"peer": peer, "message": text})
+        except Exception as e:
+            self._plog("send dict fail: {}".format(e), level="ERROR")
+        try:
+            return send_message(peer, text)
+        except Exception as e:
+            self._plog("send positional fail: {}".format(e), level="ERROR")
+        return None
+
+    def _status(self, key):
+        if not self._bool("notify_searching", False):
+            return
+        self._ui(lambda: BulletinHelper.show_info(self.tr(key), get_last_fragment()))
+
+    def _report_error(self, peer, text, extra=None):
+        body = text if not extra else "{}\n{}".format(text, extra)
+        if self._bool("notify_errors_bulletin", False):
+            self._ui(lambda: BulletinHelper.show_error(text, get_last_fragment()))
+            if extra:
+                self._ui(lambda: self._send(peer, extra))
+        else:
+            self._ui(lambda: self._send(peer, body))
+
+    # ── кэш выдачи ──────────────────────────────────────────────
+
+    def _cache_key(self, page_url):
+        return page_url
+
+    def _cache_get(self, key):
+        ttl = self._int("cache_min", R_CACHE[0], R_CACHE[1], R_CACHE[3]) * 60
+        if ttl <= 0:
+            return None
+        with self._cache_lock:
+            entry = self._cache.get(key)
+        if not entry:
+            return None
+        ts, items = entry
+        if time.time() - ts > ttl:
+            with self._cache_lock:
+                self._cache.pop(key, None)
+            return None
+        return list(items)
+
+    def _cache_put(self, key, items):
+        if self._int("cache_min", R_CACHE[0], R_CACHE[1], R_CACHE[3]) <= 0:
+            return
+        with self._cache_lock:
+            self._cache[key] = (time.time(), list(items))
+            if len(self._cache) > CACHE_MAX:
+                oldest = sorted(self._cache.items(), key=lambda kv: kv[1][0])
+                for k, _ in oldest[:len(self._cache) - CACHE_MAX]:
+                    self._cache.pop(k, None)
+
+    # ── основной поиск ──────────────────────────────────────────
+
+    def _run_search(self, peer, raw_arg):
+        if peer is None:
+            return
+        cmd = self._str("cmd_search", DEFAULT_CMD) or DEFAULT_CMD
+        if not raw_arg:
+            self._ui(lambda: self._send(peer, self.tr("usage").format(cmd=cmd)))
+            return
+
+        parsed = parse_query(raw_arg)
+        if not parsed.text:
+            self._ui(lambda: self._send(peer, self.tr("usage").format(cmd=cmd)))
+            return
+
+        if not self._alive:
+            return
+        self._status("searching")
+
+        timeout = self._timeout()
+        tries = self._int("net_tries", R_TRIES[0], R_TRIES[1], R_TRIES[3])
+        pages = self._int("pages_n", R_PAGES[0], R_PAGES[1], R_PAGES[3])
+        want = self._int("count_n", R_COUNT[0], R_COUNT[1], R_COUNT[3])
+        default_sort = SORT_VALUES[self._int("sort_default", 0, len(SORT_VALUES) - 1, 0)]
+        extra = self._str("extra_params")
+        ua = self._ua()
+        cookie = self._str("cookie")
+
+        first_url = build_page_url(parsed, 1, default_sort, extra)
+        search_link = OZON_BASE + first_url
+
+        if self._bool("warm_up", True):
+            self._session.warm_up(ua, cookie, timeout)
+
+        raw_items = []
+        seen = set()
+        blocked_err = None
+        net_err = None
+
+        for page in range(1, pages + 1):
+            if not self._alive:
+                return
+            page_url = build_page_url(parsed, page, default_sort, extra)
+            key = self._cache_key(page_url)
+            cached = self._cache_get(key)
+            if cached is not None:
+                page_items = cached
+                self._plog("страница {} из кэша ({} товаров)".format(page, len(page_items)))
+            else:
+                try:
+                    data, strategy = self._session.fetch_page(page_url, ua, cookie,
+                                                              timeout, tries)
+                except OzonBlocked as e:
+                    blocked_err = e
+                    self._plog("страница {}: антибот · {}".format(page, e), level="ERROR")
+                    break
+                except OzonUnavailable as e:
+                    net_err = e
+                    self._plog("страница {}: сеть · {}".format(page, e), level="ERROR")
+                    break
+                except Exception as e:
+                    net_err = e
+                    self._plog("страница {}: {}\n{}".format(page, e, traceback.format_exc()),
+                               level="ERROR")
+                    break
+                try:
+                    page_items = extract_products(data)
+                except Exception as e:
+                    self._plog("разбор страницы {} упал: {}\n{}".format(
+                        page, e, traceback.format_exc()), level="ERROR")
+                    page_items = []
+                self._plog("страница {}: стратегия {}, товаров {}".format(
+                    page, strategy, len(page_items)))
+                if page_items:
+                    self._cache_put(key, page_items)
+
+            if not page_items:
+                break
+            for it in page_items:
+                if it["id"] in seen:
+                    continue
+                seen.add(it["id"])
+                raw_items.append(it)
+            if len(self._filter_items(raw_items, parsed)) >= want:
+                break
+
+        if not self._alive:
+            return
+
+        if not raw_items and (blocked_err or net_err):
+            link = self.tr("err_open").format(search_link) \
+                if self._bool("send_link_on_error", True) else None
+            if blocked_err:
+                self._report_error(peer, "{}\n{}".format(self.tr("err_blocked"),
+                                                         self.tr("err_blocked_hint")), link)
+            else:
+                self._report_error(peer, self.tr("err_net"), link)
+            return
+
+        filtered = self._filter_items(raw_items, parsed)
+        filtered = self._sort_items(filtered)
+        total_matched = len(filtered)
+        shown = filtered[:want]
+
+        if not shown:
+            msg = "{}\n{}".format(self.tr("not_found").format(parsed.text),
+                                  self.tr("not_found_hint"))
+            if self._bool("send_all_link_on_empty", True) and self._bool("show_all_link", True):
+                msg += "\n{}".format(self.tr("all_link").format(search_link))
+            self._ui(lambda: self._send(peer, msg))
+            return
+
+        text = self._format_results(parsed, shown, search_link,
+                                    total_matched=total_matched, want=want)
+        self._ui(lambda: self._send(peer, text))
+
+    def _filter_items(self, items, parsed):
+        min_rating = parsed.min_rating
+        if min_rating is None:
+            x10 = self._int("min_rating_x10", R_RATE[0], R_RATE[1], R_RATE[3])
+            min_rating = (x10 / 10.0) if x10 else None
+        min_reviews = parsed.min_reviews
+        if min_reviews is None:
+            n = self._int("min_reviews_n", R_REVIEWS[0], R_REVIEWS[1], R_REVIEWS[3])
+            min_reviews = n or None
+
+        hide_ads = self._bool("hide_ads", True)
+        require_price = self._bool("require_price", True)
+
+        out = []
+        for it in items:
+            if hide_ads and it.get("is_ad"):
+                continue
+            price = it.get("price")
+            if require_price and not price:
+                continue
+            if price:
+                if parsed.price_min and price < parsed.price_min:
+                    continue
+                if parsed.price_max and price > parsed.price_max:
+                    continue
+            if min_rating:
+                r = it.get("rating")
+                if not r or r < min_rating - 1e-9:
+                    continue
+            if min_reviews:
+                rv = it.get("reviews") or 0
+                if rv < min_reviews:
+                    continue
+            if not it.get("title"):
+                continue
+            out.append(it)
+        return out
+
+    def _sort_items(self, items):
+        mode = self._int("local_sort", 0, 4, 0)
+        if mode == 0:
+            return items
+        items = list(items)
+        if mode == 1:
+            items.sort(key=lambda i: i.get("price") or 10 ** 12)
+        elif mode == 2:
+            items.sort(key=lambda i: i.get("price") or 0, reverse=True)
+        elif mode == 3:
+            items.sort(key=lambda i: (i.get("rating") or 0, i.get("reviews") or 0),
+                       reverse=True)
+        elif mode == 4:
+            items.sort(key=lambda i: i.get("reviews") or 0, reverse=True)
+        return items
+
+    # ── форматирование ──────────────────────────────────────────
+
+    def _emoji(self, s):
+        return s if self._bool("use_emoji", True) else ""
+
+    def _reviews_word(self, n):
+        if self._lang() == "en":
+            return self.tr("reviews_one") if n == 1 else self.tr("reviews_many")
+        return _plural_ru(n, self.tr("reviews_one"), self.tr("reviews_few"),
+                          self.tr("reviews_many"))
+
+    def _cut_title(self, title):
+        maxlen = self._int("title_len", R_TITLE[0], R_TITLE[1], R_TITLE[3])
+        t = re.sub(r"\s+", " ", title or "").strip()
+        if len(t) <= maxlen:
+            return t
+        cut = t[:maxlen].rsplit(" ", 1)[0].rstrip(" ,.;:-")
+        return (cut or t[:maxlen]) + "…"
+
+    def _item_link(self, item):
+        style = self._int("link_style", 0, 2, 0)
+        short = "{}/product/{}/".format(OZON_BASE, item.get("id"))
+        full = "{}/product/{}/".format(OZON_BASE, item.get("slug") or item.get("id"))
+        if style == 1:
+            return "[{}]({})".format(self.tr("link_word"), short)
+        if style == 2:
+            return full
+        return short
+
+    def _filters_suffix(self, parsed):
+        bits = []
+        if parsed.price_min and parsed.price_max:
+            bits.append(self.tr("f_range").format(_fmt_money(parsed.price_min),
+                                                  _fmt_money(parsed.price_max)))
+        elif parsed.price_max:
+            bits.append(self.tr("f_to").format(_fmt_money(parsed.price_max)))
+        elif parsed.price_min:
+            bits.append(self.tr("f_from").format(_fmt_money(parsed.price_min)))
+        if parsed.min_rating:
+            bits.append(self.tr("f_rating").format(
+                ("%g" % parsed.min_rating)))
+        if parsed.min_reviews:
+            bits.append(self.tr("f_reviews").format(parsed.min_reviews))
+        if parsed.sort_label_key:
+            bits.append(self.tr(parsed.sort_label_key))
+        if not bits:
+            return ""
+        return " ({})".format(", ".join(bits))
+
+    def _format_results(self, parsed, items, search_link, total_matched=None, want=None):
+        sep = self._sep()
+        head = self.tr("head").format(parsed.text, self._filters_suffix(parsed))
+        if not self._bool("use_emoji", True):
+            head = head.replace("🔍 ", "")
+
+        show_pos = self._bool("show_position", True)
+        show_old = self._bool("show_old_price", True)
+        show_disc = self._bool("show_discount", True)
+        show_rating = self._bool("show_rating", True)
+        show_reviews = self._bool("show_reviews", True)
+        mark_ads = self._bool("mark_ads", True) and not self._bool("hide_ads", True)
+
+        blocks = []
+        for i, it in enumerate(items, 1):
+            lines = []
+            prefix = "{}. ".format(i) if show_pos else ""
+            lines.append(prefix + self._cut_title(it.get("title")))
+
+            meta = []
+            price = it.get("price")
+            if price:
+                money = _fmt_money(price)
+                old = it.get("old_price")
+                if old and show_old:
+                    extra = self.tr("was").format(_fmt_money(old))
+                    if show_disc:
+                        try:
+                            pct = int(round((1.0 - float(price) / float(old)) * 100))
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pct = 0
+                        if pct > 0:
+                            extra += ", −{}%".format(pct)
+                    money += " ({})".format(extra)
+                meta.append("{}{}".format(self._emoji("💰 "), money))
+
+            rating = it.get("rating")
+            reviews = it.get("reviews")
+            if show_rating and rating:
+                part = "{}{:g}".format(self._emoji("★ "), rating)
+                if show_reviews and reviews:
+                    part += " ({} {})".format(reviews, self._reviews_word(reviews))
+                meta.append(part)
+            elif show_reviews and reviews:
+                meta.append("{} {}".format(reviews, self._reviews_word(reviews)))
+
+            if mark_ads and it.get("is_ad"):
+                meta.append("({})".format(self.tr("ad")))
+
+            if meta:
+                lines.append(" | ".join(meta))
+            lines.append("{}{}".format(self._emoji("🔗 "), self._item_link(it)))
+            blocks.append("\n".join(lines))
+
+        joiner = "\n{}\n".format(sep) if sep else "\n\n"
+        text = head + "\n\n" + joiner.join(blocks)
+
+        if total_matched is not None and want and total_matched < want:
+            text += "\n\n" + self.tr("shown_fewer").format(total_matched, want)
+        if self._bool("show_all_link", True):
+            text += "\n\n" + self.tr("all_link").format(search_link)
+        return text
+
+    # ── настройки: главная ──────────────────────────────────────
+
+    def _preview_click(self, view):
+        parsed = ParsedQuery()
+        parsed.text = "Pixel 9a синий"
+        parsed.price_max = 30000
+        link = OZON_BASE + build_page_url(parsed, 1, None, "")
+        want = self._int("count_n", R_COUNT[0], R_COUNT[1], R_COUNT[3])
+        items = self._sort_items(self._filter_items(SAMPLE_ITEMS, parsed))[:want]
+        if not items:
+            items = SAMPLE_ITEMS[:want]
+        body = self._format_results(parsed, items, link)
+        self._show_text_dialog(self.tr("s_preview_title"), body)
+
+    def create_settings(self) -> List[Any]:
+        return [
+            self._it(Header, text=self.tr("s_title")),
+            self._it(Text, text=self.tr("s_preview"), subtext=self.tr("s_preview_sub"),
+                     icon="msg_view_file", on_click=self._preview_click),
+            self._it(Divider),
+
+            self._it(Header, text=self.tr("s_cmds")),
+            self._it(Input, key="cmd_search", text=self.tr("s_cmd"),
+                     default=DEFAULT_CMD, subtext=self.tr("s_cmd_sub"), icon="msg_search"),
+            *self._sel("lang", self.tr("s_lang"), ["Русский", "English"], 0,
+                       icon="msg_translate"),
+            self._hint(self.tr("s_cmds_hint")),
+
+            self._it(Header, text=self.tr("s_sections")),
+            self._it(Text, text=self.tr("s_out_p"), subtext=self.tr("s_out_p_s"),
+                     icon="msg_list",
+                     create_sub_fragment=lambda: self._safe_page(self._page_output)),
+            self._it(Text, text=self.tr("s_filters_p"), subtext=self.tr("s_filters_p_s"),
+                     icon="msg_discover",
+                     create_sub_fragment=lambda: self._safe_page(self._page_filters)),
+            self._it(Text, text=self.tr("s_net_p"), subtext=self.tr("s_net_p_s"),
+                     icon="msg_language",
+                     create_sub_fragment=lambda: self._safe_page(self._page_net)),
+            self._it(Text, text=self.tr("s_notify_p"), subtext=self.tr("s_notify_p_s"),
+                     icon="msg_notifications",
+                     create_sub_fragment=lambda: self._safe_page(self._page_notify)),
+            self._it(Divider),
+            self._it(Text, text=self.tr("s_about_p"), subtext=self.tr("s_about_p_s"),
+                     icon="msg_info",
+                     create_sub_fragment=lambda: self._safe_page(self._page_about)),
+            self._it(Text, text=self.tr("s_dev_p"), subtext=self.tr("s_dev_p_s"),
+                     icon="msg_bug",
+                     create_sub_fragment=lambda: self._safe_page(self._page_dev)),
+        ]
+
+    # ── настройки: страницы ─────────────────────────────────────
+
+    def _page_output(self) -> List[Any]:
+        return [
+            self._it(Header, text=self.tr("s_out_head")),
+            self._it(Text, text=self.tr("s_preview"), subtext=self.tr("s_preview_sub"),
+                     icon="msg_view_file", on_click=self._preview_click),
+            self._it(Divider),
+
+            *self._slider("count_n", self.tr("s_count"), R_COUNT, icon="msg_list"),
+            *self._slider("title_len", self.tr("s_title_len"), R_TITLE,
+                          unit=self.tr("s_unit_chars"), hint=self.tr("s_title_hint")),
+            self._it(Switch, key="show_position", text=self.tr("s_show_position"),
+                     default=True, icon="msg_pin"),
+
+            self._it(Header, text=self.tr("s_price_head")),
+            self._it(Switch, key="show_old_price", text=self.tr("s_show_old"),
+                     default=True, icon="msg_payment_discount"),
+            self._it(Switch, key="show_discount", text=self.tr("s_show_discount"),
+                     default=True),
+
+            self._it(Header, text=self.tr("s_rating_head")),
+            self._it(Switch, key="show_rating", text=self.tr("s_show_rating"),
+                     default=True, icon="msg_favs"),
+            self._it(Switch, key="show_reviews", text=self.tr("s_show_reviews"),
+                     default=True),
+
+            self._it(Header, text=self.tr("s_links_head")),
+            *self._sel("link_style", self.tr("s_link_style"),
+                       ["ozon.ru/product/ID", "ссылка (markdown)", "полная со слагом"], 0,
+                       subtext=self.tr("s_link_style_hint"), icon="msg_link"),
+            self._it(Switch, key="show_all_link", text=self.tr("s_all_link"),
+                     default=True, icon="msg_shareout"),
+
+            self._it(Header, text=self.tr("s_look_head")),
+            self._it(Switch, key="use_emoji", text=self.tr("s_use_emoji"),
+                     subtext=self.tr("s_use_emoji_sub"), default=True,
+                     icon="msg_emoji_smiles"),
+            *self._sel("sep_style", self.tr("s_sep"),
+                       ["━━━━━", "┅┅┅┅┅", "═════", "• • •", "— нет —"],
+                       DEFAULTS["sep_style"], subtext=self.tr("s_sep_hint")),
+        ]
+
+    def _page_filters(self) -> List[Any]:
+        cmd = self._str("cmd_search", DEFAULT_CMD) or DEFAULT_CMD
+        sort_items = [self.tr("sort_relevance"), self.tr("sort_cheap"),
+                      self.tr("sort_expensive"), self.tr("sort_new"),
+                      self.tr("sort_rating"), self.tr("sort_discount")]
+        local_items = [self.tr("sort_relevance"), self.tr("sort_cheap"),
+                       self.tr("sort_expensive"), self.tr("sort_rating"),
+                       "≡ " + self.tr("reviews_many")]
+        return [
+            self._it(Header, text=self.tr("s_filters_head")),
+            *self._sel("sort_default", self.tr("s_sort_default"), sort_items, 0,
+                       subtext=self.tr("s_sort_default_sub"), icon="msg_sort"),
+            *self._sel("local_sort", self.tr("s_local_sort"), local_items, 0,
+                       subtext=self.tr("s_local_sort_sub")),
+            *self._slider("pages_n", self.tr("s_pages"), R_PAGES,
+                          hint=self.tr("s_pages_hint")),
+
+            self._it(Header, text=self.tr("s_quality_head")),
+            *self._slider("min_rating_x10", self.tr("s_min_rating"), R_RATE,
+                          icon="msg_favs",
+                          fmt=lambda v: self.tr("s_min_rating_any") if v == 0
+                          else "{:.1f}+".format(v / 10.0)),
+            *self._slider("min_reviews_n", self.tr("s_min_reviews"), R_REVIEWS,
+                          fmt=lambda v: self.tr("s_min_reviews_any") if v == 0
+                          else "{}+{}".format(v, self.tr("s_unit_reviews"))),
+            self._it(Switch, key="hide_ads", text=self.tr("s_hide_ads"),
+                     subtext=self.tr("s_hide_ads_sub"), default=True, icon="msg_block"),
+            self._it(Switch, key="mark_ads", text=self.tr("s_mark_ads"), default=True),
+            self._it(Switch, key="require_price", text=self.tr("s_require_price"),
+                     default=True),
+
+            self._it(Header, text=self.tr("s_cheat")),
+            self._hint(self.tr("s_cheat_text").format(cmd=cmd)),
+        ]
+
+    def _page_net(self) -> List[Any]:
+        with self._cache_lock:
+            cached = len(self._cache)
+        return [
+            self._it(Header, text=self.tr("s_net_head")),
+            *self._slider("net_timeout", self.tr("s_timeout"), R_TIMEOUT,
+                          unit=self.tr("s_unit_sec")),
+            *self._slider("net_tries", self.tr("s_tries"), R_TRIES),
+            *self._slider("cache_min", self.tr("s_cache"), R_CACHE,
+                          unit=self.tr("s_unit_min"), hint=self.tr("s_cache_hint")),
+            self._it(Text, text=self.tr("s_cache_clear"),
+                     subtext=self.tr("s_cache_clear_sub").format(cached),
+                     icon="msg_delete", red=True, on_click=self._clear_cache_click),
+
+            self._it(Header, text=self.tr("s_access_head")),
+            self._it(Switch, key="warm_up", text=self.tr("s_warm_up"),
+                     subtext=self.tr("s_warm_up_sub"), default=True, icon="msg_online"),
+            *self._sel("ua_mode", self.tr("s_ua"),
+                       ["Android (мобильный)", "Desktop Chrome", "Свой"], 0,
+                       subtext=self.tr("s_ua_hint"), icon="msg_devices"),
+            self._it(Input, key="ua_custom", text=self.tr("s_ua_custom"), default=""),
+            self._it(Input, key="cookie", text=self.tr("s_cookie"), default="",
+                     subtext=self.tr("s_cookie_sub"), icon="msg_pin_code"),
+            self._hint(self.tr("s_cookie_hint")),
+            self._it(Input, key="extra_params", text=self.tr("s_extra"), default="",
+                     subtext=self.tr("s_extra_sub"), icon="msg_settings"),
+            self._it(Text, text=self.tr("s_session_reset"),
+                     subtext=self.tr("s_session_reset_sub"),
+                     icon="msg_reset", red=True, on_click=self._reset_session_click),
+        ]
+
+    def _page_notify(self) -> List[Any]:
+        return [
+            self._it(Header, text=self.tr("s_notify_head")),
+            self._it(Switch, key="notify_searching", text=self.tr("s_notify_searching"),
+                     subtext=self.tr("s_notify_searching_sub"), default=False,
+                     icon="msg_search"),
+            self._it(Switch, key="notify_errors_bulletin",
+                     text=self.tr("s_notify_errors_bulletin"),
+                     subtext=self.tr("s_notify_errors_bulletin_sub"), default=False,
+                     icon="msg_error"),
+            self._it(Switch, key="send_link_on_error",
+                     text=self.tr("s_send_link_on_error"),
+                     subtext=self.tr("s_send_link_on_error_sub"), default=True,
+                     icon="msg_link"),
+        ]
+
+    def _page_about(self) -> List[Any]:
+        return [
+            self._it(Header, text="OzonSearch v{}".format(__version__)),
+            self._hint(self.tr("s_about_lines").format(__version__)),
+        ]
+
+    # ── клики ───────────────────────────────────────────────────
+
+    def _clear_cache_click(self, view):
+        with self._cache_lock:
+            self._cache.clear()
+        self._plog("кэш выдачи очищен")
+        self._ui(lambda: BulletinHelper.show_success(
+            self.tr("s_cache_cleared"), get_last_fragment()))
+
+    def _reset_session_click(self, view):
+        self._session.reset()
+        self._ui(lambda: BulletinHelper.show_success(
+            self.tr("s_session_reset_ok"), get_last_fragment()))
+
+    def _ping_click(self, view):
+        def task():
+            parsed = ParsedQuery()
+            parsed.text = "iphone"
+            page_url = build_page_url(parsed, 1, None, "")
+            ua, cookie = self._ua(), self._str("cookie")
+            timeout = self._timeout()
+            if self._bool("warm_up", True):
+                self._session.warm_up(ua, cookie, timeout)
+            t0 = time.time()
+            try:
+                data, strategy = self._session.fetch_page(
+                    page_url, ua, cookie, timeout,
+                    self._int("net_tries", R_TRIES[0], R_TRIES[1], R_TRIES[3]))
+                ms = int((time.time() - t0) * 1000)
+                count = len(extract_products(data))
+                self._plog("ping ok: {} мс, {}, товаров {}".format(ms, strategy, count))
+                self._ui(lambda: BulletinHelper.show_success(
+                    self.tr("s_dev_ping_ok").format(ms, strategy, count),
+                    get_last_fragment()))
+            except OzonBlocked as e:
+                self._plog("ping blocked: {}".format(e), level="ERROR")
+                self._ui(lambda: BulletinHelper.show_error(
+                    self.tr("s_dev_ping_blocked"), get_last_fragment()))
+            except Exception as e:
+                self._plog("ping fail: {}\n{}".format(e, traceback.format_exc()),
+                           level="ERROR")
+                self._ui(lambda: BulletinHelper.show_error(
+                    self.tr("s_dev_ping_fail"), get_last_fragment()))
+        self._spawn(task)
+
+    def _raw_click(self, view):
+        raw = self._session.last_raw
+        if not raw:
+            self._ui(lambda: BulletinHelper.show_info(
+                self.tr("s_dev_raw_empty"), get_last_fragment()))
+            return
+        head = "strategy: {} · status: {} · {} chars\n{}\n".format(
+            self._session.last_strategy or "?", self._session.last_status or "?",
+            len(raw), "-" * 30)
+        self._show_text_dialog(self.tr("s_dev_raw"), head + raw)
+
+    def _reset_click(self, view):
+        def do_reset():
+            errors = 0
+            for key, value in DEFAULTS.items():
+                try:
+                    self.set_setting(key, value)
+                except Exception:
+                    errors += 1
+            self._plog("settings reset, failed keys: {}".format(errors),
+                       level="WARN" if errors else "INFO")
+            self._ui(lambda: BulletinHelper.show_success(
+                self.tr("s_dev_reset_ok"), get_last_fragment()))
+        self._confirm(self.tr("s_dev_reset_q"), self.tr("s_dev_reset_yes"), do_reset)
+
+    # ── для разработчиков ──────────────────────────────────────
+
+    def _snapshot(self, only_errors=False):
+        with self._log_lock:
+            if only_errors:
+                return [e for e in self._log_buffer if e.get("level") == "ERROR"]
+            return list(self._log_buffer)
+
+    def _logs_as_text(self, entries):
+        if not entries:
+            return self.tr("s_dev_empty")
+        head = "OzonSearch v{} · SDK {} · min {} · {}\nstrategy: {} · status: {}\n{} entries\n{}\n".format(
+            __version__, SDK_INFO, __min_version__, time.strftime("%Y-%m-%d %H:%M:%S"),
+            self._session.last_strategy or "-", self._session.last_status or "-",
+            len(entries), "-" * 30)
+        body = []
+        for e in entries:
+            when = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
+            body.append("[{}] {}: {}".format(when, e.get("level", "INFO"), e.get("msg", "")))
+        return head + "\n\n".join(body)
+
+    def _entry_as_text(self, entry):
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.get("ts", 0)))
+        return "[{}] {}\n\n{}".format(when, entry.get("level", "INFO"), entry.get("msg", ""))
+
+    def _log_rows(self, entries):
+        if not entries:
+            return [self._it(Text, text=self.tr("s_dev_empty"), icon="msg_info")]
+        rows = [self._hint(self.tr("s_dev_tap_hint"))]
+        shown = list(reversed(entries))[:MAX_LOG_SHOWN]   # новые сверху
+        for entry in shown:
+            when = time.strftime("%H:%M:%S", time.localtime(entry.get("ts", 0)))
+            msg = entry.get("msg", "")
+            is_err = entry.get("level") == "ERROR"
+            head, _, rest = msg.partition("\n")
+            rows.append(self._it(
+                Text,
+                text="{}  {}".format(when, head)[:120],
+                subtext=(rest[:400] if rest else None),
+                icon="msg_error" if is_err else "msg_message",
+                red=is_err,
+                on_click=lambda view, e=entry: self._open_entry(e),
+            ))
+        if len(entries) > MAX_LOG_SHOWN:
+            rows.append(self._hint(self.tr("s_dev_more").format(len(entries) - MAX_LOG_SHOWN)))
+        return rows
+
+    def _open_entry(self, entry):
+        self._show_text_dialog(self.tr("s_dev_entry"), self._entry_as_text(entry))
+
+    def _page_dev(self) -> List[Any]:
+        total = len(self._snapshot())
+        errors = len(self._snapshot(only_errors=True))
+        ui_mode = self.tr("s_dev_ui_slider") if (SLIDER_CLS is not None and self._slider_ok) \
+            else self.tr("s_dev_ui_input")
+        return [
+            self._it(Header, text=self.tr("s_dev_header")),
+            self._it(Text, text=self.tr("s_dev_info"),
+                     subtext="OzonSearch v{} · SDK {} · min {}".format(
+                         __version__, SDK_INFO, __min_version__),
+                     icon="msg_info"),
+            self._it(Text, text=self.tr("s_dev_ui_mode"), subtext=ui_mode,
+                     icon="msg_photo_settings"),
+            self._it(Text, text=self.tr("s_dev_last"),
+                     subtext=self.tr("s_dev_last_sub").format(
+                         self._session.last_strategy or "-",
+                         self._session.last_status or "-"),
+                     icon="msg_stats"),
+            self._it(Text, text=self.tr("s_dev_ping"), subtext=self.tr("s_dev_ping_sub"),
+                     icon="msg_language", on_click=self._ping_click),
+            self._it(Text, text=self.tr("s_dev_raw"),
+                     subtext=self.tr("s_dev_raw_sub").format(len(self._session.last_raw)),
+                     icon="msg_view_file", on_click=self._raw_click),
+            self._it(Divider),
+
+            self._it(Text, text=self.tr("s_dev_logs"),
+                     subtext=self.tr("s_dev_logs_sub").format(total), icon="msg_folder",
+                     create_sub_fragment=lambda: self._safe_page(self._page_dev_logs)),
+            self._it(Text, text=self.tr("s_dev_errors"),
+                     subtext=self.tr("s_dev_errors_sub").format(errors),
+                     icon="msg_error", red=errors > 0,
+                     create_sub_fragment=lambda: self._safe_page(self._page_dev_errors)),
+            self._it(Divider),
+
+            self._it(Text, text=self.tr("s_dev_open_full"),
+                     subtext=self.tr("s_dev_open_full_sub"), icon="msg_viewintopic",
+                     on_click=lambda view: self._show_text_dialog(
+                         self.tr("s_dev_logs"), self._logs_as_text(self._snapshot()))),
+            self._it(Text, text=self.tr("s_dev_copy_all"),
+                     subtext=self.tr("s_dev_copy_all_sub"), icon="msg_copy",
+                     on_click=lambda view: self._copy_and_notify(
+                         self._logs_as_text(self._snapshot()))),
+            self._it(Text, text=self.tr("s_dev_copy_err"), icon="msg_copy",
+                     on_click=lambda view: self._copy_and_notify(
+                         self._logs_as_text(self._snapshot(only_errors=True)))),
+            self._it(Text, text=self.tr("s_dev_full_page"),
+                     subtext=self.tr("s_dev_full_page_sub"), icon="msg_list",
+                     create_sub_fragment=lambda: self._safe_page(self._page_dev_full)),
+            self._it(Divider),
+
+            self._it(Text, text=self.tr("s_dev_clear"), icon="msg_delete", red=True,
+                     on_click=self._clear_logs_click),
+            self._it(Text, text=self.tr("s_dev_reset"), subtext=self.tr("s_dev_reset_sub"),
+                     icon="msg_reset", red=True, on_click=self._reset_click),
+        ]
+
+    def _dev_actions(self, only_errors=False):
+        def text():
+            return self._logs_as_text(self._snapshot(only_errors=only_errors))
+        title = self.tr("s_dev_errors") if only_errors else self.tr("s_dev_logs")
+        return [
+            self._it(Text, text=self.tr("s_dev_open_full"), icon="msg_viewintopic",
+                     on_click=lambda view: self._show_text_dialog(title, text())),
+            self._it(Text, text=self.tr("s_dev_copy_all"), icon="msg_copy",
+                     on_click=lambda view: self._copy_and_notify(text())),
+            self._it(Divider),
+        ]
+
+    def _page_dev_logs(self) -> List[Any]:
+        return ([self._it(Header, text=self.tr("s_dev_logs"))]
+                + self._dev_actions(False) + self._log_rows(self._snapshot()))
+
+    def _page_dev_errors(self) -> List[Any]:
+        return ([self._it(Header, text=self.tr("s_dev_errors"))]
+                + self._dev_actions(True) + self._log_rows(self._snapshot(only_errors=True)))
+
+    def _page_dev_full(self) -> List[Any]:
+        full = self._logs_as_text(self._snapshot())
+        items = [
+            self._it(Header, text=self.tr("s_dev_full_page")),
+            self._it(Text, text=self.tr("s_dev_copy_all"), icon="msg_copy",
+                     on_click=lambda view: self._copy_and_notify(full)),
+            self._it(Divider),
+        ]
+        for chunk in self._chunk_text(full, LOG_CHUNK):
+            items.append(self._hint(chunk))
+        return items
+
+    @staticmethod
+    def _chunk_text(text, size):
+        chunks, buf = [], []
+        cur = 0
+        for line in text.split("\n"):
+            if cur + len(line) + 1 > size and buf:
+                chunks.append("\n".join(buf))
+                buf, cur = [], 0
+            while len(line) > size:
+                chunks.append(line[:size])
+                line = line[size:]
+            buf.append(line)
+            cur += len(line) + 1
+        if buf:
+            chunks.append("\n".join(buf))
+        return chunks or [""]
+
+    def _clear_logs_click(self, view):
+        try:
+            with self._log_lock:
+                self._log_buffer.clear()
+            self._kw_warned.clear()
+            self._ui(lambda: BulletinHelper.show_success(
+                self.tr("s_dev_cleared"), get_last_fragment()))
+        finally:
+            del view
