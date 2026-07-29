@@ -1,0 +1,992 @@
+import json
+import math
+import os
+import threading
+from pathlib import Path
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from java import jarray, jfloat, jint
+from org.telegram.messenger import (
+    AndroidUtilities,
+    FileLoader,
+    MediaController,
+    UserConfig,
+)
+from org.telegram.ui.ActionBar import Theme
+
+API_URL = "https://api.meiji.su/audio-to-bars"
+
+__id__ = "audiovizualizer_plugin"
+__name__ = "Audio Visualizer"
+__description__ = (
+    "аудиовизуализатор, с подробным конфигом и несколькими режимами работы"
+)
+__author__ = "@MGPlugins"
+__version__ = "2.7.0"
+__min_version__ = "12.1.1"
+__icon__ = "MeijiPlugins/4"
+
+
+def log(msg: str):
+    try:
+        inst = AudioVisualizerPlugin._instance
+        if inst and not inst.get_setting("debug_log", False):
+            return
+    except Exception:
+        pass
+    try:
+        from android_utils import log as _android_log
+
+        _android_log(f"[AudioVisualizer] {msg}")
+    except Exception:
+        print(f"[AudioVisualizer] {msg}")
+
+
+def make_argb(a: int, r: int, g: int, b: int) -> jint:
+    a = max(0, min(255, int(a)))
+    r = max(0, min(255, int(r)))
+    g = max(0, min(255, int(g)))
+    b = max(0, min(255, int(b)))
+    val = (a << 24) | (r << 16) | (g << 8) | b
+    if val >= 0x80000000:
+        val -= 0x100000000
+    return jint(val)
+
+
+def parse_hex_color(hex_str: str, default_a: int = 210) -> jint | None:
+    try:
+        s = hex_str.strip().lstrip("#")
+        if len(s) == 6:
+            r = int(s[0:2], 16)
+            g = int(s[2:4], 16)
+            b = int(s[4:6], 16)
+            return make_argb(default_a, r, g, b)
+        elif len(s) == 8:
+            a = int(s[0:2], 16)
+            r = int(s[2:4], 16)
+            g = int(s[4:6], 16)
+            b = int(s[6:8], 16)
+            return make_argb(a, r, g, b)
+    except Exception:
+        pass
+    return None
+
+
+def find_method(cls, name: str, param_count: int = -1):
+    curr = cls.getClass() if hasattr(cls, "getClass") else cls
+    while curr is not None:
+        try:
+            methods = curr.getDeclaredMethods()
+            for m in methods:
+                if m.getName() == name:
+                    if param_count < 0 or len(m.getParameterTypes()) == param_count:
+                        m.setAccessible(True)
+                        return m
+        except Exception as e:
+            log(f"Error searching method {name} in {curr}: {e}")
+        try:
+            curr = curr.getSuperclass()
+        except Exception:
+            break
+    return None
+
+
+def find_methods_by_name(cls, name: str):
+    result = []
+    curr = cls.getClass() if hasattr(cls, "getClass") else cls
+    while curr is not None:
+        try:
+            methods = curr.getDeclaredMethods()
+            for m in methods:
+                if m.getName() == name:
+                    m.setAccessible(True)
+                    result.append(m)
+        except Exception:
+            pass
+        try:
+            curr = curr.getSuperclass()
+        except Exception:
+            break
+    return result
+
+
+_BARS_CACHE: dict[str, dict] = {}
+_PENDING_UPLOADS: set[str] = set()
+_ACTIVE_VIEW = None
+_SAMPLE_CACHE: dict | None = None
+
+
+def _get_local_sample_data() -> dict | None:
+    global _SAMPLE_CACHE
+    if _SAMPLE_CACHE is not None:
+        return _SAMPLE_CACHE
+    try:
+        cur_dir = Path(__file__).parent if "__file__" in globals() else Path(".")
+        sample_path = cur_dir / "output.json"
+        if sample_path.is_file():
+            with open(sample_path, "r", encoding="utf-8") as f:
+                _SAMPLE_CACHE = json.load(f)
+                return _SAMPLE_CACHE
+    except Exception as e:
+        log(f"Error loading sample output.json: {e}")
+    return None
+
+
+def _find_audio_file_path(playing_obj, doc) -> str | None:
+    try:
+        account = UserConfig.selectedAccount
+        if hasattr(playing_obj, "messageOwner") and hasattr(
+            playing_obj.messageOwner, "attachPath"
+        ):
+            path = playing_obj.messageOwner.attachPath
+            if path and os.path.exists(path):
+                return path
+        if doc:
+            try:
+                f1 = FileLoader.getInstance(account).getPathToAttach(doc, True)
+                if f1 and f1.exists():
+                    return f1.getAbsolutePath()
+            except Exception:
+                pass
+            try:
+                f2 = FileLoader.getInstance(account).getPathToAttach(doc, False)
+                if f2 and f2.exists():
+                    return f2.getAbsolutePath()
+            except Exception:
+                pass
+            try:
+                dir_file = FileLoader.getInstance(account).getDirectory(
+                    FileLoader.MEDIA_DIR_AUDIO
+                )
+                if dir_file and dir_file.exists():
+                    doc_name = getattr(doc, "file_name", None) or f"{doc.id}.m4a"
+                    full_p = os.path.join(dir_file.getAbsolutePath(), doc_name)
+                    if os.path.exists(full_p):
+                        return full_p
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"Error finding audio file path: {e}")
+    return None
+
+
+def _upload_audio_to_bars(
+    file_path: str, cache_key: str, num_bars: int, fps: int, sensitivity: float
+):
+    if cache_key in _PENDING_UPLOADS or cache_key in _BARS_CACHE:
+        return
+    _PENDING_UPLOADS.add(cache_key)
+
+    def worker():
+        try:
+            path = Path(file_path)
+            if not path.is_file():
+                log(f"Upload skipped, file not found: {path}")
+                return
+            log(
+                f"Uploading '{path.name}' (num_bars={num_bars}, fps={fps}, sensitivity={sensitivity})..."
+            )
+            import requests
+
+            params = {
+                "num_bars": num_bars,
+                "fps": fps,
+                "sensitivity": sensitivity,
+            }
+            with open(path, "rb") as f:
+                files = {"file": (path.name, f)}
+                response = requests.post(
+                    API_URL, files=files, data=params, params=params, timeout=60
+                )
+
+            if response.ok:
+                data = response.json()
+                if isinstance(data, dict) and "frames" in data:
+                    _BARS_CACHE[cache_key] = data
+                    log(
+                        f"Successfully received {len(data['frames'])} API frames for track {cache_key}"
+                    )
+                    global _ACTIVE_VIEW
+                    if _ACTIVE_VIEW:
+                        try:
+                            from android_utils import run_on_ui_thread
+
+                            run_on_ui_thread(lambda: _ACTIVE_VIEW.invalidate())
+                        except Exception:
+                            pass
+            else:
+                log(f"API request failed: {response.status_code} {response.reason}")
+        except Exception as e:
+            log(f"Upload thread error: {e}")
+        finally:
+            _PENDING_UPLOADS.discard(cache_key)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+class ContextViewConstructorHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        pass
+
+
+class ContextViewCheckPlayerHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            view = param.thisObject
+            if view and hasattr(view, "getVisibility") and view.getVisibility() == 0:
+                view.postInvalidateOnAnimation()
+        except Exception as e:
+            log(f"checkPlayer hook error: {e}")
+
+
+class DispatchDrawHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            view = param.thisObject
+            if not view:
+                return
+
+            if hasattr(view, "getVisibility") and view.getVisibility() != 0:
+                return
+
+            global _ACTIVE_VIEW
+            _ACTIVE_VIEW = view
+            view.postInvalidateOnAnimation()
+        except Exception as e:
+            log(f"DispatchDrawHook error: {e}")
+
+
+class ActionBarLayoutDrawHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            view = param.thisObject
+            canvas = param.args[0]
+            if view and canvas and self.plugin:
+                self.plugin.draw_visualizer(view, canvas)
+        except Exception as e:
+            log(f"ActionBarLayoutDrawHook error: {e}")
+
+
+class AudioVisualizerPlugin(BasePlugin):
+    _instance = None
+
+    def __init__(self):
+        super().__init__()
+        AudioVisualizerPlugin._instance = self
+        self._last_logged_track = None
+
+        PaintClass = find_class("android.graphics.Paint")
+        PaintStyleClass = find_class("android.graphics.Paint$Style")
+        RectFClass = find_class("android.graphics.RectF")
+
+        self.PaintStyleClass = PaintStyleClass
+        self.bar_paint = PaintClass()
+        self.bar_paint.setAntiAlias(True)
+        self.bar_paint.setStyle(PaintStyleClass.FILL)
+        self.bar_rect = RectFClass()
+        self.PathClass = find_class("android.graphics.Path")
+        self.LinearGradientClass = find_class("android.graphics.LinearGradient")
+        TileModeClass = find_class("android.graphics.Shader$TileMode")
+        self.TileModeClamp = TileModeClass.CLAMP
+
+    def draw_visualizer(self, ab_view, canvas):
+        try:
+            view = _ACTIVE_VIEW
+            if not view or not canvas:
+                return
+
+            hide_without_player = self.get_setting("hide_without_player", True)
+
+            if hide_without_player:
+                if (
+                    hasattr(view, "isAttachedToWindow")
+                    and not view.isAttachedToWindow()
+                ):
+                    return
+                if hasattr(view, "isShown") and not view.isShown():
+                    return
+                if (
+                    not hasattr(view, "getVisibility") or view.getVisibility() != 0
+                ) or (hasattr(view, "getAlpha") and view.getAlpha() <= 0.05):
+                    return
+
+            mc = MediaController.getInstance()
+            if not mc:
+                return
+
+            playing_obj = mc.getPlayingMessageObject()
+            if hide_without_player and not playing_obj:
+                return
+
+            if not playing_obj:
+                return
+
+            track_id = str(playing_obj.getId())
+            if self._last_logged_track != track_id:
+                self._last_logged_track = track_id
+                title = (
+                    playing_obj.getMusicTitle()
+                    if hasattr(playing_obj, "getMusicTitle")
+                    else "Audio"
+                )
+                log(f"Active track in draw_visualizer: ID={track_id}, title='{title}'")
+
+            loc = jarray(jint)([0, 0])
+            view.getLocationInWindow(loc)
+            pill_left = float(loc[0])
+            pill_top = float(loc[1])
+            pill_w = float(view.getWidth())
+            pill_h = float(view.getHeight())
+
+            if pill_w <= 0 or pill_h <= 0:
+                return
+
+            pill_bottom = pill_top + pill_h
+            pill_mid = pill_top + pill_h / 2.0
+
+            try:
+                num_bars = int(self.get_setting("num_bars", "40"))
+                if num_bars <= 0:
+                    num_bars = 40
+            except Exception:
+                num_bars = 40
+
+            try:
+                fps_cfg = int(self.get_setting("fps", "30"))
+                if fps_cfg <= 0:
+                    fps_cfg = 30
+            except Exception:
+                fps_cfg = 30
+
+            try:
+                sensitivity = float(self.get_setting("sensitivity", "1.1"))
+                if sensitivity <= 0:
+                    sensitivity = 1.1
+            except Exception:
+                sensitivity = 1.1
+
+            doc = playing_obj.getDocument()
+            raw_id = str(doc.id) if doc else str(playing_obj.getId())
+            cache_key = f"{raw_id}_{num_bars}_{fps_cfg}_{sensitivity}"
+
+            data = _BARS_CACHE.get(cache_key)
+            if not data:
+                audio_file = _find_audio_file_path(playing_obj, doc)
+                if audio_file:
+                    _upload_audio_to_bars(
+                        audio_file, cache_key, num_bars, fps_cfg, sensitivity
+                    )
+                data = _get_local_sample_data()
+
+            duration = 140.0
+            if data and "duration" in data and float(data["duration"]) > 0:
+                duration = float(data["duration"])
+            elif hasattr(playing_obj, "getDuration") and playing_obj.getDuration() > 0:
+                duration = float(playing_obj.getDuration())
+            elif (
+                hasattr(playing_obj, "audioPlayerDuration")
+                and playing_obj.audioPlayerDuration > 0
+            ):
+                duration = float(playing_obj.audioPlayerDuration)
+
+            raw_progress = 0.0
+            if (
+                hasattr(playing_obj, "audioProgress")
+                and 0.0 <= float(playing_obj.audioProgress) <= 1.0
+            ):
+                raw_progress = float(playing_obj.audioProgress)
+            elif hasattr(mc, "getAudioProgress"):
+                try:
+                    raw_progress = float(mc.getAudioProgress())
+                except Exception:
+                    raw_progress = 0.0
+
+            if raw_progress > 1.0:
+                current_time = raw_progress
+            else:
+                current_time = raw_progress * duration
+
+            is_paused = mc.isMessagePaused()
+
+            bars_values = []
+
+            if is_paused:
+                bars_values = [0.0] * num_bars
+            elif data and "frames" in data and len(data["frames"]) > 0:
+                fps = int(data.get("fps", fps_cfg))
+                frames = data["frames"]
+                frame_float = current_time * fps
+                frame_idx = int(frame_float)
+                fraction = frame_float - frame_idx
+
+                if 0 <= frame_idx < len(frames):
+                    curr_f = frames[frame_idx]
+                    next_f = frames[min(frame_idx + 1, len(frames) - 1)]
+                    bars_cnt = len(curr_f)
+                    for i in range(bars_cnt):
+                        v1 = float(curr_f[i])
+                        v2 = float(next_f[i]) if i < len(next_f) else v1
+                        interpolated = v1 * (1.0 - fraction) + v2 * fraction
+                        bars_values.append(interpolated)
+                else:
+                    last_f = frames[-1]
+                    bars_values = [float(v) for v in last_f]
+            else:
+                for i in range(num_bars):
+                    phase = current_time * 6.0 + (i / float(num_bars)) * 2.0 * math.pi
+                    val = 0.5 + 0.45 * math.sin(phase)
+                    val = max(0.05, min(1.0, val))
+                    bars_values.append(val)
+
+            active_bars_count = len(bars_values) if bars_values else num_bars
+
+            color_idx = self.get_setting("color_mode", 0)
+            grad_orient = self.get_setting("gradient_orientation", 0)
+            grad_colors = None
+
+            if color_idx == 0:
+                grad_colors = [
+                    make_argb(220, 0, 229, 255),
+                    make_argb(220, 168, 85, 247),
+                ]
+            elif color_idx == 1:
+                grad_colors = [make_argb(220, 255, 42, 85), make_argb(220, 255, 214, 0)]
+            elif color_idx == 2:
+                grad_colors = [
+                    make_argb(220, 255, 69, 138),
+                    make_argb(220, 255, 122, 0),
+                ]
+            elif color_idx == 3:
+                grad_colors = [make_argb(220, 0, 230, 118), make_argb(220, 0, 242, 254)]
+            elif color_idx == 4:
+                grad_colors = [
+                    make_argb(230, 255, 255, 255),
+                    make_argb(160, 255, 255, 255),
+                ]
+            elif color_idx == 5:
+                try:
+                    accent = Theme.getColor(Theme.key_inappPlayerTitle)
+                    r = (accent >> 16) & 0xFF
+                    g = (accent >> 8) & 0xFF
+                    b = accent & 0xFF
+                    if r == 0 and g == 0 and b == 0:
+                        r, g, b = 0, 180, 255
+                except Exception:
+                    r, g, b = 0, 180, 255
+                c1 = make_argb(220, r, g, b)
+                c2 = make_argb(
+                    220, min(255, r + 40), min(255, g + 60), min(255, b + 80)
+                )
+                grad_colors = [c1, c2]
+            else:
+                raw_hex = str(self.get_setting("custom_hex", "#00E5FF,#9900FF,#FF007F"))
+                parts = [p.strip() for p in raw_hex.split(",") if p.strip()]
+                parsed = []
+                for p in parts:
+                    parsed_c = parse_hex_color(p)
+                    if parsed_c is not None:
+                        parsed.append(parsed_c)
+                if len(parsed) >= 2:
+                    grad_colors = parsed
+                elif len(parsed) == 1:
+                    grad_colors = [parsed[0], parsed[0]]
+                else:
+                    grad_colors = [
+                        make_argb(220, 0, 229, 255),
+                        make_argb(220, 168, 85, 247),
+                    ]
+
+            shape_mode = self.get_setting("shape_mode", 0)
+            render_direction = self.get_setting("render_direction", 0)
+
+            try:
+                raw_h = str(self.get_setting("max_height_dp", "32"))
+                max_bar_h_dp = float(raw_h)
+                if max_bar_h_dp <= 0:
+                    max_bar_h_dp = 32.0
+            except Exception:
+                max_bar_h_dp = 32.0
+
+            side_margin_dp = 20.0
+
+            if shape_mode == 4:
+                play_view = None
+                try:
+                    for c_idx in range(view.getChildCount()):
+                        child = view.getChildAt(c_idx)
+                        if (
+                            child
+                            and hasattr(child, "getVisibility")
+                            and child.getVisibility() == 0
+                        ):
+                            w_px = child.getWidth()
+                            l_px = child.getLeft()
+                            if 0 < w_px <= AndroidUtilities.dp(
+                                48
+                            ) and l_px <= AndroidUtilities.dp(36):
+                                play_view = child
+                                break
+                except Exception:
+                    pass
+
+                if play_view:
+                    center_x = pill_left + float(
+                        play_view.getLeft() + play_view.getWidth() / 2.0
+                    )
+                    center_y = pill_top + float(
+                        play_view.getTop() + play_view.getHeight() / 2.0
+                    )
+                else:
+                    center_x = pill_left + float(AndroidUtilities.dp(26.0))
+                    center_y = pill_mid
+
+                r_grad = float(AndroidUtilities.dp(35.0))
+                colors_arr = jarray(jint)(grad_colors)
+                if grad_orient == 1:
+                    shader = self.LinearGradientClass(
+                        jfloat(center_x),
+                        jfloat(center_y + r_grad),
+                        jfloat(center_x),
+                        jfloat(center_y - r_grad),
+                        colors_arr,
+                        None,
+                        self.TileModeClamp,
+                    )
+                else:
+                    shader = self.LinearGradientClass(
+                        jfloat(center_x - r_grad),
+                        jfloat(center_y),
+                        jfloat(center_x + r_grad),
+                        jfloat(center_y),
+                        colors_arr,
+                        None,
+                        self.TileModeClamp,
+                    )
+            else:
+                colors_arr = jarray(jint)(grad_colors)
+                if grad_orient == 1:
+                    shader = self.LinearGradientClass(
+                        jfloat(pill_left + pill_w / 2.0),
+                        jfloat(pill_bottom),
+                        jfloat(pill_left + pill_w / 2.0),
+                        jfloat(pill_top - AndroidUtilities.dp(max_bar_h_dp)),
+                        colors_arr,
+                        None,
+                        self.TileModeClamp,
+                    )
+                else:
+                    start_x = pill_left + float(AndroidUtilities.dp(side_margin_dp))
+                    end_x = (
+                        pill_left + pill_w - float(AndroidUtilities.dp(side_margin_dp))
+                    )
+                    shader = self.LinearGradientClass(
+                        jfloat(start_x),
+                        jfloat(pill_mid),
+                        jfloat(end_x),
+                        jfloat(pill_mid),
+                        colors_arr,
+                        None,
+                        self.TileModeClamp,
+                    )
+
+            self.bar_paint.setShader(shader)
+
+            min_bar_h_dp = 2.0
+            gap_dp = 2.0
+
+            avail_w_px = pill_w - 2 * AndroidUtilities.dp(side_margin_dp)
+            total_gap_px = (active_bars_count - 1) * AndroidUtilities.dp(gap_dp)
+            bar_w_px = max(
+                float(AndroidUtilities.dp(2)),
+                (avail_w_px - total_gap_px) / float(active_bars_count),
+            )
+
+            if shape_mode == 4:
+                r_inner = float(AndroidUtilities.dp(10.5))
+                self.bar_paint.setStyle(self.PaintStyleClass.STROKE)
+                self.bar_paint.setStrokeWidth(jfloat(AndroidUtilities.dp(2.0)))
+
+                for i in range(active_bars_count):
+                    val = float(bars_values[i]) if i < len(bars_values) else 0.0
+                    norm = min(1.0, max(0.0, val))
+                    bar_h_dp = min_bar_h_dp + norm * (max_bar_h_dp - min_bar_h_dp)
+                    bar_h_px = float(AndroidUtilities.dp(bar_h_dp))
+
+                    angle_right = (
+                        math.pi / float(active_bars_count)
+                    ) * i - math.pi / 2.0
+                    angle_left = math.pi / 2.0 + (
+                        math.pi / float(active_bars_count)
+                    ) * (active_bars_count - 1 - i)
+
+                    cos_r = math.cos(angle_right)
+                    sin_r = math.sin(angle_right)
+                    x1_r = center_x + r_inner * cos_r
+                    y1_r = center_y + r_inner * sin_r
+                    x2_r = center_x + (r_inner + bar_h_px) * cos_r
+                    y2_r = center_y + (r_inner + bar_h_px) * sin_r
+                    canvas.drawLine(
+                        jfloat(x1_r),
+                        jfloat(y1_r),
+                        jfloat(x2_r),
+                        jfloat(y2_r),
+                        self.bar_paint,
+                    )
+
+                    cos_l = math.cos(angle_left)
+                    sin_l = math.sin(angle_left)
+                    x1_l = center_x + r_inner * cos_l
+                    y1_l = center_y + r_inner * sin_l
+                    x2_l = center_x + (r_inner + bar_h_px) * cos_l
+                    y2_l = center_y + (r_inner + bar_h_px) * sin_l
+                    canvas.drawLine(
+                        jfloat(x1_l),
+                        jfloat(y1_l),
+                        jfloat(x2_l),
+                        jfloat(y2_l),
+                        self.bar_paint,
+                    )
+
+            elif shape_mode == 2:
+                self.bar_paint.setStyle(self.PaintStyleClass.FILL)
+                wave_path = self.PathClass()
+                first = True
+                start_x = 0.0
+                end_x = 0.0
+                baseline_y = (
+                    pill_bottom
+                    if render_direction in (0, 3)
+                    else (pill_top if render_direction in (1, 4) else pill_mid)
+                )
+
+                for i in range(active_bars_count):
+                    val = float(bars_values[i]) if i < len(bars_values) else 0.0
+                    norm = min(1.0, max(0.0, val))
+                    bar_h_dp = min_bar_h_dp + norm * (max_bar_h_dp - min_bar_h_dp)
+                    bar_h_px = float(AndroidUtilities.dp(bar_h_dp))
+
+                    cx = (
+                        pill_left
+                        + AndroidUtilities.dp(side_margin_dp)
+                        + i * (bar_w_px + AndroidUtilities.dp(gap_dp))
+                        + bar_w_px / 2.0
+                    )
+
+                    if render_direction == 1:
+                        cy = pill_top + bar_h_px
+                    elif render_direction == 2:
+                        cy = pill_mid - bar_h_px / 2.0
+                    elif render_direction == 3:
+                        cy = pill_bottom + bar_h_px
+                    elif render_direction == 4:
+                        cy = pill_top - bar_h_px
+                    else:
+                        cy = pill_bottom - bar_h_px
+
+                    if first:
+                        wave_path.moveTo(jfloat(cx), jfloat(cy))
+                        start_x = cx
+                        first = False
+                    else:
+                        wave_path.lineTo(jfloat(cx), jfloat(cy))
+                    end_x = cx
+
+                wave_path.lineTo(jfloat(end_x), jfloat(baseline_y))
+                wave_path.lineTo(jfloat(start_x), jfloat(baseline_y))
+                wave_path.close()
+
+                canvas.drawPath(wave_path, self.bar_paint)
+
+            else:
+                self.bar_paint.setStyle(self.PaintStyleClass.FILL)
+                is_lasers = shape_mode == 3
+                is_square = shape_mode == 0
+
+                actual_bar_w = (
+                    float(AndroidUtilities.dp(1.5)) if is_lasers else bar_w_px
+                )
+                radius = jfloat(0.0 if (is_square or is_lasers) else actual_bar_w / 2.0)
+
+                for i in range(active_bars_count):
+                    val = float(bars_values[i]) if i < len(bars_values) else 0.0
+                    norm = min(1.0, max(0.0, val))
+
+                    bar_h_dp = min_bar_h_dp + norm * (max_bar_h_dp - min_bar_h_dp)
+                    bar_h_px = float(AndroidUtilities.dp(bar_h_dp))
+
+                    left_px = (
+                        pill_left
+                        + AndroidUtilities.dp(side_margin_dp)
+                        + i * (bar_w_px + AndroidUtilities.dp(gap_dp))
+                        + (bar_w_px - actual_bar_w) / 2.0
+                    )
+                    right_px = left_px + actual_bar_w
+
+                    if render_direction == 1:
+                        top_px = pill_top
+                        bottom_px = pill_top + bar_h_px
+                    elif render_direction == 2:
+                        top_px = pill_mid - bar_h_px / 2.0
+                        bottom_px = pill_mid + bar_h_px / 2.0
+                    elif render_direction == 3:
+                        top_px = pill_bottom
+                        bottom_px = pill_bottom + bar_h_px
+                    elif render_direction == 4:
+                        bottom_px = pill_top
+                        top_px = pill_top - bar_h_px
+                    else:
+                        bottom_px = pill_bottom
+                        top_px = pill_bottom - bar_h_px
+
+                    self.bar_rect.set(
+                        jfloat(left_px),
+                        jfloat(top_px),
+                        jfloat(right_px),
+                        jfloat(bottom_px),
+                    )
+                    if is_square or is_lasers:
+                        canvas.drawRect(self.bar_rect, self.bar_paint)
+                    else:
+                        canvas.drawRoundRect(
+                            self.bar_rect, radius, radius, self.bar_paint
+                        )
+
+            if shape_mode == 4 or render_direction in (0, 1, 2):
+                try:
+                    for c_idx in range(view.getChildCount()):
+                        child = view.getChildAt(c_idx)
+                        if (
+                            child
+                            and hasattr(child, "getVisibility")
+                            and child.getVisibility() == 0
+                            and hasattr(child, "getAlpha")
+                            and child.getAlpha() > 0.05
+                        ):
+                            c_left = float(child.getLeft())
+                            c_w = float(child.getWidth())
+
+                            if c_left <= AndroidUtilities.dp(
+                                36
+                            ) and c_w <= AndroidUtilities.dp(48):
+                                continue
+
+                            c_top = float(child.getTop())
+                            canvas.save()
+                            canvas.translate(
+                                jfloat(pill_left + c_left), jfloat(pill_top + c_top)
+                            )
+                            child.draw(canvas)
+                            canvas.restore()
+                except Exception as e:
+                    log(f"Child overlay draw error: {e}")
+
+            if ab_view and not is_paused:
+                ab_view.postInvalidateOnAnimation()
+
+        except Exception as e:
+            log(f"draw_visualizer error: {e}")
+
+    def on_plugin_load(self):
+        log("Plugin on_plugin_load started")
+
+        sample = _get_local_sample_data()
+        if sample:
+            log(
+                f"Loaded sample output.json with {len(sample.get('frames', []))} frames"
+            )
+
+        FragmentContextView = find_class(
+            "org.telegram.ui.Components.FragmentContextView"
+        )
+        ActionBarLayout = find_class("org.telegram.ui.ActionBar.ActionBarLayout")
+
+        if FragmentContextView:
+            try:
+                cls = FragmentContextView.getClass()
+                self.hook_all_constructors(cls, ContextViewConstructorHook(self))
+                log("Constructors hooked successfully")
+
+                check_player_methods = find_methods_by_name(
+                    FragmentContextView, "checkPlayer"
+                )
+                for m in check_player_methods:
+                    self.hook_method(m, ContextViewCheckPlayerHook(self))
+                log(f"Hooked {len(check_player_methods)} checkPlayer methods")
+
+                dispatch_draw = find_method(FragmentContextView, "dispatchDraw", 1)
+                if dispatch_draw:
+                    self.hook_method(dispatch_draw, DispatchDrawHook(self))
+                    log("dispatchDraw hooked successfully!")
+            except Exception as e:
+                log(f"Hook error in FragmentContextView: {e}")
+        else:
+            log("FragmentContextView class NOT found")
+
+        if ActionBarLayout:
+            try:
+                ab_draw = find_method(ActionBarLayout, "dispatchDraw", 1)
+                if ab_draw:
+                    self.hook_method(ab_draw, ActionBarLayoutDrawHook(self))
+                    log(
+                        "ActionBarLayout dispatchDraw hooked successfully for unclipped rendering!"
+                    )
+            except Exception as e:
+                log(f"ActionBarLayout hook error: {e}")
+        else:
+            log("ActionBarLayout class NOT found")
+
+    def on_plugin_unload(self):
+        log("Plugin unloaded")
+        AudioVisualizerPlugin._instance = None
+        global _ACTIVE_VIEW, _SAMPLE_CACHE
+        _ACTIVE_VIEW = None
+        _SAMPLE_CACHE = None
+        _BARS_CACHE.clear()
+        _PENDING_UPLOADS.clear()
+
+    def create_settings(self):
+        log("create_settings called")
+        from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+        shape_mode = self.get_setting("shape_mode", 0)
+        color_mode = self.get_setting("color_mode", 0)
+
+        settings = [
+            Header(text="Визуализатор / Audio Visualizer"),
+            Text(text="ℹ️ Состояние плагина", subtext="Активен (хуки подключены)"),
+            Divider(),
+            Switch(
+                key="hide_without_player",
+                text="Скрывать если нет плеера",
+                default=self.get_setting("hide_without_player", True),
+                subtext="Скрывать визуализатор, если элемент плеера не отображается на экране",
+            ),
+            Switch(
+                key="debug_log",
+                text="debug log",
+                default=self.get_setting("debug_log", False),
+                subtext="ай ай блять больно",
+            ),
+            Divider(),
+            Selector(
+                key="shape_mode",
+                text="Форма визуализатора",
+                default=shape_mode,
+                items=[
+                    "Квадратные столбики",
+                    "Закругленные столбики",
+                    "Волна",
+                    "Лазеры",
+                    "Радиальный",
+                ],
+            ),
+        ]
+
+        if shape_mode != 4:
+            settings.append(
+                Selector(
+                    key="render_direction",
+                    text="Расположение визуализатора",
+                    default=self.get_setting("render_direction", 0),
+                    items=[
+                        "Снизу внутри бокса",
+                        "Сверху внутри бокса",
+                        "По центру бокса",
+                        "Снизу снаружи бокса",
+                        "Сверху снаружи бокса",
+                    ],
+                )
+            )
+
+        settings.append(
+            Selector(
+                key="color_mode",
+                text="Цветовая схема",
+                default=color_mode,
+                items=[
+                    "Неоновый (Циан ➔ Фиолетовый)",
+                    "Лава (Красный ➔ Желтый)",
+                    "Закат (Розовый ➔ Оранжевый)",
+                    "Изумруд (зеленый ➔ Бирюзовый)",
+                    "Белый",
+                    "Акцент темы",
+                    "Свой HEX цвет / градиент",
+                ],
+            )
+        )
+
+        settings.append(
+            Selector(
+                key="gradient_orientation",
+                text="Направление градиента",
+                default=self.get_setting("gradient_orientation", 0),
+                items=["Горизонтальный", "Вертикальный"],
+            )
+        )
+
+        if color_mode == 6:
+            settings.append(
+                Input(
+                    key="custom_hex",
+                    text="Свой HEX цвет / градиент",
+                    default=str(
+                        self.get_setting("custom_hex", "#00E5FF,#9900FF,#FF007F")
+                    ),
+                    subtext="Пример: #FF007F или несколько цветов через запятую: #FF0055,#FFD600,#00E5FF",
+                    icon="msg_text",
+                )
+            )
+
+        settings.extend(
+            [
+                Input(
+                    key="max_height_dp",
+                    text="Макс. высота полос (dp)",
+                    default=str(self.get_setting("max_height_dp", "32")),
+                    subtext="Введите макс. высоту в dp (по умолчанию 32)",
+                    icon="msg_text",
+                ),
+                Divider(),
+                Header(text="Параметры API сервера"),
+                Input(
+                    key="num_bars",
+                    text="Кол-во полос (num_bars)",
+                    default=str(self.get_setting("num_bars", "40")),
+                    subtext="По умолчанию 40 полос",
+                    icon="msg_text",
+                ),
+                Input(
+                    key="fps",
+                    text="Частота кадров (fps)",
+                    default=str(self.get_setting("fps", "30")),
+                    subtext="По умолчанию 30 FPS",
+                    icon="msg_text",
+                ),
+                Input(
+                    key="sensitivity",
+                    text="Чувствительность (sensitivity)",
+                    default=str(self.get_setting("sensitivity", "1.1")),
+                    subtext="По умолчанию 1.1",
+                    icon="msg_text",
+                ),
+            ]
+        )
+
+        return settings
