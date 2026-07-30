@@ -1,0 +1,1244 @@
+"""Contact Time — local per-contact time zones for exteraGram/AyuGram."""
+
+import json
+import re
+import traceback
+from typing import Any, List
+from android.view import Gravity, HapticFeedbackConstants, MotionEvent, View
+from android.widget import EditText as AndroidEditText
+from java import dynamic_proxy, jint, jlong
+from java.lang import System
+from java.time import Instant, ZoneId, ZonedDateTime
+from java.time.format import DateTimeFormatter
+from java.util import WeakHashMap
+from org.telegram.messenger import AndroidUtilities, UserConfig
+from org.telegram.ui.ActionBar import Theme
+
+from android_utils import (
+    OnClickListener,
+    R,
+    copy_to_clipboard,
+    run_on_ui_thread,
+)
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import (
+    find_class,
+    get_private_field,
+    get_static_private_field,
+    set_private_field,
+)
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch
+
+
+__id__ = "contact_time"
+__name__ = "Contact Time"
+__description__ = "Показывает местное время контакта в профиле, сообщениях и статусе последнего посещения."
+__author__ = "@engiPlugins"
+__version__ = "1.1.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+
+STORAGE_KEY = "contact_time_zones_v1"
+REPLACE_CHAT_TIME_KEY = "contact_time_replace_chat_time_v1"
+MESSAGE_TIME_KEY = "contact_time_message_time_v1"
+LAST_SEEN_TIME_KEY = "contact_time_last_seen_time_v1"
+TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm")
+POPULAR_ZONES = [
+    ("Москва", "Europe/Moscow"),
+    ("Калининград", "Europe/Kaliningrad"),
+    ("Самара", "Europe/Samara"),
+    ("Екатеринбург", "Asia/Yekaterinburg"),
+    ("Омск", "Asia/Omsk"),
+    ("Красноярск", "Asia/Krasnoyarsk"),
+    ("Иркутск", "Asia/Irkutsk"),
+    ("Владивосток", "Asia/Vladivostok"),
+    ("Лондон", "Europe/London"),
+    ("Берлин", "Europe/Berlin"),
+    ("Нью-Йорк", "America/New_York"),
+    ("Лос-Анджелес", "America/Los_Angeles"),
+    ("Токио", "Asia/Tokyo"),
+]
+
+
+def period_for_hour(hour):
+    hour = int(hour)
+    if 5 <= hour < 12:
+        return "утро"
+    if 12 <= hour < 17:
+        return "день"
+    if 17 <= hour < 23:
+        return "вечер"
+    return "ночь"
+
+
+class TimeRowTouchListener(dynamic_proxy(View.OnTouchListener)):
+    HOLD_MS = 600
+
+    def __init__(self, plugin, profile):
+        super().__init__()
+        self.plugin = plugin
+        self.profile = profile
+        self.pending = None
+        self.fired = False
+        self.down_x = self.down_y = 0.0
+
+    def _cancel(self, view):
+        if self.pending is not None:
+            view.removeCallbacks(self.pending)
+            self.pending = None
+
+    def dispose(self, view):
+        self._cancel(view)
+        self.plugin = self.profile = None
+
+    def _fire(self, view):
+        self.pending = None
+        if (
+            self.plugin is not None
+            and self.profile is not None
+            and self.plugin._active
+            and bool(view.isAttachedToWindow())
+        ):
+            self.fired = True
+            self.plugin._copy_time_row(self.profile, view)
+
+    def onTouch(self, view, event):
+        action = int(event.getActionMasked())
+        if action == int(MotionEvent.ACTION_DOWN):
+            self._cancel(view)
+            self.fired = False
+            self.down_x, self.down_y = float(event.getX()), float(event.getY())
+            self.pending = R(lambda: self._fire(view))
+            view.postDelayed(self.pending, self.HOLD_MS)
+        elif action == int(MotionEvent.ACTION_MOVE) and not self.fired:
+            dx = float(event.getX()) - self.down_x
+            dy = float(event.getY()) - self.down_y
+            if dx * dx + dy * dy > float(AndroidUtilities.dp(12)) ** 2:
+                self._cancel(view)
+        elif action == int(MotionEvent.ACTION_UP):
+            fired = self.fired
+            self._cancel(view)
+            self.fired = False
+            return fired
+        elif action == int(MotionEvent.ACTION_CANCEL):
+            self._cancel(view)
+            self.fired = False
+        return False
+
+
+class ProfileRowsHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._install_profile_row(param.thisObject)
+        except Exception:
+            self.plugin._record_error("profile_rows", traceback.format_exc())
+
+
+class ProfileAdapterHook(MethodHook):
+    def __init__(self, plugin, mode):
+        self.plugin = plugin
+        self.mode = mode
+
+    def before_hooked_method(self, param):
+        try:
+            if self.mode == "type" and len(param.args) >= 1:
+                state = self.plugin._adapter_state(param.thisObject)
+                if state and int(param.args[0]) == state[1]:
+                    param.setResult(jint(state[2]))
+            elif self.mode == "enabled" and len(param.args) >= 1:
+                state = self.plugin._adapter_state(param.thisObject)
+                if state:
+                    position = int(param.args[0].getAdapterPosition())
+                    if position == state[1]:
+                        # Mark the row enabled so RecyclerListView provides
+                        # its native pressed/ripple feedback. The cell keeps
+                        # its own click listener, so Telegram's divider action
+                        # is not used.
+                        param.setResult(True)
+        except Exception:
+            self.plugin._record_error("adapter_" + self.mode, traceback.format_exc())
+
+    def after_hooked_method(self, param):
+        try:
+            if self.mode == "bind" and len(param.args) >= 2:
+                self.plugin._bind_profile_row(
+                    param.thisObject, param.args[0], int(param.args[1])
+                )
+            elif self.mode == "detach" and len(param.args) >= 1:
+                self.plugin._detach_profile_cell(param.args[0].itemView)
+        except Exception:
+            self.plugin._record_error("adapter_" + self.mode, traceback.format_exc())
+
+
+class ChatMessageTimeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._before_message_time(param)
+
+    def after_hooked_method(self, param):
+        self.plugin._after_message_time(param)
+
+
+class ChatInitialTimeRefreshHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._schedule_initial_chat_time_refresh(param.thisObject)
+        except Exception:
+            self.plugin._record_error("chat_initial_refresh", traceback.format_exc())
+
+
+class ChatSubtitleContextHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._before_subtitle_context(param)
+
+    def after_hooked_method(self, param):
+        self.plugin._after_subtitle_context(param)
+
+
+class ProfileStatusContextHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._before_profile_status_context(param)
+
+    def after_hooked_method(self, param):
+        self.plugin._after_profile_status_context(param)
+
+
+class LocaleOnlineTimeHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._before_online_time_format(param)
+
+    def after_hooked_method(self, param):
+        self.plugin._after_online_time_format(param)
+
+
+class ContactTimePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._zones = {}
+        self._profile_rows = WeakHashMap()
+        self._profile_types = WeakHashMap()
+        self._cell_timers = WeakHashMap()
+        self._touch_listeners = WeakHashMap()
+        self._owned_cells = WeakHashMap()
+        self._message_shift_stacks = {}
+        self._subtitle_context_stack = []
+        self._online_format_stack = []
+        self._active = True
+
+    def on_plugin_load(self):
+        self._active = True
+        pass
+        pass
+        self._load_zones()
+        self._migrate_chat_time_settings()
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                text="Contact Time",
+                subtext="Местное время контакта",
+                icon="msg_schedule",
+                item_id="contact_time_profile",
+                on_click=self._on_contact_menu,
+                priority=20,
+            )
+        )
+
+        profile_class = find_class("org.telegram.ui.ProfileActivity")
+        adapter_class = find_class("org.telegram.ui.ProfileActivity$ListAdapter")
+        if profile_class is None or adapter_class is None:
+            return
+        try:
+            self.hook_all_methods(
+                profile_class, "updateRowsIds", ProfileRowsHook(self)
+            )
+        except Exception:
+            self._record_error("hook_updateRowsIds", traceback.format_exc())
+
+        for method_name, mode in (
+            ("getItemViewType", "type"),
+            ("onBindViewHolder", "bind"),
+            ("onViewDetachedFromWindow", "detach"),
+            ("isEnabled", "enabled"),
+        ):
+            try:
+                self.hook_all_methods(
+                    adapter_class, method_name, ProfileAdapterHook(self, mode)
+                )
+            except Exception:
+                self._record_error("hook_" + method_name, traceback.format_exc())
+
+        self._install_chat_time_hooks()
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._stop_all_cell_timers()
+        try:
+            profiles = self._profile_rows.keySet().toArray()
+            for profile in profiles:
+                if profile is not None:
+                    self._rebuild_profile_rows(profile)
+        except Exception:
+            self._record_error("unload_rows", traceback.format_exc())
+        self._profile_rows.clear()
+        self._profile_types.clear()
+        self._touch_listeners.clear()
+        self._owned_cells.clear()
+        self._message_shift_stacks.clear()
+        self._subtitle_context_stack.clear()
+        self._online_format_stack.clear()
+
+
+    def _record_error(self, where, details):
+        try:
+            self.log("Contact Time %s: %s" % (where, details))
+        except Exception:
+            pass
+
+    def _load_zones(self):
+        raw = self.get_setting(STORAGE_KEY, "{}")
+        try:
+            data = json.loads(str(raw or "{}"))
+            self._zones = {
+                str(key): str(value)
+                for key, value in data.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        except Exception:
+            self._zones = {}
+            self._record_error("load_zones", traceback.format_exc())
+
+    def _save_zones(self):
+        payload = json.dumps(
+            self._zones, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        self.set_setting(STORAGE_KEY, payload)
+
+    def _account_key(self, account):
+        account = int(account)
+        try:
+            client_id = int(UserConfig.getInstance(account).getClientUserId())
+            if client_id:
+                return "user_%s" % client_id
+        except Exception:
+            pass
+        return "slot_%s" % account
+
+    def _storage_key(self, account, user_id):
+        return "%s:contact_%s" % (self._account_key(account), int(user_id))
+
+    def _zone_for(self, account, user_id):
+        return self._zones.get(self._storage_key(account, user_id))
+
+    def _normalize_zone_name(self, zone_name):
+        value = str(zone_name or "").strip()
+        if not value:
+            raise ValueError("empty timezone")
+
+        compact = value.upper().replace(" ", "")
+        if compact in ("UTC", "GMT", "Z"):
+            return "UTC"
+
+        match = re.fullmatch(
+            r"(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?",
+            compact,
+        )
+        if match is not None:
+            sign, hours_text, minutes_text = match.groups()
+            hours = int(hours_text)
+            minutes = int(minutes_text or "0")
+            if hours > 18 or minutes > 59 or (hours == 18 and minutes != 0):
+                raise ValueError("UTC offset out of range")
+            normalized = "UTC%s%02d:%02d" % (sign, hours, minutes)
+            ZoneId.of(normalized)
+            return normalized
+
+        ZoneId.of(value)
+        return value
+
+    def _set_zone(self, account, user_id, zone_name):
+        zone_name = self._normalize_zone_name(zone_name)
+        self._zones[self._storage_key(account, user_id)] = zone_name
+        self._save_zones()
+        return zone_name
+
+    def _delete_zone(self, account, user_id):
+        key = self._storage_key(account, user_id)
+        if key in self._zones:
+            del self._zones[key]
+            self._save_zones()
+            return True
+        return False
+
+    def _time_info(self, zone_name):
+        now = ZonedDateTime.now(ZoneId.of(str(zone_name)))
+        return str(now.format(TIME_FORMATTER)), period_for_hour(now.getHour())
+
+    def _utc_offset_label(self, zone_name, epoch_seconds=None):
+        zone_id = ZoneId.of(str(zone_name))
+        if epoch_seconds is None:
+            offset = ZonedDateTime.now(zone_id).getOffset()
+        else:
+            offset = zone_id.getRules().getOffset(
+                Instant.ofEpochSecond(jlong(int(epoch_seconds)))
+            )
+        total_minutes = int(offset.getTotalSeconds()) // 60
+        sign = "+" if total_minutes >= 0 else "-"
+        absolute = abs(total_minutes)
+        hours, minutes = divmod(absolute, 60)
+        return "UTC%s%d:%02d" % (sign, hours, minutes) if minutes else "UTC%s%d" % (sign, hours)
+
+    def _zone_details_label(self, zone_name):
+        zone_name = str(zone_name)
+        offset_label = self._utc_offset_label(zone_name)
+        if re.fullmatch(r"(?:UTC|GMT)(?:[+-]\d{2}:\d{2})?", zone_name.upper()):
+            return offset_label
+        return "%s · %s" % (offset_label, zone_name)
+
+    def _offset_delta_seconds(self, zone_name, epoch_seconds):
+        instant = Instant.ofEpochSecond(jlong(int(epoch_seconds)))
+        target = int(ZoneId.of(str(zone_name)).getRules().getOffset(instant).getTotalSeconds())
+        local = int(ZoneId.systemDefault().getRules().getOffset(instant).getTotalSeconds())
+        return target - local
+
+    def _format_time_line(self, zone_name, with_zone=False):
+        time_text, period = self._time_info(zone_name)
+        line = "%s · %s" % (time_text, period)
+        if with_zone:
+            return "%s (%s)" % (
+                line,
+                self._zone_details_label(zone_name),
+            )
+        return line
+
+    def _resolve_target(self, context):
+        account = context.get("account")
+        if account is None:
+            account = UserConfig.selectedAccount
+        account = int(account)
+        user = context.get("user")
+        user_id = context.get("userId")
+        if user_id is None and user is not None:
+            user_id = getattr(user, "id", None)
+        if user_id is None:
+            dialog_id = context.get("dialog_id")
+            if dialog_id is not None and int(dialog_id) > 0:
+                user_id = int(dialog_id)
+        if user_id is None or int(user_id) <= 0:
+            return None
+        name = "Контакт"
+        if user is not None:
+            first = str(getattr(user, "first_name", "") or "").strip()
+            last = str(getattr(user, "last_name", "") or "").strip()
+            name = (first + " " + last).strip() or name
+        fragment = context.get("fragment")
+        return account, int(user_id), name, fragment
+
+    def _activity_for(self, context, fragment=None):
+        candidates = [fragment, context.get("context"), get_last_fragment()]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                activity = candidate.getParentActivity()
+                if activity is not None:
+                    return activity
+            except Exception:
+                pass
+            try:
+                if candidate.getWindow() is not None:
+                    return candidate
+            except Exception:
+                pass
+        return None
+
+    def _on_contact_menu(self, context):
+        try:
+            target = self._resolve_target(context)
+            if target is None:
+                BulletinHelper.show_error("Contact Time доступен только для пользователей")
+                return
+            account, user_id, name, fragment = target
+            activity = self._activity_for(context, fragment)
+            if activity is None:
+                BulletinHelper.show_error("Не удалось открыть окно Contact Time")
+                return
+            zone_name = self._zone_for(account, user_id)
+            if zone_name:
+                self._show_current_dialog(
+                    activity, account, user_id, name, fragment, zone_name
+                )
+            else:
+                self._show_zone_picker(
+                    activity, account, user_id, name, fragment, None
+                )
+        except Exception:
+            self._record_error("contact_menu", traceback.format_exc())
+            BulletinHelper.show_error("Ошибка Contact Time")
+
+    def _show_current_dialog(
+        self, activity, account, user_id, name, fragment, zone_name
+    ):
+        try:
+            message = "%s\n%s" % (
+                self._format_time_line(zone_name), zone_name
+            )
+        except Exception:
+            message = "Не удалось вычислить время\n%s" % zone_name
+
+        items = ["Изменить часовой пояс", "Удалить часовой пояс"]
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(name)
+        builder.set_message(message)
+
+        def on_item(dialog, which):
+            dialog.dismiss()
+            if int(which) == 0:
+                self._show_zone_picker(
+                    activity, account, user_id, name, fragment, zone_name
+                )
+            elif int(which) == 1:
+                self._show_delete_dialog(
+                    activity, account, user_id, name, fragment, zone_name
+                )
+
+        builder.set_items(items, on_item)
+        builder.set_negative_button("Закрыть", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _show_zone_picker(
+        self, activity, account, user_id, name, fragment, current_zone
+    ):
+        labels = [
+            "%s — %s · %s" % (city, self._utc_offset_label(zone), zone)
+            for city, zone in POPULAR_ZONES
+        ]
+        labels.append("Ввести IANA-зону или UTC вручную…")
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Часовой пояс: %s" % name)
+
+        def on_item(dialog, which):
+            index = int(which)
+            dialog.dismiss()
+            if index < len(POPULAR_ZONES):
+                zone_name = POPULAR_ZONES[index][1]
+                self._assign_zone(
+                    account, user_id, zone_name, fragment
+                )
+            else:
+                self._show_manual_zone_dialog(
+                    activity, account, user_id, name, fragment, current_zone
+                )
+
+        builder.set_items(labels, on_item)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _show_manual_zone_dialog(
+        self, activity, account, user_id, name, fragment, current_zone
+    ):
+        edit = AndroidEditText(activity)
+        edit.setSingleLine(True)
+        edit.setHint("Europe/Paris или UTC+3")
+        edit.setText(str(current_zone or ""))
+        edit.setTextColor(
+            Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+        )
+        edit.setHintTextColor(
+            Theme.getColor(Theme.key_windowBackgroundWhiteHintText)
+        )
+        edit.setTextSize(18)
+        edit.setGravity(Gravity.CENTER_VERTICAL)
+        horizontal = int(AndroidUtilities.dp(20))
+        vertical = int(AndroidUtilities.dp(8))
+        edit.setPadding(horizontal, vertical, horizontal, vertical)
+        edit.setMinHeight(int(AndroidUtilities.dp(56)))
+        edit.setSelection(edit.length())
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Часовой пояс: %s" % name)
+        builder.set_message(
+            "Введите IANA-зону или UTC-смещение.\n"
+            "Например: Europe/Paris, UTC+3 или +05:30"
+        )
+        builder.set_view(edit)
+
+        def on_save(dialog, which):
+            zone_name = str(edit.getText()).strip()
+            try:
+                zone_name = self._set_zone(account, user_id, zone_name)
+            except Exception:
+                BulletinHelper.show_error(
+                    "Некорректная IANA-зона или UTC-смещение"
+                )
+                return
+            dialog.dismiss()
+            self._after_zone_change(fragment)
+            BulletinHelper.show_info(
+                self._format_time_line(zone_name, with_zone=True)
+            )
+
+        builder.set_positive_button("Сохранить", on_save)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.show()
+
+    def _show_delete_dialog(
+        self, activity, account, user_id, name, fragment, zone_name
+    ):
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить часовой пояс?")
+        builder.set_message("%s\n%s" % (name, zone_name))
+
+        def on_delete(dialog, which):
+            self._delete_zone(account, user_id)
+            dialog.dismiss()
+            self._after_zone_change(fragment)
+            BulletinHelper.show_info("Часовой пояс удалён")
+
+        builder.set_positive_button("Удалить", on_delete)
+        builder.set_negative_button("Отмена", lambda dialog, which: dialog.dismiss())
+        builder.create()
+        builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        builder.show()
+
+    def _assign_zone(self, account, user_id, zone_name, fragment):
+        try:
+            zone_name = self._set_zone(account, user_id, zone_name)
+            self._after_zone_change(fragment)
+            BulletinHelper.show_info(
+                self._format_time_line(zone_name, with_zone=True)
+            )
+        except Exception:
+            self._record_error("assign_zone", traceback.format_exc())
+            BulletinHelper.show_error("Не удалось сохранить часовой пояс")
+
+    def _after_zone_change(self, fragment):
+        if fragment is not None:
+            self._rebuild_profile_rows(fragment)
+
+    def _profile_identity(self, profile):
+        user_id = get_private_field(profile, "userId")
+        if user_id is None or int(user_id) <= 0:
+            return None
+        account = get_private_field(profile, "currentAccount")
+        if account is None:
+            account = UserConfig.selectedAccount
+        return int(account), int(user_id)
+
+    def _detail_view_type(self, profile, adapter):
+        try:
+            value = get_static_private_field(
+                adapter.getClass(), "VIEW_TYPE_TEXT_DETAIL"
+            )
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+        for name in ("phoneRow", "birthdayRow", "locationRow", "usernameRow"):
+            position = get_private_field(profile, name)
+            if position is not None and int(position) >= 0:
+                return int(adapter.getItemViewType(int(position)))
+        return None
+
+    def _install_profile_row(self, profile):
+        if profile is None:
+            return
+        self._profile_rows.remove(profile)
+        self._profile_types.remove(profile)
+        if not self._active:
+            return
+
+        identity = self._profile_identity(profile)
+        if identity is None:
+            return
+        account, user_id = identity
+        zone_name = self._zone_for(account, user_id)
+        if not zone_name:
+            return
+
+        row_count = get_private_field(profile, "rowCount")
+        row_position = get_private_field(profile, "infoSectionRow")
+        adapter = get_private_field(profile, "listAdapter")
+        if row_count is None or row_position is None or adapter is None:
+            return
+        row_count = int(row_count)
+        row_position = int(row_position)
+        if row_position < 0 or row_position >= row_count:
+            return
+
+        view_type = self._detail_view_type(profile, adapter)
+        if view_type is None:
+            self._record_error("profile_row_type", "detail view type unavailable")
+            return
+
+        # Reuse the existing info-section divider slot instead of changing
+        # rowCount or shifting Telegram's row indexes. This keeps profile
+        # layout, clicks and animations native and stable.
+        set_private_field(profile, "infoEndRow", jint(row_position))
+        self._profile_rows.put(profile, jint(row_position))
+        self._profile_types.put(profile, jint(view_type))
+
+    def _adapter_state(self, adapter):
+        profile = get_private_field(adapter, "this$0")
+        if profile is None:
+            return None
+        position = self._profile_rows.get(profile)
+        view_type = self._profile_types.get(profile)
+        if position is None or view_type is None:
+            return None
+        return profile, int(position), int(view_type)
+
+    def _bind_profile_row(self, adapter, holder, position):
+        cell = holder.itemView
+        state = self._adapter_state(adapter)
+        if state is None or position != state[1]:
+            if self._owned_cells.get(cell) is not None:
+                self._stop_cell_timer(cell)
+                self._stop_touch_listener(cell)
+                cell.setOnClickListener(None)
+                cell.setForeground(None)
+                cell.setHapticFeedbackEnabled(True)
+                self._owned_cells.remove(cell)
+            return
+
+        profile = state[0]
+        if not self._render_profile_cell(cell, profile, position):
+            return
+        self._owned_cells.put(cell, jint(1))
+        cell.setOnClickListener(
+            OnClickListener(lambda view: self._open_time_row(profile))
+        )
+        self._attach_touch_listener(cell, profile)
+        # Preserve the rounded card background and draw Telegram's native
+        # pressed/ripple selector above it.
+        cell.setForeground(Theme.getSelectorDrawable(False))
+        # The custom 600 ms touch timer emits one controlled tick and
+        # avoids RecyclerListView's additional native long-press vibration.
+        cell.setHapticFeedbackEnabled(False)
+        self._start_cell_timer(cell, profile, position)
+
+    def _render_profile_cell(self, cell, profile, position):
+        identity = self._profile_identity(profile)
+        if identity is None:
+            return False
+        zone_name = self._zone_for(identity[0], identity[1])
+        if not zone_name:
+            return False
+        cell.setTextAndValue(
+            self._format_time_line(zone_name),
+            "Местное время · %s" % self._zone_details_label(zone_name),
+            False,
+        )
+        try:
+            cell.setImage(None, None)
+        except Exception:
+            pass
+        cell.setTag(jint(position))
+        return True
+
+    def _profile_name(self, profile):
+        views = get_private_field(profile, "nameTextView")
+        if views is not None:
+            for view in views:
+                if view is not None:
+                    text = str(view.getText() or "").strip()
+                    if text:
+                        return text
+        return "Контакт"
+
+    def _open_time_row(self, profile):
+        try:
+            identity = self._profile_identity(profile)
+            if identity is None:
+                return
+            account, user_id = identity
+            zone_name = self._zone_for(account, user_id)
+            if not zone_name:
+                return
+            activity = profile.getParentActivity()
+            if activity is None:
+                return
+            self._show_current_dialog(
+                activity,
+                account,
+                user_id,
+                self._profile_name(profile),
+                profile,
+                zone_name,
+            )
+        except Exception:
+            self._record_error("time_row_click", traceback.format_exc())
+
+    def _copy_time_row(self, profile, view=None):
+        try:
+            identity = self._profile_identity(profile)
+            if identity is None:
+                return True
+            zone_name = self._zone_for(identity[0], identity[1])
+            if not zone_name:
+                return True
+            copy_to_clipboard(self._format_time_line(zone_name))
+            if view is not None:
+                flags = (
+                    HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
+                    | HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
+                )
+                view.performHapticFeedback(
+                    HapticFeedbackConstants.VIRTUAL_KEY, flags
+                )
+        except Exception:
+            self._record_error("time_row_copy", traceback.format_exc())
+        return True
+
+    def _attach_touch_listener(self, cell, profile):
+        self._stop_touch_listener(cell)
+        listener = TimeRowTouchListener(self, profile)
+        self._touch_listeners.put(cell, listener)
+        cell.setOnLongClickListener(None)
+        cell.setLongClickable(False)
+        cell.setOnTouchListener(listener)
+
+    def _stop_touch_listener(self, cell):
+        if cell is None:
+            return
+        listener = self._touch_listeners.get(cell)
+        if listener is not None:
+            try:
+                listener.dispose(cell)
+            except Exception:
+                pass
+            self._touch_listeners.remove(cell)
+        try:
+            cell.setOnTouchListener(None)
+            cell.setOnLongClickListener(None)
+            cell.setLongClickable(False)
+        except Exception:
+            pass
+
+    def _detach_profile_cell(self, cell):
+        self._stop_cell_timer(cell)
+        self._stop_touch_listener(cell)
+
+    def _next_minute_delay(self):
+        millis = int(System.currentTimeMillis())
+        return max(250, 60050 - millis % 60000)
+
+    def _start_cell_timer(self, cell, profile, position):
+        self._stop_cell_timer(cell)
+        box = {}
+
+        def tick():
+            try:
+                if not self._active or not bool(cell.isAttachedToWindow()):
+                    self._cell_timers.remove(cell)
+                    return
+                if not self._render_profile_cell(cell, profile, position):
+                    self._cell_timers.remove(cell)
+                    return
+                runnable = box.get("runnable")
+                if runnable is not None:
+                    cell.postDelayed(runnable, self._next_minute_delay())
+            except Exception:
+                self._cell_timers.remove(cell)
+                self._record_error("minute_timer", traceback.format_exc())
+
+        runnable = R(tick)
+        box["runnable"] = runnable
+        self._cell_timers.put(cell, runnable)
+        cell.postDelayed(runnable, self._next_minute_delay())
+
+    def _stop_cell_timer(self, cell):
+        if cell is None:
+            return
+        runnable = self._cell_timers.get(cell)
+        if runnable is not None:
+            try:
+                cell.removeCallbacks(runnable)
+            except Exception:
+                pass
+            self._cell_timers.remove(cell)
+
+    def _stop_all_cell_timers(self):
+        try:
+            cells = self._owned_cells.keySet().toArray()
+            for cell in cells:
+                if cell is None:
+                    continue
+                self._stop_cell_timer(cell)
+                self._stop_touch_listener(cell)
+                try:
+                    cell.setOnClickListener(None)
+                    cell.setForeground(None)
+                    cell.setHapticFeedbackEnabled(True)
+                except Exception:
+                    pass
+        except Exception:
+            self._record_error("stop_timers", traceback.format_exc())
+
+    def _invoke_update_rows(self, profile):
+        method = profile.getClass().getDeclaredMethod("updateRowsIds")
+        method.setAccessible(True)
+        method.invoke(profile)
+
+    def _rebuild_profile_rows(self, profile):
+        if profile is None:
+            return
+        attempts = [0]
+
+        def perform():
+            attempts[0] += 1
+            try:
+                list_view = get_private_field(profile, "listView")
+                if list_view is not None:
+                    computing = bool(list_view.isComputingLayout())
+                    scrolling = int(list_view.getScrollState()) != 0
+                    if computing or scrolling:
+                        if attempts[0] < 20:
+                            run_on_ui_thread(perform, 60)
+                        return
+
+                old_position = self._profile_rows.get(profile)
+                if old_position is not None:
+                    old_position = int(old_position)
+
+                self._invoke_update_rows(profile)
+
+                new_position = self._profile_rows.get(profile)
+                if new_position is not None:
+                    new_position = int(new_position)
+
+                adapter = get_private_field(profile, "listAdapter")
+                changed_position = (
+                    new_position if new_position is not None else old_position
+                )
+                if adapter is not None and changed_position is not None:
+                    # The row reuses an existing divider slot, so only that
+                    # item changes its view type. A targeted change avoids the
+                    # full-profile hitch and lets RecyclerView crossfade it.
+                    adapter.notifyItemChanged(jint(changed_position))
+            except Exception:
+                self._record_error("rebuild_profile_rows", traceback.format_exc())
+
+        # Defer one frame so dialog dismissal and RecyclerView layout finish.
+        run_on_ui_thread(perform, 32)
+
+    def _migrate_chat_time_settings(self):
+        old_value = self.get_setting(REPLACE_CHAT_TIME_KEY, None)
+        if old_value is None:
+            old_value = False
+        else:
+            old_value = bool(old_value)
+        if self.get_setting(MESSAGE_TIME_KEY, None) is None:
+            self.set_setting(MESSAGE_TIME_KEY, old_value)
+        if self.get_setting(LAST_SEEN_TIME_KEY, None) is None:
+            self.set_setting(LAST_SEEN_TIME_KEY, old_value)
+
+    def _message_time_enabled(self):
+        return bool(self.get_setting(MESSAGE_TIME_KEY, False))
+
+    def _last_seen_time_enabled(self):
+        return bool(self.get_setting(LAST_SEEN_TIME_KEY, False))
+
+    def _install_chat_time_hooks(self):
+        message_class = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        chat_class = find_class("org.telegram.ui.ChatActivity")
+        avatar_class = find_class("org.telegram.ui.Components.ChatAvatarContainer")
+        profile_class = find_class("org.telegram.ui.ProfileActivity")
+        locale_class = find_class("org.telegram.messenger.LocaleController")
+        message_hooks = refresh_hooks = subtitle_hooks = profile_hooks = locale_hooks = 0
+        try:
+            if message_class is not None:
+                hooks = self.hook_all_methods(
+                    message_class,
+                    "setMessageObject",
+                    ChatMessageTimeHook(self),
+                )
+                message_hooks = len(hooks) if hooks else 0
+        except Exception:
+            self._record_error("hook_message_time", traceback.format_exc())
+        try:
+            if chat_class is not None:
+                hooks = self.hook_all_methods(
+                    chat_class,
+                    "createView",
+                    ChatInitialTimeRefreshHook(self),
+                )
+                refresh_hooks = len(hooks) if hooks else 0
+        except Exception:
+            self._record_error("hook_chat_initial_refresh", traceback.format_exc())
+        try:
+            if avatar_class is not None:
+                hooks = self.hook_all_methods(
+                    avatar_class,
+                    "updateSubtitle",
+                    ChatSubtitleContextHook(self),
+                )
+                subtitle_hooks = len(hooks) if hooks else 0
+        except Exception:
+            self._record_error("hook_chat_subtitle", traceback.format_exc())
+        try:
+            if profile_class is not None:
+                hooks = self.hook_all_methods(
+                    profile_class,
+                    "updateProfileData",
+                    ProfileStatusContextHook(self),
+                )
+                profile_hooks = len(hooks) if hooks else 0
+        except Exception:
+            self._record_error("hook_profile_status", traceback.format_exc())
+        try:
+            if locale_class is not None:
+                hooks = self.hook_all_methods(
+                    locale_class,
+                    "formatDateOnline",
+                    LocaleOnlineTimeHook(self),
+                )
+                locale_hooks = len(hooks) if hooks else 0
+        except Exception:
+            self._record_error("hook_online_time", traceback.format_exc())
+        pass
+
+    def _schedule_initial_chat_time_refresh(self, fragment):
+        if not self._active or not self._message_time_enabled():
+            return
+
+        def refresh(attempt=0):
+            if not self._active or not self._message_time_enabled():
+                return
+            try:
+                list_view = get_private_field(fragment, "chatListView")
+                if list_view is None or bool(list_view.isComputingLayout()):
+                    if attempt < 5:
+                        run_on_ui_thread(lambda: refresh(attempt + 1), 32)
+                    return
+                adapter = list_view.getAdapter()
+                if adapter is None:
+                    if attempt < 5:
+                        run_on_ui_thread(lambda: refresh(attempt + 1), 32)
+                    return
+                adapter.notifyDataSetChanged()
+                pass
+            except Exception:
+                self._record_error("initial_chat_time_refresh", traceback.format_exc())
+
+        run_on_ui_thread(lambda: refresh(0))
+        run_on_ui_thread(lambda: refresh(0), 120)
+
+    def _message_object_from_args(self, args):
+        for value in args:
+            if value is None:
+                continue
+            try:
+                owner = value.messageOwner
+                if owner is not None:
+                    return value, owner
+            except Exception:
+                pass
+        return None, None
+
+    def _before_message_time(self, param):
+        key = int(System.identityHashCode(param.thisObject))
+        stack = self._message_shift_stacks.setdefault(key, [])
+        if any(item is not None for item in stack):
+            stack.append(None)
+            return
+        stack.append(None)
+        if not self._active or not self._message_time_enabled():
+            return
+        try:
+            message, owner = self._message_object_from_args(param.args)
+            if message is None or owner is None:
+                return
+            dialog_id = int(message.getDialogId())
+            if dialog_id <= 0:
+                return
+            account = int(message.currentAccount)
+            zone_name = self._zone_for(account, dialog_id)
+            if not zone_name:
+                return
+            original = int(owner.date)
+            if original <= 0:
+                return
+            delta = self._offset_delta_seconds(zone_name, original)
+            if delta == 0:
+                return
+            owner.date = jint(original + delta)
+            stack[-1] = (owner, original)
+            pass
+        except Exception:
+            self._record_error("message_time_before", traceback.format_exc())
+
+    def _after_message_time(self, param):
+        key = int(System.identityHashCode(param.thisObject))
+        stack = self._message_shift_stacks.get(key)
+        if not stack:
+            return
+        item = stack.pop()
+        if not stack:
+            self._message_shift_stacks.pop(key, None)
+        if item is not None:
+            try:
+                owner, original = item
+                owner.date = jint(original)
+            except Exception:
+                self._record_error("message_time_restore", traceback.format_exc())
+
+    def _before_subtitle_context(self, param):
+        context = None
+        if self._active and self._last_seen_time_enabled():
+            try:
+                fragment = get_private_field(param.thisObject, "parentFragment")
+                if fragment is not None:
+                    user = fragment.getCurrentUser()
+                    if user is not None and int(user.id) > 0:
+                        account = get_private_field(param.thisObject, "currentAccount")
+                        if account is None:
+                            account = get_private_field(fragment, "currentAccount")
+                        if account is None:
+                            account = UserConfig.selectedAccount
+                        account = int(account)
+                        user_id = int(user.id)
+                        zone_name = self._zone_for(account, user_id)
+                        if zone_name:
+                            context = (account, user_id, zone_name)
+            except Exception:
+                self._record_error("subtitle_context", traceback.format_exc())
+        self._subtitle_context_stack.append(context)
+
+    def _after_subtitle_context(self, param):
+        if self._subtitle_context_stack:
+            self._subtitle_context_stack.pop()
+
+    def _profile_status_context(self, profile):
+        try:
+            identity = self._profile_identity(profile)
+            if identity is None:
+                return None
+            account, user_id = identity
+            zone_name = self._zone_for(account, user_id)
+            if zone_name:
+                return account, user_id, zone_name
+        except Exception:
+            pass
+        return None
+
+    def _before_profile_status_context(self, param):
+        context = None
+        if self._active and self._last_seen_time_enabled():
+            context = self._profile_status_context(param.thisObject)
+        self._subtitle_context_stack.append(context)
+
+    def _after_profile_status_context(self, param):
+        if self._subtitle_context_stack:
+            self._subtitle_context_stack.pop()
+
+    def _before_online_time_format(self, param):
+        frame = None
+        try:
+            context = (
+                self._subtitle_context_stack[-1]
+                if self._subtitle_context_stack
+                else None
+            )
+            if context is not None and param.args:
+                original = int(param.args[0])
+                if original > 0:
+                    account, user_id, zone_name = context
+                    target_time = str(
+                        ZonedDateTime.ofInstant(
+                            Instant.ofEpochSecond(jlong(original)),
+                            ZoneId.of(str(zone_name)),
+                        ).format(TIME_FORMATTER)
+                    )
+                    frame = (account, user_id, zone_name, original, target_time)
+        except Exception:
+            self._record_error("online_time_before", traceback.format_exc())
+        # Never shift the timestamp itself: AyuGram may use it to calculate
+        # relative text such as "an hour ago". Only exact clock text is
+        # replaced after Telegram has selected the correct status branch.
+        self._online_format_stack.append(frame)
+
+    def _after_online_time_format(self, param):
+        if not self._online_format_stack:
+            return
+        frame = self._online_format_stack.pop()
+        if frame is None:
+            return
+        try:
+            account, user_id, zone_name, original, target_time = frame
+            result = param.getResult()
+            if result is None:
+                return
+            text = str(result)
+            pattern = r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)"
+            match = re.search(pattern, text)
+            if match is None:
+                lowered = text.lower()
+                if "назад" in lowered or " ago" in lowered:
+                    relative_with_time = "%s (%s)" % (text, target_time)
+                    param.setResult(relative_with_time)
+                    pass
+                else:
+                    pass
+                return
+            original_time = match.group(0)
+            dual_time = "%s (%s)" % (original_time, target_time)
+            replaced = text[:match.start()] + dual_time + text[match.end():]
+            if replaced != text:
+                param.setResult(replaced)
+            pass
+        except Exception:
+            self._record_error("online_time_after", traceback.format_exc())
+
+    def _on_message_time_change(self, enabled):
+        pass
+        BulletinHelper.show_info("Переоткройте чат, чтобы обновить сообщения")
+
+    def _on_last_seen_time_change(self, enabled):
+        pass
+        BulletinHelper.show_info("Переоткройте чат или профиль, чтобы обновить статус")
+
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Время контакта в личном чате"),
+            Switch(
+                key=MESSAGE_TIME_KEY,
+                text="Время сообщений",
+                default=False,
+                subtext="Показывает местное время контакта вместо обычного времени.",
+                icon="msg_message",
+                on_change=self._on_message_time_change,
+            ),
+            Switch(
+                key=LAST_SEEN_TIME_KEY,
+                text="Последнее посещение",
+                default=False,
+                subtext="Добавляет местное время контакта к точному и относительному статусу.",
+                icon="msg_recent",
+                on_change=self._on_last_seen_time_change,
+            ),
+            Divider(
+                text="Работает только в личных чатах с назначенным часовым поясом."
+            ),
+        ]
