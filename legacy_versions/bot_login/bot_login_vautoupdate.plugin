@@ -1,0 +1,684 @@
+import os
+import requests
+import time
+
+from base_plugin import BasePlugin
+from client_utils import run_on_queue, get_last_fragment
+from android_utils import run_on_ui_thread, log
+from ui.bulletin import BulletinHelper
+from ui.settings import Text, Header, Switch, Divider
+
+from org.telegram.messenger import ApplicationLoader, LocaleController
+from java.nio import ByteBuffer
+from java import dynamic_proxy, jclass
+from android.webkit import ValueCallback
+
+__id__ = "bot_login"
+__name__ = "Bot Login"
+__description__ = "Log into Telegram as a bot using its API token.\nUse the button on the login screen or in the plugin settings."
+__author__ = "@kvucoPlugins"
+__min_version__ = "12.1.1"
+__icon__ = "PISUN424242/9"
+__version__ = "autoupdate"
+
+REPO_RAW = "https://github.com/kvuco/bot_login/raw/main"
+VERSION_URL = f"{REPO_RAW}/actual.txt"
+DEFAULT_DEX_URL = f"{REPO_RAW}/bot_login.enc"
+MIN_DEX_BYTES = 8192
+MIN_ENC_BYTES = 64
+_KEY_OBF = [205, 151, 170, 45, 13, 223, 115, 213, 54, 11, 145, 131, 29, 194, 220, 125, 225, 171, 201, 33, 142, 254, 237, 243, 33, 126, 188, 55, 235, 27, 94, 60]
+_KEY_SEED = 0x5A
+_KEY_STEP = 11
+
+JAVA_CLASS = "com.extera.plugins.botlogin.BotLoginCore"
+METHOD_LOAD = "load"
+METHOD_UNLOAD = "unload"
+METHOD_GET_VERSION = "getVersion"
+
+class Loader:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.dex_class = None
+        self.cache_dir = self._resolve_cache_dir()
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.dex_path = os.path.join(self.cache_dir, f"{__id__}.dex")
+        self.local_dex_path = self._resolve_local_dex()
+        self._download_in_progress = False
+        self._update_in_progress = False
+        self._active = True
+
+    def _resolve_cache_dir(self) -> str:
+        try:
+            ctx = ApplicationLoader.applicationContext
+            base = None
+            try:
+                if ctx is not None:
+                    base = ctx.getExternalFilesDir(None)
+            except Exception:
+                base = None
+            if base is None and ctx is not None:
+                try:
+                    base = ctx.getFilesDir()
+                except Exception:
+                    base = None
+            if base is not None:
+                return os.path.join(str(base.getAbsolutePath()), "plugins_dex_cache")
+        except Exception:
+            pass
+        return os.path.join(os.environ.get("HOME", os.getcwd()), "plugins_dex_cache")
+
+    def _resolve_local_dex(self) -> str:
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base = os.getcwd()
+        return os.path.join(base, "bot_login.enc")
+
+    def _request(self, url, timeout=10, retries=2):
+        last = None
+        for _ in range(retries + 1):
+            try:
+                return requests.get(url, timeout=timeout)
+            except Exception as e:
+                last = e
+                time.sleep(0.5)
+        raise last
+
+    def _write_atomic(self, path, data):
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+
+    def _get_key_bytes(self):
+        out = bytearray(len(_KEY_OBF))
+        for i, b in enumerate(_KEY_OBF):
+            out[i] = (b ^ _KEY_SEED ^ ((i * _KEY_STEP) & 0xFF)) & 0xFF
+        return bytes(out)
+
+    def _decrypt_enc(self, data: bytes) -> bytes:
+        if not data or len(data) < MIN_ENC_BYTES:
+            raise ValueError("enc_too_small")
+        if data.startswith(b"dex\n"):
+            return data
+        nonce = data[:12]
+        ciphertext = data[12:]
+        Cipher = jclass("javax.crypto.Cipher")
+        SecretKeySpec = jclass("javax.crypto.spec.SecretKeySpec")
+        GCMParameterSpec = jclass("javax.crypto.spec.GCMParameterSpec")
+        key = self._get_key_bytes()
+        cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        key_spec = SecretKeySpec(key, "AES")
+        gcm_spec = GCMParameterSpec(128, nonce)
+        cipher.init(Cipher.DECRYPT_MODE, key_spec, gcm_spec)
+        plain = cipher.doFinal(ciphertext)
+        try:
+            return bytes(plain)
+        except Exception:
+            return bytearray(plain)
+
+    def _load_dex_class(self, dex_bytes: bytes):
+        ctx = ApplicationLoader.applicationContext
+        if ctx is None:
+            raise Exception("no_context")
+        try:
+            InMemoryDexClassLoader = jclass("dalvik.system.InMemoryDexClassLoader")
+            buffer = ByteBuffer.wrap(dex_bytes)
+            self.dex_loader = InMemoryDexClassLoader(
+                buffer,
+                ctx.getClassLoader()
+            )
+            self.dex_class = self.dex_loader.loadClass(JAVA_CLASS)
+            return
+        except Exception:
+            pass
+        try:
+            DexClassLoader = jclass("dalvik.system.DexClassLoader")
+            code_cache = ctx.getCodeCacheDir() or ctx.getFilesDir()
+            out_dir = os.path.join(str(code_cache.getAbsolutePath()), "bot_login_dex")
+            os.makedirs(out_dir, exist_ok=True)
+            dex_file = os.path.join(out_dir, f"{__id__}.dex")
+            with open(dex_file, "wb") as f:
+                f.write(dex_bytes)
+            self.dex_loader = DexClassLoader(
+                dex_file,
+                out_dir,
+                None,
+                ctx.getClassLoader()
+            )
+            self.dex_class = self.dex_loader.loadClass(JAVA_CLASS)
+        except Exception as e:
+            raise
+
+    def _parse_version_file(self, text):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("invalid_version")
+        try:
+            remote_ver = int(lines[0])
+        except Exception:
+            raise ValueError("invalid_version")
+        download_url = DEFAULT_DEX_URL
+        if len(lines) > 1 and lines[1].startswith("http"):
+            download_url = lines[1]
+        return remote_ver, download_url
+
+    def _ui(self, fn):
+        if not self._active:
+            return
+        run_on_ui_thread(fn)
+
+    def _try_local_fallback(self):
+        try:
+            path = self.local_dex_path
+            if not path or not os.path.exists(path):
+                return False
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data or len(data) < MIN_ENC_BYTES:
+                return False
+            plain = self._decrypt_enc(data)
+            if not plain or len(plain) < MIN_DEX_BYTES:
+                return False
+            self._ui(lambda: self.start_from_bytes(plain))
+            return True
+        except Exception as e:
+            return False
+
+    def dispose(self):
+        self._active = False
+
+    def load(self):
+        if self.plugin and getattr(self.plugin, "_ayu_blocked", False):
+            return
+        if os.path.exists(self.dex_path):
+            try:
+                with open(self.dex_path, "rb") as f:
+                    data = f.read()
+                if not data or len(data) < MIN_ENC_BYTES:
+                    raise Exception("empty_cache")
+                plain = self._decrypt_enc(data)
+                if not plain or len(plain) < MIN_DEX_BYTES:
+                    raise Exception("empty_cache")
+                self.start_from_bytes(plain)
+            except Exception as e:
+                if not self._try_local_fallback():
+                    self.download_and_load()
+        else:
+            if not self._try_local_fallback():
+                self.download_and_load()
+
+    def download_and_load(self):
+        if self.plugin and getattr(self.plugin, "_ayu_blocked", False):
+            return
+        if self._download_in_progress:
+            self._ui(lambda: BulletinHelper.show_info(self.plugin.getString("already_downloading")))
+            return
+        self._download_in_progress = True
+        run_on_queue(self._download_worker)
+
+    def _download_worker(self):
+        if self.plugin and getattr(self.plugin, "_ayu_blocked", False):
+            return
+        try:
+            r = self._request(DEFAULT_DEX_URL, timeout=15, retries=2)
+            if r.status_code != 200:
+                raise Exception(f"http_{r.status_code}")
+            data = r.content or b""
+            if not data or len(data) < MIN_ENC_BYTES:
+                raise Exception("empty_download")
+            self._write_atomic(self.dex_path, data)
+            plain = self._decrypt_enc(data)
+            if not plain or len(plain) < MIN_DEX_BYTES:
+                raise Exception("empty_download")
+            self._ui(lambda: self.start_from_bytes(plain))
+        except Exception as e:
+            if self._try_local_fallback():
+                return
+            if isinstance(e, requests.RequestException):
+                self._ui(lambda: BulletinHelper.show_error(self.plugin.getString("network_error")))
+            else:
+                self._ui(lambda: BulletinHelper.show_error(self.plugin.getString("download_fail")))
+        finally:
+            self._download_in_progress = False
+
+    def start_from_bytes(self, dex_bytes):
+        try:
+            self._load_dex_class(dex_bytes)
+
+
+            try:
+                plugin = self.plugin
+                class PythonLogger(dynamic_proxy(ValueCallback)):
+                    def onReceiveValue(self, message):
+                        log(f"[BotLogin CORE] {message}")
+                        try:
+                            if message and "AyuGram" in str(message):
+                                plugin._set_ayu_blocked(True)
+                        except Exception:
+                            pass
+
+                bridge_method = None
+                for m in self.dex_class.getDeclaredMethods():
+                    if m.getName() == "setLogCallback":
+                        bridge_method = m
+                        break
+
+                if bridge_method:
+                    bridge_method.setAccessible(True)
+                    bridge_method.invoke(None, PythonLogger())
+
+            except Exception as e:
+                pass
+
+
+            load_method = self.dex_class.getDeclaredMethod(METHOD_LOAD)
+            load_method.invoke(None)
+
+            try:
+                ver_method = self.dex_class.getDeclaredMethod(METHOD_GET_VERSION)
+                ver = ver_method.invoke(None)
+            except Exception:
+                pass
+
+        except Exception as e:
+            err = str(e)
+            self._ui(lambda: BulletinHelper.show_error(f"DEX Load Error: {err}"))
+
+    def unload(self):
+        if self.dex_class:
+            try:
+                unload_method = self.dex_class.getDeclaredMethod(METHOD_UNLOAD)
+                unload_method.invoke(None)
+            except Exception as e:
+                pass
+            self.dex_class = None
+
+    def check_for_updates(self):
+        if self.plugin and getattr(self.plugin, "_ayu_blocked", False):
+            return
+        if self._update_in_progress:
+            self._ui(lambda: BulletinHelper.show_info(self.plugin.getString("already_checking")))
+            return
+        self._update_in_progress = True
+        run_on_queue(self._update_worker)
+
+    def _update_worker(self):
+        if self.plugin and getattr(self.plugin, "_ayu_blocked", False):
+            return
+        try:
+            current_ver = 0
+            if self.dex_class:
+                try:
+                    current_ver = self.dex_class.getDeclaredMethod(METHOD_GET_VERSION).invoke(None)
+                except Exception:
+                    pass
+
+            r = self._request(VERSION_URL, timeout=10, retries=2)
+            if r.status_code != 200:
+                raise Exception(f"http_{r.status_code}")
+            remote_ver, download_url = self._parse_version_file(r.text)
+
+            if remote_ver > current_ver:
+                self._ui(lambda: BulletinHelper.show_info(self.plugin.getString("downloading")))
+
+                r_dex = self._request(download_url, timeout=15, retries=2)
+                if r_dex.status_code != 200:
+                    raise Exception(f"http_{r_dex.status_code}")
+                data = r_dex.content or b""
+                if not data or len(data) < MIN_ENC_BYTES:
+                    raise Exception("empty_download")
+                self._ui(self.unload)
+                self._write_atomic(self.dex_path, data)
+                plain = self._decrypt_enc(data)
+                if not plain or len(plain) < MIN_DEX_BYTES:
+                    raise Exception("empty_download")
+                self._ui(lambda: self.start_from_bytes(plain))
+                self._ui(lambda: BulletinHelper.show_success(self.plugin.getString("updated")))
+            else:
+                self._ui(lambda: BulletinHelper.show_info(self.plugin.getString("no_updates")))
+
+        except Exception as e:
+            if isinstance(e, requests.RequestException):
+                self._ui(lambda: BulletinHelper.show_error(self.plugin.getString("network_error")))
+            elif isinstance(e, ValueError):
+                self._ui(lambda: BulletinHelper.show_error(self.plugin.getString("invalid_version")))
+            else:
+                self._ui(lambda: BulletinHelper.show_error(self.plugin.getString("update_fail")))
+        finally:
+            self._update_in_progress = False
+
+    def clear_cache(self):
+        if not os.path.exists(self.dex_path):
+            return False
+        try:
+            os.remove(self.dex_path)
+            return True
+        except Exception as e:
+            return False
+
+    def get_loaded_version(self):
+        if not self.dex_class:
+            return None
+        try:
+            return int(self.dex_class.getDeclaredMethod(METHOD_GET_VERSION).invoke(None))
+        except Exception:
+            return None
+
+    def reload_core(self):
+        def _do():
+            try:
+                self.unload()
+            finally:
+                self.load()
+        run_on_queue(_do)
+
+
+class BotLoginPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.loader = None
+        self.strings = {}
+        try:
+            self._ayu_blocked = bool(self.get_setting("ayu_blocked", False))
+        except Exception:
+            self._ayu_blocked = False
+
+    def on_plugin_load(self):
+        self.loader = Loader(self)
+        self.loader.load()
+        try:
+            if self.get_setting("auto_update", True):
+                if self._can_check_updates():
+                    self._record_update_check()
+                    self.loader.check_for_updates()
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        if self.loader:
+            self.loader.unload()
+            self.loader.dispose()
+
+    def getString(self, key):
+        if not self.strings:
+            self._update_strings()
+        return self.strings.get(key, key)
+
+    def _update_strings(self):
+        try:
+            lang = LocaleController.getInstance().getCurrentLocaleInfo().getLangCode()
+        except:
+            lang = "en"
+
+        is_ru = lang.startswith("ru")
+
+        self.strings = {
+            "settings_header": "Bot Login" if not is_ru else "Bot Login",
+            "ayu_blocked": "AyuGram is not supported" if not is_ru else "AyuGram не поддерживается",
+            "authorize": "Authorize" if not is_ru else "Авторизоваться",
+            "open_login_fail": "Failed to open login screen" if not is_ru else "Не удалось открыть экран входа",
+            "open_dialog_fail": "Failed to open bot login" if not is_ru else "Не удалось открыть авторизацию в бота",
+            "no_fragment": "No active screen" if not is_ru else "Нет активного экрана",
+            "no_free_slot": "No free account slot" if not is_ru else "Нет свободного слота аккаунта",
+            "check_updates": "Check for updates" if not is_ru else "Проверить обновления",
+            "clear_cache": "Clear cache & redownload" if not is_ru else "Очистить кэш и скачать заново",
+            "reload_core": "Reload core" if not is_ru else "Перезагрузить ядро",
+            "show_version": "Show loaded version" if not is_ru else "Показать версию ядра",
+            "show_last_check": "Last check..." if not is_ru else "Последняя проверка...",
+            "auto_update": "Auto update" if not is_ru else "Автообновление",
+            "auto_update_sub": "Check updates on plugin load" if not is_ru else "Проверять обновления при запуске",
+            "checking": "Checking updates..." if not is_ru else "Проверка обновлений...",
+            "downloading": "Downloading update..." if not is_ru else "Загрузка обновления...",
+            "no_updates": "No updates found" if not is_ru else "Обновлений нет",
+            "updated": "Updated" if not is_ru else "Обновлено",
+            "update_fail": "Update failed" if not is_ru else "Ошибка обновления",
+            "already_downloading": "Download already in progress" if not is_ru else "Загрузка уже идет",
+            "already_checking": "Update check already running" if not is_ru else "Проверка уже идет",
+            "version_unknown": "Version unknown" if not is_ru else "Версия неизвестна",
+            "version_label": "Version" if not is_ru else "Версия",
+            "last_check_label": "Last check" if not is_ru else "Последняя проверка",
+            "cache_cleared": "Cache cleared" if not is_ru else "Кэш очищен",
+            "cache_empty": "Cache is empty" if not is_ru else "Кэш пуст",
+            "cache_cleared_loading": "Cache cleared. Loading DEX" if not is_ru else "Кэш очищен. Загружаю DEX",
+            "reloading": "Reloaded" if not is_ru else "Перезагружено",
+            "core_not_loaded": "Core is not loaded" if not is_ru else "Ядро не загружено",
+            "network_error": "Network error" if not is_ru else "Ошибка сети",
+            "download_fail": "Download failed" if not is_ru else "Ошибка загрузки",
+            "invalid_version": "Invalid version file" if not is_ru else "Некорректный файл версии",
+            "last_check_never": "Last check: Never" if not is_ru else "Последняя проверка: никогда"
+        }
+
+    def _set_ayu_blocked(self, value):
+        blocked = bool(value)
+        if not blocked:
+            return
+        if self._ayu_blocked:
+            return
+        self._ayu_blocked = True
+        try:
+            self.set_setting("ayu_blocked", True, reload_settings=True)
+        except Exception:
+            pass
+        try:
+            if self.loader:
+                self.loader.unload()
+                self.loader.dispose()
+        except Exception:
+            pass
+        self.loader = None
+
+    def _find_free_account(self):
+        try:
+            UserConfig = jclass("org.telegram.messenger.UserConfig")
+            AccountInstance = jclass("org.telegram.messenger.AccountInstance")
+            max_count = 4
+            try:
+                max_count = int(UserConfig.MAX_ACCOUNT_COUNT)
+            except Exception:
+                pass
+            try:
+                dyn_count = int(UserConfig.getMaxAccountCount())
+                if dyn_count > 0:
+                    max_count = min(max_count, dyn_count)
+            except Exception:
+                pass
+            for i in range(max_count):
+                try:
+                    if not AccountInstance.getInstance(i).getUserConfig().isClientActivated():
+                        return i
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return -1
+
+    def _open_bot_login(self, *args):
+        if not self._ensure_loader():
+            return
+
+        def _do():
+            try:
+                fragment = get_last_fragment()
+                if not fragment:
+                    BulletinHelper.show_error(self.getString("no_fragment"))
+                    return
+
+                LoginActivity = jclass("org.telegram.ui.LoginActivity")
+                account = self._find_free_account()
+                if account < 0:
+                    BulletinHelper.show_error(self.getString("no_free_slot"))
+                    return
+                login_fragment = LoginActivity(account)
+
+                fragment.presentFragment(login_fragment)
+
+                def _open_dialog(attempts_left):
+                    try:
+                        if not self.loader or not self.loader.dex_class:
+                            BulletinHelper.show_error(self.getString("core_not_loaded"))
+                            return
+                        try:
+                            if login_fragment.getParentActivity() is None:
+                                raise Exception("not_attached")
+                        except Exception:
+                            if attempts_left > 0:
+                                run_on_ui_thread(lambda: _open_dialog(attempts_left - 1), 250)
+                                return
+                        method = None
+                        for m in self.loader.dex_class.getDeclaredMethods():
+                            if m.getName() == "openDialog":
+                                method = m
+                                break
+                        if method:
+                            method.setAccessible(True)
+                            method.invoke(None, login_fragment)
+                        else:
+                            BulletinHelper.show_error(self.getString("open_dialog_fail"))
+                    except Exception as e:
+                        if attempts_left > 0:
+                            run_on_ui_thread(lambda: _open_dialog(attempts_left - 1), 250)
+                        else:
+                            BulletinHelper.show_error(f"{self.getString('open_dialog_fail')}: {e}")
+
+                run_on_ui_thread(lambda: _open_dialog(3), 250)
+            except Exception as e:
+                BulletinHelper.show_error(f"{self.getString('open_login_fail')}: {e}")
+
+        run_on_ui_thread(_do)
+
+    def create_settings(self):
+        try:
+            self._update_strings()
+            if self._ayu_blocked:
+                return [
+                    Header(text=self.strings["settings_header"]),
+                    Text(
+                        text=self.strings["ayu_blocked"],
+                        icon="msg_error",
+                        red=True
+                    )
+                ]
+            return [
+                Header(text=self.strings["settings_header"]),
+                Text(
+                    text=self.strings["authorize"],
+                    icon="menu_bots_add",
+                    on_click=self._open_bot_login
+                ),
+                Divider(),
+                Switch(
+                    key="auto_update",
+                    text=self.strings["auto_update"],
+                    subtext=self.strings["auto_update_sub"],
+                    default=True,
+                    icon="msg_download_settings",
+                    on_change=self.handle_auto_update
+                ),
+                Text(
+                    text=self.strings["check_updates"],
+                    icon="msg_download",
+                    on_click=self.handle_check_updates
+                ),
+                Text(
+                    text=self.strings["show_last_check"],
+                    icon="msg_contacts_time_remix",
+                    on_click=self.handle_show_last_check
+                ),
+                Text(
+                    text=self.strings["reload_core"],
+                    icon="msg_reset",
+                    on_click=self.handle_reload
+                ),
+                Text(
+                    text=self.strings["show_version"],
+                    icon="msg_info",
+                    on_click=self.handle_show_version
+                ),
+                Text(
+                    text=self.strings["clear_cache"],
+                    icon="msg_delete",
+                    red=True,
+                    on_click=self.handle_clear_cache
+                )
+            ]
+        except Exception as e:
+            return [Header(text=f"Error: {e}")]
+
+    def _ensure_loader(self):
+        if not self.loader:
+            BulletinHelper.show_error(self.getString("core_not_loaded"))
+            return False
+        return True
+
+    def _get_last_check(self):
+        try:
+            return int(self.get_setting("last_update_check", 0))
+        except Exception:
+            return 0
+
+    def _set_last_check(self, value):
+        try:
+            self.set_setting("last_update_check", int(value))
+        except Exception:
+            pass
+
+    def _can_check_updates(self):
+        last = self._get_last_check()
+        if last <= 0:
+            return True
+        return (time.time() - last) >= 6 * 60 * 60
+
+    def _record_update_check(self):
+        self._set_last_check(int(time.time()))
+
+    def handle_auto_update(self, enabled):
+        if not enabled:
+            return
+        if not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.getString("checking"))
+        self._record_update_check()
+        self.loader.check_for_updates()
+
+    def handle_check_updates(self, *args):
+        if not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.getString("checking"))
+        self._record_update_check()
+        self.loader.check_for_updates()
+
+    def handle_clear_cache(self, *args):
+        if not self._ensure_loader():
+            return
+        self._record_update_check()
+        BulletinHelper.show_info(self.getString("cache_cleared_loading"))
+        self.loader.clear_cache()
+        self.loader.unload()
+        self.loader.download_and_load()
+
+    def handle_reload(self, *args):
+        if not self._ensure_loader():
+            return
+        BulletinHelper.show_info(self.getString("reloading"))
+        self.loader.reload_core()
+
+    def handle_show_version(self, *args):
+        if not self._ensure_loader():
+            return
+        version = self.loader.get_loaded_version()
+        if version is None:
+            BulletinHelper.show_info(self.getString("version_unknown"))
+        else:
+            BulletinHelper.show_info(f"{self.getString('version_label')}: {version}")
+
+    def handle_show_last_check(self, *args):
+        ts = self._get_last_check()
+        if not ts:
+            BulletinHelper.show_info(self.getString("last_check_never"))
+            return
+        try:
+            text = time.strftime("%H:%M %d.%m", time.localtime(ts))
+        except Exception:
+            text = str(ts)
+        BulletinHelper.show_info(f"{self.getString('last_check_label')}: {text}")
