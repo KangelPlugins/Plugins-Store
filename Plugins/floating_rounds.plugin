@@ -1,0 +1,882 @@
+__id__ = "floating_rounds"
+__name__ = "Floating Rounds"
+__description__ = (
+    "Keeps round video messages playing in a floating window when you leave "
+    "Telegram. Requires permission to display over other apps."
+)
+__author__ = "@itsbodyq"
+__version__ = "1.0"
+__icon__ = "exteraplicons/3"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.5.1"
+
+from dataclasses import dataclass
+from typing import Any
+
+from android.content import DialogInterface, Intent
+from android.net import Uri
+from android.os import Build, Looper
+from android.provider import Settings
+from android.view import WindowManager
+from com.exteragram.messenger.preferences.components import AltSeekbar
+from java import dynamic_proxy
+from java.lang import Class as JClass
+from java.lang import Runnable, System
+from java.util.concurrent import CountDownLatch, TimeUnit
+from org.telegram.messenger import (
+    AndroidUtilities,
+    ApplicationLoader,
+    LocaleController,
+    MediaController,
+)
+from org.telegram.ui import LaunchActivity
+from org.telegram.ui.ActionBar import AlertDialog
+from org.telegram.ui.Components import PipRoundVideoView
+from ui.bulletin import BulletinHelper
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import get_private_field, set_private_field
+from ui.settings import Custom
+
+MIN_SIZE_PERCENT = 100
+MAX_SIZE_PERCENT = 200
+DEFAULT_SIZE_PERCENT = 100
+SLIDER_MIN = 0
+SLIDER_MAX = MAX_SIZE_PERCENT - MIN_SIZE_PERCENT
+SIZE_SETTING_KEY = "bubble_size_percent"
+LEGACY_SIZE_SETTING_KEY = "bubble_scale"
+
+SIZE_TITLE = "size_title"
+PERMISSION_TITLE = "permission_title"
+PERMISSION_MESSAGE = "permission_message"
+OPEN_SETTINGS = "open_settings"
+CLOSE = "close"
+PERMISSION_DENIED = "permission_denied"
+
+PLUGIN_STRINGS = {
+    "ru": {
+        SIZE_TITLE: "Размер плавающего кружка",
+        PERMISSION_TITLE: "Плавающие видеосообщения",
+        PERMISSION_MESSAGE: (
+            "Чтобы показывать воспроизводимый кружок поверх других приложений, "
+            "разрешите exteraGram отображение поверх окон."
+        ),
+        OPEN_SETTINGS: "Открыть настройки",
+        CLOSE: "Закрыть",
+        PERMISSION_DENIED: (
+            "Вы не выдали разрешение, поэтому плагин был отключён."
+        ),
+    },
+    "uk": {
+        SIZE_TITLE: "Розмір плаваючого\nвідеоповідомлення",
+        PERMISSION_TITLE: "Плаваючі відеоповідомлення",
+        PERMISSION_MESSAGE: (
+            "Щоб показувати відтворюване відеоповідомлення поверх інших "
+            "програм, дозвольте exteraGram відображатися поверх інших вікон."
+        ),
+        OPEN_SETTINGS: "Відкрити налаштування",
+        CLOSE: "Закрити",
+        PERMISSION_DENIED: (
+            "Ви не надали дозвіл, тому плагін було вимкнено."
+        ),
+    },
+    "en": {
+        SIZE_TITLE: "Floating video size",
+        PERMISSION_TITLE: "Floating video messages",
+        PERMISSION_MESSAGE: (
+            "To keep the current video message visible over other apps, allow "
+            "exteraGram to display over other apps."
+        ),
+        OPEN_SETTINGS: "Open Settings",
+        CLOSE: "Close",
+        PERMISSION_DENIED: (
+            "Permission was not granted, so the plugin has been disabled."
+        ),
+    },
+}
+
+RUSSIAN_FALLBACK_LANGUAGES = {
+    "ru",
+    "be",
+    "kk",
+    "ky",
+    "uz",
+    "tg",
+    "tt",
+    "ba",
+}
+
+
+def locale_code(language_code: Any = None) -> str:
+    if language_code is None:
+        controller = LocaleController.getInstance()
+        locale_info = controller.getCurrentLocaleInfo()
+        language_code = str(getattr(locale_info, "shortName", "") or "")
+        if not language_code:
+            language_code = str(
+                controller.getCurrentLocale().getLanguage() or ""
+            )
+    normalized = str(language_code or "").strip().lower().replace("_", "-")
+    primary = normalized.split("-", 1)[0]
+    if primary == "uk":
+        return "uk"
+    if primary in RUSSIAN_FALLBACK_LANGUAGES:
+        return "ru"
+    return "en"
+
+
+def tr(key: str, language_code: Any = None) -> str:
+    language = locale_code(language_code)
+    return PLUGIN_STRINGS.get(language, PLUGIN_STRINGS["en"]).get(
+        key,
+        PLUGIN_STRINGS["en"][key],
+    )
+
+
+def normalize_size_percent(value: Any) -> int:
+    try:
+        percent = int(round(float(value)))
+    except (TypeError, ValueError):
+        percent = DEFAULT_SIZE_PERCENT
+    return max(MIN_SIZE_PERCENT, min(MAX_SIZE_PERCENT, percent))
+
+
+@dataclass(frozen=True)
+class OverlayGeometry:
+    window_width: int
+    window_height: int
+    video_width: int
+    video_height: int
+
+    def scaled(self, percent: Any) -> "OverlayGeometry":
+        scale = normalize_size_percent(percent) / 100.0
+
+        def size(value: int) -> int:
+            return int(round(value * scale)) if value > 0 else value
+
+        return OverlayGeometry(
+            window_width=size(self.window_width),
+            window_height=size(self.window_height),
+            video_width=size(self.video_width),
+            video_height=size(self.video_height),
+        )
+
+
+class _SizeDragListener(dynamic_proxy(AltSeekbar.OnDrag)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def run(self, value):
+        if self.plugin._programmatic_slider_update:
+            return
+        self.plugin._set_size_percent(
+            normalize_size_percent(MIN_SIZE_PERCENT + float(value)),
+            update_slider=False,
+        )
+
+
+def _is_round(message):
+    return message is not None and bool(message.isRoundVideo())
+
+
+def _playing_message(controller):
+    return controller.getPlayingMessageObject()
+
+
+def _same_java_object(first: Any, second: Any) -> bool:
+    if first is None or second is None:
+        return first is second
+    return int(System.identityHashCode(first)) == int(
+        System.identityHashCode(second)
+    )
+
+
+class _SliderHeaderHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not _same_java_object(
+            param.thisObject,
+            self.plugin._size_slider,
+        ):
+            return
+        try:
+            slider_value = int(
+                get_private_field(param.thisObject, "roundedValue")
+            )
+            percent = normalize_size_percent(
+                MIN_SIZE_PERCENT + slider_value
+            )
+            param.setResult(f"{percent}%")
+        except (AttributeError, TypeError, ValueError) as error:
+            self.plugin.log(f"Floating Rounds: slider header: {error!r}")
+
+
+class _PluginRunnable(dynamic_proxy(Runnable)):
+    def __init__(self, callback, *args):
+        super().__init__()
+        self.callback = callback
+        self.args = args
+
+    def run(self):
+        self.callback(*self.args)
+
+
+class _DialogButton(dynamic_proxy(AlertDialog.OnButtonClickListener)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, dialog, which):
+        self.callback()
+
+
+class _DialogCancel(dynamic_proxy(DialogInterface.OnCancelListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onCancel(self, dialog):
+        self.plugin._deny_permission()
+
+
+class _DialogDismiss(dynamic_proxy(DialogInterface.OnDismissListener)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onDismiss(self, dialog):
+        self.plugin._permission_dialog_dismissed()
+
+
+class _ActivityHook(MethodHook):
+    def __init__(self, plugin, paused):
+        self.plugin = plugin
+        self.paused = paused
+
+    def after_hooked_method(self, param):
+        self.plugin.last_activity = param.thisObject
+        if self.paused:
+            self.plugin._show(param.thisObject)
+        else:
+            self.plugin._close(True)
+            self.plugin._check_permission_return()
+
+
+class _PlaybackHook(MethodHook):
+    def __init__(self, plugin, name):
+        self.plugin = plugin
+        self.name = name
+
+    def before_hooked_method(self, param):
+        if self.name == "playMessage" and param.args:
+            message = param.args[0]
+            if _is_round(message):
+                self.plugin.cached_message = message
+
+    def after_hooked_method(self, param):
+        if self.name in ("playMessage", "playNextMessage"):
+            self.plugin._schedule_sync(False, 80)
+        elif self.name in ("cleanupPlayer", "stopAudio"):
+            self.plugin._schedule_sync(True, 900)
+
+
+class FloatingRoundsPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.last_activity = None
+        self.cached_message = None
+        self.message = None
+        self.player = None
+        self.original_texture = None
+        self.pip = None
+        self.visible = False
+        self.generation = 0
+        self.awaiting_permission = False
+        self.permission_failure_handled = False
+        self.permission_dialog_open = False
+        self.permission_action = False
+        self.reused_native_pip = False
+        self.old_window_type = None
+        self.old_window_token = None
+        self.old_window_flags = None
+        self._base_geometry: OverlayGeometry | None = None
+        self._size_percent = DEFAULT_SIZE_PERCENT
+        self._frame_scale = 1.0
+        self._programmatic_slider_update = False
+        self._size_slider_listener = None
+        self._size_slider = None
+
+    def create_settings(self):
+        self._load_size_percent()
+        return [Custom(view=self._create_size_slider())]
+
+    def _create_size_slider(self):
+        def build():
+            listener = _SizeDragListener(self)
+            slider = AltSeekbar(
+                ApplicationLoader.applicationContext,
+                listener,
+                SLIDER_MIN,
+                SLIDER_MAX,
+                tr(SIZE_TITLE),
+                f"{MIN_SIZE_PERCENT}%",
+                f"{MAX_SIZE_PERCENT}%",
+            )
+            self._size_slider_listener = listener
+            self._size_slider = slider
+            self._set_size_slider(slider, self._size_percent)
+            return slider
+
+        if Looper.myLooper() == Looper.getMainLooper():
+            return build()
+
+        result = []
+        errors = []
+        latch = CountDownLatch(1)
+
+        def create_on_ui_thread():
+            try:
+                result.append(build())
+            except Exception as error:
+                errors.append(error)
+            finally:
+                latch.countDown()
+
+        AndroidUtilities.runOnUIThread(_PluginRunnable(create_on_ui_thread))
+        if not bool(getattr(latch, "await")(3, TimeUnit.SECONDS)):
+            raise RuntimeError("Timed out while creating size slider")
+        if errors:
+            raise errors[0]
+        return result[0]
+
+    def _set_size_slider(self, slider, percent):
+        self._programmatic_slider_update = True
+        try:
+            value = normalize_size_percent(percent) - MIN_SIZE_PERCENT
+            slider.setProgress(float(value))
+        finally:
+            self._programmatic_slider_update = False
+
+    def _load_size_percent(self) -> int:
+        stored = self.get_setting(SIZE_SETTING_KEY, None)
+        if stored is None:
+            legacy_scale = self.get_setting(LEGACY_SIZE_SETTING_KEY, 1.0)
+            try:
+                migrated = int(round(float(legacy_scale) * 100.0))
+            except (TypeError, ValueError):
+                migrated = DEFAULT_SIZE_PERCENT
+            self._size_percent = normalize_size_percent(migrated)
+            self.set_setting(SIZE_SETTING_KEY, self._size_percent)
+        else:
+            self._size_percent = normalize_size_percent(stored)
+            if self._size_percent != stored:
+                self.set_setting(SIZE_SETTING_KEY, self._size_percent)
+        return self._size_percent
+
+    def _set_size_percent(
+        self,
+        percent: Any,
+        *,
+        update_slider: bool = True,
+    ) -> None:
+        normalized = normalize_size_percent(percent)
+        self._size_percent = normalized
+        self.set_setting(SIZE_SETTING_KEY, normalized)
+        if update_slider and self._size_slider is not None:
+            self._set_size_slider(self._size_slider, normalized)
+        self._apply_size(normalized)
+
+    def on_plugin_load(self):
+        self._load_size_percent()
+        self._install_hooks()
+        context = ApplicationLoader.applicationContext
+        if (
+            Build.VERSION.SDK_INT >= 23
+            and not Settings.canDrawOverlays(context)
+        ):
+            AndroidUtilities.runOnUIThread(
+                _PluginRunnable(self._show_permission_dialog),
+                250,
+            )
+
+    def on_plugin_unload(self):
+        self._close(True)
+        self._size_slider = None
+        self._size_slider_listener = None
+
+    def _install_hooks(self):
+        slider_class = JClass.forName(
+            "com.exteragram.messenger.preferences.components.AltSeekbar"
+        )
+        for method in slider_class.getDeclaredMethods():
+            if (
+                str(method.getName()) == "getTextForHeader"
+                and len(method.getParameterTypes()) == 0
+            ):
+                self.hook_method(method, _SliderHeaderHook(self))
+
+        launch = JClass.forName("org.telegram.ui.LaunchActivity")
+        for method in launch.getDeclaredMethods():
+            name = str(method.getName())
+            if len(method.getParameterTypes()) != 0:
+                continue
+            if name == "onPause":
+                self.hook_method(method, _ActivityHook(self, True))
+            elif name == "onResume":
+                self.hook_method(method, _ActivityHook(self, False))
+
+        media = JClass.forName("org.telegram.messenger.MediaController")
+        for method in media.getDeclaredMethods():
+            name = str(method.getName())
+            if name in ("playMessage", "playNextMessage", "cleanupPlayer", "stopAudio"):
+                self.hook_method(method, _PlaybackHook(self, name))
+
+    def _show_permission_dialog(self):
+        context = ApplicationLoader.applicationContext
+        if Build.VERSION.SDK_INT < 23 or Settings.canDrawOverlays(context):
+            return
+        activity = self.last_activity or LaunchActivity.instance
+        if activity is None:
+            AndroidUtilities.runOnUIThread(
+                _PluginRunnable(self._show_permission_dialog),
+                500,
+            )
+            return
+        try:
+            builder = AlertDialog.Builder(activity)
+            builder.setTitle(tr(PERMISSION_TITLE))
+            builder.setMessage(tr(PERMISSION_MESSAGE))
+            builder.setPositiveButton(
+                tr(OPEN_SETTINGS),
+                _DialogButton(self._request_overlay_permission),
+            )
+            builder.setNegativeButton(
+                tr(CLOSE),
+                _DialogButton(self._deny_permission),
+            )
+            dialog = builder.create()
+            dialog.setOnCancelListener(_DialogCancel(self))
+            dialog.setOnDismissListener(_DialogDismiss(self))
+            dialog.setCanceledOnTouchOutside(True)
+            self.permission_dialog_open = True
+            self.permission_action = False
+            dialog.show()
+        except (AttributeError, RuntimeError, TypeError) as error:
+            self.log(f"Floating Rounds: permission dialog: {error!r}")
+            self.awaiting_permission = True
+            self._open_overlay_settings()
+
+    def _request_overlay_permission(self):
+        self.permission_action = True
+        self.awaiting_permission = True
+        self._open_overlay_settings()
+
+    def _permission_dialog_dismissed(self):
+        if not self.permission_dialog_open:
+            return
+        self.permission_dialog_open = False
+        if self.permission_action or self.awaiting_permission:
+            return
+        context = ApplicationLoader.applicationContext
+        if Build.VERSION.SDK_INT >= 23 and not Settings.canDrawOverlays(context):
+            self._deny_permission()
+
+    def _check_permission_return(self):
+        if not self.awaiting_permission:
+            return
+        self.awaiting_permission = False
+        context = ApplicationLoader.applicationContext
+        if Build.VERSION.SDK_INT >= 23 and not Settings.canDrawOverlays(context):
+            self._deny_permission()
+
+    def _deny_permission(self):
+        if self.permission_failure_handled:
+            return
+        self.permission_failure_handled = True
+        self.awaiting_permission = False
+        try:
+            BulletinHelper.show_error(tr(PERMISSION_DENIED))
+        except (AttributeError, RuntimeError, TypeError) as error:
+            self.log(f"Floating Rounds: permission bulletin: {error!r}")
+        AndroidUtilities.runOnUIThread(
+            _PluginRunnable(self._disable_plugin),
+            700,
+        )
+
+    def _disable_plugin(self):
+        try:
+            from com.exteragram.messenger.plugins import PluginsController
+
+            controller = PluginsController.getInstance()
+            controller.setPluginEnabled(__id__, False, None)
+        except Exception as error:
+            self.log(f"Floating Rounds: disable plugin: {error!r}")
+
+    def _open_overlay_settings(self):
+        try:
+            activity = self.last_activity or LaunchActivity.instance
+            context = activity or ApplicationLoader.applicationContext
+            intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+            intent.setData(Uri.parse("package:" + context.getPackageName()))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        except Exception as error:
+            self.log(f"Floating Rounds: overlay settings: {error!r}")
+
+    @staticmethod
+    def _capture_base_geometry(pip, params) -> OverlayGeometry:
+        return OverlayGeometry(
+            window_width=int(params.width),
+            window_height=int(params.height),
+            video_width=int(get_private_field(pip, "videoWidth")),
+            video_height=int(get_private_field(pip, "videoHeight")),
+        )
+
+    def _apply_geometry(
+        self,
+        geometry: OverlayGeometry,
+        *,
+        update_window: bool,
+    ) -> None:
+        if self.pip is None:
+            raise RuntimeError("PipRoundVideoView geometry is not initialized")
+        params = get_private_field(self.pip, "windowLayoutParams")
+        manager = get_private_field(self.pip, "windowManager")
+        window = get_private_field(self.pip, "windowView")
+        aspect = get_private_field(self.pip, "aspectRatioFrameLayout")
+        if any(item is None for item in (params, manager, window, aspect)):
+            raise RuntimeError("PipRoundVideoView window is incomplete")
+
+        params.width = geometry.window_width
+        params.height = geometry.window_height
+        display = AndroidUtilities.displaySize
+        params.x = max(
+            0,
+            min(
+                int(params.x),
+                max(0, int(display.x) - geometry.window_width),
+            ),
+        )
+        params.y = max(
+            0,
+            min(
+                int(params.y),
+                max(0, int(display.y) - geometry.window_height),
+            ),
+        )
+        set_private_field(self.pip, "videoWidth", geometry.video_width)
+        set_private_field(self.pip, "videoHeight", geometry.video_height)
+        aspect.setPivotX(0.0)
+        aspect.setPivotY(0.0)
+        aspect.setScaleX(1.0)
+        aspect.setScaleY(1.0)
+        aspect.requestLayout()
+        aspect.invalidateOutline()
+        aspect.invalidate()
+        native_animation = get_private_field(self.pip, "hideShowAnimation")
+        if native_animation is not None:
+            native_animation.cancel()
+        window.animate().cancel()
+        window.setPivotX(0.0)
+        window.setPivotY(0.0)
+        window.setScaleX(self._frame_scale)
+        window.setScaleY(self._frame_scale)
+        window.setAlpha(1.0)
+        window.requestLayout()
+        window.invalidateOutline()
+        window.invalidate()
+        if update_window:
+            manager.updateViewLayout(window, params)
+
+    def _obtain_pip(self, activity):
+        pip = PipRoundVideoView.getInstance()
+        reused = (
+            pip is not None
+            and get_private_field(pip, "windowView") is not None
+        )
+        if not reused:
+            pip = PipRoundVideoView()
+            pip.show(activity, _PluginRunnable(self._pause_current_message))
+        return pip, reused
+
+    def _pause_current_message(self):
+        if self.message is not None:
+            MediaController.getInstance().pauseMessage(self.message)
+
+    @staticmethod
+    def _set_player_texture(controller, player, texture):
+        player.setTextureView(texture)
+        set_private_field(controller, "currentTextureView", texture)
+
+    def _activate_overlay(
+        self,
+        pip,
+        reused,
+        message,
+        player,
+        original_texture,
+    ):
+        texture = pip.getTextureView()
+        window = get_private_field(pip, "windowView")
+        manager = get_private_field(pip, "windowManager")
+        params = get_private_field(pip, "windowLayoutParams")
+        aspect = get_private_field(pip, "aspectRatioFrameLayout")
+        if any(
+            item is None for item in (texture, window, manager, params, aspect)
+        ):
+            raise RuntimeError("PipRoundVideoView is incomplete")
+
+        old_type = int(params.type)
+        old_token = params.token
+        old_flags = int(params.flags)
+        geometry = self._capture_base_geometry(pip, params)
+
+        manager.removeViewImmediate(window)
+        params.type = (
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            if Build.VERSION.SDK_INT >= 26
+            else WindowManager.LayoutParams.TYPE_PHONE
+        )
+        params.token = None
+        params.flags = (
+            old_flags
+            | int(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+            | int(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
+        ) & ~int(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+        window.setClickable(True)
+        window.setFocusable(False)
+        manager.addView(window, params)
+
+        self.generation += 1
+        self.message = message
+        self.player = player
+        self.original_texture = original_texture
+        self.pip = pip
+        self.visible = True
+        self.reused_native_pip = reused
+        self.old_window_type = old_type
+        self.old_window_token = old_token
+        self.old_window_flags = old_flags
+        self._base_geometry = geometry
+        self._apply_size(self._size_percent)
+        AndroidUtilities.runOnUIThread(
+            _PluginRunnable(self._attach_when_ready, self.generation, 0),
+            40,
+        )
+
+    def _show(self, activity):
+        if self.visible or activity is None:
+            return
+        context = ApplicationLoader.applicationContext
+        if Build.VERSION.SDK_INT >= 23 and not Settings.canDrawOverlays(context):
+            return
+        controller = MediaController.getInstance()
+        message = _playing_message(controller) or self.cached_message
+        if not _is_round(message):
+            return
+        player = controller.getVideoPlayer()
+        if player is None:
+            return
+        original_texture = get_private_field(controller, "currentTextureView")
+        pip = None
+        reused = False
+        try:
+            pip, reused = self._obtain_pip(activity)
+            self._activate_overlay(
+                pip,
+                reused,
+                message,
+                player,
+                original_texture,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            self.log(f"Floating Rounds: initialize overlay: {error!r}")
+            if not reused and pip is not None:
+                try:
+                    pip.close(False)
+                except (AttributeError, RuntimeError, TypeError) as close_error:
+                    self.log(f"Floating Rounds: discard overlay: {close_error!r}")
+            self._reset()
+
+    def _apply_size(self, percent=None):
+        if not self.visible or self.pip is None:
+            return
+        if self._base_geometry is None:
+            return
+        try:
+            selected = (
+                self._size_percent
+                if percent is None
+                else normalize_size_percent(percent)
+            )
+            self._size_percent = selected
+            self._frame_scale = selected / 100.0
+            self._apply_geometry(
+                self._base_geometry.scaled(selected),
+                update_window=True,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            self.log(f"Floating Rounds: resize overlay: {error!r}")
+
+    def _schedule_sync(self, verify, delay):
+        if self.visible:
+            AndroidUtilities.runOnUIThread(
+                _PluginRunnable(
+                    self._sync_playback,
+                    self.generation,
+                    verify,
+                ),
+                delay,
+            )
+
+    def _sync_playback(self, generation, verify):
+        if generation != self.generation or not self.visible:
+            return
+        controller = MediaController.getInstance()
+        message = _playing_message(controller)
+        player = controller.getVideoPlayer()
+        if not _is_round(message) or player is None:
+            if verify:
+                self._close(False)
+            return
+        self.cached_message = message
+        self.message = message
+        self.player = player
+        if self.pip is None:
+            return
+        try:
+            texture = self.pip.getTextureView()
+            if texture is None:
+                raise RuntimeError("PIP texture is unavailable")
+            if texture.isAvailable():
+                self._set_player_texture(controller, player, texture)
+            else:
+                AndroidUtilities.runOnUIThread(
+                    _PluginRunnable(self._attach_when_ready, generation, 0),
+                    40,
+                )
+        except (AttributeError, RuntimeError, TypeError) as error:
+            self.log(f"Floating Rounds: sync playback: {error!r}")
+            if verify:
+                self._close(False)
+
+    def _attach_when_ready(self, generation, attempt):
+        if (
+            generation != self.generation
+            or not self.visible
+            or self.pip is None
+            or self.player is None
+        ):
+            return
+        try:
+            texture = self.pip.getTextureView()
+            if texture is None:
+                raise RuntimeError("PIP texture is unavailable")
+            if not bool(texture.isAvailable()):
+                if attempt < 40:
+                    AndroidUtilities.runOnUIThread(
+                        _PluginRunnable(
+                            self._attach_when_ready,
+                            generation,
+                            attempt + 1,
+                        ),
+                        50,
+                    )
+                else:
+                    self._close(True)
+                return
+
+            controller = MediaController.getInstance()
+            self._set_player_texture(controller, self.player, texture)
+            get_private_field(self.pip, "aspectRatioFrameLayout").invalidate()
+            get_private_field(self.pip, "windowView").invalidate()
+        except (AttributeError, RuntimeError, TypeError) as error:
+            self.log(f"Floating Rounds: attach PIP texture: {error!r}")
+            self._close(True)
+
+    def _restore_native_window(self, pip):
+        window_view = get_private_field(pip, "windowView")
+        window_manager = get_private_field(pip, "windowManager")
+        params = get_private_field(pip, "windowLayoutParams")
+        if (
+            window_view is None
+            or window_manager is None
+            or params is None
+            or self._base_geometry is None
+        ):
+            return False
+        window_manager.removeViewImmediate(window_view)
+        params.type = self.old_window_type
+        params.token = self.old_window_token
+        params.flags = self.old_window_flags
+        self._frame_scale = 1.0
+        self._apply_geometry(self._base_geometry, update_window=False)
+        window_view.requestLayout()
+        window_view.invalidate()
+        window_manager.addView(window_view, params)
+        return True
+
+    def _close(self, restore):
+        if not self.visible:
+            return
+        self.generation += 1
+        pip = self.pip
+        player = self.player
+        original_texture = self.original_texture
+        reused = self.reused_native_pip
+        restored_native = False
+        controller = MediaController.getInstance()
+        if restore and reused and pip is not None:
+            try:
+                restored_native = self._restore_native_window(pip)
+                texture = pip.getTextureView()
+                current_player = controller.getVideoPlayer() or player
+                if (
+                    restored_native
+                    and current_player is not None
+                    and texture is not None
+                ):
+                    self._set_player_texture(
+                        controller,
+                        current_player,
+                        texture,
+                    )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+                self.log(f"Floating Rounds: restore native PIP: {error!r}")
+                restored_native = False
+        if (
+            restore
+            and not restored_native
+            and player is not None
+            and original_texture is not None
+        ):
+            try:
+                self._set_player_texture(controller, player, original_texture)
+            except (AttributeError, RuntimeError, TypeError) as error:
+                self.log(f"Floating Rounds: restore player texture: {error!r}")
+        if not restored_native:
+            try:
+                if pip is not None:
+                    pip.close(False)
+            except (AttributeError, RuntimeError, TypeError) as error:
+                self.log(f"Floating Rounds: close PIP window: {error!r}")
+        self._reset()
+
+    def _reset(self):
+        self.message = None
+        self.player = None
+        self.original_texture = None
+        self.pip = None
+        self.visible = False
+        self.reused_native_pip = False
+        self.old_window_type = None
+        self.old_window_token = None
+        self.old_window_flags = None
+        self._base_geometry = None
+        self._frame_scale = 1.0
+
+
+plugin = FloatingRoundsPlugin()
