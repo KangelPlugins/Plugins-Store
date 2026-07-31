@@ -1,0 +1,467 @@
+import traceback
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from ui.bulletin import BulletinHelper
+from android_utils import run_on_ui_thread
+from client_utils import get_last_fragment
+
+from java import dynamic_proxy, jclass
+from android.os import Bundle
+from org.telegram.messenger import AccountInstance, UserConfig
+from org.telegram.tgnet import RequestDelegate, TLRPC
+from org.telegram.ui import ChatActivity
+
+Color = jclass("android.graphics.Color")
+Gravity = jclass("android.view.Gravity")
+OnClickListener = jclass("android.view.View$OnClickListener")
+LinearLayout = jclass("android.widget.LinearLayout")
+TextView = jclass("android.widget.TextView")
+AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+BottomSheet = jclass("org.telegram.ui.ActionBar.BottomSheet")
+Theme = jclass("org.telegram.ui.ActionBar.Theme")
+AvatarDrawable = jclass("org.telegram.ui.Components.AvatarDrawable")
+BackupImageView = jclass("org.telegram.ui.Components.BackupImageView")
+
+_AVATAR_COLORS = [
+    "#FF5C55", "#FFA92E", "#67C23A", "#29B6D1",
+    "#5896D9", "#8D77E0", "#E166CE", "#FF7CA6",
+]
+
+__id__ = "bot_account_router"
+__name__ = "Аккаунт для бота"
+__description__ = "Открывает чат с ботом через другой аккаунт без переключения."
+__author__ = "@oaxat"
+__version__ = "1.0.0"
+__icon__ = "EKCTEPArAM/6"
+__min_version__ = "12.5.1"
+__requirements__ = []
+
+def _fragment_account(fragment):
+    try:
+        return int(fragment.getCurrentAccount())
+    except Exception:
+        return int(fragment.currentAccount)
+
+
+def _set_fragment_account(fragment, account):
+    try:
+        fragment.setCurrentAccount(int(account))
+    except Exception:
+        fragment.currentAccount = int(account)
+
+
+def _fragment_id(fragment):
+    try:
+        return int(fragment.hashCode())
+    except Exception:
+        return id(fragment)
+
+
+def _is_chat(fragment):
+    try:
+        return "ChatActivity" in str(fragment.getClass().getName())
+    except Exception:
+        return False
+
+
+def _account_instance(account):
+    return AccountInstance.getInstance(int(account))
+
+
+def _controller(account):
+    return _account_instance(account).getMessagesController()
+
+
+def _cached_user(account, user_id):
+    controller = _controller(account)
+    try:
+        user = controller.getUser(int(user_id))
+    except Exception:
+        user = None
+    if user is None:
+        try:
+            Long = jclass("java.lang.Long")
+            user = controller.getUser(Long.valueOf(str(user_id)))
+        except Exception:
+            pass
+    return user
+
+
+def _replace_chat(source, target):
+    try:
+        if source.presentFragment(target, True) is not False:
+            return
+    except Exception:
+        pass
+    try:
+        if source.getParentLayout().presentFragment(target, True) is not False:
+            return
+    except Exception:
+        pass
+    raise RuntimeError("presentFragment failed")
+
+
+class BotAccountRouterPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.sessions = {}
+        self.busy = False
+        self.unloading = False
+        self.menu_id = self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Взаимодействовать как…",
+            icon="msg_accounts",
+            on_click=self._open_picker,
+            priority=10,
+        ))
+
+    def on_plugin_unload(self):
+        self.unloading = True
+        try:
+            self.remove_menu_item(self.menu_id)
+        except Exception:
+            pass
+        self.sessions.clear()
+
+    def _source_fragment(self, context):
+        if context:
+            for key in ("fragment", "chatActivity", "context"):
+                try:
+                    fragment = context.get(key)
+                    if _is_chat(fragment):
+                        return fragment
+                except Exception:
+                    pass
+        fragment = get_last_fragment()
+        return fragment if _is_chat(fragment) else None
+
+    def _bot(self, context, fragment):
+        user = context.get("user") if context else None
+        if user is None:
+            user = fragment.currentUser
+        if not bool(user.bot):
+            return None
+
+        user_id = None
+        if context:
+            for key in ("userId", "user_id"):
+                try:
+                    user_id = int(context.get(key))
+                    break
+                except Exception:
+                    pass
+        if user_id is None:
+            try:
+                user_id = int(fragment.getArguments().getLong("user_id", 0)) or None
+            except Exception:
+                pass
+        if user_id is None:
+            user_id = int(user.id)
+        if user_id is None:
+            return None
+
+        return {
+            "id": user_id,
+            "username": str(user.username or ""),
+        }
+
+    def _accounts(self):
+        accounts = []
+        for slot in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            try:
+                config = UserConfig.getInstance(slot)
+                if not config.isClientActivated():
+                    continue
+                user = config.getCurrentUser()
+                first = str(user.first_name or "")
+                last = str(user.last_name or "")
+                username = str(user.username or "")
+                name = (first + " " + last).strip()
+                if not name:
+                    name = "@" + username if username else "ID %s" % int(user.id)
+                accounts.append({
+                    "slot": slot,
+                    "name": name,
+                    "username": username,
+                    "user": user,
+                })
+            except Exception:
+                pass
+        return accounts
+
+    def _open_picker(self, context):
+        if self.busy or self.unloading:
+            return
+        try:
+            fragment = self._source_fragment(context)
+            if fragment is None:
+                BulletinHelper.show_error("Не удалось определить открытый чат")
+                return
+            bot = self._bot(context, fragment)
+            if bot is None:
+                BulletinHelper.show_info("Этот пункт работает только в чатах с ботами")
+                return
+
+            session = self.sessions.get(_fragment_id(fragment))
+            current = _fragment_account(fragment)
+            if current is None:
+                BulletinHelper.show_error("Не удалось определить аккаунт чата")
+                return
+            host = session["host"] if session else current
+
+            accounts = self._accounts()
+            if len(accounts) < 2:
+                BulletinHelper.show_info("Добавьте второй аккаунт Telegram")
+                return
+            self._show_picker(fragment, bot, host, accounts, session)
+        except Exception:
+            self.log("account picker error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось открыть список аккаунтов")
+
+    def _row_view(self, activity, account, is_host, is_active):
+        dp = AndroidUtilities.dp
+        LP = LinearLayout.LayoutParams
+
+        row = LinearLayout(activity)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(dp(16), dp(10), dp(16), dp(10))
+
+        avatar = BackupImageView(activity)
+        avatar.setRoundRadius(dp(21))
+        drawable = AvatarDrawable()
+        try:
+            drawable.setInfo(account["user"])
+        except Exception:
+            color_idx = int(account["slot"]) % len(_AVATAR_COLORS)
+            try:
+                drawable.setColor(Color.parseColor(_AVATAR_COLORS[color_idx]))
+            except Exception:
+                pass
+            drawable.setInfo(int(account["user"].id), account["name"], "")
+        avatar.setImageDrawable(drawable)
+        try:
+            avatar.setForUserOrChat(account["user"], drawable)
+        except Exception:
+            try:
+                avatar.setImage(account["user"], None, drawable, None)
+            except Exception:
+                pass
+        avatar_params = LP(dp(42), dp(42))
+        row.addView(avatar, avatar_params)
+
+        text_col = LinearLayout(activity)
+        text_col.setOrientation(LinearLayout.VERTICAL)
+        text_col.setGravity(Gravity.CENTER_VERTICAL)
+        text_params = LP(0, LP.WRAP_CONTENT, 1.0)
+        text_params.leftMargin = dp(12)
+        text_params.rightMargin = dp(8)
+        row.addView(text_col, text_params)
+
+        title = TextView(activity)
+        title.setText(account["name"])
+        title.setTextSize(16)
+        try:
+            title.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            pass
+        title.setSingleLine(True)
+        text_col.addView(title)
+
+        if is_host:
+            subtitle_text = "Текущий аккаунт"
+        elif account["username"]:
+            subtitle_text = "@" + account["username"]
+        else:
+            subtitle_text = "Аккаунт %s" % (int(account["slot"]) + 1)
+
+        subtitle = TextView(activity)
+        subtitle.setText(subtitle_text)
+        subtitle.setTextSize(13)
+        try:
+            subtitle.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+        except Exception:
+            pass
+        subtitle.setSingleLine(True)
+        text_col.addView(subtitle)
+
+        if is_active:
+            check = TextView(activity)
+            check.setText("✓")
+            check.setTextSize(18)
+            try:
+                check.setTextColor(Theme.getColor(Theme.key_featuredStickers_addedIcon))
+            except Exception:
+                pass
+            check_params = LP(LP.WRAP_CONTENT, LP.WRAP_CONTENT)
+            check.setGravity(Gravity.CENTER_VERTICAL)
+            row.addView(check, check_params)
+
+        return row
+
+    def _show_picker(self, fragment, bot, host, accounts, session):
+        active = session["route"] if session else host
+        activity = fragment.getParentActivity()
+        plugin = self
+        LP = LinearLayout.LayoutParams
+
+        container = LinearLayout(activity)
+        container.setOrientation(LinearLayout.VERTICAL)
+
+        header = TextView(activity)
+        header.setText("Взаимодействовать как…")
+        header.setTextSize(18)
+        header.setGravity(Gravity.CENTER)
+        try:
+            header.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        except Exception:
+            pass
+        header.setPadding(
+            AndroidUtilities.dp(16), AndroidUtilities.dp(14),
+            AndroidUtilities.dp(16), AndroidUtilities.dp(10)
+        )
+        header_params = LP(LP.MATCH_PARENT, LP.WRAP_CONTENT)
+        container.addView(header, header_params)
+
+        username = bot["username"].lstrip("@") if bot["username"] else ""
+        subheader_text = ("Открыть @%s от имени другого аккаунта" % username) if username \
+            else "Выберите аккаунт для открытия бота"
+        subheader = TextView(activity)
+        subheader.setText(subheader_text)
+        subheader.setTextSize(13)
+        subheader.setGravity(Gravity.CENTER)
+        try:
+            subheader.setTextColor(Theme.getColor(Theme.key_dialogTextGray3))
+        except Exception:
+            pass
+        subheader.setPadding(
+            AndroidUtilities.dp(16), 0, AndroidUtilities.dp(16), AndroidUtilities.dp(8)
+        )
+        subheader_params = LP(LP.MATCH_PARENT, LP.WRAP_CONTENT)
+        container.addView(subheader, subheader_params)
+
+        sheet_holder = {}
+
+        for account in accounts:
+            is_host = account["slot"] == host
+            is_active = account["slot"] == active
+            row = self._row_view(activity, account, is_host, is_active)
+
+            class RowClick(dynamic_proxy(OnClickListener)):
+                def __init__(self, acc):
+                    super().__init__()
+                    self.acc = acc
+
+                def onClick(self, v):
+                    sheet = sheet_holder.get("sheet")
+                    if sheet is not None:
+                        try:
+                            sheet.dismiss()
+                        except Exception:
+                            pass
+                    run_on_ui_thread(lambda: plugin._select_account(
+                        fragment, bot, host, self.acc
+                    ))
+
+            row.setOnClickListener(RowClick(account))
+            row_params = LP(LP.MATCH_PARENT, LP.WRAP_CONTENT)
+            container.addView(row, row_params)
+
+        try:
+            builder = BottomSheet.Builder(activity)
+            builder.setCustomView(container)
+            sheet = builder.create()
+            sheet_holder["sheet"] = sheet
+            sheet.show()
+        except Exception:
+            self.log("bottom sheet error: %s" % traceback.format_exc())
+            raise
+
+    def _select_account(self, source, bot, host, account):
+        if self.busy or self.unloading:
+            return
+        self.busy = True
+        try:
+            user = _cached_user(account["slot"], bot["id"])
+            if user is not None:
+                self._open_chat(source, bot, host, account, user)
+            else:
+                self._resolve(source, bot, host, account)
+        except Exception:
+            self.busy = False
+            self.log("route start error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось подготовить выбранный аккаунт")
+
+    def _resolve(self, source, bot, host, account):
+        username = bot["username"].lstrip("@")
+        if not username:
+            self.busy = False
+            BulletinHelper.show_error("У этого бота нет username")
+            return
+
+        request = TLRPC.TL_contacts_resolveUsername()
+        request.username = username
+        plugin = self
+
+        class ResolveCallback(dynamic_proxy(RequestDelegate)):
+            def run(self, response, error):
+                run_on_ui_thread(lambda: plugin._resolved(
+                    source, bot, host, account, response, error
+                ))
+
+        try:
+            _account_instance(account["slot"]).getConnectionsManager().sendRequest(
+                request, ResolveCallback()
+            )
+            BulletinHelper.show_info("Открываю @%s через «%s»…" % (username, account["name"]))
+        except Exception:
+            self.busy = False
+            self.log("username resolve error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось найти бота через выбранный аккаунт")
+
+    def _resolved(self, source, bot, host, account, response, error):
+        if self.unloading:
+            self.busy = False
+            return
+        if error is not None or response is None:
+            self.busy = False
+            BulletinHelper.show_error("Бот недоступен в аккаунте «%s»" % account["name"])
+            return
+        try:
+            controller = _controller(account["slot"])
+            users = response.users
+            chats = response.chats
+            if users is not None:
+                controller.putUsers(users, False)
+            if chats is not None:
+                controller.putChats(chats, False)
+            self._open_chat(source, bot, host, account, _cached_user(account["slot"], bot["id"]))
+        except Exception:
+            self.busy = False
+            self.log("resolve callback error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось открыть чат выбранного аккаунта")
+
+    def _open_chat(self, source, bot, host, account, user):
+        try:
+            if user is None or not bool(user.bot):
+                BulletinHelper.show_error("Бот недоступен в аккаунте «%s»" % account["name"])
+                return
+            user_id = int(user.id)
+            if user_id != bot["id"]:
+                raise RuntimeError("resolved peer does not match the bot")
+
+            args = Bundle()
+            args.putLong("user_id", user_id)
+            fragment = ChatActivity(args)
+            _set_fragment_account(fragment, account["slot"])
+            self.sessions[_fragment_id(fragment)] = {
+                "host": int(host),
+                "route": int(account["slot"]),
+            }
+            _replace_chat(source, fragment)
+            BulletinHelper.show_info("Бот открыт как «%s»" % account["name"])
+        except Exception:
+            self.log("chat replacement error: %s" % traceback.format_exc())
+            BulletinHelper.show_error("Не удалось открыть бота через выбранный аккаунт")
+        finally:
+            self.busy = False
+            
