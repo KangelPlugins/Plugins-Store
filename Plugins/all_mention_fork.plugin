@@ -1,0 +1,576 @@
+__id__ = "all_mention_fork"
+__name__ = "AllMentions [FORK]"
+__author__ = "@Fr1endsFX | Original: @pluginsnerex, @Nekn3n"
+__version__ = "5.0"
+__description__ = """Плагин для упоминания участников чата с фильтрами: все, админы, онлайн, оффлайн, контакты, случайные. Тихий режим, настраиваемые команды, исключения."""
+__icon__ = "SoLo_HaMiD/33"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+import re
+import random
+from typing import Any, Dict, List, Set, Optional
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import (
+    GLOBAL_QUEUE,
+    run_on_queue,
+    send_message,
+    send_request,
+    get_messages_controller,
+    get_user_config,
+)
+from extera_utils.text_formatting import parse_text
+from ui.settings import Header, Selector, Switch, Input, Divider
+from ui.bulletin import BulletinHelper
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import LocaleController, ChatObject
+
+MAX_PARTICIPANTS_LIMIT = 10000
+TELEGRAM_MESSAGE_LIMIT = 4096
+BULLETIN_UPDATE_FREQUENCY = 1000
+
+
+def _bulletin(text: str, level: str = "info") -> None:
+    fn = {"error": BulletinHelper.show_error, "success": BulletinHelper.show_success
+          }.get(level, BulletinHelper.show_info)
+    run_on_ui_thread(lambda: fn(text))
+
+
+class AllMentionForkPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._stop_events: Dict[int, bool] = {}
+        self._parsed_exceptions: tuple[Set[str], Set[str]] = (set(), set())
+        self._update_parsed_settings()
+        self.add_on_send_message_hook()
+        self.log(f"[{__name__}] v{__version__} loaded")
+
+    def on_plugin_unload(self):
+        for key in list(self._stop_events):
+            self._stop_events[key] = True
+        self._stop_events.clear()
+        self.log(f"[{__name__}] unloaded")
+
+    def _update_parsed_settings(self, value: Optional[str] = None):
+        exceptions_str = value if value is not None else self.get_setting("exceptions_list", "")
+        usernames, user_ids = set(), set()
+        username_re = re.compile(r"^[a-zA-Z0-9_]{5,32}$")
+        for item in exceptions_str.split(','):
+            cleaned = item.strip().lower()
+            if not cleaned:
+                continue
+            if cleaned.startswith('@'):
+                uname = cleaned[1:]
+                if username_re.match(uname):
+                    usernames.add(uname)
+            elif cleaned.isdigit():
+                user_ids.add(cleaned)
+        self._parsed_exceptions = (user_ids, usernames)
+
+    def _is_stopped(self, peer_id: int) -> bool:
+        return self._stop_events.get(peer_id, False)
+
+    def _send_formatted(self, peer_id: int, text: str, account: int):
+        if not text or not text.strip():
+            return
+        try:
+            parsed = parse_text(text, "markdown")
+            send_message(
+                {"peer": peer_id, "message": parsed["message"],
+                 "entities": parsed["entities"]},
+                account=account,
+            )
+        except Exception:
+            send_message({"peer": peer_id, "message": text}, account=account)
+
+    def _escape_md(self, text: str) -> str:
+        if not text:
+            return ""
+        return text.replace('_', '\\_').replace('[', '\\[').replace(']', '\\]')
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        msg = getattr(params, 'message', None)
+        if not isinstance(msg, str) or not msg.strip():
+            return HookResult()
+        msg = msg.strip()
+        peer_id = getattr(params, 'peer', 0)
+        if not peer_id:
+            return HookResult()
+
+        stop_cmd = self.get_setting("all_stop_command", ".all stop").strip()
+        if msg.lower() == stop_cmd.lower():
+            if peer_id in self._stop_events:
+                self._stop_events[peer_id] = True
+                _bulletin("Остановка упоминания...", "success")
+            else:
+                _bulletin("Нет активных упоминаний в этом чате.")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        commands_map = {
+            self.get_setting(k, d).strip(): f for k, d, f in [
+                ("admins_command", ".all admins", 'a'),
+                ("random_command", ".all random", 'r'),
+                ("online_command", ".all online", 'o'),
+                ("offline_command", ".all offline", 'f'),
+                ("silent_command", ".all night", 's'),
+                ("contacts_command", ".all contacts", 'c'),
+                ("all_command", ".all", None),
+            ]
+        }
+
+        for cmd_prefix, filter_char in sorted(
+            commands_map.items(), key=lambda x: len(x[0]), reverse=True
+        ):
+            if msg.lower().startswith(cmd_prefix.lower()):
+                if peer_id in self._stop_events:
+                    _bulletin("Упоминание уже запущено в этом чате.", "error")
+                    return HookResult(strategy=HookStrategy.CANCEL)
+
+                self._stop_events[peer_id] = False
+                body = msg[len(cmd_prefix):].strip()
+                args = self._parse_command_args(body)
+                args['filters'] = {filter_char} if filter_char else set()
+                args['account'] = account
+                args['peer_id'] = peer_id
+
+                run_on_queue(
+                    lambda: self._process_command(args),
+                    GLOBAL_QUEUE, 0,
+                )
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()
+
+    def _parse_command_args(self, body: str) -> Dict[str, Any]:
+        parts = body.split()
+        limit = None
+        if parts and parts[-1].isdigit():
+            limit = int(parts.pop(-1))
+        header = ' '.join(parts).strip()
+        return {"limit": limit, "header": header}
+
+    def _process_command(self, args: Dict):
+        peer_id = args['peer_id']
+        try:
+            if 'c' in args.get('filters', set()):
+                self._fetch_contacts_then_participants(args)
+            else:
+                self._fetch_participants_dispatcher(args, set())
+        except Exception as e:
+            self.log(f"Ошибка в _process_command: {e}")
+            _bulletin(f"Ошибка: {e}", "error")
+        finally:
+            self._stop_events.pop(peer_id, None)
+
+    def _fetch_contacts_then_participants(self, args: Dict):
+        import threading
+        event = threading.Event()
+        contact_ids: Set[int] = set()
+        error_box: list = []
+
+        def on_response(response, error):
+            if error:
+                error_box.append(str(getattr(error, 'text', error)))
+            elif response and hasattr(response, 'users'):
+                for u in response.users.toArray():
+                    contact_ids.add(u.id)
+            event.set()
+
+        _bulletin("Собираю контакты...")
+        send_request(TLRPC.TL_contacts_getContacts(), on_response,
+                     account=args['account'])
+        event.wait(timeout=15)
+
+        if self._is_stopped(args['peer_id']):
+            return
+        if error_box:
+            _bulletin(f"Ошибка контактов: {error_box[0]}", "error")
+            return
+        self._fetch_participants_dispatcher(args, contact_ids)
+
+    def _fetch_participants_dispatcher(self, args: Dict, contact_ids: Set[int]):
+        peer_id = args['peer_id']
+        account = args['account']
+        chat = get_messages_controller(account).getChat(-peer_id)
+        if not chat:
+            _bulletin("Чат не найден.", "error")
+            return
+
+        if ChatObject.isChannel(chat):
+            self._fetch_channel_participants(chat, args, contact_ids)
+        else:
+            self._fetch_group_participants(chat, args, contact_ids)
+
+    def _fetch_channel_participants(self, chat, args: Dict, contact_ids: Set[int]):
+        import threading
+        account = args['account']
+        peer_id = args['peer_id']
+        input_channel = get_messages_controller(account).getInputChannel(chat.id)
+        if not input_channel:
+            _bulletin("Не удалось получить данные супергруппы.", "error")
+            return
+
+        all_users: Dict[int, Any] = {}
+        all_participants: List[Any] = []
+        offset = 0
+
+        while offset < MAX_PARTICIPANTS_LIMIT and not self._is_stopped(peer_id):
+            event = threading.Event()
+            page_data: Dict[str, Any] = {"users": {}, "participants": [], "done": False}
+            error_box: list = []
+
+            req = TLRPC.TL_channels_getParticipants()
+            req.channel = input_channel
+            req.filter = TLRPC.TL_channelParticipantsSearch()
+            req.offset = offset
+            req.limit = 200
+            req.hash = 0
+
+            def on_page(response, error, _pd=page_data, _eb=error_box, _ev=event):
+                if error:
+                    _eb.append(str(getattr(error, 'text', error)))
+                elif response:
+                    if hasattr(response, 'users'):
+                        _pd["users"] = {u.id: u for u in response.users.toArray()}
+                    if hasattr(response, 'participants'):
+                        _pd["participants"] = list(response.participants.toArray())
+                _ev.set()
+
+            send_request(req, on_page, account=account)
+            event.wait(timeout=15)
+
+            if error_box:
+                _bulletin(f"Ошибка API: {error_box[0]}", "error")
+                return
+
+            all_users.update(page_data["users"])
+            all_participants.extend(page_data["participants"])
+
+            if len(page_data["participants"]) < 199:
+                break
+            offset += len(page_data["participants"])
+
+            if len(all_participants) % BULLETIN_UPDATE_FREQUENCY < 200:
+                _bulletin(f"Собираю участников ({len(all_participants)})...")
+
+        if offset >= MAX_PARTICIPANTS_LIMIT:
+            _bulletin(f"Лимит {MAX_PARTICIPANTS_LIMIT} участников.")
+
+        if not self._is_stopped(peer_id):
+            self._process_and_send(all_users, all_participants, args, contact_ids)
+
+    def _fetch_group_participants(self, chat, args: Dict, contact_ids: Set[int]):
+        import threading
+        account = args['account']
+        peer_id = args['peer_id']
+        event = threading.Event()
+        result: Dict[str, Any] = {"users": {}, "participants": []}
+        error_box: list = []
+
+        def on_response(response, error):
+            if error:
+                error_box.append(str(getattr(error, 'text', error)))
+            elif response:
+                if hasattr(response, 'users'):
+                    result["users"] = {u.id: u for u in response.users.toArray()}
+                if (hasattr(response, 'full_chat')
+                        and hasattr(response.full_chat, 'participants')
+                        and response.full_chat.participants
+                        and hasattr(response.full_chat.participants, 'participants')):
+                    result["participants"] = list(
+                        response.full_chat.participants.participants.toArray()
+                    )
+            event.set()
+
+        _bulletin("Собираю участников группы...")
+        req = TLRPC.TL_messages_getFullChat()
+        req.chat_id = chat.id
+        send_request(req, on_response, account=account)
+        event.wait(timeout=15)
+
+        if error_box:
+            _bulletin(f"Ошибка API группы: {error_box[0]}", "error")
+            return
+        if not self._is_stopped(peer_id):
+            self._process_and_send(
+                result["users"], result["participants"], args, contact_ids
+            )
+
+    def _is_admin(self, participant) -> bool:
+        return isinstance(participant, (
+            TLRPC.TL_channelParticipantAdmin,
+            TLRPC.TL_channelParticipantCreator,
+            TLRPC.TL_chatParticipantAdmin,
+            TLRPC.TL_chatParticipantCreator,
+        ))
+
+    def _is_online(self, user) -> bool:
+        if user and user.status:
+            return isinstance(user.status,
+                              (TLRPC.TL_userStatusOnline, TLRPC.TL_userStatusRecently))
+        return False
+
+    def _process_and_send(self, all_users: Dict, all_participants: List,
+                          args: Dict, contact_ids: Set[int]):
+        peer_id = args['peer_id']
+        account = args['account']
+        filters = args.get('filters', set())
+        limit = args.get('limit')
+        header_text = args.get('header') or self.get_setting("default_header", "🔔 Общий сбор!")
+
+        is_silent = 's' in filters
+        exclude_admins = self.get_setting("exclude_admins", True) and 'a' not in filters
+        include_bots = self.get_setting("include_bots", False)
+        mention_deleted = self.get_setting("mention_deleted", False)
+        no_username_mode = self.get_setting("no_username_mode", 1)
+        silent_name_style = self.get_setting("silent_name_style", 0)
+
+        my_id = get_user_config(account).getCurrentUser().id
+        user_ids_except, usernames_except = self._parsed_exceptions
+        filtered: List[Any] = []
+
+        for p in all_participants:
+            if self._is_stopped(peer_id):
+                return
+            user_id = getattr(p, 'user_id', None)
+            if hasattr(p, 'peer') and hasattr(p.peer, 'user_id'):
+                user_id = p.peer.user_id
+            if not user_id:
+                continue
+
+            user = all_users.get(user_id)
+            if not user or user.id == my_id:
+                continue
+            if user.deleted and not mention_deleted:
+                continue
+            if not include_bots and user.bot:
+                continue
+            if str(user.id) in user_ids_except:
+                continue
+            if user.username and user.username.lower() in usernames_except:
+                continue
+            if exclude_admins and self._is_admin(p):
+                continue
+
+            # Применяем активные фильтры
+            active = filters & {'a', 'o', 'f', 'c'}
+            if active:
+                match = False
+                if 'a' in active and self._is_admin(p):
+                    match = True
+                if 'o' in active and self._is_online(user):
+                    match = True
+                if 'f' in active and not self._is_online(user):
+                    match = True
+                if 'c' in active and user.id in contact_ids:
+                    match = True
+                if not match:
+                    continue
+
+            filtered.append(user)
+
+        if 'r' in filters:
+            random.shuffle(filtered)
+        if limit is not None:
+            filtered = filtered[:limit]
+
+        if not filtered:
+            _bulletin("Не найдено подходящих участников.")
+            return
+
+        mentions: List[str] = []
+        for user in filtered:
+            if self._is_stopped(peer_id):
+                return
+            name = ""
+            if silent_name_style == 0:
+                name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+            else:
+                name = user.first_name or ""
+            if not name:
+                name = "Пользователь"
+
+            if is_silent:
+                mentions.append(
+                    f"[{self._escape_md(name)}](tg://user?id={user.id})"
+                )
+            elif user.username:
+                escaped_uname = user.username.replace('_', '\\_')
+                mentions.append(f"@{escaped_uname}")
+            elif no_username_mode == 1:
+                mentions.append(
+                    f"[{self._escape_md(name)}](tg://user?id={user.id})"
+                )
+            elif no_username_mode == 2:
+                mentions.append(
+                    f"tg://user?id={user.id} ({self._escape_md(name)})"
+                )
+
+        if not mentions:
+            _bulletin("Некого упоминать после фильтрации.")
+            return
+
+        self._send_chunks(mentions, header_text, peer_id, account)
+
+    def _send_chunks(self, mentions: List[str], header: str,
+                     peer_id: int, account: int):
+        import time
+        send_mode = self.get_setting("send_mode", 0)
+        delay = max(0.3, float(self.get_setting("message_delay", "1.5") or "1.5"))
+        chunks: List[str] = []
+
+        if send_mode == 1:
+            full = " ".join(mentions)
+            while len(full) > TELEGRAM_MESSAGE_LIMIT - 200:
+                split_at = full.rfind(' ', 0, TELEGRAM_MESSAGE_LIMIT - 200)
+                if split_at == -1:
+                    split_at = TELEGRAM_MESSAGE_LIMIT - 200
+                chunks.append(full[:split_at])
+                full = full[split_at:].strip()
+            if full:
+                chunks.append(full)
+        elif send_mode == 2:
+            seq_str = self.get_setting("batch_mode_sequence", "3,4,5")
+            seq = [int(i) for i in seq_str.split(',') if i.strip().isdigit()] or [5]
+            repeat = self.get_setting("batch_mode_repeat", True)
+            copy = list(mentions)
+            idx = 0
+            while copy:
+                size = seq[idx] if idx < len(seq) else seq[-1]
+                chunks.append(" ".join(copy[:size]))
+                copy = copy[size:]
+                if repeat:
+                    idx = (idx + 1) % len(seq)
+                else:
+                    idx += 1
+        else:
+            chunks = [" ".join(mentions[i:i + 50])
+                      for i in range(0, len(mentions), 50)]
+
+        if header:
+            self._send_formatted(peer_id, header, account)
+            time.sleep(delay)
+
+        for i, chunk in enumerate(chunks):
+            if self._is_stopped(peer_id):
+                _bulletin("Упоминание остановлено.")
+                return
+            self._send_formatted(peer_id, chunk, account)
+            if i < len(chunks) - 1:
+                time.sleep(delay)
+
+        _bulletin(f"Упомянуто {len(mentions)} участников.", "success")
+
+    def create_settings(self) -> List[Any]:
+        lang = LocaleController.getInstance().getCurrentLocale().getLanguage()
+        is_ru = lang.startswith("ru")
+
+        cmds = {k: self.get_setting(f"{k}_command", d) for k, d in [
+            ("all", ".all"), ("admins", ".all admins"), ("random", ".all random"),
+            ("silent", ".all night"), ("online", ".all online"),
+            ("offline", ".all offline"), ("contacts", ".all contacts"),
+            ("all_stop", ".all stop"),
+        ]}
+
+        help_text = (
+            "Формат: <команда> [текст] [лимит]\n\n"
+            f"• `{cmds['all']}` — все\n"
+            f"• `{cmds['admins']}` — админы\n"
+            f"• `{cmds['contacts']}` — контакты\n"
+            f"• `{cmds['random']} 5` — 5 случайных\n"
+            f"• `{cmds['online']}` — онлайн\n"
+            f"• `{cmds['offline']}` — оффлайн\n"
+            f"• `{cmds['silent']}` — тихо (без @)\n"
+            f"• `{cmds['all_stop']}` — остановить"
+            if is_ru else
+            "Format: <command> [text] [limit]\n\n"
+            f"• `{cmds['all']}` — all\n"
+            f"• `{cmds['admins']}` — admins\n"
+            f"• `{cmds['contacts']}` — contacts\n"
+            f"• `{cmds['random']} 5` — 5 random\n"
+            f"• `{cmds['online']}` — online\n"
+            f"• `{cmds['offline']}` — offline\n"
+            f"• `{cmds['silent']}` — silent\n"
+            f"• `{cmds['all_stop']}` — stop"
+        )
+
+        send_modes = (["Частями", "Одним сообщением", "Циклично"] if is_ru
+                      else ["In parts", "Single message", "Cyclic"])
+
+        settings_list = [
+            Header("Команды" if is_ru else "Commands"),
+            Input(key="all_command", text="Все" if is_ru else "All",
+                  default=".all", icon="msg_edit"),
+            Input(key="admins_command", text="Админы" if is_ru else "Admins",
+                  default=".all admins", icon="msg_admins"),
+            Input(key="contacts_command", text="Контакты" if is_ru else "Contacts",
+                  default=".all contacts", icon="msg_contacts"),
+            Input(key="random_command", text="Случайные" if is_ru else "Random",
+                  default=".all random", icon="msg_rate_up"),
+            Input(key="online_command", text="Онлайн" if is_ru else "Online",
+                  default=".all online", icon="msg_online"),
+            Input(key="offline_command", text="Оффлайн" if is_ru else "Offline",
+                  default=".all offline", icon="msg_contacts_time"),
+            Input(key="silent_command", text="Тихий" if is_ru else "Silent",
+                  default=".all night", icon="msg_bell_mute"),
+            Input(key="all_stop_command", text="Стоп" if is_ru else "Stop",
+                  default=".all stop", icon="msg_pollstop"),
+        ]
+
+        settings_list.extend([
+            Divider(),
+            Header("Параметры" if is_ru else "Parameters"),
+            Input(key="default_header",
+                  text="Заголовок" if is_ru else "Header",
+                  default="🔔 Общий сбор!", icon="msg_topic_create"),
+            Selector(key="send_mode",
+                     text="Режим отправки" if is_ru else "Send mode",
+                     items=send_modes, default=0, icon="msg_share"),
+            Input(key="message_delay",
+                  text="Задержка (сек)" if is_ru else "Delay (sec)",
+                  default="1.5", icon="msg_recent"),
+        ])
+
+        if self.get_setting("send_mode", 0) == 2:
+            settings_list.extend([
+                Divider(),
+                Header("Цикличный режим" if is_ru else "Cyclic mode"),
+                Input(key="batch_mode_sequence",
+                      text="Последовательность" if is_ru else "Sequence",
+                      subtext="3,4,5", default="3,4,5", icon="msg_stats"),
+                Switch(key="batch_mode_repeat",
+                       text="Повторять" if is_ru else "Repeat",
+                       default=True, icon="msg_retry"),
+            ])
+
+        no_uname = (["Пропускать", "Имя (ссылка)", "Ссылка + Имя"] if is_ru
+                    else ["Skip", "Name (link)", "Link + Name"])
+        settings_list.extend([
+            Divider(),
+            Header("Фильтры" if is_ru else "Filters"),
+            Switch(key="exclude_admins",
+                   text="Исключить админов" if is_ru else "Exclude admins",
+                   default=True, icon="msg_admin_add"),
+            Input(key="exceptions_list",
+                  text="Исключения" if is_ru else "Exceptions",
+                  subtext="ID/username через запятую" if is_ru else "IDs/usernames, comma-separated",
+                  on_change=self._update_parsed_settings, icon="msg_user_remove"),
+            Selector(key="silent_name_style",
+                     text="Стиль тихих" if is_ru else "Silent style",
+                     items=(["Имя + фамилия", "Только имя"] if is_ru
+                            else ["Full name", "First name"]),
+                     default=0, icon="msg_contacts"),
+            Selector(key="no_username_mode",
+                     text="Без @username" if is_ru else "No @username",
+                     items=no_uname, default=1, icon="msg_filled_menu_users"),
+            Switch(key="mention_deleted",
+                   text="Удалённые аккаунты" if is_ru else "Deleted accounts",
+                   default=False, icon="msg_delete"),
+            Switch(key="include_bots",
+                   text="Упоминать ботов" if is_ru else "Mention bots",
+                   default=False, icon="input_bot1"),
+            Divider(text=help_text),
+        ])
+        return settings_list
