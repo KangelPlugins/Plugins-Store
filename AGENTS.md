@@ -1,100 +1,73 @@
-# Plugins Store — Agent Guide
+# Plugins Store — структура репозитория
 
-Репозиторий с плагинами для Kangel Plugins Manager (ExteraGram).
+Репозиторий с плагинами для Kangel Plugins Manager (ExteraGram). Обновляется автоматически
+ботом; вручную обычно ничего не трогать.
 
 ## Структура
 
 ```
-Plugins/              # Текущие версии плагинов (.plugin файлы)
-legacy_versions/      # Старые версии плагинов, организованы по папкам
-  <plugin_name>/      # Папка для каждого плагина
-    <plugin_name>.plugin              # Последняя легаси версия
-    <plugin_name>_v<version>.plugin   # Именованные старые версии
-store.json            # Метаданные всех плагинов
+Plugins/                 # текущие версии плагинов
+  <id>.plugin            # обычный плагин (один Python-файл)
+  <id>.eaf               # elyx-плагин (ZIP-архив)
+legacy_versions/         # старые версии, по папке на плагин
+  <id>/                  # папка плагина
+    <base>_v<version>.<ext>  # именованная версия (основной паттерн)
+    <base>.<ext>              # старая запись без версии в имени
+store.json               # метаданные всех плагинов (ключ = id)
 ```
 
-## store.json структура
+## store.json
 
-Корневой объект содержит плагины с ключами-идентификаторами. Каждый плагин — объект с полями:
+Ключ корневого объекта — `id` плагина. Поля (пишутся только если есть):
 
-**Обязательные поля:**
-- `url` (string) — URL к актуальному .plugin файлу
-- `name` (string) — Отображаемое имя плагина
-- `version` (string) — Текущая версия
-- `author` (string) — Автор плагина
-- `description` (string) — Описание
-- `hash` (string) — SHA256 хеш .plugin файла
-- `status` (string) — Категория: `"fun"`, `"library"`, `"tools"`, и т.д.
-
-**Опциональные поля:**
-- `min_version` (string) — Минимальная версия ExteraGram
-- `app_version` (string) — Версия приложения
-- `icon` (string) — Путь к иконке
-- `dependencies` (array of strings) — Зависимости от других плагинов
-- `requirements` (array of strings) — Дополнительные требования
-- `legacy_version` (object) — Старые версии плагина
-
-### legacy_version структура
-
-Объект, где ключи — номера версий (string), значения — объекты с:
-- `url` (string) — URL к legacy .plugin файлу
-- `hash` (string) — SHA256 хеш legacy файла
+- `url` — `https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/Plugins/<файл>` (обязательное)
+- `name`, `version`, `author`, `description`, `hash` — SHA256 файла
+- `icon`, `min_version`, `app_version`
+- `status` — один из: `utilities`, `customization`, `fun`, `informational`, `messages`, `library`
+- `requirements`, `requires`, `dependencies`
+- `description_<lang>` — локализованные описания; `<lang>` = язык из elyx-локалей
+- `legacy_version` — объект `{ "<version>": { "url": "...", "hash": "sha256" } }`
 
 Пример:
 ```json
 {
-  "plugin_id": {
-    "url": "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/Plugins/plugin.plugin",
-    "name": "Plugin Name",
-    "version": "2.0.0",
-    "author": "@author",
-    "description": "Description text",
-    "hash": "sha256hash...",
-    "status": "tools",
+  "custom_profile": {
+    "url": "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/Plugins/custom_profile.plugin",
+    "name": "Custom Profile",
+    "version": "1.6",
+    "author": "@RoflPlugins",
+    "description": "Описание на дефолтном языке",
+    "description_ru": "Русское описание",
+    "description_en": "English description",
+    "hash": "sha256...",
+    "status": "customization",
     "legacy_version": {
-      "1.0.0": {
-        "url": "https://raw.githubusercontent.com/.../legacy_versions/plugin_id/plugin_id_v1.0.0.plugin",
-        "hash": "sha256hash..."
-      },
-      "1.5.0": {
-        "url": "https://raw.githubusercontent.com/.../legacy_versions/plugin_id/plugin_id.plugin",
-        "hash": "sha256hash..."
+      "1.1": {
+        "url": "https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/legacy_versions/custom_profile/Custom Profile_v1.1.plugin",
+        "hash": "sha256..."
       }
     }
   }
 }
 ```
 
-## Обновление плагинов
-
-При обновлении плагина:
-
-1. Сохрани старую версию в `legacy_versions/<plugin_name>/`:
-   - Либо как `<plugin_name>.plugin` (последняя legacy)
-   - Либо как `<plugin_name>_v<version>.plugin` (именованная версия)
-
-2. Обнови `Plugins/<plugin_name>.plugin` новой версией
-
-3. Обнови `store.json`:
-   - Измени `version` на новую
-   - Пересчитай `hash` (SHA256)
-   - Добавь запись в `legacy_version` со старой версией
-
-Вычисление хеша:
+Hash — SHA256 по байтам файла:
 ```python
 import hashlib
-
-def get_hash(filepath):
-    sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+def get_hash(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
 ```
 
-## Важно
+## legacy_versions: правило коллизий
 
-- Репозиторий обновляется автоматически (см. README.md)
-- Не редактируй вручную без необходимости
-- Все плагины должны быть в UTF-8
-- URL всегда начинается с `https://raw.githubusercontent.com/KangelPlugins/Plugins-Store/main/`
+Старая версия всегда сохраняется под версионированным именем `<base>_v<version>.<ext>`
+и не перезаписывает уже существующий файл в `legacy_versions/<id>/`. Если файл с таким
+именем уже есть, но хеш другой — добавляется суффикс (`<base>_v<version>_1.<ext>`).
+Это защита от потери версий при коллизии имён.
+
+## Elyx (.eaf / .elyx)
+
+Elyx — структурированный формат плагинов ExteraGram (https://plugins.exteragram.app/docs/elyx).
+Файл — ZIP-архив; в корне `refmap` (`.yml`/`.yaml`/`.json`), указывающий на `metainfo`,
+`main`, `strings`, `assets`. Метаданные — из `metainfo.json`/`metainfo.yml`/`meta.json`/`meta.yml`
+(путь из refmap, fallback — поиск по архиву). В `store.json` поля те же, что и для `.plugin`.
