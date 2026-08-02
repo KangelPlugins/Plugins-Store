@@ -1,0 +1,529 @@
+from __future__ import annotations
+
+from threading import Lock, Thread
+from typing import Any, List, Optional, Tuple
+
+from android.media import AudioAttributes, MediaPlayer
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import send_text
+from org.telegram.messenger import UserConfig
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Switch, Text
+
+__id__ = "radio_station"
+__name__ = "Radio Station"
+__description__ = (
+    "Фоновое интернет-радио. Команды: .radio — текущая станция, "
+    ".radio N — станция по номеру, .vp — следующая, .nz — предыдущая, "
+    ".stop — остановить. Статус отправляется в Избранное."
+)
+__author__ = "@RapFurBitches & @ccsFM"
+__version__ = "4.2.3"
+__icon__ = "Plugins50kk_by_fStikBot/4"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+# Public radio streams. Keep the list centralised so endpoints can be
+# maintained without touching playback logic when a broadcaster moves a stream.
+STATIONS: Tuple[Tuple[str, str], ...] = (
+    ("Европа Плюс", "https://ep256.hostingradio.ru:8052/europaplus256.mp3"),
+    ("Дорожное радио", "https://dorognoe.hostingradio.ru:8000/radio"),
+    ("Радио Шансон", "https://chanson.hostingradio.ru:8041/chanson256.mp3"),
+    ("Радио Русский Рок", "https://nashe1.hostingradio.ru:18000/rock-128.mp3"),
+    ("Ретро FM", "https://retroserver.streamr.ru:8043/retro128.mp3"),
+    ("Studio 21", "https://radio-studio21.ru:8000/radio.aac"),
+    ("Monte-Carlo", "https://montecarlo.hostingradio.ru:8041/montecarlo128.mp3"),
+    ("Comedy Radio", "https://ic6.101.ru:8000/v3_1"),
+)
+
+PAGE_MAIN = "main"
+PAGE_COMMANDS = "commands"
+PAGE_STATIONS = "stations"
+PAGE_NOTIFICATIONS = "notifications"
+PAGE_ABOUT = "about"
+
+
+class RadioStationPlugin(BasePlugin):
+    """Application-wide internet radio player controlled by chat commands."""
+
+    def on_plugin_load(self):
+        self._player: Optional[MediaPlayer] = None
+        self._pending_player: Optional[MediaPlayer] = None
+        self._player_lock = Lock()
+        self._request_id = 0
+        self._is_loaded = True
+        self._is_playing = False
+        self._current_station_name = ""
+        self.add_on_send_message_hook()
+        self.log("Radio Station v%s loaded" % __version__)
+
+    def on_plugin_unload(self):
+        with self._player_lock:
+            self._is_loaded = False
+            self._is_playing = False
+        self._stop_player()
+        self.log("Radio Station unloaded")
+
+    # ── Settings UI (UtilitiesPro-style multipage) ──────────────────────
+
+    def create_settings(self) -> List[Any]:
+        return self._build_settings(PAGE_MAIN)
+
+    def _build_settings(self, page_id: str) -> List[Any]:
+        subpage = lambda pid: (lambda: self._build_settings(pid))
+
+        if page_id == PAGE_COMMANDS:
+            return [
+                Header(text="Команды"),
+                Divider(text="Все команды вводятся в любом чате и не отправляются собеседнику."),
+                Text(
+                    text=".radio",
+                    subtext="Включить текущую (последнюю выбранную) станцию.",
+                    icon="msg_played",
+                ),
+                Text(
+                    text=".radio N",
+                    subtext="Включить станцию по номеру. Пример: .radio 1 → Европа Плюс.",
+                    icon="msg_list",
+                ),
+                Text(
+                    text=".vp",
+                    subtext="Следующая станция по списку (с зацикливанием).",
+                    icon="msg_forward",
+                ),
+                Text(
+                    text=".nz",
+                    subtext="Предыдущая станция по списку (с зацикливанием).",
+                    icon="msg_reply",
+                ),
+                Text(
+                    text=".stop",
+                    subtext="Полностью остановить воспроизведение.",
+                    icon="msg_close",
+                ),
+            ]
+
+        if page_id == PAGE_NOTIFICATIONS:
+            notify_on = bool(self.get_setting("notify_saved", True))
+            status_text = "включены" if notify_on else "выключены"
+            return [
+                Header(text="Уведомления о состоянии"),
+                Divider(text="Сейчас уведомления %s." % status_text),
+                Divider(
+                    text="После каждой команды (.radio / .vp / .nz / .stop) плагин "
+                    "отправляет в «Избранное» сообщение: какая станция играет, "
+                    "список команд и нумерованный список станций."
+                ),
+                Switch(
+                    key="notify_saved",
+                    text="Уведомления в Избранное",
+                    subtext="Вкл — статус в Избранное. Выкл — тихий режим.",
+                    default=True,
+                    icon="msg_message",
+                ),
+                Header(text="Что приходит в Избранное"),
+                Divider(text="• статус (включено / следующая / предыдущая / стоп)"),
+                Divider(text="• название и номер текущей станции"),
+                Divider(text="• полный список команд"),
+                Divider(text="• нумерованный список всех станций"),
+            ]
+
+        if page_id == PAGE_STATIONS:
+            entries: List[Any] = [
+                Header(text="Список станций"),
+                Divider(text="Нажмите на станцию, чтобы включить её прямо из настроек."),
+            ]
+            current = self._get_station_index()
+            for i, (name, url) in enumerate(STATIONS):
+                mark = " ▶" if (self._is_playing and i == current) else ""
+                idx = i  # capture for lambda
+
+                def make_click(station_index: int):
+                    def _on_click(_):
+                        self.set_setting("station_index", station_index, reload_settings=False)
+                        self._start_station(station_index)
+                        self._notify_status("play")
+
+                    return _on_click
+
+                entries.append(
+                    Text(
+                        text="%d. %s%s" % (i + 1, name, mark),
+                        subtext=url,
+                        icon="msg_played" if (self._is_playing and i == current) else "msg_media",
+                        accent=(i == current),
+                        on_click=make_click(idx),
+                    )
+                )
+            entries.append(Header(text="Управление"))
+            entries.append(
+                Text(
+                    text="Остановить радио",
+                    subtext="Остановить воспроизведение прямо сейчас.",
+                    icon="msg_close",
+                    red=True,
+                    on_click=lambda _: (self._stop_playback(), self._notify_status("stop")),
+                )
+            )
+            return entries
+
+        if page_id == PAGE_ABOUT:
+            return [
+                Header(text="О разработчике"),
+                Divider(text="Radio Station v%s" % __version__),
+                Text(
+                    text="Разработчик",
+                    subtext="@RapFurBitches",
+                    icon="msg_contact",
+                ),
+                Text(
+                    text="Канал разработчика",
+                    subtext="@ccsFM",
+                    icon="msg_channel",
+                ),
+                Header(text="О плагине"),
+                Divider(
+                    text="Фоновое интернет-радио для exteraGram. "
+                    "Воспроизведение идёт через системный MediaPlayer, "
+                    "команды перехватываются локально и не уходят в чат."
+                ),
+                Divider(text="Станций в списке: %d" % len(STATIONS)),
+                Divider(text="SDK ≥ 1.4.3.3  ·  App ≥ 12.5.1"),
+            ]
+
+        # PAGE_MAIN
+        status_line = "Сейчас играет: %s" % self._current_station_name if self._is_playing else "Радио выключено"
+        notify_on = bool(self.get_setting("notify_saved", True))
+        notify_label = "вкл" if notify_on else "выкл"
+        return [
+            Header(text="Radio Station"),
+            Divider(text="v%s  ·  %s" % (__version__, status_line)),
+            Header(text="Быстрые действия"),
+            Text(
+                text="Включить текущую станцию",
+                subtext="Запустить последнюю выбранную станцию.",
+                icon="msg_played",
+                accent=True,
+                on_click=lambda _: (self._play_current_station(), self._notify_status("play")),
+            ),
+            Text(
+                text="Остановить",
+                subtext="Остановить воспроизведение.",
+                icon="msg_close",
+                red=True,
+                on_click=lambda _: (self._stop_playback(), self._notify_status("stop")),
+            ),
+            Header(text="Разделы"),
+            Text(
+                text="Команды и подсказки",
+                subtext="Полный список команд управления радио.",
+                icon="msg_info",
+                accent=True,
+                create_sub_fragment=subpage(PAGE_COMMANDS),
+            ),
+            Text(
+                text="Список станций",
+                subtext="Все станции + быстрый запуск из настроек.",
+                icon="msg_media",
+                accent=True,
+                create_sub_fragment=subpage(PAGE_STATIONS),
+            ),
+            Text(
+                text="Уведомления о состоянии",
+                subtext="Статус в Избранное: %s. Можно выключить." % notify_label,
+                icon="msg_message",
+                accent=True,
+                create_sub_fragment=subpage(PAGE_NOTIFICATIONS),
+            ),
+            Text(
+                text="О разработчике",
+                subtext="@RapFurBitches  ·  @ccsFM",
+                icon="msg_contact",
+                create_sub_fragment=subpage(PAGE_ABOUT),
+            ),
+            Header(text="Кратко"),
+            Divider(
+                text=".radio — текущая  ·  .radio N — по номеру  ·  .vp — следующая  ·  .nz — предыдущая  ·  .stop — стоп"
+            ),
+            Divider(text="Уведомления в Избранное: %s (настраивается в разделе выше)." % notify_label),
+        ]
+
+    # ── Command hook ────────────────────────────────────────────────────
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        command = message.strip().lower()
+        if not command:
+            return HookResult()
+
+        handled = False
+
+        if command == ".radio":
+            self._play_current_station()
+            self._notify_status("play")
+            handled = True
+        elif command.startswith(".radio "):
+            arg = command[7:].strip()
+            if arg.isdigit():
+                num = int(arg)
+                if 1 <= num <= len(STATIONS):
+                    index = num - 1
+                    self.set_setting("station_index", index, reload_settings=False)
+                    self._start_station(index)
+                    self._notify_status("play")
+                else:
+                    self._notify_error(
+                        "Станция №%d не найдена. Доступны номера 1–%d." % (num, len(STATIONS))
+                    )
+                handled = True
+            else:
+                self._notify_error("Использование: .radio или .radio N (номер станции)")
+                handled = True
+        elif command == ".vp":
+            self._change_station(1)
+            self._notify_status("next")
+            handled = True
+        elif command == ".nz":
+            self._change_station(-1)
+            self._notify_status("prev")
+            handled = True
+        elif command == ".stop":
+            self._stop_playback()
+            self._notify_status("stop")
+            handled = True
+
+        if handled:
+            # Commands control only local playback and are never sent to a chat.
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
+
+    # ── Station helpers ─────────────────────────────────────────────────
+
+    def _get_station_index(self) -> int:
+        try:
+            index = int(self.get_setting("station_index", 0))
+        except (TypeError, ValueError):
+            index = 0
+        if not STATIONS:
+            return 0
+        return index % len(STATIONS)
+
+    def _change_station(self, step: int):
+        index = (self._get_station_index() + step) % len(STATIONS)
+        self.set_setting("station_index", index, reload_settings=False)
+        self._start_station(index)
+
+    def _play_current_station(self):
+        self._start_station(self._get_station_index())
+
+    def _stop_playback(self):
+        self._stop_player()
+        with self._player_lock:
+            self._is_playing = False
+            self._current_station_name = ""
+
+    def _start_station(self, index: int):
+        if not STATIONS:
+            return
+        index = index % len(STATIONS)
+        station_name, station_url = STATIONS[index]
+        with self._player_lock:
+            if not self._is_loaded:
+                return
+            self._request_id += 1
+            request_id = self._request_id
+            active_player = self._player
+            pending_player = self._pending_player
+            self._player = None
+            self._pending_player = None
+            self._is_playing = False
+            self._current_station_name = station_name
+
+        # release() cancels an in-progress prepare on Android and ensures that
+        # an earlier station cannot take ownership after a later command.
+        self._release_player(active_player)
+        self._release_player(pending_player)
+        self.log("Starting radio station: %s" % station_name)
+        Thread(
+            target=self._prepare_and_play,
+            args=(request_id, station_name, station_url),
+            daemon=True,
+        ).start()
+
+    def _prepare_and_play(self, request_id: int, station_name: str, station_url: str):
+        player = None
+        try:
+            with self._player_lock:
+                if not self._is_loaded or request_id != self._request_id:
+                    return
+
+            player = MediaPlayer()
+            attributes = (
+                AudioAttributes.Builder()
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .build()
+            )
+            player.setAudioAttributes(attributes)
+            player.setDataSource(station_url)
+
+            with self._player_lock:
+                if not self._is_loaded or request_id != self._request_id:
+                    self._release_player(player)
+                    return
+                self._pending_player = player
+
+            # Network preparation is deliberately outside the message/UI hook.
+            player.prepare()
+
+            with self._player_lock:
+                if not self._is_loaded or request_id != self._request_id:
+                    self._release_player(player)
+                    return
+                player.start()
+                self._player = player
+                self._pending_player = None
+                self._is_playing = True
+                self._current_station_name = station_name
+
+            self.log("Radio is playing: %s" % station_name)
+        except Exception as error:
+            with self._player_lock:
+                if self._player is player:
+                    self._player = None
+                if self._pending_player is player:
+                    self._pending_player = None
+                self._is_playing = False
+            self.log("Could not start %s: %s" % (station_name, error))
+            self._release_player(player)
+            self._notify_error("Не удалось запустить «%s»: %s" % (station_name, error))
+
+    def _stop_player(self):
+        with self._player_lock:
+            self._request_id += 1
+            active_player = self._player
+            pending_player = self._pending_player
+            self._player = None
+            self._pending_player = None
+            self._is_playing = False
+        self._release_player(active_player)
+        self._release_player(pending_player)
+
+    @staticmethod
+    def _release_player(player):
+        if player is None:
+            return
+        try:
+            player.release()
+        except Exception:
+            pass
+
+    # ── Notifications ───────────────────────────────────────────────────
+
+    def _get_self_user_id(self) -> Optional[int]:
+        try:
+            account = UserConfig.selectedAccount
+            return int(UserConfig.getInstance(account).getClientUserId())
+        except Exception:
+            try:
+                return int(UserConfig.getInstance(UserConfig.selectedAccount).clientUserId)
+            except Exception:
+                self.log("Failed to resolve self user id")
+                return None
+
+    def _stations_list_md(self) -> str:
+        lines = []
+        current = self._get_station_index()
+        for i, (name, _) in enumerate(STATIONS):
+            prefix = "▶ " if (self._is_playing and i == current) else ""
+            lines.append("%s`%d.` %s" % (prefix, i + 1, name))
+        return "\n".join(lines)
+
+    def _build_status_message(self, action: str) -> str:
+        index = self._get_station_index()
+        name = STATIONS[index][0] if STATIONS else "—"
+
+        if action == "stop":
+            header = "⏹ **Радио остановлено**"
+            body = "Воспроизведение выключено."
+        elif action == "next":
+            header = "⏭ **Следующая станция**"
+            body = "Сейчас играет: **%s** (`%d`)" % (name, index + 1)
+        elif action == "prev":
+            header = "⏮ **Предыдущая станция**"
+            body = "Сейчас играет: **%s** (`%d`)" % (name, index + 1)
+        else:
+            header = "📻 **Радио включено**"
+            body = "Сейчас играет: **%s** (`%d`)" % (name, index + 1)
+
+        commands = (
+            "\n\n**Управление**\n"
+            "• `.radio` — текущая станция\n"
+            "• `.radio N` — станция по номеру\n"
+            "• `.vp` — следующая\n"
+            "• `.nz` — предыдущая\n"
+            "• `.stop` — остановить"
+        )
+        stations = "\n\n**Станции**\n" + self._stations_list_md()
+        return header + "\n" + body + commands + stations
+
+    def _notify_status(self, action: str):
+        if not self.get_setting("notify_saved", True):
+            return
+        peer_id = self._get_self_user_id()
+        if not peer_id:
+            self._show_bulletin("Не удалось отправить статус: нет ID пользователя")
+            return
+        text = self._build_status_message(action)
+
+        def _send():
+            try:
+                send_text(peer_id, text, parse_mode="Markdown")
+            except Exception as e:
+                self.log("Failed to send status to Saved Messages: %s" % e)
+                try:
+                    send_text(peer_id, text)
+                except Exception as e2:
+                    self.log("Fallback send also failed: %s" % e2)
+
+        Thread(target=_send, daemon=True).start()
+
+    def _notify_error(self, message: str):
+        peer_id = self._get_self_user_id()
+        if peer_id and self.get_setting("notify_saved", True):
+            text = "⚠️ **Radio Station**\n%s" % message
+
+            def _send():
+                try:
+                    send_text(peer_id, text, parse_mode="Markdown")
+                except Exception:
+                    try:
+                        send_text(peer_id, "Radio Station: %s" % message)
+                    except Exception:
+                        pass
+
+            Thread(target=_send, daemon=True).start()
+        self._show_bulletin(message)
+
+    def _show_bulletin(self, message: str):
+        def _show():
+            try:
+                fragment = None
+                try:
+                    from client_utils import get_last_fragment
+                    fragment = get_last_fragment()
+                except Exception:
+                    pass
+                if fragment is not None:
+                    BulletinHelper.show_info("Radio Station: %s" % message, fragment)
+            except Exception:
+                pass
+
+        try:
+            run_on_ui_thread(_show)
+        except Exception:
+            pass
