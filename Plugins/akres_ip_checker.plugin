@@ -1,0 +1,592 @@
+import shlex, socket, time, concurrent.futures
+from typing import Any, List, Optional
+import requests
+from android.content import Intent
+from android.net import Uri
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import EXTERNAL_NETWORK_QUEUE, get_last_fragment, get_user_config, run_on_queue, send_message, send_text
+from org.telegram.tgnet import TLRPC
+from ui.alert import AlertDialogBuilder
+from ui.settings import Divider, Header, Switch, Text
+
+__id__ = "akres_ip_checker"
+__icon__ = "SpottyAndPersikAnimated/22"
+__name__ = "IP Checker"
+__version__ = "1.1.0"
+__author__ = "@akresik"
+__min_version__ = "12.1.1"
+__description__ = (
+    "Плагин для проверки IP-адресов и доменов.\n\n"
+    " .wh <IP/домен> – инфо о цели: страна, город, провайдер и так далее через несколько API, .whh тоже самое но IP скрыт.\n"
+    " .bs <IP/домен> – проверка на белый IP по операторам, .bsh тоже самое но IP скрыт."
+)
+
+LATENCYLAB_BASE = "https://console.latencylab.ru"
+
+class IPCheckerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.progress_dialog = None
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+
+    def _open_account_page(self, view):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if not activity:
+            return
+        instruction = (
+            "1. Нажмите кнопку «Перейти» ниже\n"
+            "2. На открывшейся странице нажмите «Войти»\n"
+            "3. Авторизуйтесь через Telegram\n"
+            "4. Вернитесь на страницу и пролистайте вниз\n"
+            "5. Нажмите «Создать ключ» и скопируйте его\n"
+            "6. Вернитесь сюда и вставьте ключ в поле выше\n\n"
+            "⚠️ Важно: никому не передавайте этот ключ.\n"
+            "Если ключ случайно утёк — вернитесь на страницу, нажмите «Отозвать» и создайте новый."
+        )
+        def _open_site():
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://latencylab.ru/account.html"))
+            activity.startActivity(intent)
+        dialog = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        dialog.set_title("Получение API ключа")
+        dialog.set_message(instruction)
+        dialog.set_positive_button("Перейти", lambda d, w: _open_site())
+        dialog.set_negative_button("Отмена", None)
+        dialog.show()
+
+    def _open_api_key_input(self, view):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if not activity:
+            return
+        from android.text import InputType
+        from android.widget import EditText as AndroidEditText
+        from org.telegram.messenger import AndroidUtilities
+        input_field = AndroidEditText(activity)
+        input_field.setText(self.get_setting("latencylab_api_key", ""))
+        input_field.setInputType(InputType.TYPE_CLASS_TEXT)
+        input_field.setPadding(
+            AndroidUtilities.dp(16), AndroidUtilities.dp(8),
+            AndroidUtilities.dp(16), AndroidUtilities.dp(8),
+        )
+        def _save(d, w):
+            self.set_setting("latencylab_api_key", str(input_field.getText()).strip(), reload_settings=True)
+        dialog = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        dialog.set_title("API ключ LatencyLab")
+        dialog.set_view(input_field)
+        dialog.set_positive_button("Готово", _save)
+        dialog.set_negative_button("Отмена", None)
+        dialog.show()
+
+    def create_settings(self) -> List[Any]:
+        api_key = self.get_setting("latencylab_api_key", "")
+        return [
+            Header(text="WHOIS (.wh / .whh)"),
+            Switch(key="wh_show_loading_indicator", text="Показывать индикатор загрузки", default=True,
+                   subtext="Окно с крутящимся спиннером во время запроса .wh / .whh"),
+            Switch(key="wh_collapse_quote", text="Сворачивать цитату", default=True,
+                   subtext="Результат .wh / .whh будет отправлен свёрнутой цитатой"),
+            Switch(key="api_ipwhois", text="IPWhois", default=True),
+            Switch(key="api_ipapi", text="IP-API", default=False),
+            Switch(key="api_freeipapi", text="FreeIPAPI", default=False),
+            Switch(key="api_ip2location", text="IP2Location", default=False),
+            Switch(key="api_dbip", text="DB-IP", default=False),
+            Divider(),
+            Header(text="Белый IP (.bs / .bsh)"),
+            Switch(key="bs_show_loading_indicator", text="Показывать индикатор загрузки", default=False,
+                   subtext="Окно с крутящимся спиннером во время запроса .bs / .bsh"),
+            Switch(key="bs_collapse_quote", text="Сворачивать цитату", default=False,
+                   subtext="Результат .bs / .bsh будет отправлен свёрнутой цитатой"),
+            Switch(key="bs_custom_emoji", text="Кастомные эмодзи", default=True,
+                   subtext="Эмодзи в результате .bs / .bsh (только для Premium пользователей)"),
+            Header(text="Отображение пинга"),
+            Switch(key="ping_icmp", text="ICMP", default=True,
+                   subtext="Показывать ICMP RTT"),
+            Switch(key="ping_tcp", text="TCP", default=True,
+                   subtext="Показывать TCP RTT"),
+            Text(text="API ключ LatencyLab", subtext="Установлен" if api_key else "Не установлен",
+                 icon="msg_pin_code", on_click=self._open_api_key_input),
+            Text(text="Получить API ключ", icon="msg_link", on_click=self._open_account_page),
+            Divider(text="Лимит: 100 запросов каждые 2 часа"),
+            Header(text="Операторы"),
+            Switch(key="op_beeline", text="Билайн", default=True),
+            Switch(key="op_megafon", text="МегаФон", default=True),
+            Switch(key="op_mts", text="МТС", default=True),
+            Switch(key="op_t2", text="Теле2", default=True),
+            Switch(key="op_tmobile", text="Т-Мобайл", default=True),
+        ]
+
+    def _is_premium(self) -> bool:
+        try:
+            user = get_user_config().getCurrentUser()
+            return bool(user and user.premium)
+        except Exception:
+            return False
+
+    def _empty(self, v):
+        return v is None or v == "" or v == "-"
+
+    def _line(self, label, value):
+        return None if self._empty(value) else f"{label}: `{value}`"
+
+    def _coords_line(self, label, lat, lon):
+        return None if (self._empty(lat) or self._empty(lon)) else f"{label}: `{lat} {lon}`"
+
+    def _maps_line(self, lat, lon):
+        return None if (self._empty(lat) or self._empty(lon)) else f"Google Карты: [*клик*](https://maps.google.com/?q={lat},{lon})"
+
+    def _is_ip(self, t: str) -> bool:
+        try:
+            socket.inet_aton(t)
+            parts = t.split(".")
+            return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+        except OSError:
+            try:
+                socket.inet_pton(socket.AF_INET6, t)
+                return True
+            except OSError:
+                return False
+
+    def _resolve(self, t: str) -> str:
+        if self._is_ip(t):
+            return t
+        try:
+            return socket.gethostbyname(t)
+        except Exception:
+            return t
+
+    def _prog(self, show, kind: str = "wh"):
+        setting_key = "wh_show_loading_indicator" if kind == "wh" else "bs_show_loading_indicator"
+        if not self.get_setting(setting_key, kind == "wh"):
+            return
+        def _a():
+            if show:
+                f = get_last_fragment()
+                if f and f.getParentActivity():
+                    self.progress_dialog = AlertDialogBuilder(f.getParentActivity(), AlertDialogBuilder.ALERT_TYPE_SPINNER)
+                    self.progress_dialog.set_message("Обработка...")
+                    self.progress_dialog.show()
+                    self.progress_dialog.set_cancelable(False)
+            elif self.progress_dialog:
+                self.progress_dialog.dismiss()
+                self.progress_dialog = None
+        run_on_ui_thread(_a)
+
+    def _send_error(self, peer, text: str, kind: str = "wh"):
+        def _do():
+            self._prog(False, kind)
+            send_text(peer, f"<blockquote>{text}</blockquote>", parse_mode="HTML")
+        run_on_ui_thread(_do)
+
+    def _send_quoted_sections(self, peer, sections):
+        def _do():
+            self._prog(False, "wh")
+            from markdown_utils import parse_markdown
+            text_parts = []
+            entities = []
+            cursor = 0
+            for i, sec_md in enumerate(sections):
+                p = parse_markdown(sec_md)
+                sec_len = len(p.text.encode('utf-16-le')) // 2
+                quote = TLRPC.TL_messageEntityBlockquote()
+                quote.collapsed = self.get_setting("wh_collapse_quote", True)
+                quote.offset = cursor
+                quote.length = sec_len
+                entities.append(quote)
+                if p.entities:
+                    for e in p.entities:
+                        e_obj = e.to_tlrpc_object()
+                        e_obj.offset += cursor
+                        entities.append(e_obj)
+                text_parts.append(p.text)
+                cursor += sec_len
+                if i < len(sections) - 1:
+                    text_parts.append("\n")
+                    cursor += 1
+            send_message({"peer": peer, "message": "".join(text_parts), "entities": entities, "searchLinks": False})
+        run_on_ui_thread(_do)
+
+    def _fetch_ipwhois(self, ip):
+        try:
+            r = requests.get(f"https://ipwho.is/{ip}", timeout=10).json()
+            if not r.get("success", True):
+                return f"**[IPWhois](https://ipwhois.io/docs)**\nОшибка: {r.get('message', 'Не найдено')}"
+            flag = (r.get("flag") or {}).get("emoji", "")
+            country = r.get("country", "")
+            connection = r.get("connection") or {}
+            timezone = r.get("timezone") or {}
+            lat, lon = r.get("latitude", ""), r.get("longitude", "")
+            tz_val = timezone.get("utc", "")
+            lines = ["**[IPWhois](https://ipwhois.io/docs)**"] + [l for l in [
+                self._line("Континент", r.get("continent", "")),
+                self._line("Страна", f"{flag} {country}".strip()),
+                self._line("Регион", r.get("region", "")),
+                self._line("Город", r.get("city", "")),
+                self._coords_line("Координаты", lat, lon),
+                self._maps_line(lat, lon),
+                self._line("Провайдер", connection.get("isp", "")),
+                self._line("Домен", connection.get("domain", "")),
+                None if self._empty(tz_val) else f"Время: `UTC {tz_val}`",
+            ] if l is not None]
+            return "\n".join(lines)
+        except Exception:
+            return "**[IPWhois](https://ipwhois.io/docs)**\nОшибка: Сетевая ошибка"
+
+    def _fetch_ipapi(self, ip):
+        try:
+            r = requests.get(
+                f"http://ip-api.com/json/{ip}?fields=status,message,continent,country,regionName,city,lat,lon,isp,currency",
+                timeout=10,
+            ).json()
+            if r.get("status") != "success":
+                return f"**[IP-API](https://ip-api.com)**\nОшибка: {r.get('message', 'Не найдено')}"
+            lat, lon = r.get("lat", ""), r.get("lon", "")
+            lines = ["**[IP-API](https://ip-api.com)**"] + [l for l in [
+                self._line("Континент", r.get("continent", "")),
+                self._line("Страна", r.get("country", "")),
+                self._line("Регион", r.get("regionName", "")),
+                self._line("Город", r.get("city", "")),
+                self._coords_line("Координаты", lat, lon),
+                self._maps_line(lat, lon),
+                self._line("Провайдер", r.get("isp", "")),
+                self._line("Валюта", r.get("currency", "")),
+            ] if l is not None]
+            return "\n".join(lines)
+        except Exception:
+            return "**[IP-API](https://ip-api.com)**\nОшибка: Сетевая ошибка"
+
+    def _fetch_dbip(self, ip):
+        try:
+            r = requests.get(f"http://api.db-ip.com/v2/free/{ip}", timeout=10).json()
+            if r.get("error"):
+                return f"**[DB-IP](https://db-ip.com)**\nОшибка: {r.get('error')}"
+            lines = ["**[DB-IP](https://db-ip.com)**"] + [l for l in [
+                self._line("Континент", r.get("continentName", "")),
+                self._line("Страна", r.get("countryName", "")),
+                self._line("Регион", r.get("stateProv", "")),
+                self._line("Город", r.get("city", "")),
+            ] if l is not None]
+            return "\n".join(lines)
+        except Exception:
+            return "**[DB-IP](https://db-ip.com)**\nОшибка: Сетевая ошибка"
+
+    def _fetch_freeipapi(self, ip):
+        try:
+            r = requests.get(f"https://free.freeipapi.com/api/json/{ip}", timeout=10).json()
+            currencies = r.get("currencies") or []
+            lat, lon = r.get("latitude", ""), r.get("longitude", "")
+            lines = ["**[FreeIPAPI](https://freeipapi.com)**"] + [l for l in [
+                self._line("Континент", r.get("continent", "")),
+                self._line("Страна", r.get("countryName", "")),
+                self._line("Город", r.get("cityName", "")),
+                self._coords_line("Координаты", lat, lon),
+                self._maps_line(lat, lon),
+                self._line("Провайдер", r.get("asnOrganization", "")),
+                self._line("Валюта", currencies[0] if currencies else ""),
+            ] if l is not None]
+            return "\n".join(lines)
+        except Exception:
+            return "**[FreeIPAPI](https://freeipapi.com)**\nОшибка: Сетевая ошибка"
+
+    def _fetch_ip2location(self, ip):
+        try:
+            r = requests.get(f"https://api.ip2location.io/?ip={ip}", timeout=10).json()
+            if r.get("error"):
+                return f"**[IP2Location](https://ip2location.com)**\nОшибка: {(r.get('error') or {}).get('error_message', 'Не найдено')}"
+            lat, lon = r.get("latitude", ""), r.get("longitude", "")
+            tz_val = r.get("time_zone", "")
+            lines = ["**[IP2Location](https://ip2location.com)**"] + [l for l in [
+                self._line("Страна", r.get("country_name", "")),
+                self._line("Регион", r.get("region_name", "")),
+                self._line("Город", r.get("city_name", "")),
+                self._coords_line("Координаты", lat, lon),
+                self._maps_line(lat, lon),
+                self._line("Провайдер", r.get("as", "")),
+                None if self._empty(tz_val) else f"Время: `UTC {tz_val}`",
+            ] if l is not None]
+            return "\n".join(lines)
+        except Exception:
+            return "**[IP2Location](https://ip2location.com)**\nОшибка: Сетевая ошибка"
+
+    def _do_whois_lookup(self, target_raw: str, peer, hidden: bool = False):
+        apis = [
+            ("api_ipwhois", True, self._fetch_ipwhois),
+            ("api_ipapi", False, self._fetch_ipapi),
+            ("api_freeipapi", False, self._fetch_freeipapi),
+            ("api_ip2location", False, self._fetch_ip2location),
+            ("api_dbip", False, self._fetch_dbip),
+        ]
+        active = [(fn, key) for key, default, fn in apis if self.get_setting(key, default)]
+        if not active:
+            self._send_error(peer, "Выберите хотя бы один API в настройках плагина", "wh")
+            return
+        ip = self._resolve(target_raw)
+
+        if hidden:
+            if self._is_ip(target_raw):
+                sections = ["TARGET: ||скрыт||"]
+            else:
+                sections = ["TARGET: ||скрыт||\nIP: ||скрыт||"]
+        else:
+            sections = (
+                [f"TARGET: {target_raw}"] if self._is_ip(target_raw)
+                else [f"TARGET: {target_raw}\n{self._line('IP', ip)}"]
+            )
+
+        fns = [fn for fn, _ in active]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(fns)) as ex:
+            futures = {ex.submit(fn, ip): i for i, fn in enumerate(fns)}
+            results_map = {}
+            for fut in concurrent.futures.as_completed(futures):
+                idx = futures[fut]
+                try:
+                    results_map[idx] = fut.result()
+                except Exception as e:
+                    results_map[idx] = f"Ошибка: {e}"
+        for i in range(len(fns)):
+            sections.append(results_map[i])
+        self._send_quoted_sections(peer, sections)
+
+    def _enabled_operators(self):
+        ops_config = [
+            ("op_beeline",  True,  "beeline",  "Билайн"),
+            ("op_megafon",  True,  "megafon",  "МегаФон"),
+            ("op_mts",      True,  "mts",      "МТС"),
+            ("op_t2",       True,  "t2",       "Теле2"),
+            ("op_tmobile",  True,  "tmobile",  "Т-Мобайл"),
+        ]
+        return [(slug, name) for key, default, slug, name in ops_config if self.get_setting(key, default)]
+
+    def _get_provider(self, ip: str) -> Optional[str]:
+        try:
+            r = requests.get(f"https://free.freeipapi.com/api/json/{ip}", timeout=10)
+            if r.ok:
+                return r.json().get("asnOrganization") or None
+        except Exception:
+            pass
+        return None
+
+    def _do_bs_check(self, peer, target: str, hidden: bool = False):
+        api_key = self.get_setting("latencylab_api_key", "")
+        if not api_key:
+            self._send_error(peer, "Не указан API ключ LatencyLab в настройках плагина.", "bs")
+            return
+        ip = self._resolve(target)
+        ops = self._enabled_operators()
+        if not ops:
+            self._send_error(peer, "Не выбран ни один оператор в настройках плагина.", "bs")
+            return
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        provider = self._get_provider(ip)
+        try:
+            ops_resp = requests.get(f"{LATENCYLAB_BASE}/api/lab/operators", headers=headers, timeout=10)
+            if ops_resp.ok:
+                available_ops = {o.get("slug") for o in (ops_resp.json().get("result") or [])}
+            else:
+                available_ops = None
+        except Exception:
+            available_ops = None
+        if available_ops is not None:
+            channels = [slug for slug, _ in ops if slug in available_ops]
+        else:
+            channels = [slug for slug, _ in ops]
+        if not channels:
+            self._send_error(peer, "Ни один из выбранных операторов не поддерживается latencylab.ru.", "bs")
+            return
+        try:
+            r = requests.post(
+                f"{LATENCYLAB_BASE}/api/lab/multiscan",
+                headers=headers,
+                json={"target": ip, "channels": channels},
+                timeout=15,
+            )
+            r.raise_for_status()
+            body = r.json()
+            if not body.get("ok"):
+                self._send_error(peer, f"Ошибка запуска скана: {body.get('error', 'Неизвестная ошибка')}", "bs")
+                return
+            result = body.get("result") or {}
+            if not result:
+                req_id = body.get("req_id")
+                data = None
+                for _ in range(120):
+                    time.sleep(1)
+                    rr = requests.get(
+                        f"{LATENCYLAB_BASE}/api/lab/job/{req_id}",
+                        headers=headers,
+                        timeout=15,
+                    )
+                    if rr.status_code == 404:
+                        if data and data.get("ok"):
+                            break
+                        continue
+                    rr.raise_for_status()
+                    data = rr.json()
+                    if not data.get("ok"):
+                        break
+                    if data.get("result"):
+                        break
+                if not data or not data.get("ok"):
+                    self._send_error(peer, f"Ошибка при получении результата: {data}", "bs")
+                    return
+                result = data.get("result") or {}
+            by_slug = {}
+            for ch in (result.get("results") or []):
+                slug = ch.get("operator")
+                if slug:
+                    by_slug[slug] = ch
+            use_emoji = self.get_setting("bs_custom_emoji", True) and self._is_premium()
+            collapse = self.get_setting("bs_collapse_quote", False)
+            OP_EMOJI = {
+                "beeline": 5280919528908267119,
+                "tmobile": 5231008469875706287,
+                "megafon": 5229218997521631084,
+                "mts": 5312126452043363774,
+                "t2": 5244453379664534900,
+            }
+            HEADER_EMOJI = 5471915062409045438
+            PROVIDER_EMOJI = 5334544901428229844
+            def _u16(s: str) -> int:
+                return len(s.encode("utf-16-le")) // 2
+            rows = []
+            header_text = "Проверка на белый IP: "
+            if hidden:
+                rows.append((HEADER_EMOJI if use_emoji else None, header_text + "скрыт", len(header_text), len(header_text)))
+            else:
+                rows.append((HEADER_EMOJI if use_emoji else None, header_text + ip, len(header_text), None))
+            if provider:
+                bold_part = "Провайдер: "
+                rows.append((PROVIDER_EMOJI if use_emoji else None, bold_part + provider, len(bold_part), None))
+            rows.append((None, "", 0, None))
+            show_icmp = self.get_setting("ping_icmp", True)
+            show_tcp  = self.get_setting("ping_tcp", True)
+            if not show_icmp and not show_tcp:
+                show_icmp = True
+            def _fmt_rtt(ok, val):                
+                return f"{int(val)}ms" if (ok and val is not None) else "Недоступен"
+            for slug, name in ops:
+                ch = by_slug.get(slug)
+                emoji_id = OP_EMOJI.get(slug) if use_emoji else None
+                if not ch or not ch.get("ok"):
+                    if use_emoji:
+                        rows.append((emoji_id, "Недоступен", 0, None))
+                    else:
+                        rows.append((None, f"{name}: Недоступен", 0, None))
+                    continue
+                icmp_str = _fmt_rtt(ch.get("icmp_ok"), ch.get("icmp_rtt_ms"))
+                tcp_str  = _fmt_rtt(ch.get("tcp_ok"),  ch.get("tcp_rtt_ms"))
+                parts = []
+                if show_icmp and show_tcp:
+                    parts.append(f"ICMP: {icmp_str}")
+                    parts.append(f"TCP: {tcp_str}")
+                elif show_icmp:
+                    parts.append(f"ICMP: {icmp_str}")
+                elif show_tcp:
+                    parts.append(f"TCP: {tcp_str}")
+                ping_str = " | ".join(parts)
+                if use_emoji:
+                    label = ping_str
+                else:
+                    label = f"{name}: {ping_str}"
+                rows.append((emoji_id, label, 0, None))
+            text_parts = []
+            entities = []
+            cursor = 0
+            for i, (emoji_id, line_text, bold_chars, spoiler_from) in enumerate(rows):
+                if emoji_id is not None:
+                    placeholder = "⭐"
+                    ph_len = _u16(placeholder)
+                    ce = TLRPC.TL_messageEntityCustomEmoji()
+                    ce.offset = cursor
+                    ce.length = ph_len
+                    ce.document_id = emoji_id
+                    entities.append(ce)
+                    text_parts.append(placeholder)
+                    cursor += ph_len
+                    text_parts.append(" ")
+                    cursor += 1
+                if bold_chars > 0 and line_text:
+                    b = TLRPC.TL_messageEntityBold()
+                    b.offset = cursor
+                    b.length = _u16(line_text[:bold_chars])
+                    entities.append(b)
+                if spoiler_from is not None and line_text:
+                    sp = TLRPC.TL_messageEntitySpoiler()
+                    sp.offset = cursor + _u16(line_text[:spoiler_from])
+                    sp.length = _u16(line_text[spoiler_from:])
+                    if sp.length > 0:
+                        entities.append(sp)
+                text_parts.append(line_text)
+                cursor += _u16(line_text)
+                if i < len(rows) - 1:
+                    text_parts.append("\n")
+                    cursor += 1
+            full_text = "".join(text_parts)
+            total_len = _u16(full_text)
+            bq = TLRPC.TL_messageEntityBlockquote()
+            bq.collapsed = collapse
+            bq.offset = 0
+            bq.length = total_len
+            entities.append(bq)
+            def _send():
+                self._prog(False, "bs")
+                send_message({"peer": peer, "message": full_text, "entities": entities, "searchLinks": False})
+            run_on_ui_thread(_send)
+        except Exception as e:
+            self._send_error(peer, f"Ошибка запроса к latencylab.ru: {e}", "bs")
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        msg = getattr(params, "message", None)
+        if not isinstance(msg, str):
+            return HookResult()
+        msg = msg.strip()
+        if msg.startswith(".wh"):
+            msg_n = msg.replace('\xa0', ' ')
+            try:
+                parts = shlex.split(msg_n)
+            except Exception:
+                parts = msg_n.split()
+            if not parts:
+                return HookResult()
+            cmd = parts[0].lower()
+            if cmd == ".wh":
+                hidden = False
+            elif cmd == ".whh":
+                hidden = True
+            else:
+                return HookResult()
+            if len(parts) < 2 or not parts[1].strip():
+                self._send_error(params.peer, "Укажите IP или домен, например .wh 8.8.8.8", "wh")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            peer = params.peer
+            target_raw = parts[1].strip()
+            self._prog(True, "wh")
+            run_on_queue(
+                lambda tr=target_raw, p=peer, h=hidden: self._do_whois_lookup(tr, p, h),
+                EXTERNAL_NETWORK_QUEUE,
+            )
+            return HookResult(strategy=HookStrategy.CANCEL)
+        if msg.startswith(".bs"):
+            parts = msg.split(" ", 1)
+            cmd = parts[0].lower()
+            if cmd == ".bs":
+                hidden = False
+            elif cmd == ".bsh":
+                hidden = True
+            else:
+                return HookResult()
+            target = parts[1].strip() if len(parts) > 1 else ""
+            peer = getattr(params, "peer", None)
+            if not target:
+                self._send_error(peer, "Использование: .bs <ip/домен>", "bs")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self._prog(True, "bs")
+            run_on_queue(
+                lambda p=peer, t=target, h=hidden: self._do_bs_check(p, t, h),
+                EXTERNAL_NETWORK_QUEUE,
+            )
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
