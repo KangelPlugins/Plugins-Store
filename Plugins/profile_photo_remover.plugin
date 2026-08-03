@@ -1,0 +1,969 @@
+from android.view import HapticFeedbackConstants, View
+from java import dynamic_proxy, jint
+from java.lang import Runnable, System
+from java.lang.ref import WeakReference
+from org.telegram.messenger import (
+    AndroidUtilities,
+    LocaleController,
+    MessagesController,
+    MessagesStorage,
+    NotificationCenter,
+    R,
+    UserConfig,
+)
+from org.telegram.tgnet import TLRPC, ConnectionsManager, RequestDelegate
+from org.telegram.ui.ActionBar import AlertDialog, Theme
+from org.telegram.ui.Components import BulletinFactory, CheckBoxBase
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+
+__id__ = "profile_photo_remover"
+__name__ = "Profile Photo Remover"
+__description__ = (
+    "Простой плагин, позволяющий одним нажатием удалить все фотографии "
+    "профиля или только выбранные."
+)
+__author__ = "@itsbodyq"
+__version__ = "1.0"
+__app_version__ = ">=12.5.1"
+__min_version__ = "12.5.1"
+
+DELETE_ALL_MENU_ID = 0x504843
+DELETE_AVATAR_MENU_ID = 35
+PAGE_SIZE = 100
+PHOTO_VIEWER_DELETE_MENU_ID = 7
+CURRENT_AVATAR_SELECTION_ID = -1
+
+PLUGIN_STRINGS = {
+    "ru": {
+        "delete_all": "Удалить все фото",
+        "delete_all_title": "Удалить все фотографии",
+        "delete_all_message": "Вы точно хотите удалить все фото?",
+        "delete_selected_title": "Удалить фотографии",
+        "delete_selected_message": "Вы точно хотите удалить выбранные фото?",
+        "cancel": "Отмена",
+        "delete": "Удалить",
+        "deleted_one": "Удалена {count} фотография",
+        "deleted_few": "Удалено {count} фотографии",
+        "deleted_many": "Удалено {count} фотографий",
+    },
+    "en": {
+        "delete_all": "Delete all photos",
+        "delete_all_title": "Delete all photos",
+        "delete_all_message": "Are you sure you want to delete all photos?",
+        "delete_selected_title": "Delete selected photos",
+        "delete_selected_message": "Are you sure you want to delete the selected photos?",
+        "cancel": "Cancel",
+        "delete": "Delete",
+        "deleted_one": "Deleted {count} photo",
+        "deleted_few": "Deleted {count} photos",
+        "deleted_many": "Deleted {count} photos",
+    },
+}
+
+RUSSIAN_FALLBACK_LANGUAGES = frozenset("ru be kk ky uz tg tt ba".split())
+
+JAVA_ERRORS = (AttributeError, RuntimeError, TypeError, ValueError)
+
+
+def locale_code(language_code=None):
+    if language_code is None:
+        controller = LocaleController.getInstance()
+        locale_info = controller.getCurrentLocaleInfo()
+        language_code = str(getattr(locale_info, "shortName", "") or "")
+        if not language_code:
+            language_code = str(controller.getCurrentLocale().getLanguage() or "")
+    normalized = str(language_code or "").strip().lower().replace("_", "-")
+    primary = normalized.split("-", 1)[0]
+    if primary in RUSSIAN_FALLBACK_LANGUAGES:
+        return "ru"
+    return "en"
+
+
+def tr(key, language_code=None):
+    language = locale_code(language_code)
+    return PLUGIN_STRINGS.get(language, PLUGIN_STRINGS["en"]).get(
+        key,
+        PLUGIN_STRINGS["en"][key],
+    )
+
+
+def _deleted_photos_label(count, language_code=None):
+    count = int(count)
+    if locale_code(language_code) == "en":
+        key = "deleted_one" if count == 1 else "deleted_many"
+    else:
+        last_two = count % 100
+        last = count % 10
+        if 11 <= last_two <= 14:
+            key = "deleted_many"
+        elif last == 1:
+            key = "deleted_one"
+        elif 2 <= last <= 4:
+            key = "deleted_few"
+        else:
+            key = "deleted_many"
+    return tr(key, language_code).format(count=count)
+
+
+def _same_object(first, second):
+    if first is None or second is None:
+        return first is second
+    return int(System.identityHashCode(first)) == int(System.identityHashCode(second))
+
+
+def _noop():
+    return None
+
+
+def _delete_request(photos):
+    request = TLRPC.TL_photos_deletePhotos()
+    photo_ids = []
+    for photo in photos:
+        if not isinstance(photo, TLRPC.TL_photo):
+            continue
+        item = TLRPC.TL_inputPhoto()
+        item.id = photo.id
+        item.access_hash = photo.access_hash
+        item.file_reference = photo.file_reference or b""
+        request.id.add(item)
+        photo_ids.append(int(photo.id))
+    return request, tuple(photo_ids)
+
+
+class _Runnable(dynamic_proxy(Runnable)):
+    def __init__(self, callback, *args):
+        super().__init__()
+        self.callback = callback
+        self.args = args
+
+    def run(self):
+        self.callback(*self.args)
+
+
+class _MenuClick(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, plugin, profile, menu):
+        super().__init__()
+        self.plugin = plugin
+        self.profile = WeakReference(profile)
+        self.menu = WeakReference(menu)
+
+    def onClick(self, _view):
+        menu = self.menu.get()
+        if menu is not None:
+            menu.closeSubMenu()
+        profile = self.profile.get()
+        if profile is not None:
+            self.plugin._show_confirmation(profile)
+
+
+class _DialogButton(dynamic_proxy(AlertDialog.OnButtonClickListener)):
+    def __init__(self, callback, *args):
+        super().__init__()
+        self.callback = callback
+        self.args = args
+
+    def onClick(self, _dialog, _which):
+        self.callback(*self.args)
+
+
+class _RequestCallback(dynamic_proxy(RequestDelegate)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def run(self, response, error):
+        self.callback(response, error)
+
+
+class _MethodHook(MethodHook):
+    def __init__(self, before=None, after=None):
+        self.before = before
+        self.after = after
+
+    def before_hooked_method(self, param):
+        if self.before is not None:
+            self.before(param)
+
+    def after_hooked_method(self, param):
+        if self.after is not None:
+            self.after(param)
+
+
+class _DeleteAllTask:
+    def __init__(self, plugin, account):
+        self.plugin = plugin
+        self.account = account
+        self.connections = ConnectionsManager.getInstance(account)
+        self.callback = None
+        self.last_batch = None
+        self.pending_count = 0
+        self.deleted_count = 0
+        self.finished = False
+
+    def start(self):
+        self._load_page()
+
+    def _load_page(self):
+        request = TLRPC.TL_photos_getUserPhotos()
+        request.user_id = TLRPC.TL_inputUserSelf()
+        request.offset = 0
+        request.max_id = 0
+        request.limit = PAGE_SIZE
+        self.callback = _RequestCallback(self._photos_loaded)
+        self.connections.sendRequest(request, self.callback)
+
+    def _photos_loaded(self, response, error):
+        if self.finished:
+            return
+        if error is not None:
+            self._finish(f"getUserPhotos: {getattr(error, 'text', error)}")
+            return
+        photos = getattr(response, "photos", None)
+        if photos is None:
+            self._finish("getUserPhotos returned an invalid response")
+            return
+
+        request, batch = _delete_request(photos.get(index) for index in range(photos.size()))
+        if not batch:
+            self._finish(None)
+            return
+        if batch == self.last_batch:
+            self._finish("getUserPhotos returned the same page")
+            return
+        self.last_batch = batch
+        self.pending_count = len(batch)
+        self.callback = _RequestCallback(self._photos_deleted)
+        self.connections.sendRequest(request, self.callback)
+
+    def _photos_deleted(self, _response, error):
+        if self.finished:
+            return
+        if error is not None:
+            self._finish(f"deletePhotos: {getattr(error, 'text', error)}")
+            return
+        self.deleted_count += self.pending_count
+        self.pending_count = 0
+        self._load_page()
+
+    def _finish(self, error):
+        if self.finished:
+            return
+        self.finished = True
+        AndroidUtilities.runOnUIThread(_Runnable(self.plugin._deletion_finished, self, error))
+
+
+class _DeleteSelectedTask:
+    def __init__(
+        self,
+        plugin,
+        viewer,
+        account,
+        dialog_id,
+        photos,
+        current_selection_id,
+    ):
+        self.plugin = plugin
+        self.viewer = viewer
+        self.account = account
+        self.dialog_id = dialog_id
+        self.photos = tuple(photos)
+        self.photo_ids = tuple(int(photo.id) for photo in photos)
+        self.callback = _RequestCallback(self._deleted)
+        self.finished = False
+        self.deleted_ids = set()
+        self.current_selection_id = current_selection_id
+
+    def start(self):
+        try:
+            if self.current_selection_id is not None:
+                MessagesController.getInstance(self.account).deleteUserPhoto(None)
+                self.deleted_ids.add(self.current_selection_id)
+            if not self.photos:
+                self._finish(None)
+                return
+            request, _ = _delete_request(self.photos)
+            ConnectionsManager.getInstance(self.account).sendRequest(
+                request,
+                self.callback,
+            )
+        except JAVA_ERRORS as error:
+            self._finish(error)
+
+    def _deleted(self, _response, error):
+        if self.finished:
+            return
+        if error is None:
+            self.deleted_ids.update(self.photo_ids)
+        self._finish(error)
+
+    def _finish(self, error):
+        self.finished = True
+        AndroidUtilities.runOnUIThread(
+            _Runnable(self.plugin._selected_deletion_finished, self, error)
+        )
+
+
+class _ViewerSelection:
+    def __init__(self, viewer, strip):
+        self.viewer = WeakReference(viewer)
+        self.strip = WeakReference(strip)
+        self.selected = set()
+        self.checkboxes = {}
+        self.original_delete_text = None
+        self.deleting = False
+
+
+class ProfilePhotoRemoverPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._build_stack = []
+        self._menus = {}
+        self._deletion = None
+        self._deletion_profile = None
+        self._viewer_states = {}
+        self._photo_viewer_class = None
+
+    def _log_error(self, operation, error):
+        self.log(f"[ProfilePhotoRemover] {operation}: {error!r}")
+
+    def on_plugin_load(self):
+        profile_class = find_class("org.telegram.ui.ProfileActivity")
+        menu_class = find_class("org.telegram.ui.ActionBar.ActionBarMenuItem")
+        strip_class = find_class("org.telegram.ui.Components.GroupedPhotosListView")
+        action_bar_menu_class = find_class("org.telegram.ui.ActionBar.ActionBarMenu")
+        self._photo_viewer_class = find_class("org.telegram.ui.PhotoViewer")
+        if (
+            profile_class is None
+            or menu_class is None
+            or strip_class is None
+            or action_bar_menu_class is None
+            or self._photo_viewer_class is None
+        ):
+            self.log("[ProfilePhotoRemover] UI classes unavailable")
+            return
+
+        hooks = (
+            (
+                profile_class,
+                "createActionBarMenu",
+                _MethodHook(
+                    before=lambda p: self._begin_menu_build(p.thisObject),
+                    after=lambda _p: self._build_stack.pop() if self._build_stack else None,
+                ),
+            ),
+            (
+                menu_class,
+                "addSubItem",
+                _MethodHook(after=lambda p: self._after_sub_item(p.thisObject, p.args)),
+            ),
+            (
+                menu_class,
+                "showSubItem",
+                _MethodHook(
+                    after=lambda p: (
+                        self._mirror_delete_visibility(p.thisObject, int(p.args[0]), True)
+                        if len(p.args) == 2
+                        else None
+                    )
+                ),
+            ),
+            (
+                menu_class,
+                "hideSubItem",
+                _MethodHook(
+                    after=lambda p: (
+                        self._mirror_delete_visibility(p.thisObject, int(p.args[0]), False)
+                        if len(p.args) == 1
+                        else None
+                    )
+                ),
+            ),
+            (
+                profile_class,
+                "onFragmentDestroy",
+                _MethodHook(after=lambda p: self._forget_profile(p.thisObject)),
+            ),
+            (
+                strip_class,
+                "onLongPress",
+                _MethodHook(
+                    before=lambda p: (
+                        p.setResult(None)
+                        if self._toggle_from_strip(p.thisObject, p.args[0], True)
+                        else None
+                    )
+                ),
+            ),
+            (
+                strip_class,
+                "onSingleTapUp",
+                _MethodHook(
+                    before=lambda p: (
+                        p.setResult(True)
+                        if self._toggle_from_strip(p.thisObject, p.args[0], False)
+                        else None
+                    )
+                ),
+            ),
+            (
+                strip_class,
+                "onDraw",
+                _MethodHook(after=lambda p: self._draw_strip_selection(p.thisObject, p.args[0])),
+            ),
+            (
+                self._photo_viewer_class,
+                "closePhoto",
+                _MethodHook(after=lambda p: self._clear_viewer_selection(p.thisObject)),
+            ),
+            (
+                action_bar_menu_class,
+                "onItemClick",
+                _MethodHook(
+                    before=lambda p: (
+                        p.setResult(None)
+                        if len(p.args) == 1
+                        and int(p.args[0]) == PHOTO_VIEWER_DELETE_MENU_ID
+                        and self._delete_selected_from_menu(p.thisObject)
+                        else None
+                    )
+                ),
+            ),
+        )
+        for target, method, callback in hooks:
+            self.hook_all_methods(target, method, callback)
+
+    def on_plugin_unload(self):
+        self._build_stack.clear()
+        self._menus.clear()
+        self._deletion = None
+        self._deletion_profile = None
+        for state in tuple(self._viewer_states.values()):
+            self._release_checkboxes(state)
+        self._viewer_states.clear()
+        self._photo_viewer_class = None
+
+    def _begin_menu_build(self, profile):
+        try:
+            account = int(profile.getCurrentAccount())
+            user_id = int(get_private_field(profile, "userId"))
+            own_profile = (
+                profile
+                if user_id == int(UserConfig.getInstance(account).getClientUserId())
+                else None
+            )
+        except JAVA_ERRORS as error:
+            self._log_error("profile menu", error)
+            own_profile = None
+        if own_profile is not None:
+            self._forget_profile(own_profile)
+        self._build_stack.append(own_profile)
+
+    def _after_sub_item(self, menu, args):
+        if (
+            not self._build_stack
+            or self._build_stack[-1] is None
+            or len(args) != 3
+            or int(args[0]) != DELETE_AVATAR_MENU_ID
+        ):
+            return
+        profile = self._build_stack[-1]
+        other_item = get_private_field(profile, "otherItem")
+        if not _same_object(menu, other_item):
+            return
+
+        key = int(System.identityHashCode(menu))
+        if self._bound_profile(menu) is not None:
+            return
+
+        cell = menu.addSubItem(
+            DELETE_ALL_MENU_ID,
+            R.drawable.msg_delete,
+            tr("delete_all"),
+        )
+        listener = _MenuClick(self, profile, menu)
+        cell.setOnClickListener(listener)
+        self._menus[key] = (
+            WeakReference(menu),
+            WeakReference(profile),
+            listener,
+        )
+
+    def _bound_profile(self, menu):
+        key = int(System.identityHashCode(menu))
+        binding = self._menus.get(key)
+        if binding is None:
+            return None
+        saved_menu = binding[0].get()
+        profile = binding[1].get()
+        if saved_menu is None or profile is None or not _same_object(menu, saved_menu):
+            self._menus.pop(key, None)
+            return None
+        return profile
+
+    def _mirror_delete_visibility(self, menu, item_id, visible):
+        if item_id != DELETE_AVATAR_MENU_ID:
+            return
+        if self._bound_profile(menu) is None:
+            return
+        if visible:
+            menu.showSubItem(DELETE_ALL_MENU_ID)
+        else:
+            menu.hideSubItem(DELETE_ALL_MENU_ID)
+
+    def _forget_profile(self, profile):
+        for key, binding in tuple(self._menus.items()):
+            saved_profile = binding[1].get()
+            if saved_profile is None or _same_object(profile, saved_profile):
+                self._menus.pop(key, None)
+
+    def _viewer_for_strip(self, strip):
+        if self._photo_viewer_class is None:
+            return None
+        viewer = self._photo_viewer_class.getInstance()
+        if viewer is None or not viewer.isVisible():
+            return None
+        viewer_strip = get_private_field(viewer, "groupedPhotosListView")
+        if not _same_object(strip, viewer_strip):
+            return None
+        account = int(get_private_field(viewer, "currentAccount"))
+        dialog_id = int(get_private_field(viewer, "avatarsDialogId"))
+        if dialog_id != int(UserConfig.getInstance(account).getClientUserId()):
+            return None
+        return viewer
+
+    def _viewer_state(self, viewer, strip=None, create=False):
+        key = int(System.identityHashCode(viewer))
+        state = self._viewer_states.get(key)
+        if state is not None and state.viewer.get() is None:
+            self._viewer_states.pop(key, None)
+            state = None
+        if state is None and create and strip is not None:
+            state = _ViewerSelection(viewer, strip)
+            self._viewer_states[key] = state
+        return state
+
+    def _photo_at_event(self, viewer, strip, event):
+        receivers = get_private_field(strip, "imagesToDraw")
+        avatars = get_private_field(viewer, "avatarsArr")
+        for position in range(int(receivers.size())):
+            receiver = receivers.get(position)
+            if not receiver.isInsideImage(event.getX(), event.getY()):
+                continue
+            index = int(receiver.getParam())
+            if index < 0 or index >= int(avatars.size()):
+                return None
+            photo = avatars.get(index)
+            photo_id = self._photo_selection_id(photo)
+            if photo_id is None:
+                return None
+            return photo_id
+        return None
+
+    @staticmethod
+    def _photo_selection_id(photo):
+        if isinstance(photo, TLRPC.TL_photo) and int(photo.id) > 0:
+            return int(photo.id)
+        if isinstance(photo, TLRPC.TL_photoEmpty):
+            return CURRENT_AVATAR_SELECTION_ID
+        return None
+
+    def _new_checkbox(self, strip):
+        checkbox = CheckBoxBase(strip, 21, None)
+        checkbox.setColor(
+            -1,
+            Theme.key_windowBackgroundWhite,
+            Theme.key_checkboxCheck,
+        )
+        checkbox.setDrawUnchecked(False)
+        checkbox.setBackgroundType(3)
+        checkbox.onAttachedToWindow()
+        return checkbox
+
+    def _toggle_from_strip(self, strip, event, long_press):
+        try:
+            viewer = self._viewer_for_strip(strip)
+            if viewer is None:
+                return False
+            state = self._viewer_state(viewer)
+            if not long_press and (state is None or not state.selected):
+                return False
+            photo_id = self._photo_at_event(viewer, strip, event)
+            if photo_id is None:
+                return False
+            if state is None:
+                state = self._viewer_state(viewer, strip, create=True)
+
+            checkbox = state.checkboxes.get(photo_id)
+            if checkbox is None:
+                checkbox = self._new_checkbox(strip)
+                state.checkboxes[photo_id] = checkbox
+            selecting = photo_id not in state.selected
+            if selecting:
+                state.selected.add(photo_id)
+            else:
+                state.selected.remove(photo_id)
+            checkbox.setChecked(selecting, True)
+            feedback = (
+                HapticFeedbackConstants.LONG_PRESS
+                if long_press
+                else HapticFeedbackConstants.KEYBOARD_TAP
+            )
+            strip.performHapticFeedback(
+                feedback,
+                HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING,
+            )
+            self._update_delete_menu(viewer, state)
+            strip.invalidate()
+            return True
+        except JAVA_ERRORS as error:
+            self._log_error("selection", error)
+            return False
+
+    def _draw_strip_selection(self, strip, canvas):
+        try:
+            viewer = self._viewer_for_strip(strip)
+            if viewer is None:
+                return
+            state = self._viewer_state(viewer)
+            if state is None or not state.checkboxes:
+                return
+            receivers = get_private_field(strip, "imagesToDraw")
+            avatars = get_private_field(viewer, "avatarsArr")
+            checkbox_size = AndroidUtilities.dp(21)
+            inset = AndroidUtilities.dp(2)
+            for position in range(int(receivers.size())):
+                receiver = receivers.get(position)
+                index = int(receiver.getParam())
+                if index < 0 or index >= int(avatars.size()):
+                    continue
+                photo = avatars.get(index)
+                photo_id = self._photo_selection_id(photo)
+                checkbox = state.checkboxes.get(photo_id)
+                if checkbox is None:
+                    continue
+                x = int(receiver.getImageX() + receiver.getImageWidth())
+                y = int(receiver.getImageY())
+                checkbox.setBounds(
+                    x - checkbox_size - inset,
+                    y + inset,
+                    checkbox_size,
+                    checkbox_size,
+                )
+                checkbox.draw(canvas)
+        except JAVA_ERRORS as error:
+            self._log_error("selection draw", error)
+
+    @staticmethod
+    def _delete_photos_label(count, language_code=None):
+        if locale_code(language_code) == "en":
+            noun = "photo" if count == 1 else "photos"
+            return f"Delete {count} {noun}"
+        last_two = count % 100
+        last = count % 10
+        if 11 <= last_two <= 14:
+            noun = "фотографий"
+        elif last == 1:
+            noun = "фотографию"
+        elif 2 <= last <= 4:
+            noun = "фотографии"
+        else:
+            noun = "фотографий"
+        return f"Удалить {count} {noun}"
+
+    def _delete_menu_item(self, viewer):
+        menu_item = get_private_field(viewer, "menuItem")
+        if menu_item is None:
+            return None
+        popup_layout = menu_item.getPopupLayout()
+        if popup_layout is None:
+            return None
+        return popup_layout.findViewWithTag(jint(PHOTO_VIEWER_DELETE_MENU_ID))
+
+    def _update_delete_menu(self, viewer, state):
+        item = self._delete_menu_item(viewer)
+        if item is None:
+            return
+        if state.original_delete_text is None:
+            state.original_delete_text = str(item.getTextView().getText())
+        count = len(state.selected)
+        text = self._delete_photos_label(count) if count > 1 else state.original_delete_text
+        item.setText(text)
+
+    def _viewer_for_menu(self, action_bar_menu):
+        parent = get_private_field(action_bar_menu, "parentActionBar")
+        for state in tuple(self._viewer_states.values()):
+            viewer = state.viewer.get()
+            if viewer is None or not state.selected:
+                continue
+            action_bar = get_private_field(viewer, "actionBar")
+            if _same_object(parent, action_bar):
+                return viewer, state
+        return None, None
+
+    def _delete_selected_from_menu(self, action_bar_menu):
+        try:
+            viewer, state = self._viewer_for_menu(action_bar_menu)
+            if viewer is None or state is None or state.deleting:
+                return False
+            if len(state.selected) == 1:
+                selected_id = next(iter(state.selected))
+                if not self._activate_selected_photo(viewer, selected_id):
+                    self.log("[ProfilePhotoRemover] selected photo unavailable")
+                    return True
+                self._clear_viewer_selection(viewer)
+                return False
+            if len(state.selected) < 2:
+                return False
+            self._show_selected_confirmation(
+                viewer,
+                tuple(state.selected),
+            )
+            return True
+        except JAVA_ERRORS as error:
+            self._log_error("selection menu", error)
+            return False
+
+    def _activate_selected_photo(self, viewer, selected_id):
+        avatars = get_private_field(viewer, "avatarsArr")
+        for index in range(int(avatars.size())):
+            photo = avatars.get(index)
+            if self._photo_selection_id(photo) != selected_id:
+                continue
+            strip = get_private_field(viewer, "groupedPhotosListView")
+            delegate = get_private_field(strip, "delegate")
+            delegate.setCurrentIndex(index)
+            return True
+        return False
+
+    def _show_selected_confirmation(self, viewer, photo_ids):
+        activity = get_private_field(viewer, "parentActivity")
+        if activity is None:
+            return
+        builder = AlertDialog.Builder(activity)
+        builder.setTitle(tr("delete_selected_title"))
+        builder.setMessage(tr("delete_selected_message"))
+        builder.setNegativeButton(tr("cancel"), _DialogButton(_noop))
+        builder.setPositiveButton(
+            tr("delete"),
+            _DialogButton(self._start_selected_deletion, viewer, photo_ids),
+        )
+        dialog = builder.create()
+        dialog.show()
+        dialog.getButton(-1).setTextColor(Theme.getColor(Theme.key_text_RedBold))
+
+    def _selected_photos(self, viewer, photo_ids):
+        wanted = set(photo_ids)
+        photos = []
+        current_selection_id = (
+            CURRENT_AVATAR_SELECTION_ID if CURRENT_AVATAR_SELECTION_ID in wanted else None
+        )
+        account = int(get_private_field(viewer, "currentAccount"))
+        dialog_id = int(get_private_field(viewer, "avatarsDialogId"))
+        user = MessagesController.getInstance(account).getUser(dialog_id)
+        user_photo = getattr(user, "photo", None)
+        current_photo_id = int(getattr(user_photo, "photo_id", 0))
+        avatars = get_private_field(viewer, "avatarsArr")
+        for index in range(int(avatars.size())):
+            photo = avatars.get(index)
+            if isinstance(photo, TLRPC.TL_photo) and int(photo.id) in wanted:
+                if int(photo.id) == current_photo_id:
+                    current_selection_id = int(photo.id)
+                else:
+                    photos.append(photo)
+        return photos, current_selection_id
+
+    def _start_selected_deletion(self, viewer, photo_ids):
+        state = None
+        try:
+            state = self._viewer_state(viewer)
+            if state is None or state.deleting:
+                return
+            selected = state.selected.intersection(photo_ids)
+            photos, current_selection_id = self._selected_photos(
+                viewer,
+                selected,
+            )
+            if not photos and current_selection_id is None:
+                return
+            account = int(get_private_field(viewer, "currentAccount"))
+            dialog_id = int(get_private_field(viewer, "avatarsDialogId"))
+            state.deleting = True
+            _DeleteSelectedTask(
+                self,
+                viewer,
+                account,
+                dialog_id,
+                photos,
+                current_selection_id,
+            ).start()
+        except JAVA_ERRORS as error:
+            if state is not None:
+                state.deleting = False
+            self._log_error("delete selected", error)
+
+    def _remove_selected_from_viewer(self, task):
+        viewer = task.viewer
+        avatars = get_private_field(viewer, "avatarsArr")
+        selected = set(task.deleted_ids)
+        current_index = int(get_private_field(viewer, "currentIndex"))
+        current_photo_id = None
+        if 0 <= current_index < int(avatars.size()):
+            current_photo_id = self._photo_selection_id(avatars.get(current_index))
+
+        indexes = []
+        for index in range(int(avatars.size())):
+            photo_id = self._photo_selection_id(avatars.get(index))
+            if photo_id in selected:
+                indexes.append(index)
+
+        arrays = (
+            avatars,
+            get_private_field(viewer, "imagesArrLocations"),
+            get_private_field(viewer, "imagesArrLocationsSizes"),
+            get_private_field(viewer, "imagesArrLocationsVideo"),
+            get_private_field(viewer, "imagesArrMessages"),
+        )
+        for index in reversed(indexes):
+            for values in arrays:
+                if index < int(values.size()):
+                    values.remove(jint(index))
+
+        if int(avatars.size()) == 0:
+            viewer.closePhoto(False, False)
+            return
+
+        next_index = min(current_index, int(avatars.size()) - 1)
+        if current_photo_id is not None and current_photo_id not in selected:
+            for index in range(int(avatars.size())):
+                photo_id = self._photo_selection_id(avatars.get(index))
+                if photo_id == current_photo_id:
+                    next_index = index
+                    break
+
+        strip = get_private_field(viewer, "groupedPhotosListView")
+        strip.clear()
+        delegate = get_private_field(strip, "delegate")
+        delegate.setCurrentIndex(next_index)
+        strip.fillList()
+        strip.invalidate()
+
+    def _selected_deletion_finished(self, task, error):
+        state = self._viewer_state(task.viewer)
+        try:
+            if task.deleted_ids:
+                storage = MessagesStorage.getInstance(task.account)
+                for photo_id in task.deleted_ids:
+                    if photo_id != task.current_selection_id:
+                        storage.clearUserPhoto(task.dialog_id, photo_id)
+                if state is not None and task.viewer.isVisible():
+                    self._remove_selected_from_viewer(task)
+                NotificationCenter.getInstance(task.account).postNotificationName(
+                    NotificationCenter.reloadDialogPhotos
+                )
+        except JAVA_ERRORS as exc:
+            self._log_error("viewer refresh", exc)
+        if error is None:
+            if task.deleted_ids:
+                try:
+                    if task.viewer.isVisible():
+                        container = get_private_field(task.viewer, "containerView")
+                        resources = get_private_field(task.viewer, "resourcesProvider")
+                        factory = BulletinFactory.of(container, resources)
+                    else:
+                        factory = getattr(BulletinFactory, "global")()
+                    if factory is not None:
+                        factory.createSuccessBulletin(
+                            _deleted_photos_label(len(task.deleted_ids))
+                        ).show()
+                except JAVA_ERRORS as exc:
+                    self._log_error("success bulletin", exc)
+            self._clear_viewer_selection(task.viewer)
+            return
+        if state is not None:
+            for photo_id in task.deleted_ids:
+                state.selected.discard(photo_id)
+                checkbox = state.checkboxes.get(photo_id)
+                if checkbox is not None:
+                    checkbox.setChecked(False, True)
+            state.deleting = False
+            self._update_delete_menu(task.viewer, state)
+            strip = state.strip.get()
+            if strip is not None:
+                strip.invalidate()
+        self._log_error("delete selected", getattr(error, "text", error))
+
+    def _release_checkboxes(self, state):
+        for checkbox in tuple(state.checkboxes.values()):
+            checkbox.setChecked(False, False)
+            checkbox.onDetachedFromWindow()
+        state.checkboxes.clear()
+        state.selected.clear()
+
+    def _clear_viewer_selection(self, viewer):
+        key = int(System.identityHashCode(viewer))
+        state = self._viewer_states.pop(key, None)
+        if state is None:
+            return
+        try:
+            if state.original_delete_text is not None:
+                item = self._delete_menu_item(viewer)
+                if item is not None:
+                    item.setText(state.original_delete_text)
+        except JAVA_ERRORS as error:
+            self._log_error("restore menu", error)
+        self._release_checkboxes(state)
+
+    def _show_confirmation(self, profile):
+        activity = profile.getParentActivity()
+        if activity is None:
+            return
+        builder = AlertDialog.Builder(activity)
+        builder.setTitle(tr("delete_all_title"))
+        builder.setMessage(tr("delete_all_message"))
+        builder.setNegativeButton(tr("cancel"), _DialogButton(_noop))
+        builder.setPositiveButton(
+            tr("delete"),
+            _DialogButton(self._start_deletion, profile),
+        )
+        dialog = builder.create()
+        dialog.show()
+        dialog.getButton(-1).setTextColor(Theme.getColor(Theme.key_text_RedBold))
+
+    def _start_deletion(self, profile):
+        if self._deletion is not None:
+            return
+        task = _DeleteAllTask(self, int(profile.getCurrentAccount()))
+        self._deletion = task
+        self._deletion_profile = WeakReference(profile)
+        task.start()
+
+    def _deletion_finished(self, task, error):
+        if self._deletion is not task:
+            return
+        self._deletion = None
+        profile_ref = self._deletion_profile
+        self._deletion_profile = None
+        if error is not None:
+            self._log_error("delete all", error)
+            return
+
+        account = task.account
+        user_id = int(UserConfig.getInstance(account).getClientUserId())
+        MessagesStorage.getInstance(account).clearUserPhotos(user_id)
+        MessagesController.getInstance(account).deleteUserPhoto(None)
+        NotificationCenter.getInstance(account).postNotificationName(
+            NotificationCenter.reloadDialogPhotos
+        )
+        profile = profile_ref.get() if profile_ref is not None else None
+        if profile is not None and task.deleted_count:
+            try:
+                BulletinFactory.of(profile).createSuccessBulletin(
+                    _deleted_photos_label(task.deleted_count)
+                ).show()
+            except JAVA_ERRORS as exc:
+                self._log_error("success bulletin", exc)
+
+
+plugin = ProfilePhotoRemoverPlugin()
