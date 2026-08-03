@@ -1,0 +1,1830 @@
+import os
+import struct
+import time
+import threading
+from array import array
+from collections import OrderedDict
+from typing import Any, List, Optional
+
+try:
+    import audioop
+    HAS_AUDIOOP = True
+except ImportError:
+    audioop = None
+    HAS_AUDIOOP = False
+
+from android.graphics import Color, PixelFormat
+from android.view import Gravity, View, WindowManager
+from android.widget import (
+    FrameLayout,
+    GridLayout,
+    LinearLayout,
+    PopupWindow,
+    TextView,
+)
+
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, HookFilter, MethodHook, hook_filters
+from file_utils import ensure_dir_exists, get_plugins_dir, list_dir
+from hook_utils import find_class
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+__id__ = "voice_soundpad"
+__name__ = "Voice Soundpad"
+__description__ = "Проигрывает и подмешивает звуки прямо в голосовое сообщение во время записи"
+__author__ = "@TapeSix"
+__version__ = "1.0.0"
+__icon__ = "Idi_gahuy/8"
+__app_version__ = ">=12.1.1"
+
+MAX_SLOTS = 8
+AUDIO_EXTENSIONS = [".wav", ".pcm", ".raw", ".mp3", ".aac", ".m4a", ".ogg", ".opus"]
+IMPORT_REQUEST_CODE = 42711
+
+STATUS_COLOR_ACTIVE = "#4CD964"
+STATUS_COLOR_INACTIVE = "#E64C3C"
+STATUS_COLOR_LOADING = "#F0A020"
+
+
+def parse_wav_pcm16(data: bytes, debug_name: str = ""):
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        debug_log(
+            f"parse_wav_pcm16({debug_name}): не RIFF/WAVE. "
+            f"Первые 16 байт (hex): {data[:16].hex()}"
+        )
+        return None
+    pos = 12
+    channels, sample_rate, bits, audio_format = 1, 44100, 16, 1
+    audio_data = None
+    fmt_found = False
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        chunk_size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body_start = pos + 8
+        if chunk_id == b"fmt ":
+            fmt = data[body_start:body_start + chunk_size]
+            if len(fmt) >= 16:
+                audio_format, channels, sample_rate, _, _, bits = struct.unpack("<HHIIHH", fmt[:16])
+                fmt_found = True
+        elif chunk_id == b"data":
+            audio_data = data[body_start:body_start + chunk_size]
+        pos = body_start + chunk_size + (chunk_size % 2)
+
+    if not fmt_found:
+        debug_log(f"parse_wav_pcm16({debug_name}): чанк 'fmt ' не найден")
+        return None
+    if audio_data is None:
+        debug_log(f"parse_wav_pcm16({debug_name}): чанк 'data' не найден")
+        return None
+    if bits != 16:
+        debug_log(
+            f"parse_wav_pcm16({debug_name}): не 16-бит PCM — "
+            f"audio_format={audio_format}, bits={bits}, channels={channels}, "
+            f"sample_rate={sample_rate}. Нужен именно 16-bit PCM WAV."
+        )
+        return None
+
+    samples = array("h")
+    samples.frombytes(audio_data[: len(audio_data) - (len(audio_data) % 2)])
+    return samples, channels, sample_rate
+
+
+def _mix_chunk_manual(base_bytes: bytes, chunk: array, gain: float) -> bytes:
+    """Поэлементное сложение одного voice-чанка в base_bytes с клиппингом.
+    Используется только если audioop недоступен или упал на этом кадре."""
+    base = array("h")
+    base.frombytes(base_bytes)
+    for i, s in enumerate(chunk):
+        mixed = base[i] + int(s * gain)
+        if mixed > 32767:
+            mixed = 32767
+        elif mixed < -32768:
+            mixed = -32768
+        base[i] = mixed
+    return base.tobytes()
+
+
+class LoadCancelled(Exception):
+    pass
+
+
+def downmix_to_mono(samples: array, channels: int, progress_cb=None, cancel_cb=None) -> array:
+    if channels <= 1:
+        if progress_cb:
+            progress_cb(1.0)
+        return samples
+    mono = array("h")
+    n_frames = len(samples) // channels
+    for i in range(n_frames):
+        base = i * channels
+        total = 0
+        for c in range(channels):
+            total += samples[base + c]
+        mono.append(int(total / channels))
+        if i % 2000 == 0:
+            time.sleep(0)
+            if cancel_cb and cancel_cb():
+                raise LoadCancelled()
+            if progress_cb and n_frames > 0:
+                progress_cb(i / n_frames)
+    if progress_cb:
+        progress_cb(1.0)
+    return mono
+
+
+def resample_mono(samples: array, src_rate: int, dst_rate: int, progress_cb=None, cancel_cb=None) -> array:
+    if src_rate == dst_rate or len(samples) < 2:
+        if progress_cb:
+            progress_cb(1.0)
+        return samples
+    ratio = dst_rate / src_rate
+    new_len = max(1, int(len(samples) * ratio))
+    out = array("h")
+    src_last = len(samples) - 1
+    for i in range(new_len):
+        src_pos = i / ratio
+        idx = int(src_pos)
+        if idx >= src_last:
+            out.append(samples[src_last])
+            continue
+        frac = src_pos - idx
+        a, b = samples[idx], samples[idx + 1]
+        out.append(int(a + (b - a) * frac))
+        if i % 2000 == 0:
+            time.sleep(0)
+            if cancel_cb and cancel_cb():
+                raise LoadCancelled()
+            if progress_cb and new_len > 0:
+                progress_cb(i / new_len)
+    if progress_cb:
+        progress_cb(1.0)
+    return out
+
+
+def downmix_to_mono_fast(samples: array, channels: int, progress_cb=None, cancel_cb=None) -> array:
+    if HAS_AUDIOOP and channels == 2:
+        try:
+            raw = samples.tobytes()
+            mono_bytes = audioop.tomono(raw, 2, 0.5, 0.5)
+            mono = array("h")
+            mono.frombytes(mono_bytes)
+            if progress_cb:
+                progress_cb(1.0)
+            debug_log(f"downmix_to_mono_fast: audioop.tomono OK ({len(mono)} сэмплов)")
+            return mono
+        except Exception as e:
+            debug_log(f"downmix_to_mono_fast: audioop упал ({e}), откатываюсь на ручной метод")
+    return downmix_to_mono(samples, channels, progress_cb=progress_cb, cancel_cb=cancel_cb)
+
+
+def resample_mono_fast(samples: array, src_rate: int, dst_rate: int, progress_cb=None, cancel_cb=None) -> array:
+    if HAS_AUDIOOP and src_rate != dst_rate and len(samples) >= 2:
+        try:
+            raw = samples.tobytes()
+            converted, _state = audioop.ratecv(raw, 2, 1, src_rate, dst_rate, None)
+            out = array("h")
+            out.frombytes(converted)
+            if progress_cb:
+                progress_cb(1.0)
+            debug_log(f"resample_mono_fast: audioop.ratecv OK ({len(out)} сэмплов)")
+            return out
+        except Exception as e:
+            debug_log(f"resample_mono_fast: audioop упал ({e}), откатываюсь на ручной метод")
+    return resample_mono(samples, src_rate, dst_rate, progress_cb=progress_cb, cancel_cb=cancel_cb)
+
+
+def decode_via_mediacodec(path: str, debug_name: str = "", cancel_cb=None, progress_cb=None):
+    extractor = None
+    codec = None
+    try:
+        from android.media import MediaExtractor, MediaCodec, MediaFormat
+
+        extractor = MediaExtractor()
+        extractor.setDataSource(path)
+
+        track_index = -1
+        track_format = None
+        for i in range(extractor.getTrackCount()):
+            fmt = extractor.getTrackFormat(i)
+            mime = fmt.getString(MediaFormat.KEY_MIME)
+            if mime is not None and mime.startswith("audio/"):
+                track_index = i
+                track_format = fmt
+                break
+
+        if track_index < 0:
+            debug_log(f"decode_via_mediacodec({debug_name}): аудиодорожка не найдена в файле")
+            return None
+
+        extractor.selectTrack(track_index)
+        mime = track_format.getString(MediaFormat.KEY_MIME)
+        channels = track_format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        sample_rate = track_format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        try:
+            duration_us = track_format.getLong(MediaFormat.KEY_DURATION)
+        except Exception:
+            duration_us = 0
+
+        codec = MediaCodec.createDecoderByType(mime)
+        codec.configure(track_format, None, None, 0)
+        codec.start()
+
+        TIMEOUT_US = 10000
+        pcm_chunks = []
+        input_done = False
+        output_done = False
+        buffer_info = MediaCodec.BufferInfo()
+
+        while not output_done:
+            if cancel_cb and cancel_cb():
+                raise LoadCancelled()
+            if not input_done:
+                in_index = codec.dequeueInputBuffer(TIMEOUT_US)
+                if in_index >= 0:
+                    in_buf = codec.getInputBuffer(in_index)
+                    in_buf.clear()
+                    sample_size = extractor.readSampleData(in_buf, 0)
+                    if sample_size < 0:
+                        codec.queueInputBuffer(in_index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        input_done = True
+                    else:
+                        pts = extractor.getSampleTime()
+                        codec.queueInputBuffer(in_index, 0, sample_size, pts, 0)
+                        if progress_cb and duration_us > 0:
+                            progress_cb(min(1.0, pts / duration_us))
+                        extractor.advance()
+
+            out_index = codec.dequeueOutputBuffer(buffer_info, TIMEOUT_US)
+            if out_index >= 0:
+                out_buf = codec.getOutputBuffer(out_index)
+                if buffer_info.size > 0:
+                    chunk = bytearray(buffer_info.size)
+                    out_buf.position(buffer_info.offset)
+                    out_buf.limit(buffer_info.offset + buffer_info.size)
+                    out_buf.get(chunk, 0, buffer_info.size)
+                    pcm_chunks.append(bytes(chunk))
+                codec.releaseOutputBuffer(out_index, False)
+                if (buffer_info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0:
+                    output_done = True
+            elif out_index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                new_format = codec.getOutputFormat()
+                channels = new_format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                sample_rate = new_format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+
+        raw = b"".join(pcm_chunks)
+        if not raw:
+            debug_log(f"decode_via_mediacodec({debug_name}): пустой результат декодирования")
+            return None
+
+        samples = array("h")
+        samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+        debug_log(
+            f"decode_via_mediacodec({debug_name}): декодировано {len(samples)} сэмплов, "
+            f"{channels} канал(а), {sample_rate} Гц (mime={mime})"
+        )
+        return samples, channels, sample_rate
+    except LoadCancelled:
+        raise
+    except Exception as e:
+        import traceback
+        debug_log(f"decode_via_mediacodec({debug_name}): ОШИБКА: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        try:
+            if codec is not None:
+                codec.stop()
+                codec.release()
+        except Exception:
+            pass
+        try:
+            if extractor is not None:
+                extractor.release()
+        except Exception:
+            pass
+
+
+class Voice:
+    __slots__ = ("samples", "pos", "gain", "on_start", "_started")
+
+    def __init__(self, samples: array, gain: float = 1.0, on_start=None):
+        self.samples = samples
+        self.pos = 0
+        self.gain = gain
+        # Вызывается один раз, когда голос впервые попадает в mix_into —
+        # синхронизирует старт динамика с реальным моментом записи, а не с кликом.
+        self.on_start = on_start
+        self._started = False
+
+    @property
+    def finished(self) -> bool:
+        return self.pos >= len(self.samples)
+
+
+class SoundEngine:
+    MAX_CACHED_SAMPLES = 24  # 8 слотов + запас под недавно импортированные звуки
+
+    def __init__(self):
+        self._samples_cache: "OrderedDict[str, array]" = OrderedDict()
+        self._loading_locks: dict[str, threading.Lock] = {}
+        self.active: List[Voice] = []
+        self._lock = threading.Lock()
+        self.master_gain = 1.0
+        self.target_sample_rate = 48000
+        self.loading_progress: dict[str, int] = {}
+        self.cancel_generation = 0
+
+    def _cache_put(self, path: str, samples: array):
+        self._samples_cache[path] = samples
+        self._samples_cache.move_to_end(path)
+        while len(self._samples_cache) > self.MAX_CACHED_SAMPLES:
+            evicted_path, _ = self._samples_cache.popitem(last=False)
+            debug_log(f"_cache_put: кэш переполнен, вытеснён {os.path.basename(evicted_path)}")
+
+    def request_cancel_all(self):
+        self.cancel_generation += 1
+        self.loading_progress.clear()
+
+    def get_loading_progress(self, path: str) -> Optional[int]:
+        return self.loading_progress.get(path)
+
+    def load_sample(self, path: str) -> Optional[array]:
+        if path in self._samples_cache:
+            self._samples_cache.move_to_end(path)
+            return self._samples_cache[path]
+
+        lock = self._loading_locks.setdefault(path, threading.Lock())
+        with lock:
+            if path in self._samples_cache:
+                self._samples_cache.move_to_end(path)
+                return self._samples_cache[path]
+            try:
+                my_generation = self.cancel_generation
+
+                def cancel_cb():
+                    return self.cancel_generation != my_generation
+
+                with open(path, "rb") as f:
+                    data = f.read()
+
+                name = os.path.basename(path)
+                is_wav = len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+
+                def make_progress_cb(phase_start: float, phase_span: float):
+                    def cb(frac: float):
+                        self.loading_progress[path] = int((phase_start + frac * phase_span) * 100)
+                    return cb
+
+                self.loading_progress[path] = 0
+
+                if is_wav:
+                    parsed = parse_wav_pcm16(data, debug_name=name)
+                    decode_span = 0.0
+                else:
+                    parsed = decode_via_mediacodec(
+                        path, debug_name=name, cancel_cb=cancel_cb,
+                        progress_cb=make_progress_cb(0.0, 0.4),
+                    )
+                    decode_span = 0.4
+
+                if parsed is None:
+                    self.loading_progress.pop(path, None)
+                    return None
+                samples, channels, src_rate = parsed
+                n_frames = len(samples) // max(channels, 1)
+                if n_frames > src_rate * 15:
+                    debug_log(
+                        "load_sample: ВНИМАНИЕ — файл длиннее ~15 сек, обработка на чистом "
+                        "Python может занять десятки секунд/минуты. Для соундпада рекомендуются "
+                        "короткие сэмплы (1-5 сек)."
+                    )
+
+                remaining = 1.0 - decode_span
+                downmix_start = decode_span
+                downmix_span = remaining * 0.5
+                resample_start = downmix_start + downmix_span
+                resample_span = remaining * 0.5
+
+                samples = downmix_to_mono_fast(
+                    samples, channels,
+                    progress_cb=make_progress_cb(downmix_start, downmix_span),
+                    cancel_cb=cancel_cb,
+                )
+                samples = resample_mono_fast(
+                    samples, src_rate, self.target_sample_rate,
+                    progress_cb=make_progress_cb(resample_start, resample_span),
+                    cancel_cb=cancel_cb,
+                )
+                self._cache_put(path, samples)
+                self.loading_progress.pop(path, None)
+                return samples
+            except LoadCancelled:
+                debug_log(f"load_sample: обработка {os.path.basename(path)} прервана кнопкой Стоп")
+                self.loading_progress.pop(path, None)
+                return None
+            except Exception as e:
+                import traceback
+                debug_log(f"load_sample: ОШИБКА {path}: {e}\n{traceback.format_exc()}")
+                self.loading_progress.pop(path, None)
+                return None
+
+    def trigger(self, path: str, gain: float = 1.0, on_start=None):
+        cached = self._samples_cache.get(path)
+        if cached is not None and len(cached) > 0:
+            with self._lock:
+                self.active.append(Voice(cached, gain, on_start=on_start))
+            debug_log(f"trigger: добавлен из кэша ({os.path.basename(path)}, {len(cached)} сэмплов)")
+            return
+        if path in self._samples_cache:
+            debug_log(
+                f"trigger: в кэше невалидное значение для {os.path.basename(path)} "
+                f"({cached!r}) — перезагружаю заново"
+            )
+            self._samples_cache.pop(path, None)
+
+        def _load_and_add():
+            samples = self.load_sample(path)
+            if samples is None or len(samples) == 0:
+                debug_log(f"trigger: загрузка не дала валидных сэмплов ({os.path.basename(path)})")
+                return
+            with self._lock:
+                self.active.append(Voice(samples, gain, on_start=on_start))
+            debug_log(f"trigger: сэмпл догружен и добавлен в микс ({os.path.basename(path)})")
+
+        threading.Thread(target=_load_and_add, daemon=True).start()
+
+    def clear(self):
+        with self._lock:
+            self.active.clear()
+
+    def mix_into(self, pcm_bytes: bytes) -> bytes:
+        # Колбэки собираем под локом, но вызываем после его отпускания,
+        # чтобы track.play() не мог держать блокировку движка.
+        to_start: List = []
+        with self._lock:
+            if not self.active:
+                return pcm_bytes
+
+            trimmed = pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % 2)]
+            frame_len = len(trimmed) // 2
+            mixed_bytes = trimmed
+
+            still_active: List[Voice] = []
+            for voice in self.active:
+                if not voice.samples:
+                    debug_log("mix_into: пропускаю voice с пустыми/None samples")
+                    continue
+                if voice.pos == 0 and not voice._started:
+                    voice._started = True
+                    if voice.on_start is not None:
+                        to_start.append(voice.on_start)
+                end = min(voice.pos + frame_len, len(voice.samples))
+                chunk = voice.samples[voice.pos:end]
+                gain = voice.gain * self.master_gain
+
+                if HAS_AUDIOOP and chunk:
+                    try:
+                        chunk_bytes = chunk.tobytes()
+                        if gain != 1.0:
+                            chunk_bytes = audioop.mul(chunk_bytes, 2, gain)
+                        pad = len(mixed_bytes) - len(chunk_bytes)
+                        if pad > 0:
+                            chunk_bytes += b"\x00" * pad
+                        mixed_bytes = audioop.add(mixed_bytes, chunk_bytes, 2)
+                    except Exception as e:
+                        debug_log(f"mix_into: audioop упал ({e}), ручное микширование для кадра")
+                        mixed_bytes = _mix_chunk_manual(mixed_bytes, chunk, gain)
+                elif chunk:
+                    mixed_bytes = _mix_chunk_manual(mixed_bytes, chunk, gain)
+
+                voice.pos = end
+                if not voice.finished:
+                    still_active.append(voice)
+            self.active = still_active
+
+        for cb in to_start:
+            try:
+                cb()
+            except Exception as e:
+                import traceback
+                debug_log(f"mix_into: колбэк on_start упал: {e}\n{traceback.format_exc()}")
+
+        return mixed_bytes
+
+
+_active_tracks = []
+_active_tracks_lock = threading.Lock()
+
+
+def stop_all_speaker_playback():
+    with _active_tracks_lock:
+        tracks = list(_active_tracks)
+        _active_tracks.clear()
+    for t in tracks:
+        try:
+            t.stop()
+            t.release()
+        except Exception:
+            pass
+    if tracks:
+        debug_log(f"stop_all_speaker_playback: остановлено {len(tracks)} AudioTrack")
+
+
+def _apply_gain_bytes_slow(raw: bytes, gain: float) -> bytes:
+    """Медленный чистый Python fallback на случай, если audioop недоступен.
+    Используется только если HAS_AUDIOOP=False — на нормальном Android
+    это не должно происходить."""
+    samples = array("h")
+    samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+    out = array("h")
+    for s in samples:
+        v = int(s * gain)
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        out.append(v)
+    return out.tobytes()
+
+
+def arm_speaker(samples: array, sample_rate: int, gain: float = 1.0):
+    """Готовит AudioTrack (gain + MODE_STATIC буфер), но не запускает play().
+    Возвращает (track, duration_sec) или (None, 0.0). Вызывать из фонового
+    потока, не из аудио-хука — тут есть выделение памяти и системные вызовы."""
+    try:
+        from android.media import AudioTrack, AudioFormat, AudioManager
+
+        raw = samples.tobytes()
+        if gain != 1.0:
+            if HAS_AUDIOOP:
+                try:
+                    raw = audioop.mul(raw, 2, gain)
+                except Exception as e:
+                    debug_log(f"arm_speaker: audioop.mul упал ({e}), медленный fallback")
+                    raw = _apply_gain_bytes_slow(raw, gain)
+            else:
+                raw = _apply_gain_bytes_slow(raw, gain)
+
+        from java import jarray
+        byte_array = jarray("B")(raw)
+
+        channel_config = AudioFormat.CHANNEL_OUT_MONO
+        audio_format = AudioFormat.ENCODING_PCM_16BIT
+        min_buf = AudioTrack.getMinBufferSize(sample_rate, channel_config, audio_format)
+        buf_size_bytes = max(min_buf, len(raw))
+
+        track = AudioTrack(
+            AudioManager.STREAM_MUSIC,
+            sample_rate,
+            channel_config,
+            audio_format,
+            buf_size_bytes,
+            AudioTrack.MODE_STATIC,
+        )
+        track.write(byte_array, 0, len(byte_array))
+
+        n_samples = len(raw) // 2
+        duration_sec = n_samples / float(sample_rate)
+        debug_log(f"arm_speaker: готов, {n_samples} сэмплов, ~{duration_sec:.2f} сек")
+        return track, duration_sec
+    except Exception as e:
+        import traceback
+        debug_log(f"arm_speaker: ОШИБКА: {e}\n{traceback.format_exc()}")
+        return None, 0.0
+
+
+def fire_speaker(track, duration_sec: float):
+    """Лёгкий вызов (только track.play()) — безопасно вызывать прямо из
+    writeFrame-хука, никаких аллокаций/диска/логов на каждый кадр."""
+    if track is None:
+        return
+    try:
+        track.play()
+        with _active_tracks_lock:
+            _active_tracks.append(track)
+    except Exception as e:
+        debug_log(f"fire_speaker: ОШИБКА play(): {e}")
+        return
+
+    def _cleanup():
+        time.sleep(duration_sec + 0.2)
+        with _active_tracks_lock:
+            if track in _active_tracks:
+                _active_tracks.remove(track)
+        try:
+            track.stop()
+            track.release()
+        except Exception:
+            pass
+
+    threading.Thread(target=_cleanup, daemon=True).start()
+
+
+def play_through_speaker(samples: array, sample_rate: int, gain: float = 1.0):
+    """Взвести и сразу выстрелить — для режима "только через динамик",
+    где синхронизировать с записью не с чем."""
+    def _play():
+        track, duration_sec = arm_speaker(samples, sample_rate, gain)
+        fire_speaker(track, duration_sec)
+
+    threading.Thread(target=_play, daemon=True).start()
+
+
+sound_engine = SoundEngine()
+
+
+class WriteFrameHook(MethodHook):
+    _logged_first_mix = False
+    _capacity_mismatch_count = 0
+    _total_frame_count = 0
+
+    def before_hooked_method(self, param):
+        try:
+            byte_buffer = param.args[0]
+            length = param.args[1]
+
+            original_position = byte_buffer.position()
+            original_limit = byte_buffer.limit()
+            capacity = byte_buffer.capacity()
+
+            WriteFrameHook._total_frame_count += 1
+
+            effective_length = length
+            if length > capacity:
+                # На части устройств buffer.capacity() < length — обрабатываем
+                # сколько влезает, вместо полного пропуска кадра.
+                effective_length = capacity
+                WriteFrameHook._capacity_mismatch_count += 1
+                if WriteFrameHook._capacity_mismatch_count <= 5:
+                    debug_log(
+                        f"WriteFrameHook: length={length} > capacity={capacity} — "
+                        f"обрабатываю только {effective_length} байт вместо пропуска "
+                        f"(кадр #{WriteFrameHook._total_frame_count}, "
+                        f"несовпадений подряд/всего: {WriteFrameHook._capacity_mismatch_count})"
+                    )
+
+            if effective_length <= 0:
+                return
+
+            byte_buffer.position(0)
+            byte_buffer.limit(effective_length)
+            raw = bytearray(effective_length)
+            byte_buffer.get(raw, 0, effective_length)
+
+            had_active_voices = len(sound_engine.active) > 0
+            mixed = sound_engine.mix_into(bytes(raw))
+            changed = mixed != bytes(raw)
+
+            if had_active_voices and not WriteFrameHook._logged_first_mix:
+                WriteFrameHook._logged_first_mix = True
+                debug_log(
+                    f"WriteFrameHook: активных голосов={len(sound_engine.active)}, "
+                    f"буфер изменён={changed}, длина={length}, "
+                    f"orig_pos={original_position}, orig_limit={original_limit}, "
+                    f"capacity={capacity}"
+                )
+
+            if changed:
+                byte_buffer.position(0)
+                byte_buffer.put(mixed, 0, len(mixed))
+
+            byte_buffer.limit(original_limit)
+            byte_buffer.position(original_position)
+        except Exception as e:
+            import traceback
+            debug_log(f"WriteFrameHook: ОШИБКА микширования: {e}\n{traceback.format_exc()}")
+
+
+class StartRecordHook(MethodHook):
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        sample_rate = param.args[1]
+        debug_log(f"startRecord вызван, sampleRate={sample_rate}")
+        sound_engine.target_sample_rate = int(sample_rate)
+        WriteFrameHook._logged_first_mix = False
+        WriteFrameHook._capacity_mismatch_count = 0
+        WriteFrameHook._total_frame_count = 0
+        run_on_ui_thread(lambda: self.plugin.show_overlay())
+        self.plugin.preload_enabled_samples()
+
+
+class StopRecordHook(MethodHook):
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            debug_log("stopRecord вызван — скрываю оверлей")
+            if WriteFrameHook._total_frame_count > 0:
+                debug_log(
+                    f"Итог записи: кадров всего={WriteFrameHook._total_frame_count}, "
+                    f"пропущено из-за несовпадения буфера={WriteFrameHook._capacity_mismatch_count}"
+                )
+            sound_engine.clear()
+            stop_all_speaker_playback()
+            run_on_ui_thread(lambda: self.plugin.hide_overlay())
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА в StopRecordHook: {e}\n{traceback.format_exc()}")
+
+
+class RecordHooks:
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+        self.unhooks = []
+
+    def install(self):
+        try:
+            MediaControllerClass = get_reflect_class("org.telegram.messenger.MediaController")
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА get_reflect_class(MediaController): {e}\n{traceback.format_exc()}")
+            return
+        if not MediaControllerClass:
+            debug_log("Класс MediaController не найден — хуки не установлены")
+            return
+        debug_log("Класс MediaController найден, ищу writeFrame...")
+
+        from java.lang import Integer as JInteger
+        from java.lang import String as JString
+        from java.nio import ByteBuffer as JByteBuffer
+
+        try:
+            write_frame = MediaControllerClass.getDeclaredMethod(
+                "writeFrame", JByteBuffer, JInteger.TYPE
+            )
+            write_frame.setAccessible(True)
+            u1 = self.plugin.hook_method(write_frame, WriteFrameHook())
+            if u1:
+                self.unhooks.append(u1)
+                debug_log("writeFrame захукан")
+            else:
+                debug_log("Не удалось захукать writeFrame")
+        except Exception as e:
+            debug_log(f"writeFrame: сигнатура не совпала: {e}")
+            self._scan_similar_methods(MediaControllerClass, ["record", "frame", "write", "encod"])
+
+        try:
+            start_record = MediaControllerClass.getDeclaredMethod(
+                "startRecord", JString, JInteger.TYPE
+            )
+            start_record.setAccessible(True)
+            u2 = self.plugin.hook_method(start_record, StartRecordHook(self.plugin))
+            if u2:
+                self.unhooks.append(u2)
+                debug_log("startRecord захукан")
+            else:
+                debug_log("Не удалось захукать startRecord")
+        except Exception as e:
+            debug_log(f"startRecord: сигнатура не совпала: {e}")
+
+        try:
+            stop_record = MediaControllerClass.getDeclaredMethod("stopRecord")
+            stop_record.setAccessible(True)
+            u3 = self.plugin.hook_method(stop_record, StopRecordHook(self.plugin))
+            if u3:
+                self.unhooks.append(u3)
+                debug_log("stopRecord захукан")
+            else:
+                debug_log("Не удалось захукать stopRecord")
+        except Exception as e:
+            debug_log(f"stopRecord: сигнатура не совпала: {e}")
+
+        for name, params in [
+            ("stopRecording", [JInteger.TYPE, "boolean", JInteger.TYPE, "boolean", "long"]),
+            ("cleanRecording", ["boolean"]),
+        ]:
+            try:
+                from java.lang import Boolean as JBoolean, Long as JLong
+                type_map = {
+                    "boolean": JBoolean.TYPE,
+                    "long": JLong.TYPE,
+                }
+                resolved = [type_map.get(p, p) for p in params]
+                m = MediaControllerClass.getDeclaredMethod(name, *resolved)
+                m.setAccessible(True)
+                u = self.plugin.hook_method(m, StopRecordHook(self.plugin))
+                if u:
+                    self.unhooks.append(u)
+                    debug_log(f"{name} захукан (доп. точка закрытия оверлея)")
+            except Exception as e:
+                debug_log(f"{name}: сигнатура не совпала: {e}")
+
+    def uninstall(self):
+        for u in self.unhooks:
+            try:
+                self.plugin.unhook_method(u)
+            except Exception:
+                pass
+        self.unhooks.clear()
+
+    @staticmethod
+    def _scan_similar_methods(java_class, keywords):
+        try:
+            methods = java_class.getDeclaredMethods()
+            found_any = False
+            for m in methods:
+                name = m.getName()
+                if any(k.lower() in name.lower() for k in keywords):
+                    found_any = True
+                    param_types = m.getParameterTypes()
+                    params_str = ", ".join(pt.getName() for pt in param_types)
+                    debug_log(f"  найден кандидат: {name}({params_str})")
+            if not found_any:
+                debug_log(f"  ни одного метода с ключевыми словами {keywords} не найдено")
+        except Exception as e:
+            debug_log(f"  ошибка сканирования методов: {e}")
+
+
+class ImportResultHook(MethodHook):
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            request_code = param.args[0]
+            data = param.args[2]
+
+            if request_code != IMPORT_REQUEST_CODE:
+                return
+            if data is None:
+                debug_log("onActivityResult: пользователь отменил выбор файла")
+                return
+
+            uri = data.getData()
+            if uri is None:
+                return
+
+            context = self.plugin.get_context()
+            content_resolver = context.getContentResolver()
+
+            display_name = self._query_display_name(content_resolver, uri)
+            raw_bytes = self._read_all_bytes(content_resolver, uri)
+
+            if raw_bytes is None:
+                self.plugin.notify("Не удалось прочитать выбранный файл")
+                return
+
+            if not display_name:
+                import time
+                display_name = f"imported_{int(time.time())}.wav"
+
+            safe_name = "".join(c for c in display_name if c.isalnum() or c in "._- ")
+            dest_path = os.path.join(sounds_dir(), safe_name)
+
+            with open(dest_path, "wb") as f:
+                f.write(raw_bytes)
+
+            debug_log(f"файл записан: {dest_path}")
+
+            size_mb = len(raw_bytes) / (1024 * 1024)
+
+            if size_mb > 1:
+                self.plugin.notify(
+                    f"Звук импортирован: {safe_name} ({size_mb:.1f} МБ). "
+                    f"⚠️ Файл больше 1 МБ — обработка может занять десятки секунд "
+                    f"и вызвать заметную рассинхронизацию/подвисания при нажатии "
+                    f"кнопки. Рекомендуется использовать короткие сэмплы (1-5 сек, "
+                    f"обычно <1 МБ)."
+                )
+            else:
+                self.plugin.notify(f"Звук импортирован: {safe_name}")
+
+            assigned_slot = self.plugin.assign_to_first_free_slot(safe_name)
+            if assigned_slot is not None:
+                self.plugin.notify(f"Автоматически назначен на слот {assigned_slot + 1}")
+                debug_log(f"Автоназначение: {safe_name} -> слот {assigned_slot + 1}")
+            else:
+                debug_log("Автоназначение: свободных слотов нет, файл только сохранён")
+
+            run_on_ui_thread(self.plugin.refresh_settings_ui)
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА в ImportResultHook: {e}\n{traceback.format_exc()}")
+            self.plugin.notify(f"Ошибка импорта: {e}")
+
+    @staticmethod
+    def _query_display_name(content_resolver, uri) -> Optional[str]:
+        try:
+            from android.provider import OpenableColumns
+            cursor = content_resolver.query(uri, None, None, None, None)
+            if cursor is None:
+                return None
+            try:
+                idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if idx >= 0 and cursor.moveToFirst():
+                    return cursor.getString(idx)
+            finally:
+                cursor.close()
+        except Exception as e:
+            log(f"[Voice Soundpad] Не удалось получить имя файла: {e}")
+        return None
+
+    @staticmethod
+    def _read_all_bytes(content_resolver, uri) -> Optional[bytes]:
+        try:
+            input_stream = content_resolver.openInputStream(uri)
+            if input_stream is None:
+                return None
+            chunks = []
+            buf = bytearray(65536)
+            while True:
+                n = input_stream.read(buf)
+                if n == -1:
+                    break
+                chunks.append(bytes(buf[:n]))
+            input_stream.close()
+            return b"".join(chunks)
+        except Exception as e:
+            log(f"[Voice Soundpad] Не удалось прочитать поток файла: {e}")
+            return None
+
+
+class ActivityCaptureHook(MethodHook):
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.current_activity = param.thisObject
+
+
+class ImportHooks:
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+        self.unhooks = []
+
+    def install(self):
+        from java.lang import Integer as JInteger
+        from android.content import Intent as JIntent
+
+        try:
+            LaunchActivityClass = get_reflect_class("org.telegram.ui.LaunchActivity")
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА get_reflect_class(LaunchActivity): {e}\n{traceback.format_exc()}")
+            return
+        if not LaunchActivityClass:
+            debug_log("LaunchActivity не найден — импорт файлов недоступен")
+            return
+        debug_log("Класс LaunchActivity найден, ищу onActivityResult...")
+        try:
+            method = LaunchActivityClass.getDeclaredMethod(
+                "onActivityResult", JInteger.TYPE, JInteger.TYPE, JIntent
+            )
+            method.setAccessible(True)
+            u = self.plugin.hook_method(method, ImportResultHook(self.plugin))
+            if u:
+                self.unhooks.append(u)
+                debug_log("onActivityResult захукан (импорт файлов)")
+            else:
+                debug_log("hook_method вернул пусто для onActivityResult")
+        except Exception as e:
+            debug_log(f"onActivityResult: сигнатура не совпала: {e}")
+
+        try:
+            resume_method = LaunchActivityClass.getDeclaredMethod("onResume")
+            resume_method.setAccessible(True)
+            u2 = self.plugin.hook_method(resume_method, ActivityCaptureHook(self.plugin))
+            if u2:
+                self.unhooks.append(u2)
+                debug_log("onResume захукан (захват Activity)")
+            else:
+                debug_log("hook_method вернул пусто для onResume")
+        except Exception as e:
+            debug_log(f"onResume: сигнатура не совпала: {e}")
+
+    def uninstall(self):
+        for u in self.unhooks:
+            try:
+                self.plugin.unhook_method(u)
+            except Exception:
+                pass
+        self.unhooks.clear()
+
+
+def start_import_picker(context):
+    from android.content import Intent
+
+    intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    intent.setType("audio/*")
+    context.startActivityForResult(intent, IMPORT_REQUEST_CODE)
+
+
+class SoundpadOverlay:
+    def __init__(self, plugin: "VoiceSoundpadPlugin"):
+        self.plugin = plugin
+        self.decor_root = None
+        self.container: Optional[FrameLayout] = None
+        self.visible = False
+        self.mic_status_view = None
+        self.speaker_status_view = None
+        self._status_thread = None
+        self._status_stop = threading.Event()
+        self.last_clicked_path: Optional[str] = None
+
+    _pending_clicks = set()
+    _pending_clicks_lock = threading.Lock()
+
+    def _on_sound_click(self, path: str, gain: float, mode: str):
+        self.last_clicked_path = path
+        cached_value = sound_engine._samples_cache.get(path)
+        already_cached = cached_value is not None and len(cached_value) > 0
+        if not already_cached:
+            with SoundpadOverlay._pending_clicks_lock:
+                if path in SoundpadOverlay._pending_clicks:
+                    debug_log(f"Клик проигнорирован (уже грузится): {os.path.basename(path)}")
+                    return
+                SoundpadOverlay._pending_clicks.add(path)
+
+        debug_log(f"Кнопка звука нажата: {os.path.basename(path)}, режим={mode}")
+
+        def _release_pending():
+            with SoundpadOverlay._pending_clicks_lock:
+                SoundpadOverlay._pending_clicks.discard(path)
+
+        if mode == "both":
+            # Динамик взводится заранее, а play() на нём дёргает writeFrame-хук
+            # в момент, когда сэмпл реально попадает в запись (см. mix_into).
+            def _fire_synced():
+                try:
+                    samples = sound_engine.load_sample(path)
+                    if samples is None:
+                        debug_log(f"both: сэмпл не загрузился ({os.path.basename(path)}) — отмена")
+                        return
+                    track, duration_sec = arm_speaker(samples, sound_engine.target_sample_rate, gain)
+                    sound_engine.trigger(
+                        path, gain,
+                        on_start=lambda t=track, d=duration_sec: fire_speaker(t, d),
+                    )
+                    if already_cached:
+                        self._force_mic_active()
+                finally:
+                    if not already_cached:
+                        _release_pending()
+
+            threading.Thread(target=_fire_synced, daemon=True).start()
+            return
+
+        if mode == "mic":
+            sound_engine.trigger(path, gain)
+            if already_cached:
+                self._force_mic_active()
+            elif not already_cached:
+                def _release_after_mic():
+                    sound_engine.load_sample(path)
+                    _release_pending()
+
+                threading.Thread(target=_release_after_mic, daemon=True).start()
+            return
+
+        if mode == "speaker":
+            def _load_and_play():
+                try:
+                    samples = sound_engine.load_sample(path)
+                    if samples is None:
+                        debug_log("Не удалось воспроизвести через динамик — сэмпл не загрузился")
+                        return
+                    play_through_speaker(samples, sound_engine.target_sample_rate, gain)
+                finally:
+                    if not already_cached:
+                        _release_pending()
+
+            threading.Thread(target=_load_and_play, daemon=True).start()
+            return
+
+    def _build_card(self, context, blur_drawable=None) -> View:
+        from android.graphics.drawable import GradientDrawable, LayerDrawable
+
+        try:
+            accent_color = get_theme_color("key_colorAccent", Color.parseColor("#2F6FED"))
+            service_bg = get_theme_color("key_chat_serviceBackground", Color.parseColor("#CC1F1F1F"))
+            service_text = get_theme_color("key_chat_serviceText", Color.WHITE)
+        except Exception as e:
+            debug_log(f"_build_card: не удалось прочитать цвета темы, использую свои ({e})")
+            accent_color = Color.parseColor("#2F6FED")
+            service_bg = Color.parseColor("#1F1F1F")
+            service_text = Color.WHITE
+
+        card = LinearLayout(context)
+        card.setOrientation(LinearLayout.VERTICAL)
+        card.setPadding(dp(14), dp(10), dp(14), dp(10))
+
+        try:
+            tint = GradientDrawable()
+            tint.setColor(service_bg)
+            tint.setCornerRadius(float(dp(16)))
+            bg = tint
+            if blur_drawable is not None:
+                try:
+                    bg = LayerDrawable([blur_drawable, tint])
+                except Exception as e:
+                    debug_log(f"_build_card: LayerDrawable не собрался, без блюра ({e})")
+                    bg = tint
+            card.setBackground(bg)
+        except Exception as e:
+            debug_log(f"_build_card: фон карточки не собрался, ставлю сплошной цвет ({e})")
+            fallback_bg = GradientDrawable()
+            fallback_bg.setColor(Color.parseColor("#1F1F1F"))
+            fallback_bg.setCornerRadius(float(dp(16)))
+            card.setBackground(fallback_bg)
+        card.setElevation(float(dp(6)))
+
+        status_row = LinearLayout(context)
+        status_row.setOrientation(LinearLayout.HORIZONTAL)
+        status_row.setPadding(dp(2), 0, dp(2), dp(8))
+
+        self.mic_status_view = TextView(context)
+        self.mic_status_view.setText("Микро")
+        self.mic_status_view.setTextColor(Color.parseColor(STATUS_COLOR_INACTIVE))
+        self.mic_status_view.setTextSize(12.0)
+        self.mic_status_view.setPadding(0, 0, dp(16), 0)
+
+        self.speaker_status_view = TextView(context)
+        self.speaker_status_view.setText("Динамик")
+        self.speaker_status_view.setTextColor(Color.parseColor(STATUS_COLOR_INACTIVE))
+        self.speaker_status_view.setTextSize(12.0)
+
+        status_row.addView(self.mic_status_view)
+        status_row.addView(self.speaker_status_view)
+        card.addView(status_row)
+
+        grid = LinearLayout(context)
+        grid.setOrientation(LinearLayout.VERTICAL)
+
+        slots = self.plugin.get_enabled_slots()
+        if not slots:
+            empty = TextView(context)
+            empty.setText("Нет добавленных звуков — настройте их в настройках плагина")
+            empty.setTextColor(service_text)
+            empty.setTextSize(13.0)
+            card.addView(empty)
+        else:
+            from android.text import TextUtils
+
+            for slot in slots:
+                btn = TextView(context)
+                btn.setText(slot["label"])
+                btn.setTextColor(Color.WHITE)
+                btn.setTextSize(13.0)
+                btn.setPadding(dp(16), dp(10), dp(16), dp(10))
+                btn.setSingleLine(True)
+                btn.setEllipsize(TextUtils.TruncateAt.END)
+                btn.setMaxWidth(dp(220))
+                btn_bg = GradientDrawable()
+                btn_bg.setColor(accent_color)
+                btn_bg.setCornerRadius(float(dp(10)))
+                btn.setBackground(btn_bg)
+                path = slot["path"]
+                gain = slot.get("gain", 1.0)
+                mode = self.plugin.get_playback_mode()
+                btn.setOnClickListener(
+                    OnClickListener(lambda v, p=path, g=gain, m=mode: self._on_sound_click(p, g, m))
+                )
+                row_lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                )
+                row_lp.setMargins(0, dp(3), 0, dp(3))
+                grid.addView(btn, row_lp)
+
+        card.addView(grid)
+
+        stop_btn = TextView(context)
+        stop_btn.setText("⏹ Стоп")
+        stop_btn.setTextColor(Color.WHITE)
+        stop_btn.setTextSize(13.0)
+        stop_btn.setPadding(dp(16), dp(10), dp(16), dp(10))
+        stop_btn.setSingleLine(True)
+        stop_btn_bg = GradientDrawable()
+        stop_btn_bg.setColor(Color.parseColor("#E64C3C"))
+        stop_btn_bg.setCornerRadius(float(dp(10)))
+        stop_btn.setBackground(stop_btn_bg)
+        stop_btn.setOnClickListener(OnClickListener(lambda v: self._on_stop_click()))
+        stop_lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        )
+        stop_lp.setMargins(0, dp(8), 0, 0)
+        stop_lp.gravity = Gravity.CENTER
+        card.addView(stop_btn, stop_lp)
+
+        return card
+
+    def show(self):
+        if self.visible:
+            return
+        activity = self.plugin.get_context()
+        if activity is None:
+            debug_log("Оверлей: нет Activity — показать нельзя")
+            return
+
+        try:
+            decor_view = activity.getWindow().getDecorView()
+            from android import R as AndroidR
+            content_root = decor_view.findViewById(AndroidR.id.content)
+        except Exception as e:
+            import traceback
+            debug_log(f"Оверлей: не удалось получить DecorView: {e}\n{traceback.format_exc()}")
+            return
+
+        try:
+            self.decor_root = content_root
+            self.container = FrameLayout(activity)
+
+            blur_drawable = None
+            if self.plugin.get_setting("glass_blur_enabled", False):
+                blur_drawable = capture_blurred_background(content_root)
+
+            card = self._build_card(activity, blur_drawable=blur_drawable)
+
+            from android.widget import FrameLayout as JFrameLayout
+            lp = JFrameLayout.LayoutParams(
+                JFrameLayout.LayoutParams.WRAP_CONTENT,
+                JFrameLayout.LayoutParams.WRAP_CONTENT,
+            )
+            lp.gravity = Gravity.TOP | Gravity.END
+            lp.topMargin = dp(64)
+            lp.rightMargin = dp(10)
+            self.container.addView(card, lp)
+
+            content_root.addView(self.container)
+            self.visible = True
+            debug_log("Оверлей показан (DecorView)")
+            self._start_status_updater()
+        except Exception as e:
+            import traceback
+            debug_log(f"Оверлей: addView не сработал: {e}\n{traceback.format_exc()}")
+
+    def hide(self):
+        self._status_stop.set()
+        if not self.visible or self.container is None:
+            return
+        try:
+            if self.decor_root is not None:
+                self.decor_root.removeView(self.container)
+        except Exception as e:
+            debug_log(f"Оверлей: ошибка при скрытии: {e}")
+        self.visible = False
+        self.container = None
+        self.mic_status_view = None
+        self.speaker_status_view = None
+
+    def _start_status_updater(self):
+        self._status_stop.clear()
+        debug_log("Индикаторы статуса: поток опроса запущен")
+
+        def _loop():
+            while not self._status_stop.is_set():
+                mic_active = len(sound_engine.active) > 0
+                with _active_tracks_lock:
+                    speaker_active = len(_active_tracks) > 0
+                progress = None
+                if self.last_clicked_path:
+                    progress = sound_engine.get_loading_progress(self.last_clicked_path)
+                run_on_ui_thread(
+                    lambda m=mic_active, s=speaker_active, p=progress: self._apply_status(m, s, p)
+                )
+                self._status_stop.wait(0.1)
+            debug_log("Индикаторы статуса: поток опроса остановлен")
+
+        self._status_thread = threading.Thread(target=_loop, daemon=True)
+        self._status_thread.start()
+
+    _apply_status_error_logged = False
+
+    def _force_mic_active(self):
+        try:
+            if self.mic_status_view is not None:
+                self.mic_status_view.setTextColor(Color.parseColor(STATUS_COLOR_ACTIVE))
+        except Exception:
+            pass
+
+    def _force_mic_inactive(self):
+        try:
+            if self.mic_status_view is not None:
+                self.mic_status_view.setTextColor(Color.parseColor(STATUS_COLOR_INACTIVE))
+        except Exception:
+            pass
+
+    def _on_stop_click(self):
+        debug_log("Нажата кнопка 'Стоп' — останавливаю звук и обработку")
+        sound_engine.clear()
+        sound_engine.request_cancel_all()
+        stop_all_speaker_playback()
+        SoundpadOverlay._pending_clicks.clear()
+        self._force_mic_inactive()
+
+    def _apply_status(self, mic_active: bool, speaker_active: bool, progress: Optional[int] = None):
+        try:
+            if progress is not None:
+                if self.mic_status_view is not None:
+                    self.mic_status_view.setTextColor(Color.parseColor(STATUS_COLOR_LOADING))
+                if self.speaker_status_view is not None:
+                    self.speaker_status_view.setTextColor(Color.parseColor(STATUS_COLOR_LOADING))
+                return
+
+            if self.mic_status_view is not None:
+                self.mic_status_view.setTextColor(
+                    Color.parseColor(STATUS_COLOR_ACTIVE if mic_active else STATUS_COLOR_INACTIVE)
+                )
+            if self.speaker_status_view is not None:
+                self.speaker_status_view.setTextColor(
+                    Color.parseColor(STATUS_COLOR_ACTIVE if speaker_active else STATUS_COLOR_INACTIVE)
+                )
+        except Exception as e:
+            if not SoundpadOverlay._apply_status_error_logged:
+                SoundpadOverlay._apply_status_error_logged = True
+                import traceback
+                debug_log(f"_apply_status: ОШИБКА: {e}\n{traceback.format_exc()}")
+
+
+def get_reflect_class(fqcn: str):
+    from java.lang import Class as JClass
+    return JClass.forName(fqcn)
+
+
+def dp(value: int) -> int:
+    try:
+        from org.telegram.messenger import AndroidUtilities
+        return AndroidUtilities.dp(value)
+    except Exception:
+        return value * 2
+
+
+_theme_color_warned = set()
+
+
+def get_theme_color(key_name: str, fallback: int) -> int:
+    """Цвет текущей темы Telegram через Theme.getColor(). При отсутствии
+    ключа (другая версия клиента) — fallback, один раз с логом."""
+    try:
+        from org.telegram.ui.ActionBar import Theme
+        key = getattr(Theme, key_name, None)
+        if key is None:
+            raise AttributeError(key_name)
+        return Theme.getColor(key)
+    except Exception as e:
+        if key_name not in _theme_color_warned:
+            _theme_color_warned.add(key_name)
+            debug_log(f"get_theme_color({key_name}): недоступен, использую свой цвет ({e})")
+        return fallback
+
+
+def get_current_activity_via_reflection():
+    try:
+        activity_thread_class = get_reflect_class("android.app.ActivityThread")
+        current_thread_method = activity_thread_class.getMethod("currentActivityThread")
+        activity_thread = current_thread_method.invoke(None)
+
+        activities_field = activity_thread_class.getDeclaredField("mActivities")
+        activities_field.setAccessible(True)
+        activities_map = activities_field.get(activity_thread)
+
+        iterator = activities_map.values().iterator()
+        while iterator.hasNext():
+            record = iterator.next()
+            record_class = record.getClass()
+
+            paused_field = record_class.getDeclaredField("paused")
+            paused_field.setAccessible(True)
+            if paused_field.getBoolean(record):
+                continue
+
+            activity_field = record_class.getDeclaredField("activity")
+            activity_field.setAccessible(True)
+            activity = activity_field.get(record)
+            if activity is not None:
+                return activity
+        return None
+    except Exception as e:
+        debug_log(f"get_current_activity_via_reflection: ошибка: {e}")
+        return None
+
+
+def _migrate_legacy_path(old_path: str, new_path: str, is_dir: bool):
+    """Переносит данные из старых путей с 'test_' в имени (ранние версии плагина)."""
+    try:
+        if not os.path.exists(old_path) or os.path.exists(new_path):
+            return
+        if is_dir:
+            os.rename(old_path, new_path)
+        else:
+            os.rename(old_path, new_path)
+    except Exception:
+        pass
+
+
+def sounds_dir() -> str:
+    new_path = os.path.join(get_plugins_dir(), "voice_soundpad_sounds")
+    old_path = os.path.join(get_plugins_dir(), "voice_soundpad_test_sounds")
+    _migrate_legacy_path(old_path, new_path, is_dir=True)
+    ensure_dir_exists(new_path)
+    return new_path
+
+
+def debug_log_path() -> str:
+    new_path = os.path.join(get_plugins_dir(), "voice_soundpad_debug.log")
+    old_path = os.path.join(get_plugins_dir(), "voice_soundpad_test_debug.log")
+    _migrate_legacy_path(old_path, new_path, is_dir=False)
+    return new_path
+
+
+# По умолчанию пишется только logcat; файл-лог включается тумблером в настройках.
+_debug_file_logging_enabled = False
+
+
+def set_debug_file_logging(enabled: bool):
+    global _debug_file_logging_enabled
+    _debug_file_logging_enabled = enabled
+
+
+def debug_log(msg: str):
+    if _debug_file_logging_enabled:
+        try:
+            import time
+            line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+            with open(debug_log_path(), "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+    log(msg)
+
+
+def read_debug_log(last_n: int = 15) -> str:
+    if not _debug_file_logging_enabled:
+        return "(файл-лог выключен — включите в настройках, чтобы увидеть историю)"
+    try:
+        with open(debug_log_path(), "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return "".join(lines[-last_n:]) if lines else "(лог пуст)"
+    except Exception:
+        return "(лог ещё не создан — ни один хук ни разу не сработал)"
+
+
+def capture_blurred_background(content_root):
+    """Снимок экрана, уменьшенный в ~16 раз (даёт блюр за счёт билинейной
+    фильтрации) и растянутый обратно как Drawable. Статичный, не живой блюр.
+    Возвращает Drawable или None."""
+    try:
+        from android.graphics import Bitmap, Canvas
+        from android.graphics.drawable import BitmapDrawable
+
+        w = content_root.getWidth()
+        h = content_root.getHeight()
+        if w <= 0 or h <= 0:
+            return None
+
+        full = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        content_root.draw(Canvas(full))
+
+        small_w = max(1, w // 16)
+        small_h = max(1, h // 16)
+        small = Bitmap.createScaledBitmap(full, small_w, small_h, True)
+        full.recycle()
+
+        drawable = BitmapDrawable(small)
+        drawable.setFilterBitmap(True)
+        return drawable
+    except Exception as e:
+        debug_log(f"capture_blurred_background: не удалось снять фон: {e}")
+        return None
+
+
+class VoiceSoundpadPlugin(BasePlugin):
+    def on_plugin_load(self):
+        set_debug_file_logging(bool(self.get_setting("debug_file_logging", False)))
+        debug_log("=== on_plugin_load: старт ===")
+        debug_log(f"audioop доступен: {HAS_AUDIOOP}")
+        self.current_activity = None
+        try:
+            self.record_hooks = RecordHooks(self)
+            self.record_hooks.install()
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА при установке RecordHooks: {e}\n{traceback.format_exc()}")
+
+        try:
+            self.import_hooks = ImportHooks(self)
+            self.import_hooks.install()
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА при установке ImportHooks: {e}\n{traceback.format_exc()}")
+
+        self.overlay = SoundpadOverlay(self)
+        debug_log("=== on_plugin_load: завершено ===")
+        self.log("Voice Soundpad загружен")
+        self.preload_enabled_samples()
+
+    def on_plugin_unload(self):
+        if hasattr(self, "record_hooks"):
+            self.record_hooks.uninstall()
+        if hasattr(self, "import_hooks"):
+            self.import_hooks.uninstall()
+        self.hide_overlay()
+        sound_engine.clear()
+        stop_all_speaker_playback()
+
+    def notify(self, text: str):
+        try:
+            from ui.bulletin import BulletinHelper
+            run_on_ui_thread(lambda: BulletinHelper.show_info(text))
+        except Exception:
+            log(f"[Voice Soundpad] {text}")
+
+    def refresh_settings_ui(self):
+        try:
+            self.set_setting("_last_import_ts", str(id(self)), reload_settings=True)
+        except Exception:
+            pass
+
+    def show_overlay(self):
+        self.overlay.show()
+
+    def hide_overlay(self):
+        if hasattr(self, "overlay"):
+            self.overlay.hide()
+        stop_all_speaker_playback()
+
+    def get_context(self):
+        if getattr(self, "current_activity", None) is not None:
+            return self.current_activity
+        activity = get_current_activity_via_reflection()
+        if activity is not None:
+            self.current_activity = activity
+            return activity
+        try:
+            return super().get_context()
+        except AttributeError:
+            from org.telegram.messenger import ApplicationLoader
+            return ApplicationLoader.applicationContext
+
+    def get_playback_mode(self) -> str:
+        idx = self.get_setting("playback_mode_index", 2)
+        return {0: "mic", 1: "speaker", 2: "both"}.get(idx, "both")
+
+    def assign_to_first_free_slot(self, filename: str) -> Optional[int]:
+        for i in range(MAX_SLOTS):
+            if self.get_setting(f"slot_{i}_file", "") == filename:
+                return None  # уже назначен на какой-то слот, повторно не трогаем
+        for i in range(MAX_SLOTS):
+            if not self.get_setting(f"slot_{i}_file", ""):
+                self.set_setting(f"slot_{i}_file", filename)
+                self.set_setting(f"slot_{i}_enabled", True, reload_settings=True)
+                return i
+        return None
+
+    def get_enabled_slots(self) -> List[dict]:
+        slots = []
+        for i in range(MAX_SLOTS):
+            if not self.get_setting(f"slot_{i}_enabled", i < 4):
+                continue
+            filename = self.get_setting(f"slot_{i}_file", "")
+            if not filename:
+                continue
+            path = os.path.join(sounds_dir(), filename)
+            if not os.path.exists(path):
+                continue
+            slots.append(
+                {
+                    "path": path,
+                    "label": self.get_setting(f"slot_{i}_label", f"🔊 {i + 1}") or f"🔊 {i + 1}",
+                    "gain": self.get_setting(f"slot_{i}_gain", 100) / 100.0,
+                }
+            )
+        return slots
+
+    def preload_enabled_samples(self):
+        def _worker():
+            slots = self.get_enabled_slots()
+            if not slots:
+                return
+            debug_log(f"preload_enabled_samples: предзагружаю {len(slots)} сэмпл(ов)...")
+            for slot in slots:
+                sound_engine.load_sample(slot["path"])
+            debug_log("preload_enabled_samples: готово")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _discovered_files(self) -> List[str]:
+        try:
+            files = list_dir(path=sounds_dir(), extensions=AUDIO_EXTENSIONS)
+            return [os.path.basename(f) for f in files]
+        except Exception:
+            return []
+
+    def _all_files_in_sounds_dir(self) -> List[str]:
+        try:
+            d = sounds_dir()
+            return sorted(f for f in os.listdir(d) if os.path.isfile(os.path.join(d, f)))
+        except Exception:
+            return []
+
+    def _create_delete_sounds_page(self) -> List[Any]:
+        files = self._all_files_in_sounds_dir()
+        if not files:
+            return [
+                Header(text="Удаление звуков"),
+                Text(text="Нет сохранённых звуков"),
+            ]
+        rows: List[Any] = [Header(text="Нажми на звук, чтобы удалить его")]
+        for filename in files:
+            rows.append(
+                Text(
+                    text=filename,
+                    subtext="Удалить",
+                    icon="msg_delete",
+                    red=True,
+                    on_click=lambda v, f=filename: self._delete_sound(f),
+                )
+            )
+        return rows
+
+    def _delete_sound(self, filename: str):
+        path = os.path.join(sounds_dir(), filename)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            sound_engine._samples_cache.pop(path, None)
+            sound_engine._loading_locks.pop(path, None)
+
+            freed_slots = []
+            for i in range(MAX_SLOTS):
+                if self.get_setting(f"slot_{i}_file", "") == filename:
+                    self.set_setting(f"slot_{i}_file", "")
+                    freed_slots.append(i + 1)
+
+            debug_log(
+                f"Удалён звук: {filename}"
+                + (f", освобождены слоты: {freed_slots}" if freed_slots else "")
+            )
+            self.notify(f"Удалено: {filename}")
+        except Exception as e:
+            import traceback
+            debug_log(f"Ошибка удаления {filename}: {e}\n{traceback.format_exc()}")
+            self.notify(f"Не удалось удалить {filename}: {e}")
+
+        try:
+            self.set_setting("_last_delete_ts", str(time.time()), reload_settings=True)
+        except Exception:
+            pass
+
+    def create_settings(self) -> List[Any]:
+        files = self._discovered_files()
+        file_choices = ["(не выбрано)"] + files
+
+        rows: List[Any] = [
+            Header(text="Voice Soundpad"),
+            Text(
+                text="Импортировать звук",
+                icon="msg_addbot",
+                accent=True,
+                on_click=self._on_import_click,
+            ),
+            Text(
+                text="Удалить звуки",
+                icon="msg_delete",
+                create_sub_fragment=self._create_delete_sounds_page,
+            ),
+            Text(
+                text="Папка со звуками",
+                subtext=sounds_dir(),
+                icon="msg_folder",
+                on_click=self._copy_sounds_path,
+            ),
+            Text(
+                text=f"Найдено файлов: {len(files)}",
+                subtext="WAV (PCM16) и mp3/aac/m4a/ogg. Крупные/длинные файлы "
+                        "обрабатываются заметно дольше.",
+            ),
+            Divider(),
+            Header(text="Отладка (без ПК/ADB)"),
+            Switch(
+                key="debug_file_logging",
+                text="Писать файл-лог на диск",
+                subtext="По умолчанию выключено. Логи в logcat идут всегда.",
+                default=False,
+                on_change=self._on_debug_logging_change,
+            ),
+            Text(
+                text="Лог отладки (превью, может обрезаться)",
+                subtext=read_debug_log(20),
+                icon="msg_log",
+            ),
+            Text(
+                text="Скопировать лог",
+                icon="msg_copy",
+                accent=True,
+                on_click=self._copy_debug_log,
+            ),
+            Text(
+                text="Очистить лог",
+                on_click=self._clear_debug_log,
+                red=True,
+            ),
+            Divider(),
+            Header(text="Вид оверлея"),
+            Switch(
+                key="glass_blur_enabled",
+                text="Эффект стекла (блюр фона)",
+                subtext="Красиво, но при каждом открытии оверлея делает снимок "
+                        "экрана — на слабых устройствах может ощущаться небольшая "
+                        "задержка. Блюр статичный (не живой), фон подстраивается "
+                        "под текущую тему.",
+                default=False,
+            ),
+            Divider(),
+            Header(text="Куда играть звук при нажатии"),
+            Selector(
+                key="playback_mode_index",
+                text="Режим вывода",
+                default=2,
+                items=[
+                    "Только в микрофон (слышно в самом ГС)",
+                    "Только через динамик (слышно только вам)",
+                    "И туда, и туда",
+                ],
+            ),
+            Divider(
+                text="В режиме «И туда, и туда» звук на динамике запускается "
+                     "в момент реального попадания в запись — держите телефон "
+                     "как обычно."
+            ),
+            Header(text="Общая громкость подмеса"),
+            Selector(
+                key="master_gain",
+                text="Громкость сэмплов",
+                default=2,
+                items=["25%", "50%", "75%", "100%", "125%"],
+                on_change=self._on_master_gain_change,
+            ),
+            Divider(),
+        ]
+
+        for i in range(MAX_SLOTS):
+            rows.append(Header(text=f"Слот {i + 1}"))
+            rows.append(
+                Switch(
+                    key=f"slot_{i}_enabled",
+                    text="Показывать в оверлее",
+                    default=i < 4,
+                )
+            )
+            rows.append(
+                Selector(
+                    key=f"slot_{i}_file_index",
+                    text="Файл звука",
+                    default=0,
+                    items=file_choices,
+                    on_change=lambda idx, i=i, files=files: self._on_slot_file_change(i, idx, files),
+                )
+            )
+            rows.append(
+                Input(
+                    key=f"slot_{i}_label",
+                    text="Подпись на кнопке",
+                    default=f"🔊 {i + 1}",
+                )
+            )
+            rows.append(Divider())
+
+        return rows
+
+    def _on_master_gain_change(self, idx: int):
+        sound_engine.master_gain = [0.25, 0.5, 0.75, 1.0, 1.25][idx]
+
+    def _on_debug_logging_change(self, enabled: bool):
+        set_debug_file_logging(bool(enabled))
+
+    def _on_slot_file_change(self, slot_index: int, choice_index: int, files: List[str]):
+        filename = files[choice_index - 1] if choice_index > 0 else ""
+        self.set_setting(f"slot_{slot_index}_file", filename)
+
+    def _copy_debug_log(self, view):
+        from android_utils import copy_to_clipboard
+        full_log = read_debug_log(500)
+        copy_to_clipboard(full_log)
+
+    def _clear_debug_log(self, view):
+        try:
+            with open(debug_log_path(), "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception:
+            pass
+        run_on_ui_thread(self.refresh_settings_ui)
+
+    def _copy_sounds_path(self, view):
+        from android_utils import copy_to_clipboard
+        copy_to_clipboard(sounds_dir())
+
+    def _on_import_click(self, view):
+        debug_log("Нажата кнопка 'Импортировать звук'")
+        try:
+            context = view.getContext()
+            start_import_picker(context)
+            debug_log("startActivityForResult вызван успешно")
+        except Exception as e:
+            import traceback
+            debug_log(f"ОШИБКА открытия пикера: {e}\n{traceback.format_exc()}")
+            self.notify(f"Не удалось открыть выбор файла: {e}")
