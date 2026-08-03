@@ -1,0 +1,515 @@
+__id__ = "clear_playlist"
+__name__ = "Clear Playlist"
+__description__ = "Adds a 'Delete All' button to your profile playlist to clear it."
+__author__ = "@anivplugins & @mraniv"
+__version__ = "1.0.0"
+__icon__ = "pk_2731651_by_Ctikerubot/15"
+__app_version__ = ">=12.9.0"
+__sdk_version__ = ">=1.4.3.3"
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import log, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from client_utils import RequestCallback, send_request
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+from android.view import View
+from org.telegram.messenger import (
+    ApplicationLoader,
+    LocaleController,
+    MediaController,
+    MessagesController,
+    NotificationCenter,
+    UserConfig,
+)
+from org.telegram.tgnet import TLRPC
+
+MENU_ITEM_ID = 31770
+
+ALERT_CLASS = "org.telegram.ui.Components.AudioPlayerAlert"
+MENU_ITEM_CLASS = "org.telegram.ui.ActionBar.ActionBarMenuItem"
+
+STRINGS = {
+    "en": {
+        "menu": "Delete all tracks",
+        "confirm_title": "Delete all tracks",
+        "confirm_text": "Are you sure you want to delete all tracks from the playlist?",
+        "delete": "Delete",
+        "cancel": "Cancel",
+        "progress_title": "Deleting tracks",
+        "progress_text": "Please keep this window open until it finishes.",
+        "empty": "The playlist is already empty",
+        "done": "Deleted %d tracks",
+        "partial": "Deleted %d tracks, %d failed",
+        "cancelled": "Cancelled, %d tracks deleted",
+        "failed": "Could not clear the playlist: %s",
+    },
+    "ru": {
+        "menu": "Удалить все треки",
+        "confirm_title": "Удалить все треки",
+        "confirm_text": "Вы точно хотите удалить все треки из плейлиста?",
+        "delete": "Удалить",
+        "cancel": "Отмена",
+        "progress_title": "Удаление треков",
+        "progress_text": "Не закрывайте это окно до завершения.",
+        "empty": "Плейлист уже пуст",
+        "done": "Удалено треков: %d",
+        "partial": "Удалено треков: %d, не удалось: %d",
+        "cancelled": "Отменено, удалено треков: %d",
+        "failed": "Не удалось очистить плейлист: %s",
+    },
+}
+
+
+def tr(key):
+    try:
+        language = str(LocaleController.getInstance().getCurrentLocale().getLanguage())
+    except Exception:
+        language = "en"
+    return STRINGS.get(language, STRINGS["en"]).get(key, STRINGS["en"][key])
+
+
+def error_text(error):
+    try:
+        if error is not None and error.text is not None:
+            return str(error.text)
+    except Exception:
+        pass
+    return ""
+
+
+def drawable_id(name):
+    try:
+        resources = find_class("org.telegram.messenger.R$drawable")
+        value = getattr(resources, name, None)
+        if isinstance(value, int):
+            return value
+    except Exception:
+        pass
+    try:
+        context = ApplicationLoader.applicationContext
+        return context.getResources().getIdentifier(name, "drawable", context.getPackageName())
+    except Exception as error:
+        log(f"[clear_playlist] cannot resolve drawable {name}: {error}")
+        return 0
+
+
+class ClearTask:
+    PAGE_LIMIT = 100
+    STEP_DELAY_MS = 60
+    MAX_RETRIES = 2
+
+    def __init__(self, plugin, alert, account):
+        self.plugin = plugin
+        self.alert = alert
+        self.account = account
+        self.queue = []
+        self.deleted_ids = set()
+        self.attempted_ids = set()
+        self.total = 1
+        self.failed = 0
+        self.retries = 0
+        self.cancelled = False
+        self.finished = False
+        self.dialog = None
+
+    def start(self, context, expected_total):
+        self.total = max(1, expected_total)
+        try:
+            self.dialog = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_LOADING)
+            self.dialog.set_title(tr("progress_title"))
+            self.dialog.set_message(tr("progress_text"))
+            self.dialog.set_negative_button(tr("cancel"), lambda builder, which: self.cancel())
+            self.dialog.set_on_cancel_listener(lambda builder: self.cancel())
+            self.dialog.show()
+        except Exception as error:
+            log(f"[clear_playlist] cannot show progress dialog: {error}")
+            self.dialog = None
+        self.fetch_page()
+
+    def cancel(self):
+        self.cancelled = True
+
+    def send(self, request, callback):
+        try:
+            send_request(request, RequestCallback(callback))
+        except Exception as error:
+            log(f"[clear_playlist] send failed: {error}")
+            run_on_ui_thread(lambda: self.finish(str(error)))
+
+    def fetch_page(self):
+        if self.cancelled:
+            self.finish()
+            return
+        try:
+            request = TLRPC.TL_getSavedMusic()
+            request.id = TLRPC.TL_inputUserSelf()
+            request.offset = 0
+            request.limit = self.PAGE_LIMIT
+            request.hash = 0
+        except Exception as error:
+            log(f"[clear_playlist] cannot build getSavedMusic request: {error}")
+            self.finish(str(error))
+            return
+        self.send(request, self.on_page)
+
+    def on_page(self, response, error):
+        documents = []
+        try:
+            raw = getattr(response, "documents", None)
+            if raw is not None:
+                for index in range(raw.size()):
+                    document = raw.get(index)
+                    if document is not None and int(document.id) not in self.attempted_ids:
+                        documents.append(document)
+            count = getattr(response, "count", None)
+            if count:
+                self.total = max(self.total, int(count) + len(self.deleted_ids))
+        except Exception as parse_error:
+            log(f"[clear_playlist] cannot read saved music page: {parse_error}")
+
+        if not documents:
+            message = None
+            if error is not None and not self.deleted_ids:
+                message = error_text(error) or "request failed"
+            run_on_ui_thread(lambda: self.finish(message))
+            return
+
+        self.queue = documents
+        run_on_ui_thread(self.delete_next)
+
+    def delete_next(self):
+        if self.cancelled:
+            self.finish()
+            return
+        while self.queue:
+            document = self.queue.pop(0)
+            try:
+                document_id = int(document.id)
+            except Exception:
+                continue
+            if document_id in self.attempted_ids:
+                continue
+            self.attempted_ids.add(document_id)
+            self.retries = 0
+            self.send_delete(document)
+            return
+        self.fetch_page()
+
+    def send_delete(self, document):
+        if self.cancelled:
+            self.finish()
+            return
+        try:
+            request = TLRPC.TL_account_saveMusic()
+            request.unsave = True
+            input_document = TLRPC.TL_inputDocument()
+            input_document.id = document.id
+            input_document.access_hash = document.access_hash
+            input_document.file_reference = document.file_reference or b""
+            request.id = input_document
+        except Exception as error:
+            log(f"[clear_playlist] cannot build saveMusic request: {error}")
+            self.failed += 1
+            run_on_ui_thread(self.step_done, self.STEP_DELAY_MS)
+            return
+        self.send(request, lambda response, err: self.on_deleted(document, response, err))
+
+    def on_deleted(self, document, response, error):
+        if self.cancelled:
+            run_on_ui_thread(self.finish)
+            return
+
+        text = error_text(error)
+        if text.startswith("FLOOD_WAIT_"):
+            try:
+                wait = int(text.rsplit("_", 1)[1])
+            except Exception:
+                wait = 5
+            wait = min(max(wait, 1), 60)
+            run_on_ui_thread(lambda: self.send_delete(document), (wait + 1) * 1000)
+            return
+
+        if text and self.retries < self.MAX_RETRIES:
+            self.retries += 1
+            run_on_ui_thread(lambda: self.send_delete(document), 1000)
+            return
+
+        if text:
+            self.failed += 1
+            log(f"[clear_playlist] saveMusic failed: {text}")
+        else:
+            try:
+                self.deleted_ids.add(int(document.id))
+            except Exception:
+                pass
+        run_on_ui_thread(self.step_done, self.STEP_DELAY_MS)
+
+    def step_done(self):
+        done = len(self.deleted_ids) + self.failed
+        if self.dialog is not None:
+            try:
+                self.dialog.set_progress(min(100, int(done * 100 / max(1, self.total))))
+            except Exception:
+                pass
+        self.delete_next()
+
+    def finish(self, message=None):
+        if self.finished:
+            return
+        self.finished = True
+        if self.dialog is not None:
+            try:
+                self.dialog.dismiss()
+            except Exception:
+                pass
+            self.dialog = None
+        run_on_ui_thread(lambda: self.apply_local_state(message))
+
+    def apply_local_state(self, message):
+        deleted = len(self.deleted_ids)
+        saved = None
+        try:
+            saved = MediaController.getInstance().currentSavedMusicList
+            if saved is not None and int(saved.currentAccount) != self.account:
+                saved = None
+        except Exception as error:
+            log(f"[clear_playlist] cannot read saved music list: {error}")
+
+        if deleted:
+            try:
+                ids = MessagesController.getInstance(self.account).getSavedMusicIds()
+                for document_id in self.deleted_ids:
+                    ids.update(document_id, False)
+            except Exception as error:
+                log(f"[clear_playlist] cannot update saved music ids: {error}")
+
+        emptied = False
+        if saved is not None and deleted:
+            try:
+                kept = []
+                for index in range(saved.list.size()):
+                    message_object = saved.list.get(index)
+                    document = message_object.getDocument() if message_object is not None else None
+                    if document is None or int(document.id) not in self.deleted_ids:
+                        kept.append(message_object)
+                saved.list.clear()
+                for message_object in kept:
+                    saved.list.add(message_object)
+                saved.totalCount = max(0, int(saved.totalCount) - deleted)
+                if saved.list.isEmpty() and not self.cancelled and self.failed == 0:
+                    saved.totalCount = 0
+                    saved.endReached = True
+                    emptied = True
+                saved.updateFirstMusic()
+            except Exception as error:
+                log(f"[clear_playlist] cannot update local playlist: {error}")
+
+        try:
+            if emptied:
+                MediaController.getInstance().cleanup()
+            elif saved is not None and deleted:
+                NotificationCenter.getInstance(self.account).postNotificationName(
+                    NotificationCenter.musicListLoaded, saved
+                )
+        except Exception as error:
+            log(f"[clear_playlist] cannot refresh player state: {error}")
+
+        if emptied:
+            try:
+                self.alert.dismiss()
+            except Exception:
+                pass
+
+        self.plugin.on_task_finished(self)
+        self.show_result(message, deleted)
+
+    def show_result(self, message, deleted):
+        try:
+            if message:
+                BulletinHelper.show_error(tr("failed") % message)
+            elif self.cancelled:
+                BulletinHelper.show_info(tr("cancelled") % deleted)
+            elif self.failed:
+                BulletinHelper.show_error(tr("partial") % (deleted, self.failed))
+            elif deleted:
+                BulletinHelper.show_success(tr("done") % deleted)
+        except Exception as error:
+            log(f"[clear_playlist] cannot show result: {error}")
+
+
+class AlertConstructorHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.setup_alert(param.thisObject)
+        except Exception as error:
+            log(f"[clear_playlist] constructor hook error: {error}")
+
+
+class SubItemClickHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if len(param.args) != 1 or int(param.args[0]) != MENU_ITEM_ID:
+                return
+            param.setResult(None)
+            self.plugin.on_clear_clicked(param.thisObject)
+        except Exception as error:
+            log(f"[clear_playlist] click hook error: {error}")
+
+
+class ToggleSearchHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            entry = self.plugin.entry
+            if entry is None:
+                return
+            search_item, menu_item = entry
+            if search_item is None or menu_item is None:
+                return
+            if not search_item.equals(param.thisObject):
+                return
+            expanded = bool(param.getResult())
+            menu_item.setVisibility(View.GONE if expanded else View.VISIBLE)
+        except Exception as error:
+            log(f"[clear_playlist] search hook error: {error}")
+
+
+class AlertDismissHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.entry = None
+        except Exception as error:
+            log(f"[clear_playlist] dismiss hook error: {error}")
+
+
+class Plugin(BasePlugin):
+    def on_plugin_load(self):
+        self.unhooks = []
+        self.entry = None
+        self.task = None
+
+        alert_class = find_class(ALERT_CLASS)
+        if alert_class is None:
+            log(f"[clear_playlist] {ALERT_CLASS} not found, plugin disabled")
+            return
+
+        self.register(lambda: self.hook_all_constructors(alert_class, AlertConstructorHook(self)))
+        self.register(lambda: self.hook_all_methods(alert_class, "onSubItemClick", SubItemClickHook(self)))
+        self.register(lambda: self.hook_all_methods(alert_class, "dismiss", AlertDismissHook(self)))
+
+        menu_item_class = find_class(MENU_ITEM_CLASS)
+        if menu_item_class is not None:
+            self.register(lambda: self.hook_all_methods(menu_item_class, "toggleSearch", ToggleSearchHook(self)))
+        else:
+            log(f"[clear_playlist] {MENU_ITEM_CLASS} not found, search hiding disabled")
+
+    def register(self, factory):
+        try:
+            result = factory()
+        except Exception as error:
+            log(f"[clear_playlist] hook failed: {error}")
+            return
+        if not result:
+            log("[clear_playlist] hook returned nothing")
+            return
+        if isinstance(result, list):
+            self.unhooks.extend(result)
+        else:
+            self.unhooks.append(result)
+
+    def on_plugin_unload(self):
+        entry = self.entry
+        if entry is not None and entry[1] is not None:
+            try:
+                run_on_ui_thread(lambda: entry[1].setVisibility(View.GONE))
+            except Exception:
+                pass
+        self.entry = None
+        if self.task is not None:
+            self.task.cancel()
+            self.task = None
+        for unhook in getattr(self, "unhooks", []):
+            try:
+                self.unhook_method(unhook)
+            except Exception as error:
+                log(f"[clear_playlist] error unhooking: {error}")
+        self.unhooks = []
+
+    def setup_alert(self, alert):
+        saved = get_private_field(alert, "savedMusicList")
+        if saved is None:
+            return
+        account = int(saved.currentAccount)
+        if account != int(UserConfig.selectedAccount):
+            return
+        if int(saved.dialogId) != int(UserConfig.getInstance(account).getClientUserId()):
+            return
+
+        action_bar = get_private_field(alert, "actionBar")
+        if action_bar is None:
+            return
+        menu_item = action_bar.createMenu().addItem(MENU_ITEM_ID, drawable_id("msg_delete"))
+        if menu_item is None:
+            return
+        try:
+            menu_item.setContentDescription(tr("menu"))
+        except Exception:
+            pass
+        self.entry = (get_private_field(alert, "searchItem"), menu_item)
+
+    def on_clear_clicked(self, alert):
+        if self.task is not None and not self.task.finished:
+            return
+
+        saved = get_private_field(alert, "savedMusicList")
+        if saved is None:
+            return
+        account = int(saved.currentAccount)
+        expected = max(int(saved.totalCount), saved.list.size())
+        if expected <= 0:
+            BulletinHelper.show_info(tr("empty"))
+            return
+
+        context = get_private_field(alert, "parentActivity")
+        if context is None:
+            context = alert.getContext()
+
+        builder = AlertDialogBuilder(context)
+        builder.set_title(tr("confirm_title"))
+        builder.set_message(tr("confirm_text"))
+        builder.set_positive_button(
+            tr("delete"),
+            lambda dialog, which: self.start_task(alert, account, context, expected),
+        )
+        builder.set_negative_button(tr("cancel"), None)
+        builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        builder.show()
+
+    def start_task(self, alert, account, context, expected):
+        try:
+            self.task = ClearTask(self, alert, account)
+            self.task.start(context, expected)
+        except Exception as error:
+            log(f"[clear_playlist] cannot start clear task: {error}")
+            self.task = None
+
+    def on_task_finished(self, task):
+        if self.task is task:
+            self.task = None
