@@ -1,0 +1,4531 @@
+import hashlib
+import json
+import os
+import re
+import shutil
+import threading
+import time
+import traceback
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import Counter
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, get_messages_controller, run_on_queue, send_document, send_message, send_photo
+from file_utils import ensure_dir_exists, get_cache_dir
+from ui.settings import Divider, Header, Selector, Switch, Text
+
+try:
+    from ui.alert import AlertDialogBuilder
+except Exception:
+    AlertDialogBuilder = None
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
+    try:
+        from bulletin import BulletinHelper
+    except Exception:
+        BulletinHelper = None
+
+try:
+    from PIL import Image, ImageDraw, ImageOps
+except Exception:
+    Image = ImageDraw = ImageOps = None
+
+
+__id__ = "privacy_firewall"
+__name__ = "Privacy Firewall"
+__description__ = (
+    "Персональный Privacy Firewall для Telegram. Защищает сообщения и файлы "
+    "от случайной отправки личных данных, опасных ссылок, координат, документов, "
+    "банковских реквизитов, паролей и токенов. Все проверки выполняются локально.\n\n"
+    "По всем вопросам или найденным уязвимостям: @qwertsyiks"
+)
+__author__ = "@qwertsyiks"
+__version__ = "0.7.3"
+__icon__ = "teststiofgu/0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+__requirements__ = ["pypdf>=5.0"]
+
+
+PROFILE_BASIC, PROFILE_STANDARD, PROFILE_STRICT = 0, 1, 2
+ACTION_ASK, ACTION_AUTO_MASK, ACTION_BLOCK = 0, 1, 2
+MASK_PARTIAL, MASK_BULLETS, MASK_LABELS = 0, 1, 2
+VISIBLE_TAIL_OPTIONS = (0, 2, 4)
+FILE_LIMIT_MB_OPTIONS = (1, 5, 10, 25, 50, 100, 250)
+MAX_SCAN = 16000
+MAX_FILE = 250 * 1024 * 1024
+BYPASS_TTL = 12
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+VOICE_NOTE_EXTS = {".ogg", ".opus", ".oga"}
+VIDEO_NOTE_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".3gp"}
+AUTO_MEDIA_STEM_RE = re.compile(
+    r"(?i)^(?:(?:voice|audio|video|video[_ .-]?note|videonote|round|ptt|"
+    r"record(?:ing)?|telegram|tg|cache|temp|tmp|vid|aud)[ _.-]*)?"
+    r"-?\d+(?:[_.-]\d+)*$"
+)
+PHONE_FILENAME_MARKER_RE = re.compile(
+    r"(?i)(?:тел(?:ефон)?|phone|mobile|whatsapp|контакт|номер)[ _.-]*"
+)
+OFFICE_EXTS = {".docx", ".xlsx", ".pptx"}
+TEXT_EXTS = {".txt", ".csv", ".json", ".xml", ".md", ".log", ".ini", ".conf", ".yaml", ".yml", ".html", ".htm"}
+PDF_EXTS = {".pdf"}
+CONTENT_SCAN_EXTS = TEXT_EXTS | OFFICE_EXTS | PDF_EXTS
+MAX_CONTENT_BYTES = 4 * 1024 * 1024
+MAX_CONTENT_CHARS = 120000
+MAX_PDF_PAGES = 30
+HIDDEN = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff",
+          "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+          "\u2066", "\u2067", "\u2068", "\u2069"}
+SENSITIVE_NAMES = ("passport", "паспорт", "password", "пароль", "secret",
+                   "секрет", "token", "токен", "seed", "private", "приват",
+                   "card", "карта", "договор", "contract", "invoice", "снилс",
+                   "инн", "iban", "wallet", "кошел[её]к", "recovery", "backup")
+
+SHORTENER_HOSTS = {
+    "bit.ly", "tinyurl.com", "t.co", "clck.ru", "goo.su", "is.gd",
+    "cutt.ly", "rb.gy", "shorturl.at", "vk.cc",
+}
+DANGEROUS_FILE_SUFFIXES = (
+    ".apk", ".exe", ".scr", ".bat", ".cmd", ".com", ".msi", ".jar",
+)
+SENSITIVE_URL_PARAM_RE = re.compile(
+    r"(?i)(?:[?&](?:token|access_token|auth|session|password|passwd|secret|"
+    r"api_key|apikey|code|otp|phone|email|address|location)=)[^&#\s]{3,}"
+)
+BOT_COMMAND_RE = re.compile(
+    r"^\s*/([a-z0-9_]{1,64})(?:@[a-z0-9_]{3,64})?(?:\s+([^\n]{1,1000}))?",
+    re.IGNORECASE,
+)
+RISKY_BOT_COMMANDS = {
+    "verify", "verification", "login", "auth", "authenticate", "passport",
+    "document", "kyc", "card", "payment", "pay", "token", "password",
+    "seed", "recovery", "wallet", "bank", "phone", "email", "address",
+    "location", "otp", "code", "confirm", "identity", "profile",
+}
+
+DETECTION_REASONS = {
+    "private_key": "Похож на блок приватного криптографического ключа.",
+    "seed": "После маркера seed/recovery найдена мнемоническая фраза из 12–24 слов.",
+    "bot_token": "Строка совпадает с форматом токена Telegram-бота.",
+    "api_secret": "Рядом с маркером token, secret или API key найдено значение секрета.",
+    "password": "После слова «пароль» или password найдено значение.",
+    "card": "Число похоже на банковскую карту и прошло проверку Луна.",
+    "iban": "Строка соответствует структуре IBAN и контрольной сумме.",
+    "document_id": "Номер указан рядом с маркером паспорта или документа.",
+    "full_name": "Найдена последовательность имени, фамилии и отчества либо явный маркер ФИО.",
+    "gps_coordinates": "Две координаты попадают в допустимые диапазоны широты и долготы.",
+    "map_link": "Ссылка ведёт на картографический сервис и может раскрыть местоположение.",
+    "address": "Найдены маркеры улицы, дома, корпуса, квартиры или явный адрес.",
+    "settlement": "Название указано после маркера города, села, района или контекстной фразы.",
+    "postal_code": "Число указано как почтовый индекс.",
+    "email": "Строка соответствует формату электронной почты.",
+    "phone": "Последовательность похожа на международный или форматированный номер телефона.",
+    "otp": "Короткий цифровой код указан рядом с OTP, 2FA или кодом подтверждения.",
+    "suspicious_link": "В ссылке обнаружен признак риска или раскрытия данных.",
+    "hidden_chars": "В тексте есть невидимый или управляющий Unicode-символ.",
+    "safe_filename": "Название файла может раскрывать личные данные ещё до открытия вложения.",
+    "file_content_mask": "Внутри файла найдены фрагменты, совпавшие с правилами защиты.",
+    "pdf_content_warning": "В PDF найден текст с конфиденциальными данными, который нельзя безопасно заменить автоматически.",
+    "location_share_block": "Telegram-вложение содержит точную географическую точку.",
+}
+
+LABELS = {
+    "private_key": "Приватный ключ", "seed": "Seed-фраза",
+    "bot_token": "Токен Telegram-бота", "api_secret": "API-ключ или токен",
+    "password": "Пароль", "card": "Банковская карта",
+    "iban": "Банковский счёт", "document_id": "Документ или паспорт",
+    "full_name": "ФИО",
+    "gps_coordinates": "GPS-координаты",
+    "map_link": "Ссылка на карту",
+    "address": "Адрес",
+    "settlement": "Город или населённый пункт",
+    "postal_code": "Почтовый индекс",
+    "email": "Электронная почта", "phone": "Номер телефона",
+    "otp": "Код подтверждения", "suspicious_link": "Подозрительная ссылка",
+    "hidden_chars": "Скрытые символы", "image_metadata": "Метаданные изображения",
+    "office_metadata": "Метаданные Office-файла", "safe_filename": "Безопасное имя файла",
+    "file_content_mask": "Маскировать данные внутри файла",
+    "pdf_content_warning": "Не отправлять PDF с личными данными",
+    "location_share_block": "Не отправлять точную геолокацию",
+    "bot_command_warning": "Команда бота",
+    "forward_warning": "Пересылка сообщения",
+}
+PRIORITY = {
+    "private_key": 110, "seed": 105, "bot_token": 100, "api_secret": 95,
+    "password": 95, "map_link": 94, "gps_coordinates": 93,
+    "address": 92, "card": 90, "iban": 88, "settlement": 86,
+    "document_id": 82, "postal_code": 80,
+    "full_name": 70, "email": 65, "phone": 60, "otp": 55, "suspicious_link": 45,
+    "hidden_chars": 40,
+}
+STATS = ("scans", "warnings", "protected_sends", "sent_unchanged", "cancelled",
+         "text_masks", "media_cleaned", "files_renamed", "recipient_warnings",
+         "location_masks", "location_shares_blocked", "forward_warnings",
+         "bot_command_warnings", "link_warnings", "filename_warnings")
+
+EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]{1,64}@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}(?![\w.-])")
+CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+PHONE_RE = re.compile(r"(?<!\d)\+?\d(?:[\d\s().-]{7,}\d)(?!\d)")
+IBAN_RE = re.compile(r"(?i)\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b")
+BOT_RE = re.compile(r"(?<![A-Za-z0-9_-])\d{6,12}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])")
+OPENAI_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-)?[A-Za-z0-9_-]{16,}")
+GITHUB_RE = re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{20,}")
+AWS_RE = re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")
+SECRET_RE = re.compile(
+    r"(?i)\b(api[\s_-]?key|access[\s_-]?token|auth[\s_-]?token|bot[\s_-]?token|"
+    r"token|secret|client[\s_-]?secret|password|passwd|passphrase|session|"
+    r"api[\s_-]?ключ|токен|секрет|пароль)\b\s*[:=]\s*[\"']?([A-Za-z0-9_./+\-=]{6,})"
+)
+OTP_RE = re.compile(
+    r"(?i)\b(?:код\s+подтверждения|одноразовый\s+код|verification\s+code|"
+    r"security\s+code|login\s+code|код|otp|2fa)\b[\s:=-]{0,12}(\d{4,8})\b"
+)
+SEED_RE = re.compile(
+    r"(?is)\b(?:seed(?:\s+phrase)?|mnemonic|recovery\s+phrase|сид(?:[-\s]+фраза)?|"
+    r"мнемоническая\s+фраза)\b\s*[:=-]?\s*((?:[A-Za-zА-Яа-яЁё]{3,}[,\s]+){11,23}[A-Za-zА-Яа-яЁё]{3,})"
+)
+PRIVATE_RE = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----[\s\S]{20,}?-----END(?: [A-Z0-9]+)? PRIVATE KEY-----"
+)
+PASSPORT_RE = re.compile(
+    r"(?i)\b(?:серия\s+и\s+номер\s+паспорта|номер\s+паспорта|"
+    r"паспорт(?:а|ные\s+данные)?|passport(?:\s+(?:number|no\.?|id))?|"
+    r"document\s+id|номер\s+документа)\s*[:№#=-]?\s*"
+    r"([A-ZА-ЯЁ]{0,3}\s*\d(?:[\d -]{4,16}\d))"
+)
+RUSSIAN_NAME_WORD = r"[А-ЯЁа-яё][А-Яа-яЁё-]{1,30}"
+FULL_NAME_LABEL_RE = re.compile(
+    r"(?i)\b(?:фио|ф\.?\s*и\.?\s*о\.?|получатель|владелец|"
+    r"имя\s+получателя)\s*[:=-]\s*"
+    rf"({RUSSIAN_NAME_WORD}(?:\s+{RUSSIAN_NAME_WORD}){{1,2}})"
+)
+RUSSIAN_NAME_PART = r"[А-ЯЁ][а-яё-]{1,30}"
+RUSSIAN_SURNAME = (
+    r"[А-ЯЁ][а-яё-]{1,25}(?:"
+    r"ов|ев|ёв|ин|ын|ский|цкий|ской|цкой|"
+    r"ова|ева|ёва|ина|ына|ская|цкая"
+    r")"
+)
+RUSSIAN_PATRONYMIC = (
+    r"[А-ЯЁ][а-яё-]{1,25}(?:"
+    r"ович|евич|ич|овна|евна|ична|инична"
+    r")"
+)
+FULL_NAME_RE = re.compile(
+    rf"(?<![А-Яа-яЁё-])(?:"
+    rf"{RUSSIAN_SURNAME}\s+{RUSSIAN_NAME_PART}\s+{RUSSIAN_PATRONYMIC}|"
+    rf"{RUSSIAN_NAME_PART}\s+{RUSSIAN_PATRONYMIC}\s+{RUSSIAN_SURNAME}"
+    rf")(?![А-Яа-яЁё-])",
+    re.IGNORECASE,
+)
+URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>()]{5,}")
+
+SENSITIVE_MARKER_RE = re.compile(
+    r"(?i)\b(?:фио|паспорт|номер\s+документа|телефон|тел\.|"
+    r"почта|email|e-mail|карта|iban|сч[её]т|пароль|password|"
+    r"token|токен|api[\s_-]?key|код|otp|2fa|адрес|улица|ул\.|"
+    r"город|г\.|село|с\.|пос[её]лок|пос\.|gps|координат|"
+    r"индекс|живу\s+в|проживаю\s+в|нахожусь\s+в)\b"
+)
+
+
+# Location Guard. Any name following an explicit administrative marker is
+# treated as a location, so no fixed list of cities or villages is required.
+PLACE_TOKEN = r"[А-ЯЁA-Z][А-Яа-яЁёA-Za-z0-9'’\-]{0,40}"
+PLACE_NAME = rf"{PLACE_TOKEN}(?:\s+{PLACE_TOKEN}){{0,3}}"
+STREET_TOKEN = (
+    r"(?:\d{1,3}(?:-?[А-Яа-яA-Za-z]{0,3})?|"
+    r"[А-ЯЁA-Z][А-Яа-яЁёA-Za-z0-9'’.\-]{0,40}|"
+    r"имени|им\.)"
+)
+STREET_NAME = rf"{STREET_TOKEN}(?:\s+{STREET_TOKEN}){{0,4}}"
+
+DECIMAL_COORD_RE = re.compile(
+    r"(?<![\d.,])"
+    r"([+-]?\d{1,2}(?:[.,]\d{3,8}))"
+    r"\s*(?:[,;/]|\s{1,3})\s*"
+    r"([+-]?\d{1,3}(?:[.,]\d{3,8}))"
+    r"(?![\d.,])"
+)
+DMS_COORD_RE = re.compile(
+    r"(?i)(?<!\w)"
+    r"\d{1,3}\s*[°º]\s*\d{1,2}\s*['′]\s*"
+    r"(?:\d{1,2}(?:[.,]\d+)?)?\s*[\"″]?\s*[NSEWСЮВЗ]"
+    r"\s*[,;/ ]+\s*"
+    r"\d{1,3}\s*[°º]\s*\d{1,2}\s*['′]\s*"
+    r"(?:\d{1,2}(?:[.,]\d+)?)?\s*[\"″]?\s*[NSEWСЮВЗ]"
+)
+MAP_LINK_RE = re.compile(
+    r"(?i)\bhttps?://(?:"
+    r"(?:www\.)?google\.[^/\s]+/maps|"
+    r"maps\.google\.[^/\s]+|goo\.gl/maps|maps\.app\.goo\.gl|"
+    r"(?:www\.)?yandex\.[^/\s]+/maps|maps\.yandex\.[^/\s]+|"
+    r"(?:www\.)?2gis\.[^/\s]+|maps\.apple\.com|"
+    r"(?:www\.)?openstreetmap\.org"
+    r")[^\s<>()]*"
+)
+ADDRESS_LABEL_RE = re.compile(
+    r"(?i)\b(?:адрес|место\s+(?:жительства|проживания)|"
+    r"фактический\s+адрес|адрес\s+регистрации|прописка)"
+    r"\s*[:=-]\s*"
+    r"(.{3,180}?)"
+    r"(?=(?:\s+(?:телефон|тел\.|почта|email|e-mail|фио|паспорт|"
+    r"инн|снилс)\s*[:=-])|[\n;]|$)"
+)
+SETTLEMENT_RE = re.compile(
+    rf"(?<![\w])(?:"
+    rf"(?i:(?:г|гор)(?:\.\s*|\s+))|(?i:город)\s+|"
+    rf"(?i:с)(?:\.\s*|\s+)|(?i:село)\s+|"
+    rf"(?i:(?:пос|п)(?:\.\s*|\s+))|(?i:пос[её]лок)\s+|"
+    rf"(?i:(?:пгт|рп)(?:\.\s*|\s+))|"
+    rf"(?i:(?:д|дер)(?:\.\s*|\s+))|(?i:деревня)\s+|"
+    rf"(?i:ст)(?:\.\s*|\s+)|(?i:станица)\s+|"
+    rf"(?i:х)(?:\.\s*|\s+)|(?i:хутор|аул|кишлак)\s+"
+    rf"){PLACE_NAME}"
+)
+ADMIN_AREA_RE = re.compile(
+    rf"(?<![\w])(?:"
+    rf"(?i:обл)(?:\.\s*|\s+)|(?i:область)\s+|"
+    rf"(?i:респ)(?:\.\s*|\s+)|(?i:республика)\s+|"
+    rf"(?i:край)\s+|(?i:р-н)(?:\.\s*|\s+)|(?i:район)\s+|"
+    rf"(?i:округ)\s+"
+    rf"){PLACE_NAME}"
+)
+STREET_RE = re.compile(
+    rf"(?<![\w])(?:"
+    rf"(?i:ул)(?:\.\s*|\s+)|(?i:улица)\s+|"
+    rf"(?i:пр-?т|просп)(?:\.\s*|\s+)|(?i:проспект)\s+|"
+    rf"(?i:пер)(?:\.\s*|\s+)|(?i:переулок)\s+|"
+    rf"(?i:ш)(?:\.\s*|\s+)|(?i:шоссе)\s+|"
+    rf"(?i:наб)(?:\.\s*|\s+)|(?i:набережная)\s+|"
+    rf"(?i:б-р)(?:\.\s*|\s+)|(?i:бульвар)\s+|"
+    rf"(?i:пл)(?:\.\s*|\s+)|(?i:площадь)\s+|"
+    rf"(?i:пр-д)(?:\.\s*|\s+)|(?i:проезд|аллея|тупик)\s+|"
+    rf"(?i:мкр)(?:\.\s*|\s+)|(?i:микрорайон)\s+"
+    rf"){STREET_NAME}"
+)
+BUILDING_RE = re.compile(
+    r"(?<![\w])(?:"
+    r"(?i:д)(?:\.\s*|\s+)|(?i:дом)\s+|"
+    r"(?i:корп)(?:\.\s*|\s+)|(?i:корпус)\s+|"
+    r"(?i:стр)(?:\.\s*|\s+)|(?i:строение)\s+|"
+    r"(?i:кв)(?:\.\s*|\s+)|(?i:квартира)\s+|"
+    r"(?i:оф)(?:\.\s*|\s+)|(?i:офис)\s+|"
+    r"(?i:подъезд)\s+|(?i:этаж)\s+"
+    r")[:№#=-]?\s*\d{1,6}[A-Za-zА-Яа-яЁё]?"
+    r"(?:[/.\-]\d{1,6}[A-Za-zА-Яа-яЁё]?)?"
+    r"(?![\w])"
+)
+LOCATION_CONTEXT_RE = re.compile(
+    rf"(?i:\b(?:живу|проживаю|нахожусь|находимся|родом|"
+    rf"прописан(?:а)?|зарегистрирован(?:а)?|локация|местоположение)"
+    rf"\s+(?:в|во|из|около|рядом\s+с)\s+)"
+    rf"({PLACE_NAME})"
+)
+POSTAL_LABEL_RE = re.compile(
+    r"(?i)\b(?:почтовый\s+индекс|индекс)\s*[:=-]?\s*(\d{5,6})\b"
+)
+POSTAL_BEFORE_PLACE_RE = re.compile(
+    r"(?<!\d)(\d{6})(?=\s*,\s*(?:(?:г|гор)\.?|город|с\.|село|"
+    r"пос\.?|пос[её]лок|дер\.?|деревня)\s*)"
+)
+
+SEND_KEYS = (
+    "peer", "message", "caption", "location", "photo", "user", "document",
+    "videoEditedInfo", "game", "poll", "pollSendParams", "pollIndex", "todo",
+    "invoice", "mediaWebPage", "cover", "path", "replyToMsg", "replyToTopMsg",
+    "webPage", "searchLinks", "retryMessageObject", "entities", "replyMarkup",
+    "params", "notify", "scheduleDate", "scheduleRepeatPeriod", "ttl",
+    "parentObject", "sendAnimationData", "updateStickersOrder", "effect_id",
+    "hasMediaSpoilers", "replyToStoryItem", "sendingStory", "replyQuote",
+    "invert_media", "sendingHighQuality", "stars", "payStars", "monoForumPeer",
+    "quick_reply_shortcut", "quick_reply_shortcut_id", "suggestionParams",
+    "isLivePhoto", "livePhotoTimestamp", "dice_stake", "inputRichMessage",
+)
+
+
+def digits(value):
+    return re.sub(r"\D", "", value)
+
+
+def luhn(value):
+    ds = digits(value)
+    if not 13 <= len(ds) <= 19 or len(set(ds)) == 1:
+        return False
+    total, parity = 0, len(ds) % 2
+    for i, char in enumerate(ds):
+        n = int(char)
+        if i % 2 == parity:
+            n = n * 2 - 9 if n * 2 > 9 else n * 2
+        total += n
+    return total % 10 == 0
+
+
+def iban_valid(value):
+    value = re.sub(r"\s", "", value).upper()
+    if not 15 <= len(value) <= 34 or not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]+", value):
+        return False
+    rem = 0
+    for char in value[4:] + value[:4]:
+        part = str(ord(char) - 55) if char.isalpha() else char
+        for d in part:
+            rem = (rem * 10 + int(d)) % 97
+    return rem == 1
+
+
+def finding(kind, match, group=0, reason=""):
+    item = {
+        "kind": kind, "start": match.start(group), "end": match.end(group),
+        "original": match.group(group), "priority": PRIORITY.get(kind, 0),
+    }
+    if reason:
+        item["reason"] = reason
+    return item
+
+
+def resolve(findings):
+    picked = []
+    for item in sorted(findings, key=lambda x: (-x["priority"], -(x["end"]-x["start"]), x["start"])):
+        if not any(item["start"] < p["end"] and item["end"] > p["start"] for p in picked):
+            picked.append(item)
+    return sorted(picked, key=lambda x: x["start"])
+
+
+def mask_value(kind, value):
+    if kind == "email":
+        local, sep, domain = value.partition("@")
+        return f"{local[:1] or '*'}***@{domain}" if sep else "***@***"
+    if kind == "phone":
+        return f"+••• ••• •• {digits(value)[-2:]}".rstrip()
+    if kind == "card":
+        return f"•••• •••• •••• {digits(value)[-4:]}".rstrip()
+    if kind == "iban":
+        compact = re.sub(r"\s", "", value)
+        return f"•••• •••• •••• {compact[-4:]}".rstrip()
+    if kind in ("api_secret", "bot_token"):
+        return f"{value[:4]}••••••{value[-4:]}" if len(value) >= 12 else "••••••••"
+    if kind == "password":
+        return "••••••••"
+    if kind == "otp":
+        return "••••••"
+    if kind == "seed":
+        return "[SEED-ФРАЗА СКРЫТА]"
+    if kind == "private_key":
+        return "[ПРИВАТНЫЙ КЛЮЧ СКРЫТ]"
+    if kind == "document_id":
+        ds = digits(value)
+        tail = ds[-2:] if len(ds) >= 2 else ""
+        return f"••••••{tail}" if tail else "[НОМЕР ДОКУМЕНТА СКРЫТ]"
+    if kind == "full_name":
+        parts = value.split()
+        return " ".join((part[:1] + "***") if part else "***" for part in parts)
+    if kind == "gps_coordinates":
+        return "[КООРДИНАТЫ СКРЫТЫ]"
+    if kind == "map_link":
+        return "[ССЫЛКА НА КАРТУ СКРЫТА]"
+    if kind == "address":
+        return "[АДРЕС СКРЫТ]"
+    if kind == "settlement":
+        return "[НАСЕЛЁННЫЙ ПУНКТ СКРЫТ]"
+    if kind == "postal_code":
+        return "••••••"
+    if kind == "suspicious_link":
+        return "[ПОДОЗРИТЕЛЬНАЯ ССЫЛКА СКРЫТА]"
+    if kind == "hidden_chars":
+        return ""
+    return "••••••"
+
+
+def masked_text(text, findings, selected):
+    result = text
+    for item in reversed([f for f in findings if f["kind"] in selected]):
+        result = result[:item["start"]] + mask_value(item["kind"], item["original"]) + result[item["end"]:]
+    return result
+
+
+class PrivacyFirewallPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.RLock()
+        self._bypass = {}
+        self._ocr_warning_shown = False
+        self._ocr_engine_cache = None
+        self._active_protection_banner = None
+        self._last_forward_notice = ("", 0.0)
+        self._forward_bypass = {}
+        self._forward_pending = {}
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook(priority=120)
+        # Raw TL_messages_forwardMessages interception is intentionally disabled.
+        # Cancelling this request can crash some Telegram/exteraGram builds.
+        # Forward-related checks remain available only through the safe
+        # outgoing-message payload path.
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            item_id="privacy_firewall_profile",
+            text="Уровень защиты",
+            subtext="Посмотреть или изменить текущий уровень",
+            icon="msg_security",
+            on_click=self._open_chat_profile_menu,
+            priority=30,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            item_id="privacy_firewall_trust",
+            text="Доверие к чату",
+            subtext="Нажмите, чтобы сразу изменить статус",
+            icon="msg_permissions",
+            on_click=self._open_trust_dialog,
+            priority=20,
+        ))
+        self.log("Privacy Firewall loaded")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="БЕЗОПАСНОСТЬ"),
+            Text(
+                text="✓ БЕЗОПАСЕН · LOCAL ONLY",
+                subtext=(
+                    "Нет сетевых запросов. Тексты, файлы и найденные значения "
+                    "не отправляются на сторонние серверы."
+                ),
+                icon="msg_security",
+                on_click=self._show_safety_info,
+            ),
+            Divider(),
+
+            Header(text="Основные настройки"),
+            Switch(
+                key="enabled",
+                text="Защищать исходящие сообщения",
+                default=True,
+                subtext="Главный переключатель Privacy Firewall.",
+                icon="msg_secret",
+            ),
+            Text(
+                text="Профили защиты",
+                subtext="Нажмите, чтобы посмотреть описание каждого уровня.",
+                icon="msg_info",
+                on_click=self._show_profile_info,
+            ),
+            Selector(
+                key="profile",
+                text="Выбранный профиль",
+                default=PROFILE_STANDARD,
+                items=["Базовый", "Стандартный", "Максимальный"],
+                icon="msg_security",
+            ),
+            Selector(
+                key="action_mode",
+                text="Действие при обнаружении",
+                default=ACTION_ASK,
+                items=[
+                    "Показать окно выбора",
+                    "Автоматически защитить",
+                    "Полностью блокировать",
+                ],
+                icon="msg_warning",
+            ),
+            Switch(
+                key="check_saved",
+                text="Проверять «Избранное»",
+                default=False,
+                icon="msg_saved",
+            ),
+            Switch(
+                key="marker_only_mode",
+                text="Только сообщения с маркерами",
+                default=False,
+                subtext=(
+                    "Проверять только текст со словами «телефон», «адрес», "
+                    "«ФИО», «паспорт» и похожими."
+                ),
+                icon="msg_filter",
+            ),
+            Divider(),
+
+            Header(text="Text Guard · финансы"),
+            Switch(key="detect_cards", text="Банковские карты", default=True, icon="msg_payment"),
+            Switch(key="detect_iban", text="IBAN и банковские счета", default=True, icon="msg_payment"),
+            Divider(),
+
+            Header(text="Text Guard · контакты"),
+            Switch(key="detect_phone", text="Номера телефонов", default=True, icon="msg_calls"),
+            Switch(key="detect_email", text="Электронная почта", default=True, icon="msg_email"),
+            Divider(),
+
+            Header(text="Text Guard · личность"),
+            Switch(
+                key="detect_fio",
+                text="ФИО",
+                default=True,
+                subtext="Поддерживает заглавные и маленькие буквы.",
+                icon="msg_contacts",
+            ),
+            Switch(key="detect_documents", text="Паспорт и номера документов", default=True, icon="msg_contact_name"),
+            Switch(key="detect_codes", text="Коды подтверждения, OTP и 2FA", default=True, icon="msg_verification"),
+            Divider(),
+
+            Header(text="Text Guard · секреты"),
+            Switch(key="detect_passwords", text="Пароли и кодовые фразы", default=True, icon="msg_password"),
+            Switch(key="detect_tokens", text="Токены и API-ключи", default=True, icon="msg_permissions"),
+            Switch(key="detect_seed", text="Seed-фразы", default=True, icon="msg_secret"),
+            Switch(key="detect_private_keys", text="Приватные ключи", default=True, icon="msg_secret"),
+            Divider(),
+
+            Header(text="Location Guard"),
+            Switch(key="detect_gps", text="GPS-координаты", default=True, icon="msg_location"),
+            Switch(key="detect_map_links", text="Ссылки на карты", default=True, icon="msg_map"),
+            Switch(key="detect_addresses", text="Улицы, дома и квартиры", default=True, icon="msg_location"),
+            Switch(key="detect_settlements", text="Города, сёла и посёлки", default=True, icon="msg_map"),
+            Switch(key="detect_postal", text="Почтовые индексы", default=True, icon="msg_location"),
+            Switch(
+                key="detect_location_context",
+                text="Названия по контексту",
+                default=True,
+                subtext="Например: «живу в Москве», «нахожусь в Казани».",
+                icon="msg_map",
+            ),
+            Switch(
+                key="block_location_shares",
+                text="Проверять геолокацию Telegram",
+                default=True,
+                subtext="Предупреждает при отправке точной точки на карте.",
+                icon="msg_live_location",
+            ),
+            Text(
+                text="Изображения не проверяются",
+                subtext="Плагин не распознаёт и не изменяет фотографии.",
+                icon="msg_gallery",
+            ),
+            Divider(),
+
+            Header(text="Link Guard"),
+            Switch(
+                key="detect_suspicious_links",
+                text="Проверять подозрительные ссылки",
+                default=True,
+                subtext="IP-адреса, Punycode, смешанные алфавиты, сокращатели и секреты в параметрах.",
+                icon="msg_link",
+            ),
+            Switch(
+                key="warn_all_links_strict",
+                text="Предупреждать обо всех внешних ссылках",
+                default=False,
+                subtext="Работает только в максимальном профиле.",
+                icon="msg_warning",
+            ),
+            Divider(),
+
+            Header(text="Маскирование"),
+            Selector(
+                key="mask_style",
+                text="Стиль скрытия",
+                default=MASK_PARTIAL,
+                items=[
+                    "Частичное скрытие",
+                    "Полностью точками",
+                    "Плашка «ДАННЫЕ СКРЫТЫ»",
+                ],
+                icon="msg_edit",
+            ),
+            Text(
+                text="Видимые последние цифры",
+                subtext="Применяется к телефону, карте, IBAN, паспорту и индексу.",
+                icon="msg_info",
+            ),
+            Selector(
+                key="visible_tail_index",
+                text="Оставлять последних цифр",
+                default=1,
+                items=["0", "2", "4"],
+                icon="msg_view_file",
+            ),
+            Switch(
+                key="show_preview",
+                text="Показывать безопасный предпросмотр",
+                default=True,
+                icon="msg_view_file",
+            ),
+            Divider(),
+
+            Header(text="Recipient Guard"),
+            Switch(key="recipient_guard", text="Проверять получателя", default=True, icon="msg_contacts"),
+            Switch(key="warn_noncontacts", text="Предупреждать о незнакомцах", default=True, icon="msg_contacts"),
+            Switch(key="warn_bots", text="Предупреждать о ботах", default=True, icon="msg_bots"),
+            Switch(
+                key="check_bot_commands",
+                text="Проверять команды ботов",
+                default=True,
+                subtext="Предупреждает о командах авторизации, документов, оплаты, паролей и кошельков.",
+                icon="msg_bots",
+            ),
+            Switch(key="warn_groups", text="Предупреждать о группах и каналах", default=True, icon="msg_groups"),
+            Switch(
+                key="forward_guard",
+                text="Проверять пересылки",
+                default=True,
+                subtext=(
+                    "Проверяет признаки пересланного контента через безопасный "
+                    "хук отправки. Сетевой запрос пересылки не блокируется, "
+                    "чтобы не вызывать сбой клиента."
+                ),
+                icon="msg_forward",
+            ),
+            Switch(
+                key="skip_trusted",
+                text="Не проверять доверенные чаты",
+                default=False,
+                subtext="Полностью пропускает Text Guard и File Inspector.",
+                icon="msg_permissions",
+            ),
+            Text(
+                text="Управление доверенными чатами",
+                subtext="Посмотреть список и удалить отдельный чат.",
+                icon="msg_contacts",
+                on_click=self._show_trusted_chats,
+            ),
+            Text(
+                text="Очистить доверенные чаты",
+                subtext="Удалить все исключения Recipient Guard.",
+                icon="msg_clear",
+                red=True,
+                on_click=self._clear_trusted,
+            ),
+            Divider(),
+
+            Header(text="File Inspector"),
+            Switch(key="scan_file_contents", text="Проверять содержимое файлов", default=True, icon="msg_view_file"),
+            Switch(key="scan_text_files", text="TXT, CSV, JSON, XML и MD", default=True, icon="msg_document"),
+            Switch(key="scan_office_files", text="DOCX, XLSX и PPTX", default=True, icon="msg_document"),
+            Switch(key="scan_pdf_files", text="Текстовые PDF", default=True, icon="msg_document"),
+            Switch(
+                key="clean_office",
+                text="Удалять метаданные Office",
+                default=True,
+                subtext="Удаляет автора, приложение и свойства документа.",
+                icon="msg_clear",
+            ),
+            Switch(
+                key="safe_names",
+                text="Проверять имена файлов",
+                default=True,
+                subtext="Ищет ФИО, телефон, почту, номера документов, карты, токены и чувствительные слова.",
+                icon="msg_edit",
+            ),
+            Switch(
+                key="auto_rename_files",
+                text="Автоматически выбирать переименование",
+                default=True,
+                subtext="В окне защиты пункт будет отмечен заранее.",
+                icon="msg_edit",
+            ),
+            Selector(
+                key="max_file_size_index",
+                text="Максимальный размер проверки",
+                default=4,
+                items=["1 МБ", "5 МБ", "10 МБ", "25 МБ", "50 МБ", "100 МБ", "250 МБ"],
+                icon="msg_files",
+            ),
+            Divider(),
+
+            Header(text="Уведомления"),
+            Switch(key="vibrate_on_detection", text="Вибрация при обнаружении", default=True, icon="msg_notifications"),
+            Switch(key="show_notifications", text="Показывать краткие уведомления", default=True, icon="msg_notifications"),
+            Switch(
+                key="show_success_banner",
+                text="Плашка после успешной защиты",
+                default=True,
+                subtext="Мягкое свечение и подтверждение безопасной отправки.",
+                icon="msg_verification",
+            ),
+            Divider(),
+
+            Header(text="Локальный журнал"),
+            Switch(
+                key="track_stats",
+                text="Сохранять локальную статистику",
+                default=True,
+                subtext="Только счётчики. Тексты и найденные значения не записываются.",
+                icon="msg_stats",
+            ),
+            Text(text="Показать статистику", subtext="Проверки, защиты и отмены.", icon="msg_stats", on_click=self._show_stats),
+            Text(text="Очистить статистику", subtext="Удалить локальные счётчики.", icon="msg_delete", red=True, on_click=self._clear_stats),
+            Divider(),
+
+            Header(text="Проверка работы"),
+            Text(
+                text="Почему срабатывает защита",
+                subtext="Справочник по причинам обнаружения каждой категории.",
+                icon="msg_info",
+                on_click=self._show_detection_reasons,
+            ),
+            Text(
+                text="Проверить плашку защиты",
+                subtext="Показывает новую светящуюся плашку успешной отправки.",
+                icon="msg_verification",
+                on_click=self._test_protection_banner,
+            ),
+            Text(
+                text="Проверить плашку доверия",
+                subtext="Показывает ту же нижнюю плашку, что и в меню чата.",
+                icon="msg_verification",
+                on_click=self._test_trust_banner,
+            ),
+            Text(
+                text="Запустить тестовую проверку",
+                subtext="Покажет найденные категории и безопасный вариант текста.",
+                icon="msg_verification",
+                on_click=self._run_test_scan,
+            ),
+            Text(
+                text="О безопасности плагина",
+                subtext="Подробное объяснение локальной обработки.",
+                icon="msg_info",
+                on_click=self._show_safety_info,
+            ),
+        ]
+
+    def _setting_int(self, key, default, minimum, maximum):
+        try:
+            return max(minimum, min(maximum, int(self.get_setting(key, default))))
+        except Exception:
+            return default
+
+    def _action_mode(self):
+        return self._setting_int("action_mode", ACTION_ASK, ACTION_ASK, ACTION_BLOCK)
+
+    def _mask_style(self):
+        return self._setting_int("mask_style", MASK_PARTIAL, MASK_PARTIAL, MASK_LABELS)
+
+    def _visible_tail(self):
+        index = self._setting_int(
+            "visible_tail_index",
+            1,
+            0,
+            len(VISIBLE_TAIL_OPTIONS) - 1,
+        )
+        return VISIBLE_TAIL_OPTIONS[index]
+
+    def _max_file_bytes(self):
+        index = self._setting_int(
+            "max_file_size_index",
+            4,
+            0,
+            len(FILE_LIMIT_MB_OPTIONS) - 1,
+        )
+        return FILE_LIMIT_MB_OPTIONS[index] * 1024 * 1024
+
+    def _mask_value(self, kind, value):
+        style = self._mask_style()
+        tail_count = self._visible_tail()
+
+        labels = {
+            "email": "ПОЧТА",
+            "phone": "ТЕЛЕФОН",
+            "card": "КАРТА",
+            "iban": "БАНКОВСКИЙ СЧЁТ",
+            "api_secret": "API-КЛЮЧ",
+            "bot_token": "ТОКЕН",
+            "password": "ПАРОЛЬ",
+            "otp": "КОД",
+            "seed": "SEED-ФРАЗА",
+            "private_key": "ПРИВАТНЫЙ КЛЮЧ",
+            "document_id": "НОМЕР ДОКУМЕНТА",
+            "full_name": "ФИО",
+            "gps_coordinates": "КООРДИНАТЫ",
+            "map_link": "ССЫЛКА НА КАРТУ",
+            "address": "АДРЕС",
+            "settlement": "НАСЕЛЁННЫЙ ПУНКТ",
+            "postal_code": "ИНДЕКС",
+            "suspicious_link": "ПОДОЗРИТЕЛЬНАЯ ССЫЛКА",
+        }
+
+        if kind == "hidden_chars":
+            return ""
+
+        if style == MASK_LABELS:
+            return f"[{labels.get(kind, 'ДАННЫЕ')} СКРЫТЫ]"
+
+        if style == MASK_BULLETS:
+            return "••••••••"
+
+        if kind == "email":
+            local, sep, domain = value.partition("@")
+            return f"{local[:1] or '*'}***@{domain}" if sep else "***@***"
+
+        if kind in ("phone", "card", "iban", "document_id", "postal_code"):
+            compact = re.sub(r"\s", "", value)
+            numeric = digits(value)
+            tail = numeric[-tail_count:] if tail_count else ""
+
+            if kind == "phone":
+                return f"+••• ••• •• {tail}".rstrip()
+            if kind == "card":
+                return f"•••• •••• •••• {tail}".rstrip()
+            if kind == "iban":
+                return f"•••• •••• •••• {tail}".rstrip()
+            if kind == "document_id":
+                return f"••••••{tail}" if tail else "••••••••"
+            return f"••••{tail}" if tail else "••••••"
+
+        if kind in ("api_secret", "bot_token"):
+            if tail_count and len(value) > tail_count:
+                return f"{value[:2]}••••••{value[-tail_count:]}"
+            return "••••••••"
+
+        if kind == "password":
+            return "••••••••"
+        if kind == "otp":
+            return "••••••"
+        if kind == "seed":
+            return "[SEED-ФРАЗА СКРЫТА]"
+        if kind == "private_key":
+            return "[ПРИВАТНЫЙ КЛЮЧ СКРЫТ]"
+        if kind == "full_name":
+            return " ".join(
+                (part[:1] + "***") if part else "***"
+                for part in value.split()
+            )
+        if kind == "gps_coordinates":
+            return "[КООРДИНАТЫ СКРЫТЫ]"
+        if kind == "map_link":
+            return "[ССЫЛКА НА КАРТУ СКРЫТА]"
+        if kind == "address":
+            return "[АДРЕС СКРЫТ]"
+        if kind == "settlement":
+            return "[НАСЕЛЁННЫЙ ПУНКТ СКРЫТ]"
+        if kind == "suspicious_link":
+            return "[ПОДОЗРИТЕЛЬНАЯ ССЫЛКА СКРЫТА]"
+        return "••••••"
+
+    def _masked_text(self, text, findings, selected):
+        result = text
+        chosen = [item for item in findings if item["kind"] in selected]
+
+        for item in reversed(chosen):
+            result = (
+                result[:item["start"]]
+                + self._mask_value(item["kind"], item["original"])
+                + result[item["end"]:]
+            )
+
+        return result
+
+    def pre_request_hook(self, request_name: str, account: int, request: Any) -> HookResult:
+        """Never intercept native forwarding requests.
+
+        Some client builds crash when TL_messages_forwardMessages is cancelled
+        from a plugin hook, even if the Java request object is not retained.
+        Returning the default result here guarantees that Telegram owns the full
+        forwarding lifecycle without plugin-side cancellation or delayed UI.
+        """
+        return HookResult()
+
+    @staticmethod
+    def _forward_request_peer(request):
+        try:
+            target = request.to_peer
+        except Exception:
+            return 0
+        for field, sign in (("user_id", 1), ("chat_id", -1), ("channel_id", -1)):
+            try:
+                value = int(getattr(target, field, 0) or 0)
+                if value:
+                    return value if sign > 0 else -abs(value)
+            except Exception:
+                pass
+        return 0
+
+    @staticmethod
+    def _forward_sequence_values(value, limit=64):
+        result = []
+        if value is None:
+            return result
+        try:
+            for item in value:
+                result.append(int(item))
+                if len(result) >= limit:
+                    break
+            return result
+        except Exception:
+            pass
+        try:
+            size = int(value.size())
+            for index in range(min(size, limit)):
+                result.append(int(value.get(index)))
+        except Exception:
+            pass
+        return result
+
+    def _forward_request_count(self, request):
+        try:
+            ids = self._forward_sequence_values(getattr(request, "id", None))
+            if ids:
+                return len(ids)
+        except Exception:
+            pass
+        return 1
+
+    def _forward_signature(self, account, request):
+        peer = self._forward_request_peer(request)
+        ids = self._forward_sequence_values(getattr(request, "id", None))
+        try:
+            from_peer = getattr(request, "from_peer", None)
+            source = []
+            for field in ("user_id", "chat_id", "channel_id"):
+                source.append(int(getattr(from_peer, field, 0) or 0))
+        except Exception:
+            source = []
+
+        # random_id is regenerated by Telegram on every retry, so it must not be
+        # part of a one-time permission key. Message IDs, source and destination
+        # are stable and sufficiently narrow for the short bypass window.
+        stable = f"{int(account)}:{int(peer)}:{ids}:{source}"
+        return hashlib.sha256(stable.encode("utf-8", "ignore")).hexdigest()
+
+    def _cleanup_forward_state(self):
+        now = time.monotonic()
+        with self._lock:
+            for mapping in (self._forward_bypass, self._forward_pending):
+                expired = [key for key, expiry in mapping.items() if expiry < now]
+                for key in expired:
+                    mapping.pop(key, None)
+
+    def _mark_forward_pending(self, signature):
+        self._cleanup_forward_state()
+        with self._lock:
+            self._forward_pending[signature] = time.monotonic() + 45.0
+
+    def _forward_is_pending(self, signature):
+        self._cleanup_forward_state()
+        with self._lock:
+            return signature in self._forward_pending
+
+    def _clear_forward_pending(self, signature):
+        with self._lock:
+            self._forward_pending.pop(signature, None)
+
+    def _remember_forward_bypass(self, signature):
+        self._cleanup_forward_state()
+        with self._lock:
+            self._forward_bypass[signature] = time.monotonic() + BYPASS_TTL
+
+    def _consume_forward_bypass(self, signature):
+        self._cleanup_forward_state()
+        with self._lock:
+            expiry = self._forward_bypass.pop(signature, None)
+            return bool(expiry and expiry >= time.monotonic())
+
+    def _show_forward_guard_dialog(self, account, peer, count, recipient,
+                                   risky, signature):
+        fragment = self._visible_chat_fragment(self._fragment())
+        activity = self._activity(fragment)
+
+        if AlertDialogBuilder is None or activity is None:
+            self._clear_forward_pending(signature)
+            self._inc(account, cancelled=1)
+            self._bulletin(
+                "Пересылка остановлена: окно защиты недоступно.",
+                error=True,
+                fragment=fragment,
+            )
+            return
+
+        target = recipient.get("details") or (
+            f"Получатель: {self._peer_title(account, peer)}."
+            if peer else
+            "Получатель не определён."
+        )
+        risk_line = (
+            "Получатель требует дополнительной проверки."
+            if risky else
+            "Получатель распознан, но пересылаемый контент сохранится полностью."
+        )
+        message = (
+            f"Сообщений: {max(1, int(count))}\n"
+            f"{target}\n\n"
+            f"{risk_line}\n\n"
+            "Почему сработала защита:\n"
+            "• пересылка сохраняет исходный текст и вложения;\n"
+            "• могут сохраниться сведения об авторе и источнике;\n"
+            "• готовую пересылку нельзя безопасно замаскировать.\n\n"
+            "Для безопасности первая попытка остановлена. Разрешите её и "
+            "повторите пересылку ещё раз."
+        )
+
+        mode = self._action_mode()
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(
+            "Пересылка заблокирована"
+            if mode == ACTION_BLOCK and risky else
+            "Проверка пересылки"
+        )
+        builder.set_message(message)
+
+        if mode == ACTION_BLOCK and risky:
+            self._clear_forward_pending(signature)
+            self._inc(account, cancelled=1)
+            builder.set_positive_button(
+                "Понятно",
+                lambda dialog, which: dialog.dismiss(),
+            )
+            builder.show()
+            return
+
+        def allow_once(dialog, which):
+            dialog.dismiss()
+            self._clear_forward_pending(signature)
+            self._remember_forward_bypass(signature)
+            self._bulletin(
+                "Разрешено на одну попытку. Повторите пересылку.",
+                fragment=self._fragment(),
+            )
+
+        def cancel_forward(dialog, which):
+            dialog.dismiss()
+            self._clear_forward_pending(signature)
+            self._inc(account, cancelled=1)
+            self._bulletin("Пересылка отменена.", fragment=fragment)
+
+        def trust_chat(dialog, which):
+            dialog.dismiss()
+            if peer:
+                values = self._trusted_set(account)
+                values.add(int(peer))
+                self._save_trusted(account, values)
+            self._clear_forward_pending(signature)
+            self._bulletin(
+                "Чат добавлен в доверенные. Повторите пересылку.",
+                fragment=self._fragment(),
+            )
+
+        builder.set_positive_button("Разрешить один раз", allow_once)
+        if peer:
+            builder.set_neutral_button("Доверять чату", trust_chat)
+        builder.set_negative_button("Отмена", cancel_forward)
+        builder.show()
+        try:
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception:
+            pass
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not self.get_setting("enabled", True):
+            return HookResult()
+
+        # Voice messages and video notes must stay entirely inside Telegram's
+        # native send pipeline. Do not inspect, cancel, copy, rename or resend.
+        path = self._path(params)
+        if self._is_voice_or_round_media(params, path):
+            return HookResult()
+
+        peer = self._int_attr(params, "peer")
+        text, field = self._extract_text(params)
+
+        if self._consume(account, peer, text, path):
+            return HookResult()
+        if not self.get_setting("check_saved", False) and self._saved(account, peer):
+            return HookResult()
+
+        if (
+            self.get_setting("skip_trusted", False)
+            and peer
+            and self._trusted(account, peer)
+        ):
+            return HookResult()
+
+        profile = self._profile()
+        findings = self._scan(text, profile) if text else []
+        payload = self._payload(params)
+        fragment = self._fragment()
+        context_alerts = self._context_alerts(account, peer, text, payload)
+
+        # File parsing can be slow, so it runs outside the UI/send hook thread.
+        if path and os.path.isfile(path) and self._should_scan_file(path):
+            run_on_queue(lambda: self._finish_check(
+                account, peer, text, field, path, findings,
+                profile, payload, fragment, context_alerts
+            ))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        media = self._media(path, profile, inspect_content=False)
+        self._append_location_attachment(media, payload)
+        if not findings and not media["ops"] and not context_alerts:
+            return HookResult()
+
+        self._present_check(
+            account, peer, text, field, path, findings,
+            media, payload, fragment, context_alerts
+        )
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _finish_check(self, account, peer, text, field, path, findings,
+                      profile, payload, fragment, context_alerts=None):
+        try:
+            media = self._media(path, profile, inspect_content=True)
+            self._append_location_attachment(media, payload)
+        except Exception as error:
+            self.log(f"Privacy Firewall file inspection failed: {error}")
+            media = {"ops": [], "details": ["Не удалось прочитать содержимое файла."],
+                     "content_findings": [], "filename_reason": ""}
+
+        if not findings and not media["ops"] and not context_alerts:
+            # The original send was paused only for background inspection.
+            self._resend(account, peer, text, field, path, payload)
+            return
+
+        run_on_ui_thread(lambda: self._present_check(
+            account, peer, text, field, path, findings,
+            media, payload, fragment, context_alerts or []
+        ))
+
+    def _present_check(self, account, peer, text, field, path, findings,
+                       media, payload, fragment, context_alerts=None):
+        context_alerts = list(context_alerts or [])
+        recipient = self._recipient(account, peer)
+        self._inc(
+            account,
+            scans=1,
+            warnings=1,
+            recipient_warnings=1 if recipient["warn"] else 0,
+            bot_command_warnings=sum(1 for item in context_alerts if item.get("kind") == "bot_command_warning"),
+            forward_warnings=sum(1 for item in context_alerts if item.get("kind") == "forward_warning"),
+            link_warnings=sum(1 for item in findings if item.get("kind") == "suspicious_link"),
+            filename_warnings=1 if "safe_filename" in media.get("ops", []) else 0,
+        )
+        self._vibrate()
+
+        kinds = {item["kind"] for item in findings}
+        default_ops = self._default_operations(media)
+        action = self._action_mode()
+
+        if action == ACTION_BLOCK:
+            self._inc(account, cancelled=1)
+            self._bulletin(
+                "Отправка заблокирована: обнаружены конфиденциальные данные.",
+                error=True,
+                fragment=fragment,
+            )
+            return
+
+        if action == ACTION_AUTO_MASK:
+            self._protect(
+                account,
+                peer,
+                text,
+                self._masked_text(text, findings, kinds),
+                field,
+                path,
+                payload,
+                default_ops,
+                kinds,
+                fragment,
+                media,
+                context_alerts,
+            )
+            return
+
+        activity = self._activity(fragment)
+        if AlertDialogBuilder is None or activity is None:
+            self._protect(
+                account,
+                peer,
+                text,
+                self._masked_text(text, findings, kinds),
+                field,
+                path,
+                payload,
+                default_ops,
+                kinds,
+                fragment,
+                media,
+                context_alerts,
+            )
+            return
+
+        self._dialog(
+            account, peer, text, field, path, findings,
+            media, recipient, payload, fragment, context_alerts
+        )
+
+    def _default_operations(self, media):
+        operations = set(media.get("ops", []))
+
+        if (
+            "safe_filename" in operations
+            and not self.get_setting("auto_rename_files", True)
+        ):
+            operations.remove("safe_filename")
+
+        return operations
+
+    def _vibrate(self):
+        if not self.get_setting("vibrate_on_detection", True):
+            return
+
+        try:
+            from android.content import Context
+            from android.os import Build, VibrationEffect
+            from org.telegram.messenger import ApplicationLoader
+
+            context = ApplicationLoader.applicationContext
+            if context is None:
+                return
+
+            vibrator = context.getSystemService(Context.VIBRATOR_SERVICE)
+            if vibrator is None or not bool(vibrator.hasVibrator()):
+                return
+
+            if int(Build.VERSION.SDK_INT) >= 26:
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(
+                        80,
+                        VibrationEffect.DEFAULT_AMPLITUDE,
+                    )
+                )
+            else:
+                vibrator.vibrate(80)
+        except Exception as error:
+            self.log(f"Privacy Firewall vibration error: {error}")
+
+    def _scan(self, text, profile):
+        text = text[:MAX_SCAN]
+
+        if (
+            self.get_setting("marker_only_mode", False)
+            and not SENSITIVE_MARKER_RE.search(text)
+        ):
+            return []
+
+        out = []
+
+        if self.get_setting("detect_private_keys", True):
+            out += [finding("private_key", match) for match in PRIVATE_RE.finditer(text)]
+
+        if self.get_setting("detect_seed", True):
+            for match in SEED_RE.finditer(text):
+                words = re.findall(r"[A-Za-zА-Яа-яЁё]{3,}", match.group(1))
+                if len(words) in (12, 15, 18, 21, 24):
+                    out.append(finding("seed", match, 1))
+
+        if self.get_setting("detect_tokens", True):
+            out += [finding("bot_token", match) for match in BOT_RE.finditer(text)]
+            for pattern in (OPENAI_RE, GITHUB_RE, AWS_RE):
+                out += [finding("api_secret", match) for match in pattern.finditer(text)]
+
+        for match in SECRET_RE.finditer(text):
+            name = match.group(1).lower()
+            is_password = any(
+                token in name
+                for token in ("password", "passwd", "passphrase", "пароль")
+            )
+
+            if is_password and self.get_setting("detect_passwords", True):
+                out.append(finding("password", match, 2))
+            elif not is_password and self.get_setting("detect_tokens", True):
+                out.append(finding("api_secret", match, 2))
+
+        if self.get_setting("detect_cards", True):
+            out += [
+                finding("card", match)
+                for match in CARD_RE.finditer(text)
+                if luhn(match.group(0))
+            ]
+
+        if self.get_setting("detect_iban", True):
+            out += [
+                finding("iban", match)
+                for match in IBAN_RE.finditer(text)
+                if iban_valid(match.group(0))
+            ]
+
+        if profile >= PROFILE_STANDARD:
+            if self.get_setting("detect_email", True):
+                out += [finding("email", match) for match in EMAIL_RE.finditer(text)]
+
+            if self.get_setting("detect_phone", True):
+                for match in PHONE_RE.finditer(text):
+                    number = digits(match.group(0))
+                    if not 10 <= len(number) <= 15:
+                        continue
+
+                    separators = len(re.findall(r"[\s().-]", match.group(0)))
+                    if (
+                        len(number) < 13
+                        or match.group(0).lstrip().startswith("+")
+                        or separators >= 2
+                    ):
+                        out.append(finding("phone", match))
+
+            if self.get_setting("detect_codes", True):
+                out += [finding("otp", match, 1) for match in OTP_RE.finditer(text)]
+
+            if self.get_setting("detect_documents", True):
+                out += [
+                    finding("document_id", match, 1)
+                    for match in PASSPORT_RE.finditer(text)
+                ]
+
+            if self.get_setting("detect_fio", True):
+                out += [
+                    finding("full_name", match, 1)
+                    for match in FULL_NAME_LABEL_RE.finditer(text)
+                ]
+                out += [finding("full_name", match) for match in FULL_NAME_RE.finditer(text)]
+
+            if self.get_setting("detect_gps", True):
+                for match in DECIMAL_COORD_RE.finditer(text):
+                    try:
+                        latitude = float(match.group(1).replace(",", "."))
+                        longitude = float(match.group(2).replace(",", "."))
+                    except Exception:
+                        continue
+
+                    if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+                        out.append(finding("gps_coordinates", match))
+
+                out += [
+                    finding("gps_coordinates", match)
+                    for match in DMS_COORD_RE.finditer(text)
+                ]
+
+            if self.get_setting("detect_map_links", True):
+                out += [finding("map_link", match) for match in MAP_LINK_RE.finditer(text)]
+
+            if self.get_setting("detect_addresses", True):
+                out += [finding("address", match, 1) for match in ADDRESS_LABEL_RE.finditer(text)]
+                out += [finding("address", match) for match in STREET_RE.finditer(text)]
+                out += [finding("address", match) for match in BUILDING_RE.finditer(text)]
+
+            if self.get_setting("detect_settlements", True):
+                out += [finding("settlement", match) for match in SETTLEMENT_RE.finditer(text)]
+                out += [finding("settlement", match) for match in ADMIN_AREA_RE.finditer(text)]
+
+                if self.get_setting("detect_location_context", True):
+                    out += [
+                        finding("settlement", match, 1)
+                        for match in LOCATION_CONTEXT_RE.finditer(text)
+                    ]
+
+            if self.get_setting("detect_postal", True):
+                out += [finding("postal_code", match, 1) for match in POSTAL_LABEL_RE.finditer(text)]
+                out += [finding("postal_code", match, 1) for match in POSTAL_BEFORE_PLACE_RE.finditer(text)]
+
+        if (
+            profile >= PROFILE_STANDARD
+            and self.get_setting("detect_suspicious_links", True)
+        ):
+            for match in URL_RE.finditer(text):
+                reason = self._link_reason(match.group(0))
+                if reason or (
+                    profile >= PROFILE_STRICT
+                    and self.get_setting("warn_all_links_strict", False)
+                ):
+                    out.append(finding(
+                        "suspicious_link",
+                        match,
+                        reason=reason or "В максимальном профиле включена проверка всех внешних ссылок.",
+                    ))
+
+        if profile >= PROFILE_STRICT:
+            for index, char in enumerate(text):
+                if char in HIDDEN:
+                    out.append({
+                        "kind": "hidden_chars",
+                        "start": index,
+                        "end": index + 1,
+                        "original": char,
+                        "priority": PRIORITY["hidden_chars"],
+                        "reason": DETECTION_REASONS["hidden_chars"],
+                    })
+
+        return resolve(out)
+
+    @staticmethod
+    def _link_reason(value):
+        raw = str(value or "").strip()
+        normalized = "https://" + raw if raw.lower().startswith("www.") else raw
+        try:
+            parts = urlsplit(normalized)
+            host = (parts.hostname or "").lower().strip(".")
+            port = parts.port
+        except Exception:
+            return "Ссылка имеет повреждённую или неоднозначную структуру."
+
+        if not host:
+            return "В ссылке не удалось определить домен."
+        if host.startswith("xn--") or ".xn--" in host:
+            return "Домен использует Punycode и может визуально подменять знакомый адрес."
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+            return "Ссылка ведёт напрямую на IP-адрес вместо доменного имени."
+        if bool(re.search(r"[а-яё]", host, re.I)) and bool(re.search(r"[a-z]", host, re.I)):
+            return "В домене смешаны кириллица и латиница, что часто используется для подмены."
+        if host in SHORTENER_HOSTS or any(host.endswith("." + item) for item in SHORTENER_HOSTS):
+            return "Сокращённая ссылка скрывает конечный адрес перехода."
+        if "@" in parts.netloc:
+            return "В адресе есть встроенные учётные данные или маскирующая часть перед доменом."
+        if port not in (None, 80, 443):
+            return f"Ссылка использует нестандартный порт {port}."
+        if SENSITIVE_URL_PARAM_RE.search(normalized):
+            return "В параметрах ссылки обнаружен токен, код, контакт или другое чувствительное значение."
+        low_path = (parts.path or "").lower()
+        if low_path.endswith(DANGEROUS_FILE_SUFFIXES):
+            return "Ссылка ведёт на исполняемый или устанавливаемый файл."
+        return ""
+
+    @classmethod
+    def _bad_url(cls, value):
+        return bool(cls._link_reason(value))
+
+    def _is_bot_peer(self, account, peer):
+        if not peer or peer <= 0:
+            return False
+        try:
+            controller = get_messages_controller(account)
+            user = controller.getUser(int(peer)) if controller else None
+            return bool(user is not None and getattr(user, "bot", False))
+        except Exception:
+            return False
+
+    def _bot_command_alert(self, account, peer, text):
+        if not self.get_setting("check_bot_commands", True):
+            return None
+        if not text or not self._is_bot_peer(account, peer):
+            return None
+
+        match = BOT_COMMAND_RE.match(text)
+        if not match:
+            return None
+
+        command = (match.group(1) or "").lower()
+        argument = (match.group(2) or "").strip()
+        risky = command in RISKY_BOT_COMMANDS
+        payload_risk = bool(argument and (
+            len(argument) >= 20
+            or SECRET_RE.search(argument)
+            or EMAIL_RE.search(argument)
+            or PHONE_RE.search(argument)
+            or SENSITIVE_URL_PARAM_RE.search(argument)
+        ))
+
+        if command == "start" and not payload_risk:
+            return None
+        if not risky and not payload_risk:
+            return None
+
+        reason = (
+            f"Команда /{command} связана с авторизацией, документами, оплатой или личными данными."
+            if risky else
+            f"Параметр команды /{command} похож на токен, контакт или другое чувствительное значение."
+        )
+        return {
+            "kind": "bot_command_warning",
+            "title": "Команда отправляется боту",
+            "details": reason + " Бот может обработать и сохранить переданные данные.",
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _forward_payload_alert(payload):
+        if not payload:
+            return None
+        candidates = (
+            payload.get("retryMessageObject"),
+            payload.get("parentObject"),
+        )
+        for obj in candidates:
+            if obj is None:
+                continue
+            try:
+                owner = getattr(obj, "messageOwner", None)
+                if owner is not None and bool(getattr(owner, "fwd_from", None)):
+                    return {
+                        "kind": "forward_warning",
+                        "title": "Пересылаемое сообщение",
+                        "details": "Проверьте исходный текст и вложения: пересылка сохраняет их содержимое.",
+                        "reason": "Сообщение содержит сведения о первоисточнике или пересылаемый контент.",
+                    }
+            except Exception:
+                pass
+            try:
+                if bool(getattr(obj, "isForwarded", lambda: False)()):
+                    return {
+                        "kind": "forward_warning",
+                        "title": "Пересылаемое сообщение",
+                        "details": "Проверьте исходный текст и вложения: пересылка сохраняет их содержимое.",
+                        "reason": "Сообщение отмечено клиентом как пересланное.",
+                    }
+            except Exception:
+                pass
+        return None
+
+    def _context_alerts(self, account, peer, text, payload):
+        alerts = []
+        bot_alert = self._bot_command_alert(account, peer, text)
+        if bot_alert:
+            alerts.append(bot_alert)
+        if self.get_setting("forward_guard", True):
+            forward_alert = self._forward_payload_alert(payload)
+            if forward_alert:
+                alerts.append(forward_alert)
+        return alerts
+
+    def _recipient(self, account, peer):
+        if not self.get_setting("recipient_guard", True):
+            return {"warn": False, "title": "", "details": ""}
+
+        if not peer or self._saved(account, peer):
+            return {"warn": False, "title": "", "details": ""}
+
+        if self._trusted(account, peer):
+            return {
+                "warn": False,
+                "title": "Доверенный чат",
+                "details": "",
+            }
+
+        try:
+            controller = get_messages_controller(account)
+        except Exception:
+            controller = None
+
+        if peer > 0:
+            try:
+                user = controller.getUser(int(peer)) if controller else None
+            except Exception:
+                user = None
+
+            if user is None:
+                if not self.get_setting("warn_noncontacts", True):
+                    return {"warn": False, "title": "", "details": ""}
+                return {
+                    "warn": True,
+                    "title": "Неизвестный получатель",
+                    "details": "Не удалось подтвердить данные пользователя.",
+                }
+
+            if bool(getattr(user, "bot", False)):
+                if not self.get_setting("warn_bots", True):
+                    return {"warn": False, "title": "", "details": ""}
+                return {
+                    "warn": True,
+                    "title": "Получатель — бот",
+                    "details": "Боты могут обрабатывать и хранить отправленные данные.",
+                }
+
+            if not bool(getattr(user, "contact", False)):
+                if not self.get_setting("warn_noncontacts", True):
+                    return {"warn": False, "title": "", "details": ""}
+
+                username = str(getattr(user, "username", "") or "")
+                name = str(getattr(user, "first_name", "") or "").strip()
+                recipient_name = f"@{username}" if username else (name or "пользователь")
+                return {
+                    "warn": True,
+                    "title": "Получатель не в контактах",
+                    "details": f"Конфиденциальные данные отправляются: {recipient_name}.",
+                }
+
+            return {"warn": False, "title": "Контакт", "details": ""}
+
+        if not self.get_setting("warn_groups", True):
+            return {"warn": False, "title": "", "details": ""}
+
+        try:
+            chat = controller.getChat(int(-peer)) if controller else None
+        except Exception:
+            chat = None
+
+        title = str(getattr(chat, "title", "") or "группа") if chat else "группа"
+        return {
+            "warn": True,
+            "title": "Групповой получатель",
+            "details": f"Данные могут увидеть участники чата «{title}».",
+        }
+
+    def _file_format_enabled(self, extension):
+        if extension in TEXT_EXTS:
+            return self.get_setting("scan_text_files", True)
+        if extension in OFFICE_EXTS:
+            return self.get_setting("scan_office_files", True)
+        if extension in PDF_EXTS:
+            return self.get_setting("scan_pdf_files", True)
+        return False
+
+    def _should_scan_file(self, path):
+        if not path or not os.path.isfile(path):
+            return False
+        if self._is_voice_or_round_media(None, path):
+            return False
+
+        extension = os.path.splitext(path)[1].lower()
+
+        if (
+            extension in OFFICE_EXTS
+            and self.get_setting("clean_office", True)
+        ):
+            return True
+
+        return bool(
+            self.get_setting("scan_file_contents", True)
+            and self._file_format_enabled(extension)
+        )
+
+    def _append_location_attachment(self, media, payload):
+        if not self.get_setting("block_location_shares", True):
+            return
+        if payload.get("location") is None:
+            return
+
+        media.setdefault("ops", []).append("location_share_block")
+        media.setdefault("details", []).append(
+            "К сообщению прикреплена точная геолокация Telegram."
+        )
+        media["ops"] = list(dict.fromkeys(media["ops"]))
+
+    def _media(self, path, profile, inspect_content=False):
+        result = {
+            "ops": [],
+            "details": [],
+            "content_findings": [],
+            "ocr_findings": [],
+            "ocr_boxes": [],
+            "ocr_width": 0,
+            "ocr_height": 0,
+            "ocr_status": "not_checked",
+            "ocr_engine": "",
+            "filename_reason": "",
+        }
+        if not path or not os.path.isfile(path):
+            return result
+        if self._is_voice_or_round_media(None, path):
+            return result
+        try:
+            if os.path.getsize(path) > self._max_file_bytes():
+                result["details"].append("Файл слишком большой для полной проверки.")
+                return result
+        except Exception:
+            return result
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in OFFICE_EXTS and self.get_setting("clean_office", True) and self._office_meta(path):
+            result["ops"].append("office_metadata")
+            result["details"].append("Office-файл содержит свойства автора или приложения.")
+        if profile >= PROFILE_STANDARD and self.get_setting("safe_names", True):
+            filename_reason = self._sensitive_name_reason(os.path.basename(path))
+            if filename_reason:
+                result["ops"].append("safe_filename")
+                result["filename_reason"] = filename_reason
+                result["details"].append(
+                    f"Имя файла раскрывает данные: {filename_reason}."
+                )
+
+        if (
+            inspect_content
+            and self.get_setting("scan_file_contents", True)
+            and self._file_format_enabled(ext)
+        ):
+            extracted = self._extract_file_text(path, ext)
+            if extracted:
+                content_findings = self._scan(extracted, max(profile, PROFILE_STANDARD))
+                result["content_findings"] = content_findings
+                if content_findings:
+                    counts = Counter(LABELS.get(f["kind"], f["kind"]) for f in content_findings)
+                    summary = ", ".join(
+                        f"{name} ×{count}" if count > 1 else name
+                        for name, count in counts.items()
+                    )
+                    result["details"].append(f"Внутри файла найдено: {summary}.")
+                    if ext in PDF_EXTS:
+                        result["ops"].append("pdf_content_warning")
+                    else:
+                        result["ops"].append("file_content_mask")
+
+        # Keep operation order stable and remove duplicates.
+        result["ops"] = list(dict.fromkeys(result["ops"]))
+        return result
+
+
+    def _ocr_image(self, path, profile):
+        """
+        Runs OCR on an enhanced high-contrast image first and then on the
+        original. This helps with pixel fonts, low contrast and numbers split
+        across multiple lines.
+        """
+        variants = []
+        enhanced_path = ""
+
+        try:
+            enhanced_path = self._prepare_ocr_image(path)
+            if enhanced_path:
+                variants.append((enhanced_path, "enhanced"))
+        except Exception as error:
+            self.log(f"Privacy Firewall OCR preprocessing failed: {error}")
+
+        variants.append((path, "original"))
+        best_result = None
+        modern_available = False
+        modern_error = None
+
+        try:
+            for variant_path, variant_name in variants:
+                try:
+                    result = self._ocr_mlkit(variant_path, profile)
+                    modern_available = True
+                    result["engine"] = (
+                        f"{result.get('engine', 'ML Kit')} · "
+                        f"{'усиленное изображение' if variant_name == 'enhanced' else 'оригинал'}"
+                    )
+
+                    if result.get("findings"):
+                        return result
+
+                    if best_result is None:
+                        best_result = result
+                except Exception as error:
+                    modern_error = error
+                    break
+
+            if best_result is not None:
+                return best_result
+
+            for variant_path, variant_name in variants:
+                try:
+                    result = self._ocr_legacy_vision(
+                        variant_path,
+                        profile,
+                    )
+                    result["engine"] = (
+                        f"{result.get('engine', 'Google Vision')} · "
+                        f"{'усиленное изображение' if variant_name == 'enhanced' else 'оригинал'}"
+                    )
+
+                    if result.get("findings"):
+                        return result
+
+                    if best_result is None:
+                        best_result = result
+                except Exception as error:
+                    self.log(
+                        "Privacy Firewall legacy OCR unavailable: "
+                        f"{error}; ML Kit error: {modern_error}"
+                    )
+                    break
+
+            if best_result is not None:
+                return best_result
+
+            return {
+                "status": "unavailable",
+                "engine": "",
+                "findings": [],
+                "boxes": [],
+                "width": 0,
+                "height": 0,
+                "error": str(modern_error or ""),
+            }
+        finally:
+            if enhanced_path and enhanced_path != path:
+                try:
+                    os.remove(enhanced_path)
+                except Exception:
+                    pass
+
+    def _prepare_ocr_image(self, path):
+        if Image is None or ImageOps is None:
+            return ""
+
+        cache = os.path.join(
+            get_cache_dir(),
+            "privacy_firewall",
+            "ocr",
+        )
+        ensure_dir_exists(cache)
+
+        token = hashlib.sha256(
+            f"{path}:{os.path.getmtime(path)}:{os.path.getsize(path)}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
+        destination = os.path.join(
+            cache,
+            f"ocr_enhanced_{token}.png",
+        )
+
+        with Image.open(path) as source:
+            if bool(getattr(source, "is_animated", False)):
+                return ""
+
+            image = ImageOps.exif_transpose(source).convert("L")
+            image = ImageOps.autocontrast(image, cutoff=1)
+
+            # Pixel fonts are often recognised better after a 3x enlargement.
+            scale = 3 if max(image.size) < 2200 else 2
+            try:
+                resample = Image.Resampling.LANCZOS
+            except Exception:
+                resample = Image.LANCZOS
+
+            image = image.resize(
+                (
+                    max(1, image.width * scale),
+                    max(1, image.height * scale),
+                ),
+                resample,
+            )
+
+            # Keep hard black/white edges while removing pale compression noise.
+            image = ImageOps.autocontrast(image, cutoff=1)
+            threshold = 190
+            image = image.point(
+                lambda pixel: 255 if pixel >= threshold else 0,
+                mode="1",
+            ).convert("L")
+            image.save(destination, format="PNG", optimize=True)
+
+        return destination
+
+    def _ocr_mlkit(self, path, profile):
+        from android.net import Uri
+        from com.google.android.gms.tasks import Tasks
+        from com.google.mlkit.vision.common import InputImage
+        from com.google.mlkit.vision.text import TextRecognition
+        from com.google.mlkit.vision.text.latin import TextRecognizerOptions
+        from java.io import File
+        from org.telegram.messenger import ApplicationLoader
+
+        context = ApplicationLoader.applicationContext
+        if context is None:
+            raise RuntimeError("Application context unavailable")
+
+        file_uri = Uri.fromFile(File(path))
+        input_image = InputImage.fromFilePath(context, file_uri)
+        recognizer = TextRecognition.getClient(
+            TextRecognizerOptions.DEFAULT_OPTIONS
+        )
+
+        try:
+            task = recognizer.process(input_image)
+            vision_text = getattr(Tasks, "await")(task)
+            records = []
+
+            for block in vision_text.getTextBlocks():
+                line_count = 0
+
+                for line in block.getLines():
+                    line_count += 1
+                    records.append({
+                        "text": str(line.getText() or ""),
+                        "box": self._rect_tuple(
+                            line.getBoundingBox()
+                        ),
+                        "level": "line",
+                    })
+
+                if line_count == 0:
+                    records.append({
+                        "text": str(block.getText() or ""),
+                        "box": self._rect_tuple(
+                            block.getBoundingBox()
+                        ),
+                        "level": "block",
+                    })
+
+            return self._analyse_ocr_records(
+                records=records,
+                profile=profile,
+                width=int(input_image.getWidth()),
+                height=int(input_image.getHeight()),
+                engine="ML Kit",
+            )
+        finally:
+            try:
+                recognizer.close()
+            except Exception:
+                pass
+
+    def _ocr_legacy_vision(self, path, profile):
+        from android.graphics import BitmapFactory
+        from com.google.android.gms.vision import Frame
+        from com.google.android.gms.vision.text import TextRecognizer
+        from org.telegram.messenger import ApplicationLoader
+
+        context = ApplicationLoader.applicationContext
+        if context is None:
+            raise RuntimeError("Application context unavailable")
+
+        recognizer = TextRecognizer.Builder(context).build()
+        bitmap = None
+
+        try:
+            if not bool(recognizer.isOperational()):
+                raise RuntimeError(
+                    "Legacy OCR model is not operational"
+                )
+
+            bitmap = BitmapFactory.decodeFile(path)
+            if bitmap is None:
+                raise RuntimeError("Cannot decode image")
+
+            frame = Frame.Builder().setBitmap(bitmap).build()
+            blocks = recognizer.detect(frame)
+            records = []
+
+            for index in range(int(blocks.size())):
+                block = blocks.valueAt(index)
+                records.append({
+                    "text": str(block.getValue() or ""),
+                    "box": self._rect_tuple(
+                        block.getBoundingBox()
+                    ),
+                    "level": "block",
+                })
+
+            return self._analyse_ocr_records(
+                records=records,
+                profile=profile,
+                width=int(bitmap.getWidth()),
+                height=int(bitmap.getHeight()),
+                engine="Google Vision",
+            )
+        finally:
+            try:
+                recognizer.release()
+            except Exception:
+                pass
+            try:
+                if bitmap is not None:
+                    bitmap.recycle()
+            except Exception:
+                pass
+
+    def _analyse_ocr_records(
+        self,
+        records,
+        profile,
+        width,
+        height,
+        engine,
+    ):
+        records = [
+            item
+            for item in records
+            if str(item.get("text", "") or "").strip()
+        ]
+        records.sort(
+            key=lambda item: (
+                (item.get("box") or (0, 0, 0, 0))[1],
+                (item.get("box") or (0, 0, 0, 0))[0],
+            )
+        )
+
+        findings = []
+        boxes = []
+
+        # First pass: every recognised line or block individually.
+        for item in records:
+            item_findings = self._scan_ocr_text(
+                item["text"],
+                profile,
+            )
+            if not item_findings:
+                continue
+
+            findings.extend(item_findings)
+            if item.get("box") is not None:
+                boxes.append(item["box"])
+
+        # Second pass: join neighbouring rows. This catches a number whose
+        # last digits wrapped onto the next line.
+        for group in self._ocr_record_groups(records):
+            if len(group) < 2:
+                continue
+
+            joined = "\n".join(
+                str(item.get("text", "") or "")
+                for item in group
+            )
+            group_findings = self._scan_ocr_text(
+                joined,
+                profile,
+            )
+
+            if not group_findings:
+                continue
+
+            findings.extend(group_findings)
+            boxes.extend(
+                item["box"]
+                for item in group
+                if item.get("box") is not None
+            )
+
+        # Last-resort global numeric pass. It deliberately only joins
+        # digit-heavy rows to avoid covering unrelated text.
+        numeric_records = [
+            item
+            for item in records
+            if self._ocr_digit_density(
+                str(item.get("text", "") or "")
+            ) >= 0.45
+        ]
+
+        if numeric_records:
+            numeric_text = "\n".join(
+                str(item.get("text", "") or "")
+                for item in numeric_records
+            )
+            numeric_findings = self._scan_ocr_text(
+                numeric_text,
+                profile,
+            )
+
+            if numeric_findings:
+                findings.extend(numeric_findings)
+                boxes.extend(
+                    item["box"]
+                    for item in numeric_records
+                    if item.get("box") is not None
+                )
+
+        return {
+            "status": "ok",
+            "engine": engine,
+            "findings": self._dedupe_ocr_findings(findings),
+            "boxes": self._merge_boxes(boxes),
+            "width": int(width or 0),
+            "height": int(height or 0),
+        }
+
+    def _scan_ocr_text(self, value, profile):
+        value = str(value or "")
+        findings = self._ocr_findings_without_positions(
+            self._scan(value, profile)
+        )
+        seen_kinds = {
+            item.get("kind")
+            for item in findings
+        }
+
+        # OCR frequently confuses these glyphs in pixel fonts.
+        char_map = {
+            "O": "0", "o": "0", "О": "0", "о": "0",
+            "Q": "0", "q": "0", "D": "0",
+            "I": "1", "i": "1", "l": "1", "L": "1",
+            "|": "1", "!": "1", "І": "1", "Ӏ": "1",
+            "Z": "2", "z": "2",
+            "S": "5", "s": "5", "$": "5",
+            "G": "6", "g": "6",
+            "B": "8",
+        }
+
+        allowed = (
+            r"0-9OoОоQqDdIiLl\|!ІӀZzSs\$GgB"
+        )
+        fuzzy_pattern = re.compile(
+            rf"(?<![\w])\+?[{allowed}]"
+            rf"(?:[{allowed}\s().\-]{{7,}})"
+            rf"[{allowed}](?![\w])"
+        )
+
+        for match in fuzzy_pattern.finditer(value):
+            original = match.group(0)
+            normalized = "".join(
+                char_map.get(char, char)
+                for char in original
+            )
+            number = re.sub(r"\D", "", normalized)
+
+            if (
+                "card" not in seen_kinds
+                and 13 <= len(number) <= 19
+                and luhn(number)
+            ):
+                findings.append({
+                    "kind": "card",
+                    "original": original,
+                    "priority": PRIORITY["card"],
+                })
+                seen_kinds.add("card")
+                continue
+
+            if (
+                "phone" not in seen_kinds
+                and 10 <= len(number) <= 15
+            ):
+                findings.append({
+                    "kind": "phone",
+                    "original": original,
+                    "priority": PRIORITY["phone"],
+                })
+                seen_kinds.add("phone")
+
+        return findings
+
+    @staticmethod
+    def _ocr_digit_density(value):
+        value = str(value or "")
+        visible = [
+            char
+            for char in value
+            if not char.isspace()
+        ]
+
+        if not visible:
+            return 0.0
+
+        digit_like = set(
+            "0123456789+OoОоQqDdIiLl|!ІӀZzSs$GgB().-"
+        )
+        count = sum(
+            1
+            for char in visible
+            if char in digit_like
+        )
+        return count / len(visible)
+
+    @staticmethod
+    def _ocr_record_groups(records):
+        groups = []
+        current = []
+
+        for item in records:
+            box = item.get("box")
+
+            if box is None:
+                if current:
+                    groups.append(current)
+                    current = []
+                continue
+
+            if not current:
+                current = [item]
+                continue
+
+            prev_box = current[-1].get("box")
+            if prev_box is None:
+                groups.append(current)
+                current = [item]
+                continue
+
+            prev_height = max(1, prev_box[3] - prev_box[1])
+            item_height = max(1, box[3] - box[1])
+            vertical_gap = box[1] - prev_box[3]
+            left_distance = abs(box[0] - prev_box[0])
+            horizontal_overlap = (
+                min(prev_box[2], box[2])
+                - max(prev_box[0], box[0])
+            )
+            min_width = max(
+                1,
+                min(
+                    prev_box[2] - prev_box[0],
+                    box[2] - box[0],
+                ),
+            )
+
+            is_neighbour = (
+                vertical_gap
+                <= max(prev_height, item_height) * 1.8
+                and (
+                    left_distance
+                    <= max(prev_height, item_height) * 2.5
+                    or horizontal_overlap / min_width >= 0.25
+                )
+            )
+
+            if is_neighbour:
+                current.append(item)
+            else:
+                groups.append(current)
+                current = [item]
+
+        if current:
+            groups.append(current)
+
+        return groups
+
+    @staticmethod
+    def _rect_tuple(rect):
+        if rect is None:
+            return None
+
+        try:
+            left = int(rect.left)
+            top = int(rect.top)
+            right = int(rect.right)
+            bottom = int(rect.bottom)
+        except Exception:
+            try:
+                left = int(rect.left())
+                top = int(rect.top())
+                right = int(rect.right())
+                bottom = int(rect.bottom())
+            except Exception:
+                return None
+
+        if right <= left or bottom <= top:
+            return None
+
+        return (left, top, right, bottom)
+
+    @staticmethod
+    def _ocr_findings_without_positions(findings):
+        result = []
+
+        for item in findings:
+            result.append({
+                "kind": item.get("kind", ""),
+                "original": item.get("original", ""),
+                "priority": int(item.get("priority", 0)),
+            })
+
+        return result
+
+    @staticmethod
+    def _dedupe_ocr_findings(findings):
+        result = []
+        seen = set()
+
+        for item in findings:
+            key = (
+                str(item.get("kind", "")),
+                str(item.get("original", "")).strip().lower(),
+            )
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+
+        return result
+
+    @staticmethod
+    def _merge_boxes(boxes):
+        cleaned = []
+
+        for box in boxes:
+            try:
+                left, top, right, bottom = map(int, box)
+            except Exception:
+                continue
+
+            if right <= left or bottom <= top:
+                continue
+
+            cleaned.append((left, top, right, bottom))
+
+        cleaned.sort(key=lambda box: (box[1], box[0]))
+        merged = []
+
+        for box in cleaned:
+            if not merged:
+                merged.append(box)
+                continue
+
+            prev = merged[-1]
+            horizontal_overlap = min(prev[2], box[2]) - max(prev[0], box[0])
+            min_width = max(1, min(prev[2] - prev[0], box[2] - box[0]))
+            vertical_gap = box[1] - prev[3]
+
+            if (
+                horizontal_overlap / min_width >= 0.45
+                and vertical_gap <= max(8, int((prev[3] - prev[1]) * 0.35))
+            ):
+                merged[-1] = (
+                    min(prev[0], box[0]),
+                    min(prev[1], box[1]),
+                    max(prev[2], box[2]),
+                    max(prev[3], box[3]),
+                )
+            else:
+                merged.append(box)
+
+        return merged
+
+    def _ocr_engine_status(self):
+        cached = self._ocr_engine_cache
+        if cached:
+            return cached
+
+        try:
+            from com.google.mlkit.vision.text import TextRecognition
+            from com.google.mlkit.vision.text.latin import TextRecognizerOptions
+            _ = TextRecognition
+            _ = TextRecognizerOptions
+            result = ("ok", "ML Kit")
+        except Exception:
+            try:
+                from com.google.android.gms.vision.text import TextRecognizer
+                _ = TextRecognizer
+                result = ("ok", "Google Vision")
+            except Exception:
+                result = ("unavailable", "")
+
+        self._ocr_engine_cache = result
+        return result
+
+    def _check_ocr_status_click(self, view=None):
+        def work():
+            status, engine = self._ocr_engine_status()
+
+            if status == "ok":
+                message = f"OCR доступен: {engine}."
+                error = False
+            else:
+                message = (
+                    "OCR недоступен в этой сборке клиента. "
+                    "Нужна сборка exteraGram/AyuGram с ML Kit "
+                    "или Google Vision внутри приложения."
+                )
+                error = True
+
+            run_on_ui_thread(
+                lambda: self._bulletin(message, error=error)
+            )
+
+        run_on_queue(work)
+
+    def _notify_ocr_unavailable_once(self, fragment):
+        if self._ocr_warning_shown:
+            return
+
+        self._ocr_warning_shown = True
+        run_on_ui_thread(
+            lambda: self._bulletin(
+                "Текст на изображении не проверен: OCR недоступен "
+                "в этой сборке клиента.",
+                error=True,
+                fragment=fragment,
+            )
+        )
+
+    def _extract_file_text(self, path, ext):
+        try:
+            if ext in TEXT_EXTS:
+                return self._read_text_file(path)
+            if ext in OFFICE_EXTS:
+                return self._read_office_text(path)
+            if ext in PDF_EXTS:
+                return self._read_pdf_text(path)
+        except Exception as error:
+            self.log(f"Privacy Firewall content extraction failed: {error}")
+        return ""
+
+    @staticmethod
+    def _decode_bytes(data):
+        for encoding in ("utf-8-sig", "utf-16", "cp1251", "latin-1"):
+            try:
+                return data.decode(encoding)
+            except Exception:
+                continue
+        return ""
+
+    def _read_text_file(self, path):
+        with open(path, "rb") as stream:
+            data = stream.read(MAX_CONTENT_BYTES)
+        return self._decode_bytes(data)[:MAX_CONTENT_CHARS]
+
+    def _read_office_text(self, path):
+        parts = []
+        with zipfile.ZipFile(path, "r") as archive:
+            for name in archive.namelist():
+                low = name.lower()
+                wanted = (
+                    (low == "word/document.xml")
+                    or low.startswith("word/header")
+                    or low.startswith("word/footer")
+                    or low == "xl/sharedstrings.xml"
+                    or low.startswith("xl/worksheets/sheet")
+                    or low.startswith("ppt/slides/slide")
+                    or low.startswith("ppt/notesSlides/notesSlide".lower())
+                )
+                if not wanted or not low.endswith(".xml"):
+                    continue
+                try:
+                    root = ET.fromstring(archive.read(name))
+                    value = " ".join(piece.strip() for piece in root.itertext() if piece.strip())
+                    if value:
+                        parts.append(value)
+                except Exception:
+                    continue
+                if sum(len(item) for item in parts) >= MAX_CONTENT_CHARS:
+                    break
+        return "\n".join(parts)[:MAX_CONTENT_CHARS]
+
+    def _read_pdf_text(self, path):
+        try:
+            from pypdf import PdfReader
+        except Exception as error:
+            self.log(f"Privacy Firewall: pypdf unavailable: {error}")
+            return ""
+
+        reader = PdfReader(path)
+        parts = []
+        for page in reader.pages[:MAX_PDF_PAGES]:
+            try:
+                value = page.extract_text() or ""
+            except Exception:
+                value = ""
+            if value:
+                parts.append(value)
+            if sum(len(item) for item in parts) >= MAX_CONTENT_CHARS:
+                break
+        return "\n".join(parts)[:MAX_CONTENT_CHARS]
+
+    @staticmethod
+    def _image_meta(path):
+        if Image is None:
+            return False
+        try:
+            with Image.open(path) as image:
+                if bool(getattr(image, "is_animated", False)):
+                    return False
+                try:
+                    if len(image.getexif()) > 0:
+                        return True
+                except Exception:
+                    pass
+                return any(k in image.info for k in ("exif", "xmp", "XML:com.adobe.xmp", "icc_profile", "photoshop"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _office_meta(path):
+        try:
+            with zipfile.ZipFile(path, "r") as z:
+                names = {n.lower() for n in z.namelist()}
+                return any(n in names for n in ("docprops/core.xml", "docprops/app.xml", "docprops/custom.xml"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _sensitive_name_reason(name):
+        base = os.path.basename(str(name or ""))
+        stem, extension = os.path.splitext(base)
+        low = stem.lower()
+        extension = extension.lower()
+
+        # Telegram assigns voice messages and video notes technical names made
+        # from internal numeric IDs. Those IDs are not phone numbers and must
+        # never trigger filename protection.
+        if (
+            extension in (VOICE_NOTE_EXTS | VIDEO_NOTE_EXTS)
+            and AUTO_MEDIA_STEM_RE.fullmatch(stem.strip())
+        ):
+            return ""
+
+        for token in SENSITIVE_NAMES:
+            try:
+                if re.search(token, low, re.IGNORECASE):
+                    return f"название содержит чувствительный маркер «{token}»"
+            except re.error:
+                if token in low:
+                    return f"название содержит чувствительный маркер «{token}»"
+
+        if EMAIL_RE.search(stem):
+            return "в названии обнаружена электронная почта"
+
+        # A bare run of digits in a cache filename is usually a Telegram file
+        # ID or timestamp. Treat it as a phone only when the filename contains
+        # an explicit contact marker, starts with '+', or has phone formatting.
+        for match in PHONE_RE.finditer(stem):
+            raw = match.group(0)
+            number = digits(raw)
+            separators = len(re.findall(r"[\s().-]", raw))
+            has_marker = bool(PHONE_FILENAME_MARKER_RE.search(stem))
+            if (
+                10 <= len(number) <= 15
+                and (
+                    raw.lstrip().startswith("+")
+                    or separators >= 2
+                    or has_marker
+                )
+            ):
+                return "в названии обнаружен номер телефона"
+
+        for match in CARD_RE.finditer(stem):
+            if luhn(match.group(0)):
+                return "в названии обнаружен номер банковской карты"
+        if re.search(r"(?<!\d)\d{6,12}(?!\d)", stem):
+            return "в названии есть длинный номер, похожий на документ или идентификатор"
+        if re.search(r"(?i)(?:фио|паспорт|договор|invoice|contract)[ _.-]*[А-ЯA-Z]", stem):
+            return "название связывает документ с личностью или назначением"
+        return ""
+
+    @classmethod
+    def _sensitive_name(cls, name):
+        return bool(cls._sensitive_name_reason(name))
+
+    @staticmethod
+    def _finding_reason(item):
+        return str(
+            item.get("reason")
+            or DETECTION_REASONS.get(item.get("kind"), "Совпало с правилом обнаружения конфиденциальных данных.")
+        )
+
+    @staticmethod
+    def _operation_reason(operation, media=None):
+        if operation == "safe_filename":
+            return str((media or {}).get("filename_reason") or DETECTION_REASONS["safe_filename"])
+        return DETECTION_REASONS.get(operation, "Вложение требует безопасной обработки перед отправкой.")
+
+    def _dialog(self, account, peer, text, field, path, findings, media, recipient, payload, fragment, context_alerts=None):
+        activity = self._activity(fragment)
+        if activity is None:
+            return
+        try:
+            from android.graphics import Color, Typeface
+            from android.graphics.drawable import GradientDrawable
+            from android.widget import CheckBox, LinearLayout, ScrollView, TextView
+            from org.telegram.messenger import AndroidUtilities
+        except Exception:
+            return self._simple_dialog(account, peer, text, field, path, findings, media, recipient, payload, fragment, context_alerts)
+
+        box = LinearLayout(activity)
+        box.setOrientation(LinearLayout.VERTICAL)
+        p = AndroidUtilities.dp(20)
+        box.setPadding(p, AndroidUtilities.dp(14), p, p)
+
+        try:
+            bg = GradientDrawable()
+            bg.setColor(Color.parseColor("#2B313B"))
+            bg.setCornerRadius(float(AndroidUtilities.dp(22)))
+            box.setBackground(bg)
+        except Exception:
+            pass
+
+        if recipient["warn"]:
+            tv = TextView(activity)
+            tv.setText(f"⚠ {recipient['title']}\n{recipient['details']}")
+            tv.setTextSize(15)
+            try:
+                tv.setTextColor(Color.parseColor("#FFD7D7"))
+            except Exception:
+                pass
+            try:
+                tv.setTypeface(tv.getTypeface(), Typeface.BOLD)
+            except Exception:
+                pass
+            box.addView(tv)
+
+        for alert in list(context_alerts or []):
+            tv = TextView(activity)
+            tv.setText(f"⚠ {alert.get('title', 'Дополнительная проверка')}\n{alert.get('details', '')}")
+            tv.setTextSize(14)
+            tv.setPadding(0, AndroidUtilities.dp(10), 0, 0)
+            try:
+                tv.setTextColor(Color.parseColor("#FFE3AE"))
+            except Exception:
+                pass
+            box.addView(tv)
+
+        hint = TextView(activity)
+        hint.setText("Выберите, что защитить перед отправкой:")
+        hint.setTextSize(15)
+        try:
+            hint.setTextColor(Color.WHITE)
+        except Exception:
+            pass
+        hint.setPadding(0, AndroidUtilities.dp(12), 0, AndroidUtilities.dp(8))
+        box.addView(hint)
+
+        grouped = {}
+        for item in findings:
+            grouped.setdefault(item["kind"], []).append(item)
+        kind_boxes = {}
+        for kind, items in list(grouped.items())[:14]:
+            cb = CheckBox(activity)
+            cb.setChecked(True)
+            sample = " ".join(items[0]["original"].split())
+            if len(sample) > 34:
+                sample = sample[:33] + "…"
+            count = f" ×{len(items)}" if len(items) > 1 else ""
+            reason = self._finding_reason(items[0])
+            cb.setText(f"{LABELS.get(kind, kind)}{count}\n{sample}\nПочему: {reason}")
+            cb.setTextSize(14)
+            try:
+                cb.setTextColor(Color.parseColor("#F4F7FB"))
+            except Exception:
+                pass
+            box.addView(cb)
+            kind_boxes[kind] = cb
+
+        op_boxes = {}
+        for op in media["ops"]:
+            cb = CheckBox(activity)
+            checked = not (
+                op == "safe_filename"
+                and not self.get_setting("auto_rename_files", True)
+            )
+            cb.setChecked(checked)
+            op_reason = self._operation_reason(op, media)
+            cb.setText(f"{LABELS.get(op, op)}\nПочему: {op_reason}")
+            cb.setTextSize(14)
+            try:
+                cb.setTextColor(Color.parseColor("#F4F7FB"))
+            except Exception:
+                pass
+            box.addView(cb)
+            op_boxes[op] = cb
+
+        if media["details"]:
+            tv = TextView(activity)
+            tv.setText("\n".join(media["details"]))
+            tv.setTextSize(13)
+            try:
+                tv.setTextColor(Color.parseColor("#C9D3E0"))
+            except Exception:
+                pass
+            box.addView(tv)
+
+        if (
+            text
+            and findings
+            and self.get_setting("show_preview", True)
+        ):
+            preview = self._masked_text(
+                text,
+                findings,
+                {item["kind"] for item in findings},
+            )
+            if len(preview) > 700:
+                preview = preview[:700] + "…"
+
+            preview_view = TextView(activity)
+            preview_view.setText(
+                f"\nБезопасный предпросмотр:\n{preview}"
+            )
+            preview_view.setTextSize(13)
+            try:
+                preview_view.setTextColor(Color.parseColor("#D8EFFF"))
+            except Exception:
+                pass
+            box.addView(preview_view)
+
+        scroll = ScrollView(activity)
+        try:
+            scroll.setFillViewport(True)
+            scroll.setBackgroundColor(Color.TRANSPARENT)
+        except Exception:
+            pass
+        scroll.addView(box)
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Privacy Firewall")
+        builder.set_view(scroll)
+
+        def protect(dialog, which):
+            dialog.dismiss()
+            kinds = {k for k, cb in kind_boxes.items() if bool(cb.isChecked())}
+            ops = {k for k, cb in op_boxes.items() if bool(cb.isChecked())}
+            self._protect(account, peer, text, self._masked_text(text, findings, kinds), field,
+                          path, payload, ops, kinds, fragment, media, context_alerts)
+
+        def unchanged(dialog, which):
+            dialog.dismiss()
+            self._inc(account, sent_unchanged=1)
+            self._resend(account, peer, text, field, path, payload)
+
+        def cancel(dialog, which):
+            dialog.dismiss()
+            self._inc(account, cancelled=1)
+            self._bulletin("Отправка отменена.", fragment=fragment)
+
+        has_protection = bool(findings or media.get("ops"))
+        builder.set_positive_button(
+            "Защитить и отправить" if has_protection else "Проверил, отправить",
+            protect,
+        )
+        if has_protection:
+            builder.set_neutral_button("Отправить как есть", unchanged)
+        builder.set_negative_button("Отмена", cancel)
+        builder.show()
+        try:
+            builder.make_button_red(AlertDialogBuilder.BUTTON_NEUTRAL)
+        except Exception:
+            pass
+
+    def _simple_dialog(self, account, peer, text, field, path, findings, media, recipient, payload, fragment, context_alerts=None):
+        activity = self._activity(fragment)
+        if activity is None or AlertDialogBuilder is None:
+            return
+        kinds = {f["kind"] for f in findings}
+        ops = self._default_operations(media)
+        counts = Counter(LABELS[f["kind"]] for f in findings)
+        items = [f"{k} ×{v}" if v > 1 else k for k, v in counts.items()]
+        items += [LABELS.get(op, op) for op in media["ops"]]
+        items += [alert.get("title", "Дополнительная проверка") for alert in list(context_alerts or [])]
+        msg = "Обнаружено:\n• " + "\n• ".join(items)
+        if recipient["warn"]:
+            msg = f"{recipient['title']}\n{recipient['details']}\n\n{msg}"
+        reasons = [
+            f"• {LABELS.get(item['kind'], item['kind'])}: {self._finding_reason(item)}"
+            for item in findings[:8]
+        ]
+        reasons += [
+            f"• {alert.get('title', 'Проверка')}: {alert.get('reason', alert.get('details', ''))}"
+            for alert in list(context_alerts or [])[:4]
+        ]
+        if reasons:
+            msg += "\n\nПочему сработало:\n" + "\n".join(reasons)
+        b = AlertDialogBuilder(activity)
+        b.set_title("Privacy Firewall")
+        b.set_message(msg)
+        b.set_positive_button("Защитить", lambda d, w: (
+            d.dismiss(), self._protect(account, peer, text, self._masked_text(text, findings, kinds),
+                                       field, path, payload, ops, kinds, fragment, media, context_alerts)))
+        b.set_neutral_button("Как есть", lambda d, w: (
+            d.dismiss(), self._inc(account, sent_unchanged=1),
+            self._resend(account, peer, text, field, path, payload)))
+        b.set_negative_button("Отмена", lambda d, w: (d.dismiss(), self._inc(account, cancelled=1)))
+        b.show()
+
+    def _protect(self, account, peer, original, protected, field, path, payload, ops, kinds, fragment, media=None, context_alerts=None):
+        safe_payload = dict(payload)
+
+        if "location_share_block" in ops:
+            safe_payload.pop("location", None)
+            if not protected.strip():
+                protected = "[ГЕОЛОКАЦИЯ СКРЫТА]"
+
+        if "pdf_content_warning" in ops:
+            self._inc(account, cancelled=1)
+            self._bulletin(
+                "В PDF найдены личные данные. Автоматическое редактирование PDF недоступно, поэтому файл не отправлен.",
+                error=True,
+                fragment=fragment,
+            )
+            return
+
+        def work():
+            try:
+                new_path = self._protected_path(path, ops, media) if ops else path
+            except Exception as error:
+                self.log(f"Privacy Firewall cleaning failed: {error}")
+                run_on_ui_thread(lambda: self._bulletin(
+                    "Не удалось очистить вложение. Отправка отменена.", error=True, fragment=fragment))
+                return
+            changes = {"protected_sends": 1}
+            if kinds:
+                changes["text_masks"] = 1
+            if "image_metadata" in ops or "office_metadata" in ops:
+                changes["media_cleaned"] = 1
+            if "safe_filename" in ops:
+                changes["files_renamed"] = 1
+            location_kinds = {
+                "gps_coordinates", "map_link", "address",
+                "settlement", "postal_code",
+            }
+            if kinds & location_kinds:
+                changes["location_masks"] = 1
+            if "location_share_block" in ops:
+                changes["location_shares_blocked"] = 1
+            self._inc(account, **changes)
+            self._resend(account, peer, protected, field, new_path, safe_payload, original_path=path)
+            run_on_ui_thread(lambda: self._show_protection_success(
+                fragment=fragment,
+                kinds=set(kinds or set()),
+                ops=set(ops or set()),
+                context_alerts=list(context_alerts or []),
+            ), 180)
+        if ops:
+            self._bulletin("Privacy Firewall очищает вложение…", fragment=fragment)
+            run_on_queue(work)
+        else:
+            work()
+
+    def _protected_path(self, source, ops, media=None):
+        if not source or not ops:
+            return source
+        if self._is_voice_or_round_media(None, source):
+            return source
+        cache = os.path.join(get_cache_dir(), "privacy_firewall")
+        ensure_dir_exists(cache)
+        ext = os.path.splitext(source)[1].lower()
+        token = hashlib.sha256(f"{source}:{time.time_ns()}".encode()).hexdigest()[:12]
+        current = source
+        stage = 0
+
+        def next_path(prefix="privacy_stage"):
+            nonlocal stage
+            stage += 1
+            return os.path.join(cache, f"{prefix}_{token}_{stage}{ext}")
+
+        if "image_ocr_redact" in ops:
+            boxes = list((media or {}).get("ocr_boxes", []))
+            width = int((media or {}).get("ocr_width", 0) or 0)
+            height = int((media or {}).get("ocr_height", 0) or 0)
+
+            if not boxes:
+                raise RuntimeError("OCR boxes are missing")
+
+            dest = next_path()
+            self._redact_image(current, dest, boxes, width, height)
+            current = dest
+
+        elif "image_metadata" in ops:
+            dest = next_path()
+            self._clean_image(current, dest)
+            current = dest
+        if "office_metadata" in ops:
+            dest = next_path()
+            self._clean_office(current, dest)
+            current = dest
+        if "file_content_mask" in ops:
+            dest = next_path()
+            self._clean_file_content(current, dest, ext)
+            current = dest
+        if "safe_filename" in ops:
+            dest = os.path.join(cache, f"protected_file_{token}{ext}")
+            shutil.copyfile(current, dest)
+            current = dest
+        elif current != source:
+            final = os.path.join(cache, f"privacy_clean_{token}{ext}")
+            shutil.copyfile(current, final)
+            current = final
+        return current
+
+    def _clean_file_content(self, source, dest, ext):
+        if ext in TEXT_EXTS:
+            raw = self._read_text_file(source)
+            findings = self._scan(raw, PROFILE_STRICT)
+            protected = self._masked_text(raw, findings, {f["kind"] for f in findings})
+            with open(dest, "w", encoding="utf-8") as stream:
+                stream.write(protected)
+            return
+        if ext in OFFICE_EXTS:
+            self._clean_office_content(source, dest)
+            return
+        raise RuntimeError("Автоматическое маскирование этого формата не поддерживается")
+
+    def _clean_office_content(self, source, dest):
+        with zipfile.ZipFile(source, "r") as src, zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                low = info.filename.lower()
+                content_xml = (
+                    low.endswith(".xml")
+                    and (
+                        low == "word/document.xml"
+                        or low.startswith("word/header")
+                        or low.startswith("word/footer")
+                        or low == "xl/sharedstrings.xml"
+                        or low.startswith("xl/worksheets/sheet")
+                        or low.startswith("ppt/slides/slide")
+                        or low.startswith("ppt/notesslides/notesslide")
+                    )
+                )
+                if content_xml:
+                    try:
+                        root = ET.fromstring(data)
+                        for node in root.iter():
+                            if node.text:
+                                found = self._scan(node.text, PROFILE_STRICT)
+                                if found:
+                                    node.text = self._masked_text(
+                                        node.text,
+                                        found,
+                                        {item["kind"] for item in found},
+                                    )
+                            if node.tail:
+                                found = self._scan(node.tail, PROFILE_STRICT)
+                                if found:
+                                    node.tail = self._masked_text(
+                                        node.tail,
+                                        found,
+                                        {item["kind"] for item in found},
+                                    )
+                        data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                    except Exception:
+                        pass
+                dst.writestr(info, data)
+
+
+    @staticmethod
+    def _redact_image(source, dest, boxes, ocr_width=0, ocr_height=0):
+        if Image is None or ImageDraw is None or ImageOps is None:
+            raise RuntimeError("Pillow недоступен")
+
+        with Image.open(source) as image:
+            if bool(getattr(image, "is_animated", False)):
+                raise RuntimeError(
+                    "OCR-маскирование анимированных изображений не поддерживается"
+                )
+
+            cleaned = ImageOps.exif_transpose(image)
+            cleaned.load()
+
+            source_width = max(1, int(ocr_width or cleaned.width))
+            source_height = max(1, int(ocr_height or cleaned.height))
+            scale_x = cleaned.width / source_width
+            scale_y = cleaned.height / source_height
+            margin = max(
+                4,
+                int(min(cleaned.width, cleaned.height) * 0.006),
+            )
+            radius = max(3, margin)
+
+            if cleaned.mode == "L":
+                fill = 0
+            elif "A" in cleaned.getbands():
+                fill = (0, 0, 0, 255)
+            else:
+                if cleaned.mode not in ("RGB", "RGBA"):
+                    cleaned = cleaned.convert("RGB")
+                fill = (0, 0, 0)
+
+            draw = ImageDraw.Draw(cleaned)
+
+            for left, top, right, bottom in boxes:
+                x1 = max(
+                    0,
+                    int(left * scale_x) - margin,
+                )
+                y1 = max(
+                    0,
+                    int(top * scale_y) - margin,
+                )
+                x2 = min(
+                    cleaned.width,
+                    int(right * scale_x) + margin,
+                )
+                y2 = min(
+                    cleaned.height,
+                    int(bottom * scale_y) + margin,
+                )
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                try:
+                    draw.rounded_rectangle(
+                        (x1, y1, x2, y2),
+                        radius=radius,
+                        fill=fill,
+                    )
+                except Exception:
+                    draw.rectangle(
+                        (x1, y1, x2, y2),
+                        fill=fill,
+                    )
+
+            ext = os.path.splitext(dest)[1].lower()
+
+            if ext in (".jpg", ".jpeg"):
+                if cleaned.mode not in ("RGB", "L"):
+                    background = Image.new("RGB", cleaned.size, "white")
+                    if "A" in cleaned.getbands():
+                        background.paste(
+                            cleaned,
+                            mask=cleaned.getchannel("A"),
+                        )
+                    else:
+                        background.paste(cleaned)
+                    cleaned = background
+                cleaned.save(
+                    dest,
+                    format="JPEG",
+                    quality=95,
+                    optimize=True,
+                )
+            elif ext == ".png":
+                cleaned.save(dest, format="PNG", optimize=True)
+            elif ext == ".webp":
+                cleaned.save(dest, format="WEBP", quality=95)
+            else:
+                raise RuntimeError("Неподдерживаемый формат изображения")
+
+    @staticmethod
+    def _clean_image(source, dest):
+        if Image is None or ImageOps is None:
+            raise RuntimeError("Pillow недоступен")
+        with Image.open(source) as image:
+            if bool(getattr(image, "is_animated", False)):
+                raise RuntimeError("Анимированные изображения не поддерживаются")
+            cleaned = ImageOps.exif_transpose(image)
+            cleaned.load()
+            ext = os.path.splitext(dest)[1].lower()
+            if ext in (".jpg", ".jpeg"):
+                if cleaned.mode not in ("RGB", "L"):
+                    bg = Image.new("RGB", cleaned.size, "white")
+                    if "A" in cleaned.getbands():
+                        bg.paste(cleaned, mask=cleaned.getchannel("A"))
+                    else:
+                        bg.paste(cleaned)
+                    cleaned = bg
+                cleaned.save(dest, format="JPEG", quality=95, optimize=True)
+            elif ext == ".png":
+                cleaned.save(dest, format="PNG", optimize=True)
+            elif ext == ".webp":
+                cleaned.save(dest, format="WEBP", quality=95)
+            else:
+                raise RuntimeError("Неподдерживаемый формат")
+
+    @staticmethod
+    def _clean_office(source, dest):
+        blocked = {"docprops/core.xml", "docprops/app.xml", "docprops/custom.xml"}
+        with zipfile.ZipFile(source, "r") as src, zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in src.infolist():
+                if info.filename.lower() not in blocked:
+                    dst.writestr(info, src.read(info.filename))
+
+    @staticmethod
+    def _payload_has_link_preview(payload, original_text=""):
+        """Return True when the original send payload contains a URL or preview."""
+        if not isinstance(payload, dict):
+            return bool(URL_RE.search(str(original_text or "")))
+
+        if URL_RE.search(str(original_text or "")):
+            return True
+
+        if payload.get("webPage") is not None or payload.get("mediaWebPage") is not None:
+            return True
+
+        entities = payload.get("entities")
+        if entities is None:
+            return False
+
+        try:
+            values = list(entities)
+        except Exception:
+            values = []
+            try:
+                size = int(entities.size())
+                values = [entities.get(index) for index in range(size)]
+            except Exception:
+                pass
+
+        for entity in values:
+            try:
+                name = type(entity).__name__.lower()
+            except Exception:
+                name = ""
+            if "messageentityurl" in name or "messageentitytexturl" in name:
+                return True
+            try:
+                if str(getattr(entity, "url", "") or "").strip():
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    @staticmethod
+    def _clear_link_preview(payload):
+        """Remove an already generated preview and prevent Telegram rebuilding it."""
+        cleaned = dict(payload or {})
+        cleaned.pop("webPage", None)
+        cleaned.pop("mediaWebPage", None)
+        cleaned["searchLinks"] = False
+
+        # invert_media controls the placement of a web preview. It has no meaning
+        # after the preview object is removed and can keep stale preview state.
+        if cleaned.get("photo") is None and cleaned.get("document") is None:
+            cleaned.pop("invert_media", None)
+
+        return cleaned
+
+    def _resend(self, account, peer, text, field, path, payload, original_path=""):
+        new = dict(payload)
+        new["peer"] = peer
+        if field:
+            new[field] = text
+        elif text:
+            new["message"] = text
+        original_text = self._payload_text(payload)
+        text_changed = text != original_text
+        if text_changed:
+            new.pop("entities", None)
+            if self._payload_has_link_preview(payload, original_text):
+                new = self._clear_link_preview(new)
+        changed = bool(path and path != original_path)
+        if path:
+            new["path"] = path
+        self._allow(account, peer, text, path)
+        try:
+            if changed:
+                common = {k: new[k] for k in ("replyToMsg", "replyToTopMsg", "notify",
+                                               "scheduleDate", "ttl", "hasMediaSpoilers")
+                          if k in new and new[k] is not None}
+                if new.get("photo") is not None and new.get("document") is None:
+                    send_photo(peer, path, caption=text or "",
+                               high_quality=bool(new.get("sendingHighQuality", False)), **common)
+                else:
+                    send_document(peer, path, caption=text or "", **common)
+            else:
+                send_message(new)
+        except Exception as error:
+            self._remove(account, peer, text, path)
+            self.log(f"Privacy Firewall resend failed: {error}")
+            self._bulletin("Не удалось повторно отправить сообщение.", error=True)
+
+    def _show_profile_info(self, view=None):
+        message = (
+            "БАЗОВЫЙ\n"
+            "Ищет самые опасные данные:\n"
+            "• пароли и кодовые фразы;\n"
+            "• токены и API-ключи;\n"
+            "• seed-фразы и приватные ключи;\n"
+            "• банковские карты и IBAN.\n\n"
+            "СТАНДАРТНЫЙ\n"
+            "Включает базовую защиту и дополнительно проверяет:\n"
+            "• телефоны и электронную почту;\n"
+            "• ФИО, паспорт и документы;\n"
+            "• коды подтверждения;\n"
+            "• GPS, адреса, улицы, города и ссылки на карты.\n\n"
+            "МАКСИМАЛЬНЫЙ\n"
+            "Включает стандартную защиту и дополнительно ищет:\n"
+            "• подозрительные ссылки;\n"
+            "• скрытые Unicode-символы;\n"
+            "• чувствительные названия файлов.\n\n"
+            "Выбор уровня находится в строке «Выбранный профиль»."
+        )
+        self._show_info_dialog(
+            "Уровни защиты",
+            message,
+        )
+
+    def _show_detection_reasons(self, view=None):
+        ordered = (
+            "card", "iban", "phone", "email", "full_name", "document_id",
+            "gps_coordinates", "map_link", "address", "settlement", "password",
+            "api_secret", "bot_token", "otp", "suspicious_link", "safe_filename",
+        )
+        message = "\n\n".join(
+            f"{LABELS.get(kind, kind).upper()}\n{DETECTION_REASONS.get(kind, '')}"
+            for kind in ordered
+        )
+        self._show_info_dialog("Почему срабатывает защита", message)
+
+    def _test_protection_banner(self, view=None):
+        run_on_ui_thread(lambda: self._show_protection_success(
+            fragment=self._fragment(),
+            kinds={"phone", "email"},
+            ops=set(),
+            context_alerts=[],
+        ), 120)
+
+    def _show_safety_info(self, view=None):
+        message = (
+            "✓ Статус: БЕЗОПАСЕН\n\n"
+            "• Проверка выполняется локально на устройстве.\n"
+            "• Код плагина не делает сетевых запросов.\n"
+            "• Тексты сообщений и найденные значения не сохраняются.\n"
+            "• В журнал записываются только числовые счётчики.\n"
+            "• Временные копии файлов создаются только при выбранной защите.\n"
+            "• Изображения не распознаются и не изменяются.\n\n"
+            "Для чтения текстовых PDF используется локальная библиотека pypdf."
+        )
+        self._show_info_dialog(
+            "Безопасность Privacy Firewall",
+            message,
+        )
+
+    def _test_trust_banner(self, view=None):
+        run_on_ui_thread(
+            lambda: self._show_trust_feedback(
+                message="Чат добавлен в доверенные",
+                added=True,
+                preferred_fragment=self._fragment(),
+            ),
+            120,
+        )
+
+    def _run_test_scan(self, view=None):
+        sample = (
+            "ФИО: иванов иван иванович\n"
+            "Телефон: +7 999 123-45-67\n"
+            "Почта: test@example.com\n"
+            "Номер паспорта: 7139183\n"
+            "Адрес: г. Москва, ул. Тверская, д. 10, кв. 5\n"
+            "GPS: 55.7558, 37.6173"
+        )
+        findings = self._scan(sample, PROFILE_STRICT)
+        selected = {item["kind"] for item in findings}
+        protected = self._masked_text(sample, findings, selected)
+        categories = Counter(
+            LABELS.get(item["kind"], item["kind"])
+            for item in findings
+        )
+        summary = "\n".join(
+            f"• {name}" + (f" ×{count}" if count > 1 else "")
+            for name, count in categories.items()
+        )
+        message = (
+            f"Найдено категорий: {len(categories)}\n"
+            f"{summary or 'Ничего не найдено'}\n\n"
+            f"Безопасный вариант:\n{protected}"
+        )
+        self._show_info_dialog("Тест Privacy Firewall", message)
+
+    def _show_info_dialog(self, title, message):
+        fragment = self._fragment()
+        activity = self._activity(fragment)
+
+        if AlertDialogBuilder is None or activity is None:
+            self._bulletin(message, fragment=fragment)
+            return
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(title)
+        builder.set_message(message)
+        builder.set_positive_button(
+            "Закрыть",
+            lambda dialog, which: dialog.dismiss(),
+        )
+        builder.show()
+
+    def _peer_title(self, account, peer):
+        try:
+            controller = get_messages_controller(account)
+
+            if peer > 0:
+                user = controller.getUser(int(peer))
+                if user is not None:
+                    first = str(getattr(user, "first_name", "") or "").strip()
+                    last = str(getattr(user, "last_name", "") or "").strip()
+                    username = str(getattr(user, "username", "") or "").strip()
+                    name = " ".join(part for part in (first, last) if part)
+                    if name:
+                        return name
+                    if username:
+                        return f"@{username}"
+
+            if peer < 0:
+                chat = controller.getChat(int(-peer))
+                if chat is not None:
+                    title = str(getattr(chat, "title", "") or "").strip()
+                    if title:
+                        return title
+        except Exception:
+            pass
+
+        return f"Чат {peer}"
+
+    def _show_trusted_chats(self, view=None):
+        account = self._selected_account()
+        peers = sorted(self._trusted_set(account))
+        fragment = self._fragment()
+        activity = self._activity(fragment)
+
+        if not peers:
+            self._bulletin(
+                "Список доверенных чатов пуст.",
+                fragment=fragment,
+            )
+            return
+
+        labels = [
+            f"{self._peer_title(account, peer)}\nID: {peer}"
+            for peer in peers
+        ]
+
+        if AlertDialogBuilder is None or activity is None:
+            self._bulletin(
+                "\n".join(labels[:5]),
+                fragment=fragment,
+            )
+            return
+
+        def remove_chat(dialog, index):
+            dialog.dismiss()
+            if not 0 <= index < len(peers):
+                return
+
+            values = self._trusted_set(account)
+            values.discard(peers[index])
+            self._save_trusted(account, values)
+            self._bulletin(
+                "Чат удалён из доверенных.",
+                fragment=fragment,
+            )
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Доверенные чаты")
+        builder.set_message(
+            "Нажмите на чат, чтобы удалить его из списка."
+        )
+        builder.set_items(labels, remove_chat)
+        builder.set_negative_button(
+            "Закрыть",
+            lambda dialog, which: dialog.dismiss(),
+        )
+        builder.show()
+
+    @staticmethod
+    def _profile_name(profile):
+        return {
+            PROFILE_BASIC: "Базовый",
+            PROFILE_STANDARD: "Стандартный",
+            PROFILE_STRICT: "Максимальный",
+        }.get(int(profile), "Стандартный")
+
+    @staticmethod
+    def _profile_description(profile):
+        descriptions = {
+            PROFILE_BASIC: (
+                "Критические секреты: банковские данные, пароли, токены, "
+                "API-ключи, seed-фразы и приватные ключи."
+            ),
+            PROFILE_STANDARD: (
+                "Базовая защита плюс телефоны, почта, ФИО, документы, "
+                "коды подтверждения, GPS и адреса."
+            ),
+            PROFILE_STRICT: (
+                "Стандартная защита плюс расширенный Link Guard, скрытые "
+                "Unicode-символы и чувствительные названия файлов."
+            ),
+        }
+        return descriptions.get(int(profile), descriptions[PROFILE_STANDARD])
+
+    def _open_chat_profile_menu(self, context):
+        fragment = context.get("fragment") or self._fragment()
+        activity = self._activity(fragment)
+        current = self._profile()
+
+        if AlertDialogBuilder is None or activity is None:
+            self._bulletin(
+                f"Уровень защиты: {self._profile_name(current)}",
+                fragment=fragment,
+            )
+            return
+
+        items = []
+        for value in (PROFILE_BASIC, PROFILE_STANDARD, PROFILE_STRICT):
+            marker = "✓ " if value == current else ""
+            items.append(
+                f"{marker}{self._profile_name(value)}\n"
+                f"{self._profile_description(value)}"
+            )
+
+        def select_profile(dialog, index):
+            dialog.dismiss()
+
+            if index not in (
+                PROFILE_BASIC,
+                PROFILE_STANDARD,
+                PROFILE_STRICT,
+            ):
+                return
+
+            self.set_setting(
+                "profile",
+                int(index),
+                reload_settings=True,
+            )
+            self._bulletin(
+                f"Уровень защиты: {self._profile_name(index)}",
+                fragment=fragment,
+            )
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(
+            f"Уровень защиты · {self._profile_name(current)}"
+        )
+        builder.set_message(
+            "Выберите уровень. Галочкой отмечен текущий профиль."
+        )
+        builder.set_items(items, select_profile)
+        builder.set_negative_button(
+            "Закрыть",
+            lambda dialog, which: dialog.dismiss(),
+        )
+        builder.show()
+
+    def _open_trust_dialog(self, context):
+        """
+        Toggle trust immediately, then show feedback after the plugin submenu
+        has closed. The callback is intentionally exception-proof because
+        menu context differs between exteraGram and AyuGram builds.
+        """
+        try:
+            account = self._context_account(context)
+            peer = self._context_peer(context)
+            fragment = self._context_fragment(context)
+
+            if not peer:
+                # The active chat is often easier to resolve after the menu
+                # callback than from the callback dictionary itself.
+                peer = self._peer_from_fragment(fragment)
+
+            if not peer:
+                active_fragment = self._fragment()
+                if active_fragment is not None:
+                    fragment = active_fragment
+                    peer = self._peer_from_fragment(active_fragment)
+
+            if not peer:
+                self.log(
+                    "Privacy Firewall: trust click received, "
+                    "but chat ID could not be resolved."
+                )
+                run_on_ui_thread(
+                    lambda: self._show_trust_failure(
+                        "Не удалось определить этот чат"
+                    ),
+                    300,
+                )
+                return
+
+            values = self._trusted_set(account)
+
+            if peer in values:
+                values.remove(peer)
+                message = "Чат убран из доверенных"
+                added = False
+            else:
+                values.add(peer)
+                message = "Чат добавлен в доверенные"
+                added = True
+
+            self._save_trusted(account, values)
+
+            # Wait until the plugins submenu is completely dismissed.
+            run_on_ui_thread(
+                lambda: self._show_trust_feedback(
+                    message=message,
+                    added=added,
+                    preferred_fragment=fragment,
+                ),
+                320,
+            )
+
+        except Exception as error:
+            self.log(
+                "Privacy Firewall trust handler error: "
+                f"{error}\n{traceback.format_exc()}"
+            )
+            run_on_ui_thread(
+                lambda: self._show_trust_failure(
+                    "Не удалось изменить доверие к чату"
+                ),
+                320,
+            )
+
+    def _trusted_key(self, account):
+        return f"trusted_chats_{int(account)}"
+
+    def _trusted_set(self, account):
+        raw = self.get_setting(self._trusted_key(account), "[]")
+        try:
+            return {int(x) for x in (raw if isinstance(raw, list) else json.loads(raw))}
+        except Exception:
+            return set()
+
+    def _save_trusted(self, account, values):
+        self.set_setting(self._trusted_key(account), json.dumps(sorted(values)))
+
+    def _trusted(self, account, peer):
+        return int(peer) in self._trusted_set(account)
+
+    def _stats_key(self, account):
+        return f"stats_{int(account)}"
+
+    def _load_stats(self, account):
+        raw = self.get_setting(self._stats_key(account), "{}")
+        try:
+            data = raw if isinstance(raw, dict) else json.loads(raw)
+        except Exception:
+            data = {}
+        return {k: max(0, int(data.get(k, 0))) for k in STATS}
+
+    def _inc(self, account, **changes):
+        if not self.get_setting("track_stats", True):
+            return
+
+        data = self._load_stats(account)
+        for key, value in changes.items():
+            if key in data:
+                data[key] += int(value)
+        self.set_setting(self._stats_key(account), json.dumps(data, separators=(",", ":")))
+
+    def _show_stats(self, view=None):
+        account = self._selected_account()
+        s = self._load_stats(account)
+        text = (
+            f"Проверок: {s['scans']}\nПредупреждений: {s['warnings']}\n"
+            f"Защищённых отправок: {s['protected_sends']}\n"
+            f"Отправлено без изменений: {s['sent_unchanged']}\nОтменено: {s['cancelled']}\n\n"
+            f"Маскирований текста: {s['text_masks']}\nОчищено вложений: {s['media_cleaned']}\n"
+            f"Переименовано файлов: {s['files_renamed']}\n"
+            f"Предупреждений о получателе: {s['recipient_warnings']}\n\n"
+            f"Маскирований геоданных: {s['location_masks']}\n"
+            f"Заблокировано отправок геолокации: {s['location_shares_blocked']}\n"
+            f"Предупреждений о ссылках: {s['link_warnings']}\n"
+            f"Проверок имён файлов: {s['filename_warnings']}\n"
+            f"Предупреждений о командах ботов: {s['bot_command_warnings']}\n"
+            f"Предупреждений о пересылках: {s['forward_warnings']}\n\n"
+            f"Доверенных чатов: {len(self._trusted_set(account))}"
+        )
+        fragment = self._fragment()
+        activity = self._activity(fragment)
+        if AlertDialogBuilder is None or activity is None:
+            return self._bulletin(text, fragment=fragment)
+        b = AlertDialogBuilder(activity)
+        b.set_title("Статистика Privacy Firewall")
+        b.set_message(text)
+        b.set_positive_button("Закрыть", lambda d, w: d.dismiss())
+        b.show()
+
+    def _clear_stats(self, view=None):
+        self.set_setting(self._stats_key(self._selected_account()), "{}")
+        self._bulletin("Статистика очищена.")
+
+    def _clear_trusted(self, view=None):
+        self._save_trusted(self._selected_account(), set())
+        self._bulletin("Список доверенных чатов очищен.")
+
+    def _profile(self):
+        try:
+            return max(PROFILE_BASIC, min(PROFILE_STRICT, int(self.get_setting("profile", PROFILE_STANDARD))))
+        except Exception:
+            return PROFILE_STANDARD
+
+
+    @staticmethod
+    def _media_flag(obj, names):
+        """Return True only for explicit boolean-like media flags."""
+        if obj is None:
+            return False
+        for name in names:
+            try:
+                value = getattr(obj, name)
+            except Exception:
+                continue
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            if isinstance(value, bool):
+                if value:
+                    return True
+                continue
+            if isinstance(value, int) and value != 0:
+                return True
+        return False
+
+    @classmethod
+    def _media_objects(cls, params):
+        """Collect the small set of Telegram objects that describe an attachment."""
+        if params is None:
+            return []
+
+        nested_names = (
+            "document", "photo", "videoEditedInfo", "retryMessageObject",
+            "parentObject", "messageOwner", "media", "message", "object",
+            "audio", "video",
+        )
+        result = []
+        queue = [(params, 0)]
+        seen = set()
+
+        while queue:
+            obj, depth = queue.pop(0)
+            if obj is None:
+                continue
+            try:
+                marker = id(obj)
+            except Exception:
+                marker = None
+            if marker is not None and marker in seen:
+                continue
+            if marker is not None:
+                seen.add(marker)
+            result.append(obj)
+            if depth >= 3:
+                continue
+
+            for name in nested_names:
+                try:
+                    value = getattr(obj, name)
+                except Exception:
+                    continue
+                if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                    continue
+                queue.append((value, depth + 1))
+
+            try:
+                attributes = getattr(obj, "attributes")
+            except Exception:
+                attributes = None
+            if attributes is not None:
+                try:
+                    for item in attributes:
+                        queue.append((item, depth + 1))
+                except Exception:
+                    try:
+                        size = int(attributes.size())
+                        for index in range(min(size, 32)):
+                            queue.append((attributes.get(index), depth + 1))
+                    except Exception:
+                        pass
+
+        return result
+
+    @classmethod
+    def _is_voice_or_round_media(cls, params=None, path=""):
+        """Voice messages and video notes are fully outside firewall processing."""
+        try:
+            base = os.path.basename(str(path or ""))
+        except Exception:
+            base = ""
+        stem, extension = os.path.splitext(base)
+        extension = extension.lower()
+
+        # Telegram voice messages are encoded as OGG/Opus. They must never be
+        # scanned, renamed, copied, cleaned or re-sent by the plugin.
+        if extension in VOICE_NOTE_EXTS:
+            return True
+
+        # Video notes normally use an internal numeric/cache filename. This is
+        # a safe path-only fallback when Telegram's object flags are unavailable.
+        if (
+            extension in VIDEO_NOTE_EXTS
+            and AUTO_MEDIA_STEM_RE.fullmatch(stem.strip())
+        ):
+            return True
+
+        voice_flags = (
+            "voice", "isVoice", "is_voice", "isVoiceMessage",
+            "voiceMessage", "voice_note", "isVoiceNote", "ptt", "isPtt",
+        )
+        round_flags = (
+            "roundVideo", "round_video", "isRoundVideo", "isRound",
+            "roundMessage", "round_message", "videoNote", "video_note",
+            "isVideoNote",
+        )
+
+        for obj in cls._media_objects(params):
+            if cls._media_flag(obj, voice_flags):
+                return True
+            if cls._media_flag(obj, round_flags):
+                return True
+
+            try:
+                class_name = type(obj).__name__.lower()
+            except Exception:
+                class_name = ""
+
+            # Telegram document attributes expose definitive flags.
+            if "documentattributeaudio" in class_name:
+                if cls._media_flag(obj, ("voice", "isVoice", "is_voice")):
+                    return True
+            if "documentattributevideo" in class_name:
+                if cls._media_flag(
+                    obj,
+                    ("round_message", "roundMessage", "roundVideo", "isRoundVideo"),
+                ):
+                    return True
+
+            try:
+                mime = str(getattr(obj, "mime_type", "") or "").lower()
+            except Exception:
+                mime = ""
+            if mime in ("audio/ogg", "audio/opus", "application/ogg"):
+                if extension in VOICE_NOTE_EXTS or cls._media_flag(obj, voice_flags):
+                    return True
+
+        return False
+
+    @staticmethod
+    def _extract_text(params):
+        for key in ("message", "caption"):
+            try:
+                value = getattr(params, key)
+                if isinstance(value, str):
+                    return value, key
+            except Exception:
+                pass
+        return "", ""
+
+    @classmethod
+    def _path(cls, params):
+        candidates = []
+
+        def add(value):
+            try:
+                value = str(value or "").strip()
+            except Exception:
+                return
+            if not value:
+                return
+            if value.startswith("file://"):
+                value = value[7:]
+            candidates.append(value)
+
+        def inspect(obj, depth=0):
+            if obj is None or depth > 2:
+                return
+            for name in ("path", "originalPath", "filePath", "attachPath", "localPath"):
+                try:
+                    add(getattr(obj, name))
+                except Exception:
+                    pass
+            try:
+                nested = getattr(obj, "messageOwner")
+                inspect(nested, depth + 1)
+            except Exception:
+                pass
+
+        inspect(params)
+        for name in ("photo", "document", "retryMessageObject", "parentObject", "videoEditedInfo"):
+            try:
+                inspect(getattr(params, name), 1)
+            except Exception:
+                pass
+        try:
+            extra = getattr(params, "params")
+            if isinstance(extra, dict):
+                for name in ("path", "originalPath", "filePath", "attachPath"):
+                    add(extra.get(name))
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return candidates[0] if candidates else ""
+
+    @staticmethod
+    def _int_attr(obj, name):
+        try:
+            return int(getattr(obj, name, 0) or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _payload(params):
+        out = {}
+        for key in SEND_KEYS:
+            try:
+                value = getattr(params, key)
+                if value is not None:
+                    out[key] = value
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
+    def _payload_text(payload):
+        for key in ("message", "caption"):
+            if isinstance(payload.get(key), str):
+                return payload[key]
+        return ""
+
+    @staticmethod
+    def _saved(account, peer):
+        if not peer:
+            return False
+        try:
+            from org.telegram.messenger import UserConfig
+            return int(UserConfig.getInstance(account).getClientUserId()) == int(peer)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _context_get(context, key, default=None):
+        if context is None:
+            return default
+
+        try:
+            value = context.get(key)
+            return default if value is None else value
+        except Exception:
+            pass
+
+        try:
+            value = context[key]
+            return default if value is None else value
+        except Exception:
+            pass
+
+        try:
+            value = getattr(context, key)
+            return default if value is None else value
+        except Exception:
+            return default
+
+    def _context_account(self, context):
+        value = self._context_get(context, "account", None)
+
+        if value is None:
+            nested = self._context_get(context, "context", None)
+            value = self._context_get(nested, "account", None)
+
+        try:
+            return int(value)
+        except Exception:
+            return self._selected_account()
+
+    def _context_fragment(self, context):
+        fragment = self._context_get(context, "fragment", None)
+        if fragment is not None:
+            return fragment
+
+        nested = self._context_get(context, "context", None)
+
+        # Some SDK builds put the ChatActivity itself into "context".
+        if nested is not None and (
+            hasattr(nested, "getDialogId")
+            or hasattr(nested, "getCurrentUser")
+            or hasattr(nested, "getCurrentChat")
+        ):
+            return nested
+
+        nested_fragment = self._context_get(nested, "fragment", None)
+        if nested_fragment is not None:
+            return nested_fragment
+
+        return self._fragment()
+
+    def _context_peer(self, context):
+        containers = [context]
+        nested = self._context_get(context, "context", None)
+
+        if nested is not None and nested is not context:
+            containers.append(nested)
+
+        for container in containers:
+            for key in ("dialog_id", "dialogId"):
+                try:
+                    value = int(
+                        self._context_get(container, key, 0) or 0
+                    )
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+            for key in ("userId", "user_id"):
+                try:
+                    value = int(
+                        self._context_get(container, key, 0) or 0
+                    )
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+            for key in ("chatId", "chat_id"):
+                try:
+                    value = int(
+                        self._context_get(container, key, 0) or 0
+                    )
+                    if value:
+                        return -abs(value)
+                except Exception:
+                    pass
+
+            user = self._context_get(container, "user", None)
+            if user is not None:
+                try:
+                    value = int(user.id)
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+            chat = self._context_get(container, "chat", None)
+            if chat is not None:
+                try:
+                    value = int(chat.id)
+                    if value:
+                        return -abs(value)
+                except Exception:
+                    pass
+
+        return self._peer_from_fragment(
+            self._context_fragment(context)
+        )
+
+    @staticmethod
+    def _peer_from_fragment(fragment):
+        if fragment is None:
+            return 0
+
+        for method_name in (
+            "getDialogId",
+            "getDialogIdForEncryptedChat",
+        ):
+            try:
+                method = getattr(fragment, method_name)
+                value = int(method() or 0)
+                if value:
+                    return value
+            except Exception:
+                pass
+
+        try:
+            current_user = fragment.getCurrentUser()
+            if current_user is not None:
+                value = int(current_user.id)
+                if value:
+                    return value
+        except Exception:
+            pass
+
+        try:
+            current_chat = fragment.getCurrentChat()
+            if current_chat is not None:
+                value = int(current_chat.id)
+                if value:
+                    return -abs(value)
+        except Exception:
+            pass
+
+        try:
+            arguments = fragment.getArguments()
+        except Exception:
+            arguments = None
+
+        if arguments is not None:
+            for key in ("user_id", "userId"):
+                try:
+                    value = int(arguments.getLong(key, 0) or 0)
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+            for key in ("chat_id", "chatId"):
+                try:
+                    value = int(arguments.getLong(key, 0) or 0)
+                    if value:
+                        return -abs(value)
+                except Exception:
+                    pass
+
+        # Last fallback for forks where dialog ID is a private field.
+        try:
+            from hook_utils import get_private_field
+
+            for field_name in (
+                "dialog_id",
+                "dialogId",
+                "currentDialogId",
+            ):
+                try:
+                    value = int(
+                        get_private_field(fragment, field_name) or 0
+                    )
+                    if value:
+                        return value
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return 0
+
+    @staticmethod
+    def _selected_account():
+        try:
+            from org.telegram.messenger import UserConfig
+            return int(UserConfig.selectedAccount)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _fragment():
+        try:
+            return get_last_fragment()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _activity(fragment):
+        try:
+            return fragment.getParentActivity() if fragment else None
+        except Exception:
+            return None
+
+    def _show_protection_success(self, fragment=None, kinds=None, ops=None, context_alerts=None):
+        if not self.get_setting("show_success_banner", True):
+            return
+        if not self.get_setting("show_notifications", True):
+            return
+
+        kinds = set(kinds or set())
+        ops = set(ops or set())
+        alerts = list(context_alerts or [])
+        count = len(kinds) + len(ops)
+
+        if count:
+            title = "Готово, данные под защитой"
+            subtitle = (
+                "Чувствительные фрагменты скрыты, сообщение отправлено безопасно."
+                if kinds and not ops else
+                "Текст и вложение обработаны перед безопасной отправкой."
+            )
+        elif alerts:
+            title = "Проверка завершена"
+            subtitle = "Предупреждение учтено, сообщение отправлено."
+        else:
+            title = "Сообщение защищено"
+            subtitle = "Privacy Firewall завершил безопасную отправку."
+
+        visible_fragment = self._visible_chat_fragment(fragment)
+        activity = self._activity(visible_fragment)
+        if activity is None:
+            self._show_native_success(f"{title}. {subtitle}", visible_fragment)
+            return
+
+        try:
+            from android.graphics import Color, Typeface
+            from android.graphics.drawable import GradientDrawable
+            from android.view import Gravity, ViewGroup
+            from android.widget import FrameLayout, LinearLayout, TextView
+            from org.telegram.messenger import AndroidUtilities
+
+            dp = AndroidUtilities.dp
+            content = activity.findViewById(16908290)
+            if content is None or not hasattr(content, "addView"):
+                content = activity.getWindow().getDecorView()
+            if content is None or not hasattr(content, "addView"):
+                raise RuntimeError("Root content ViewGroup not found")
+
+            previous = getattr(self, "_active_protection_banner", None)
+            if previous is not None:
+                try:
+                    parent = previous.getParent()
+                    if parent is not None:
+                        parent.removeView(previous)
+                except Exception:
+                    pass
+
+            panel = LinearLayout(activity)
+            panel.setOrientation(LinearLayout.HORIZONTAL)
+            panel.setGravity(Gravity.CENTER_VERTICAL)
+            panel.setPadding(dp(14), dp(11), dp(17), dp(11))
+
+            bg = GradientDrawable()
+            bg.setColor(Color.parseColor("#F01C2D31"))
+            bg.setCornerRadius(float(dp(20)))
+            bg.setStroke(dp(1), Color.parseColor("#B85DE7C4"))
+            panel.setBackground(bg)
+            try:
+                panel.setElevation(float(dp(18)))
+            except Exception:
+                pass
+
+            icon = TextView(activity)
+            icon.setText("✓")
+            icon.setGravity(Gravity.CENTER)
+            icon.setTextSize(20)
+            icon.setTextColor(Color.parseColor("#10251F"))
+            icon.setPadding(dp(8), dp(3), dp(8), dp(4))
+            try:
+                icon.setTypeface(icon.getTypeface(), Typeface.BOLD)
+                icon.setShadowLayer(float(dp(14)), 0.0, 0.0, Color.parseColor("#6EF2CC"))
+            except Exception:
+                pass
+            icon_bg = GradientDrawable()
+            icon_bg.setShape(GradientDrawable.OVAL)
+            icon_bg.setColor(Color.parseColor("#68EBC6"))
+            icon.setBackground(icon_bg)
+
+            copy = LinearLayout(activity)
+            copy.setOrientation(LinearLayout.VERTICAL)
+            copy.setPadding(dp(12), 0, 0, 0)
+
+            title_view = TextView(activity)
+            title_view.setText(title)
+            title_view.setTextSize(15)
+            title_view.setTextColor(Color.WHITE)
+            try:
+                title_view.setTypeface(title_view.getTypeface(), Typeface.BOLD)
+                title_view.setShadowLayer(float(dp(7)), 0.0, 0.0, Color.parseColor("#4F9DFFD9"))
+            except Exception:
+                pass
+
+            subtitle_view = TextView(activity)
+            subtitle_view.setText(subtitle)
+            subtitle_view.setTextSize(12)
+            subtitle_view.setTextColor(Color.parseColor("#CBE8E1"))
+            subtitle_view.setMaxLines(2)
+
+            copy.addView(title_view)
+            copy.addView(subtitle_view)
+            panel.addView(icon)
+            panel.addView(copy)
+
+            params = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL
+            params.leftMargin = dp(14)
+            params.rightMargin = dp(14)
+            params.bottomMargin = dp(76)
+            content.addView(panel, params)
+            self._active_protection_banner = panel
+
+            panel.setAlpha(0.0)
+            panel.setTranslationY(float(dp(24)))
+            panel.setScaleX(0.94)
+            panel.setScaleY(0.94)
+            panel.animate().alpha(1.0).translationY(0.0).scaleX(1.0).scaleY(1.0).setDuration(240).start()
+            self._trust_haptic(activity)
+
+            def soft_pulse():
+                try:
+                    panel.animate().scaleX(1.015).scaleY(1.015).setDuration(180).withEndAction(
+                        lambda: panel.animate().scaleX(1.0).scaleY(1.0).setDuration(220).start()
+                    ).start()
+                except Exception:
+                    pass
+
+            def hide():
+                try:
+                    panel.animate().alpha(0.0).translationY(float(dp(14))).scaleX(0.98).scaleY(0.98).setDuration(190).start()
+                except Exception:
+                    pass
+
+                def remove():
+                    try:
+                        parent = panel.getParent()
+                        if parent is not None:
+                            parent.removeView(panel)
+                    except Exception:
+                        pass
+                    if getattr(self, "_active_protection_banner", None) is panel:
+                        self._active_protection_banner = None
+
+                run_on_ui_thread(remove, 210)
+
+            run_on_ui_thread(soft_pulse, 420)
+            run_on_ui_thread(hide, 3000)
+
+        except Exception as error:
+            self.log(f"Privacy Firewall protection banner error: {error}\n{traceback.format_exc()}")
+            self._show_native_success(f"{title}. {subtitle}", visible_fragment)
+
+    def _show_trust_feedback(
+        self,
+        message,
+        added=True,
+        preferred_fragment=None,
+    ):
+        """
+        Add the banner directly to android.R.id.content. This avoids attaching
+        it to the temporary plugins submenu, which disappears after a click.
+        """
+        fragment = self._visible_chat_fragment(preferred_fragment)
+        activity = self._activity(fragment)
+
+        if activity is None:
+            self._show_native_success(message, fragment)
+            return
+
+        try:
+            from android.graphics import Color, Typeface
+            from android.graphics.drawable import GradientDrawable
+            from android.view import Gravity, ViewGroup
+            from android.widget import FrameLayout, LinearLayout, TextView
+            from org.telegram.messenger import AndroidUtilities
+
+            dp = AndroidUtilities.dp
+            content = activity.findViewById(16908290)
+
+            if content is None or not hasattr(content, "addView"):
+                content = activity.getWindow().getDecorView()
+
+            if content is None or not hasattr(content, "addView"):
+                raise RuntimeError("Root content ViewGroup not found")
+
+            # Remove a previous banner if the user taps repeatedly.
+            previous = getattr(self, "_active_trust_banner", None)
+            if previous is not None:
+                try:
+                    old_parent = previous.getParent()
+                    if old_parent is not None:
+                        old_parent.removeView(previous)
+                except Exception:
+                    pass
+
+            accent = Color.parseColor(
+                "#55E6A8" if added else "#73C9FF"
+            )
+            panel_color = Color.parseColor(
+                "#F0243B34" if added else "#F0203442"
+            )
+            border_color = Color.parseColor(
+                "#CC55E6A8" if added else "#CC73C9FF"
+            )
+
+            panel = LinearLayout(activity)
+            panel.setOrientation(LinearLayout.HORIZONTAL)
+            panel.setGravity(Gravity.CENTER_VERTICAL)
+            panel.setPadding(
+                dp(12),
+                dp(10),
+                dp(16),
+                dp(10),
+            )
+
+            panel_background = GradientDrawable()
+            panel_background.setColor(panel_color)
+            panel_background.setCornerRadius(float(dp(18)))
+            panel_background.setStroke(dp(1), border_color)
+            panel.setBackground(panel_background)
+
+            try:
+                panel.setElevation(float(dp(16)))
+            except Exception:
+                pass
+
+            icon = TextView(activity)
+            icon.setText("✓")
+            icon.setGravity(Gravity.CENTER)
+            icon.setTextSize(19)
+            icon.setTextColor(Color.parseColor("#10251D"))
+            icon.setPadding(dp(7), dp(2), dp(7), dp(3))
+
+            try:
+                icon.setTypeface(
+                    icon.getTypeface(),
+                    Typeface.BOLD,
+                )
+            except Exception:
+                pass
+
+            icon_background = GradientDrawable()
+            icon_background.setShape(GradientDrawable.OVAL)
+            icon_background.setColor(accent)
+            icon.setBackground(icon_background)
+
+            try:
+                icon.setShadowLayer(
+                    float(dp(10)),
+                    0.0,
+                    0.0,
+                    accent,
+                )
+            except Exception:
+                pass
+
+            label = TextView(activity)
+            label.setText(message)
+            label.setTextSize(15)
+            label.setTextColor(Color.WHITE)
+            label.setGravity(Gravity.CENTER_VERTICAL)
+            label.setPadding(dp(11), 0, 0, 0)
+
+            try:
+                label.setTypeface(
+                    label.getTypeface(),
+                    Typeface.BOLD,
+                )
+            except Exception:
+                pass
+
+            panel.addView(icon)
+            panel.addView(label)
+
+            params = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            params.gravity = (
+                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL
+            )
+            params.leftMargin = dp(16)
+            params.rightMargin = dp(16)
+            params.bottomMargin = dp(76)
+
+            content.addView(panel, params)
+            self._active_trust_banner = panel
+
+            panel.setAlpha(0.0)
+            panel.setTranslationY(float(dp(22)))
+            panel.setScaleX(0.96)
+            panel.setScaleY(0.96)
+            panel.animate().alpha(1.0).translationY(0.0).scaleX(
+                1.0
+            ).scaleY(1.0).setDuration(190).start()
+
+            self._trust_haptic(activity)
+
+            def hide_banner():
+                try:
+                    panel.animate().alpha(0.0).translationY(
+                        float(dp(14))
+                    ).scaleX(0.98).scaleY(0.98).setDuration(
+                        170
+                    ).start()
+                except Exception:
+                    pass
+
+                def remove_banner():
+                    try:
+                        parent = panel.getParent()
+                        if parent is not None:
+                            parent.removeView(panel)
+                    except Exception:
+                        pass
+
+                    if getattr(
+                        self,
+                        "_active_trust_banner",
+                        None,
+                    ) is panel:
+                        self._active_trust_banner = None
+
+                run_on_ui_thread(remove_banner, 190)
+
+            run_on_ui_thread(hide_banner, 2200)
+
+        except Exception as error:
+            self.log(
+                "Privacy Firewall trust banner error: "
+                f"{error}\n{traceback.format_exc()}"
+            )
+            self._show_native_success(message, fragment)
+
+    def _visible_chat_fragment(self, preferred=None):
+        candidates = [
+            self._fragment(),
+            preferred,
+        ]
+
+        for fragment in candidates:
+            if fragment is None:
+                continue
+
+            try:
+                class_name = str(
+                    fragment.getClass().getName()
+                )
+            except Exception:
+                class_name = ""
+
+            if (
+                "ChatActivity" in class_name
+                or hasattr(fragment, "getDialogId")
+                or hasattr(fragment, "getCurrentUser")
+                or hasattr(fragment, "getCurrentChat")
+            ):
+                return fragment
+
+        return preferred or self._fragment()
+
+    def _show_native_success(self, message, fragment=None):
+        # Official helper first. It handles its own UI-thread dispatch.
+        try:
+            if BulletinHelper is not None:
+                BulletinHelper.show_success(
+                    message,
+                    fragment,
+                )
+                return
+        except Exception as error:
+            self.log(
+                f"Privacy Firewall native success error: {error}"
+            )
+
+        self._show_trust_failure(f"✓ {message}", error=False)
+
+    def _show_trust_failure(self, message, error=True):
+        # Last-resort visible feedback. This is intentionally independent
+        # from Telegram's BulletinFactory.
+        try:
+            from android.widget import Toast
+            from org.telegram.messenger import ApplicationLoader
+
+            context = ApplicationLoader.applicationContext
+            Toast.makeText(
+                context,
+                message,
+                Toast.LENGTH_LONG if error else Toast.LENGTH_SHORT,
+            ).show()
+        except Exception as toast_error:
+            self.log(
+                f"Privacy Firewall fallback feedback error: "
+                f"{toast_error}"
+            )
+
+    def _trust_haptic(self, activity=None):
+        try:
+            from android.content import Context
+            from android.os import Build, VibrationEffect
+            from org.telegram.messenger import ApplicationLoader
+
+            context = (
+                activity
+                if activity is not None
+                else ApplicationLoader.applicationContext
+            )
+            vibrator = context.getSystemService(
+                Context.VIBRATOR_SERVICE
+            )
+
+            if vibrator is None or not bool(vibrator.hasVibrator()):
+                return
+
+            if int(Build.VERSION.SDK_INT) >= 26:
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(
+                        38,
+                        VibrationEffect.DEFAULT_AMPLITUDE,
+                    )
+                )
+            else:
+                vibrator.vibrate(38)
+        except Exception:
+            pass
+
+    def _bulletin(self, text, error=False, fragment=None):
+        if (
+            not error
+            and not self.get_setting("show_notifications", True)
+        ):
+            return
+
+        if BulletinHelper is None:
+            return self.log(text)
+        try:
+            if error:
+                BulletinHelper.show_error(text, fragment or self._fragment())
+            else:
+                BulletinHelper.show_info(text, fragment or self._fragment())
+        except Exception as exc:
+            self.log(f"Privacy Firewall bulletin error: {exc}")
+
+    @staticmethod
+    def _key(account, peer, text, path):
+        return (int(account), int(peer), hashlib.sha256((text or "").encode()).hexdigest(),
+                os.path.abspath(path) if path else "")
+
+    def _allow(self, account, peer, text, path):
+        key = self._key(account, peer, text, path)
+        with self._lock:
+            count, _ = self._bypass.get(key, (0, 0))
+            self._bypass[key] = (count + 1, time.monotonic() + BYPASS_TTL)
+
+    def _consume(self, account, peer, text, path):
+        now = time.monotonic()
+        key = self._key(account, peer, text, path)
+        with self._lock:
+            for old in [k for k, (_, expiry) in self._bypass.items() if expiry < now]:
+                self._bypass.pop(old, None)
+            item = self._bypass.get(key)
+            if item is None:
+                return False
+            count, expiry = item
+            if count <= 1:
+                self._bypass.pop(key, None)
+            else:
+                self._bypass[key] = (count - 1, expiry)
+            return True
+
+    def _remove(self, account, peer, text, path):
+        with self._lock:
+            self._bypass.pop(self._key(account, peer, text, path), None)
