@@ -24,18 +24,18 @@ from android.widget import (
 )
 
 from android_utils import OnClickListener, log, run_on_ui_thread
-from base_plugin import BasePlugin, HookFilter, HookResult, HookStrategy, MethodHook, hook_filters
+from base_plugin import BasePlugin, HookFilter, MethodHook, hook_filters
 from file_utils import ensure_dir_exists, get_plugins_dir, list_dir
 from hook_utils import find_class
 from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
 __id__ = "voice_soundpad"
 __name__ = "Voice Soundpad"
-__description__ = "Проигрывает и подмешивает звуки в голосовые сообщения, кружки, звонки и войс-чаты. Команды: .sounds .soundpad"
+__description__ = "Проигрывает и подмешивает звуки прямо в голосовое сообщение во время записи"
 __author__ = "@TapeSix"
-__version__ = "1.5.0"
+__version__ = "1.0.0"
 __icon__ = "Idi_gahuy/8"
-__app_version__ = ">=12.5.1"
+__app_version__ = ">=12.1.1"
 
 MAX_SLOTS = 8
 AUDIO_EXTENSIONS = [".wav", ".pcm", ".raw", ".mp3", ".aac", ".m4a", ".ogg", ".opus"]
@@ -44,7 +44,6 @@ IMPORT_REQUEST_CODE = 42711
 STATUS_COLOR_ACTIVE = "#4CD964"
 STATUS_COLOR_INACTIVE = "#E64C3C"
 STATUS_COLOR_LOADING = "#F0A020"
-STATUS_COLOR_IDLE = "#8E8E93"
 
 
 def parse_wav_pcm16(data: bytes, debug_name: str = ""):
@@ -91,6 +90,8 @@ def parse_wav_pcm16(data: bytes, debug_name: str = ""):
 
 
 def _mix_chunk_manual(base_bytes: bytes, chunk: array, gain: float) -> bytes:
+    """Поэлементное сложение одного voice-чанка в base_bytes с клиппингом.
+    Используется только если audioop недоступен или упал на этом кадре."""
     base = array("h")
     base.frombytes(base_bytes)
     for i, s in enumerate(chunk):
@@ -309,6 +310,8 @@ class Voice:
         self.samples = samples
         self.pos = 0
         self.gain = gain
+        # Вызывается один раз, когда голос впервые попадает в mix_into —
+        # синхронизирует старт динамика с реальным моментом записи, а не с кликом.
         self.on_start = on_start
         self._started = False
 
@@ -318,7 +321,7 @@ class Voice:
 
 
 class SoundEngine:
-    MAX_CACHED_SAMPLES = 24
+    MAX_CACHED_SAMPLES = 24  # 8 слотов + запас под недавно импортированные звуки
 
     def __init__(self):
         self._samples_cache: "OrderedDict[str, array]" = OrderedDict()
@@ -331,12 +334,11 @@ class SoundEngine:
         self.cancel_generation = 0
 
     def _cache_put(self, path: str, samples: array):
-        key = (path, self.target_sample_rate)
-        self._samples_cache[key] = samples
-        self._samples_cache.move_to_end(key)
+        self._samples_cache[path] = samples
+        self._samples_cache.move_to_end(path)
         while len(self._samples_cache) > self.MAX_CACHED_SAMPLES:
-            evicted_key, _ = self._samples_cache.popitem(last=False)
-            debug_log(f"_cache_put: кэш переполнен, вытеснён {os.path.basename(evicted_key[0])}")
+            evicted_path, _ = self._samples_cache.popitem(last=False)
+            debug_log(f"_cache_put: кэш переполнен, вытеснён {os.path.basename(evicted_path)}")
 
     def request_cancel_all(self):
         self.cancel_generation += 1
@@ -346,16 +348,15 @@ class SoundEngine:
         return self.loading_progress.get(path)
 
     def load_sample(self, path: str) -> Optional[array]:
-        key = (path, self.target_sample_rate)
-        if key in self._samples_cache:
-            self._samples_cache.move_to_end(key)
-            return self._samples_cache[key]
+        if path in self._samples_cache:
+            self._samples_cache.move_to_end(path)
+            return self._samples_cache[path]
 
         lock = self._loading_locks.setdefault(path, threading.Lock())
         with lock:
-            if key in self._samples_cache:
-                self._samples_cache.move_to_end(key)
-                return self._samples_cache[key]
+            if path in self._samples_cache:
+                self._samples_cache.move_to_end(path)
+                return self._samples_cache[path]
             try:
                 my_generation = self.cancel_generation
 
@@ -427,18 +428,18 @@ class SoundEngine:
                 return None
 
     def trigger(self, path: str, gain: float = 1.0, on_start=None):
-        key = (path, self.target_sample_rate)
-        cached = self._samples_cache.get(key)
+        cached = self._samples_cache.get(path)
         if cached is not None and len(cached) > 0:
             with self._lock:
                 self.active.append(Voice(cached, gain, on_start=on_start))
             debug_log(f"trigger: добавлен из кэша ({os.path.basename(path)}, {len(cached)} сэмплов)")
             return
-        if key in self._samples_cache:
+        if path in self._samples_cache:
             debug_log(
                 f"trigger: в кэше невалидное значение для {os.path.basename(path)} "
                 f"({cached!r}) — перезагружаю заново"
             )
+            self._samples_cache.pop(path, None)
 
         def _load_and_add():
             samples = self.load_sample(path)
@@ -456,6 +457,8 @@ class SoundEngine:
             self.active.clear()
 
     def mix_into(self, pcm_bytes: bytes) -> bytes:
+        # Колбэки собираем под локом, но вызываем после его отпускания,
+        # чтобы track.play() не мог держать блокировку движка.
         to_start: List = []
         with self._lock:
             if not self.active:
@@ -527,6 +530,9 @@ def stop_all_speaker_playback():
 
 
 def _apply_gain_bytes_slow(raw: bytes, gain: float) -> bytes:
+    """Медленный чистый Python fallback на случай, если audioop недоступен.
+    Используется только если HAS_AUDIOOP=False — на нормальном Android
+    это не должно происходить."""
     samples = array("h")
     samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
     out = array("h")
@@ -541,6 +547,9 @@ def _apply_gain_bytes_slow(raw: bytes, gain: float) -> bytes:
 
 
 def arm_speaker(samples: array, sample_rate: int, gain: float = 1.0):
+    """Готовит AudioTrack (gain + MODE_STATIC буфер), но не запускает play().
+    Возвращает (track, duration_sec) или (None, 0.0). Вызывать из фонового
+    потока, не из аудио-хука — тут есть выделение памяти и системные вызовы."""
     try:
         from android.media import AudioTrack, AudioFormat, AudioManager
 
@@ -584,6 +593,8 @@ def arm_speaker(samples: array, sample_rate: int, gain: float = 1.0):
 
 
 def fire_speaker(track, duration_sec: float):
+    """Лёгкий вызов (только track.play()) — безопасно вызывать прямо из
+    writeFrame-хука, никаких аллокаций/диска/логов на каждый кадр."""
     if track is None:
         return
     try:
@@ -609,6 +620,8 @@ def fire_speaker(track, duration_sec: float):
 
 
 def play_through_speaker(samples: array, sample_rate: int, gain: float = 1.0):
+    """Взвести и сразу выстрелить — для режима "только через динамик",
+    где синхронизировать с записью не с чем."""
     def _play():
         track, duration_sec = arm_speaker(samples, sample_rate, gain)
         fire_speaker(track, duration_sec)
@@ -617,50 +630,6 @@ def play_through_speaker(samples: array, sample_rate: int, gain: float = 1.0):
 
 
 sound_engine = SoundEngine()
-
-
-MIC_LEVEL_GREEN_MAX = 0.03
-MIC_LEVEL_YELLOW_MAX = 0.15
-MIC_LEVEL_SILENCE_TIMEOUT = 0.5
-
-
-class MicLevelMonitor:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._level = 0.0
-        self._last_update = 0.0
-
-    def update(self, raw_bytes: bytes):
-        if not raw_bytes:
-            return
-        try:
-            if HAS_AUDIOOP:
-                peak = audioop.rms(bytes(raw_bytes), 2)
-            else:
-                peak = self._manual_rms(raw_bytes)
-        except Exception:
-            return
-        with self._lock:
-            self._level = min(1.0, peak / 32767.0)
-            self._last_update = time.time()
-
-    @staticmethod
-    def _manual_rms(raw_bytes: bytes) -> float:
-        samples = array("h")
-        samples.frombytes(raw_bytes[: len(raw_bytes) - (len(raw_bytes) % 2)])
-        if not samples:
-            return 0.0
-        total = sum(s * s for s in samples)
-        return (total / len(samples)) ** 0.5
-
-    def get_level(self) -> Optional[float]:
-        with self._lock:
-            if time.time() - self._last_update > MIC_LEVEL_SILENCE_TIMEOUT:
-                return None
-            return self._level
-
-
-mic_level_monitor = MicLevelMonitor()
 
 
 class WriteFrameHook(MethodHook):
@@ -681,6 +650,8 @@ class WriteFrameHook(MethodHook):
 
             effective_length = length
             if length > capacity:
+                # На части устройств buffer.capacity() < length — обрабатываем
+                # сколько влезает, вместо полного пропуска кадра.
                 effective_length = capacity
                 WriteFrameHook._capacity_mismatch_count += 1
                 if WriteFrameHook._capacity_mismatch_count <= 5:
@@ -702,8 +673,6 @@ class WriteFrameHook(MethodHook):
             had_active_voices = len(sound_engine.active) > 0
             mixed = sound_engine.mix_into(bytes(raw))
             changed = mixed != bytes(raw)
-
-            mic_level_monitor.update(bytes(mixed))
 
             if had_active_voices and not WriteFrameHook._logged_first_mix:
                 WriteFrameHook._logged_first_mix = True
@@ -737,7 +706,6 @@ class StartRecordHook(MethodHook):
         WriteFrameHook._capacity_mismatch_count = 0
         WriteFrameHook._total_frame_count = 0
         run_on_ui_thread(lambda: self.plugin.show_overlay())
-        run_on_ui_thread(lambda: self.plugin.show_corner_overlay())
         self.plugin.preload_enabled_samples()
 
 
@@ -747,9 +715,6 @@ class StopRecordHook(MethodHook):
 
     def before_hooked_method(self, param):
         try:
-            if self.plugin.in_call:
-                debug_log("stopRecord вызван во время звонка — игнорирую (это не конец звонка)")
-                return
             debug_log("stopRecord вызван — скрываю оверлей")
             if WriteFrameHook._total_frame_count > 0:
                 debug_log(
@@ -759,7 +724,6 @@ class StopRecordHook(MethodHook):
             sound_engine.clear()
             stop_all_speaker_playback()
             run_on_ui_thread(lambda: self.plugin.hide_overlay())
-            run_on_ui_thread(lambda: self.plugin.hide_corner_overlay())
         except Exception as e:
             import traceback
             debug_log(f"ОШИБКА в StopRecordHook: {e}\n{traceback.format_exc()}")
@@ -871,229 +835,6 @@ class RecordHooks:
                 debug_log(f"  ни одного метода с ключевыми словами {keywords} не найдено")
         except Exception as e:
             debug_log(f"  ошибка сканирования методов: {e}")
-
-
-class VoipWriteFrameHook(MethodHook):
-    _field_cache = None
-
-    def before_hooked_method(self, param):
-        try:
-            bytes_read = param.args[0]
-            if bytes_read is None or bytes_read <= 0:
-                return
-
-            instance = param.thisObject
-
-            field = VoipWriteFrameHook._field_cache
-            if field is None:
-                java_class = instance.getClass()
-                field = java_class.getDeclaredField("byteBuffer")
-                field.setAccessible(True)
-                VoipWriteFrameHook._field_cache = field
-
-            buf = field.get(instance)
-            if buf is None:
-                return
-
-            capacity = buf.capacity()
-            length = min(bytes_read, capacity)
-            if length <= 0:
-                return
-
-            buf.position(0)
-            buf.limit(length)
-            raw = bytearray(length)
-            buf.get(raw, 0, length)
-
-            if sound_engine.active:
-                mixed = sound_engine.mix_into(bytes(raw))
-                if mixed != bytes(raw):
-                    buf.position(0)
-                    buf.put(mixed, 0, len(mixed))
-            else:
-                mixed = bytes(raw)
-
-            mic_level_monitor.update(bytes(mixed))
-
-            buf.position(0)
-            buf.limit(capacity)
-        except Exception as e:
-            import traceback
-            debug_log(f"VoipWriteFrameHook: ОШИБКА: {e}\n{traceback.format_exc()}")
-
-
-class VoipCallStartHook(MethodHook):
-    def __init__(self, plugin: "VoiceSoundpadPlugin"):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param):
-        self.plugin.in_call = True
-        sound_engine.target_sample_rate = 48000
-        self.plugin.preload_enabled_samples()
-
-
-class VoipCallStopHook(MethodHook):
-    def __init__(self, plugin: "VoiceSoundpadPlugin"):
-        self.plugin = plugin
-
-    def before_hooked_method(self, param):
-        self.plugin.in_call = False
-        sound_engine.clear()
-        stop_all_speaker_playback()
-        run_on_ui_thread(lambda: self.plugin.hide_overlay())
-        run_on_ui_thread(lambda: self.plugin.hide_corner_overlay())
-
-
-class VoipStateHook(MethodHook):
-    def __init__(self, plugin: "VoiceSoundpadPlugin", established_state: int, end_states: set):
-        self.plugin = plugin
-        self.established_state = established_state
-        self.end_states = end_states
-
-    def after_hooked_method(self, param):
-        try:
-            state = param.args[0]
-        except Exception as e:
-            debug_log(f"VoipStateHook: не удалось прочитать состояние: {e}")
-            return
-
-        debug_log(f"VoIP dispatchStateChanged: {state}")
-
-        if state == self.established_state:
-            self.plugin.in_call = True
-            sound_engine.target_sample_rate = 48000
-            run_on_ui_thread(lambda: self.plugin.show_overlay())
-            run_on_ui_thread(lambda: self.plugin.show_corner_overlay())
-            self.plugin.preload_enabled_samples()
-        elif state in self.end_states:
-            self.plugin.in_call = False
-            sound_engine.clear()
-            stop_all_speaker_playback()
-            run_on_ui_thread(lambda: self.plugin.hide_overlay())
-            run_on_ui_thread(lambda: self.plugin.hide_corner_overlay())
-
-
-VOIP_AUDIO_CAPTURE_CANDIDATES = [
-    ("org.webrtc.voiceengine.WebRtcAudioRecord", "nativeDataIsRecorded"),
-    ("org.webrtc.audio.WebRtcAudioRecord", "nativeDataIsRecorded"),
-    ("org.webrtc.audio.JavaAudioDeviceModule$WebRtcAudioRecord", "nativeDataIsRecorded"),
-]
-
-VOIP_LIFECYCLE_CANDIDATES = {
-    "start": [
-        ("org.telegram.messenger.voip.VoIPService", "onCreate", []),
-    ],
-    "stop": [
-        ("org.telegram.messenger.voip.VoIPService", "onDestroy", []),
-    ],
-}
-
-VOIP_SERVICE_CLASS_NAME = "org.telegram.messenger.voip.VoIPService"
-
-VOIP_ESTABLISHED_FIELD = "STATE_ESTABLISHED"
-VOIP_END_FIELDS = ["STATE_ENDED", "STATE_FAILED", "STATE_BUSY", "STATE_HANGING_UP"]
-
-VOIP_ESTABLISHED_FALLBACK = 3
-VOIP_END_FALLBACKS = [11, 4, 17, 10]
-
-
-class VoipHooks:
-    def __init__(self, plugin: "VoiceSoundpadPlugin"):
-        self.plugin = plugin
-        self.unhooks = []
-        self.audio_hook_installed = False
-
-    def install(self):
-        self._install_lifecycle_hooks()
-        self._install_state_hook()
-        self._install_audio_hook()
-
-    def _install_lifecycle_hooks(self):
-        for kind, candidates in VOIP_LIFECYCLE_CANDIDATES.items():
-            hook_cls = VoipCallStartHook if kind == "start" else VoipCallStopHook
-            for class_name, method_name, param_types in candidates:
-                try:
-                    java_class = get_reflect_class(class_name)
-                    method = java_class.getDeclaredMethod(method_name, *param_types)
-                    method.setAccessible(True)
-                    u = self.plugin.hook_method(method, hook_cls(self.plugin))
-                    if u:
-                        self.unhooks.append(u)
-                        debug_log(f"{class_name}.{method_name}() захукан")
-                except Exception as e:
-                    debug_log(f"{class_name}.{method_name}(): сигнатура не совпала: {e}")
-
-    @staticmethod
-    def _read_static_int(java_class, field_name: str, fallback: int) -> int:
-        try:
-            field = java_class.getDeclaredField(field_name)
-            field.setAccessible(True)
-            return field.getInt(None)
-        except Exception as e:
-            debug_log(f"VoipHooks: не удалось прочитать {field_name}, использую {fallback} ({e})")
-            return fallback
-
-    def _install_state_hook(self):
-        from java.lang import Integer as JInteger
-
-        try:
-            java_class = get_reflect_class(VOIP_SERVICE_CLASS_NAME)
-        except Exception as e:
-            debug_log(f"VoipHooks: не удалось получить класс VoIPService: {e}")
-            return
-
-        established = self._read_static_int(
-            java_class, VOIP_ESTABLISHED_FIELD, VOIP_ESTABLISHED_FALLBACK
-        )
-        end_states = {
-            self._read_static_int(java_class, name, fallback)
-            for name, fallback in zip(VOIP_END_FIELDS, VOIP_END_FALLBACKS)
-        }
-
-        try:
-            method = java_class.getDeclaredMethod("dispatchStateChanged", JInteger.TYPE)
-            method.setAccessible(True)
-            hook = VoipStateHook(self.plugin, established, end_states)
-            u = self.plugin.hook_method(method, hook)
-            if u:
-                self.unhooks.append(u)
-                debug_log(
-                    f"dispatchStateChanged захукан (established={established}, "
-                    f"end_states={end_states})"
-                )
-            else:
-                debug_log("Не удалось захукать dispatchStateChanged")
-        except Exception as e:
-            debug_log(f"dispatchStateChanged: сигнатура не совпала: {e}")
-
-    def _install_audio_hook(self):
-        from java.lang import Integer as JInteger, Long as JLong
-
-        for class_name, method_name in VOIP_AUDIO_CAPTURE_CANDIDATES:
-            try:
-                java_class = get_reflect_class(class_name)
-            except Exception:
-                continue
-            try:
-                method = java_class.getDeclaredMethod(method_name, JInteger.TYPE, JLong.TYPE)
-                method.setAccessible(True)
-                u = self.plugin.hook_method(method, VoipWriteFrameHook())
-                if u:
-                    self.unhooks.append(u)
-                    self.audio_hook_installed = True
-                    debug_log(f"{class_name}.{method_name}(int, long) захукан")
-                    break
-            except Exception as e:
-                debug_log(f"{class_name}.{method_name}(int, long): сигнатура не совпала: {e}")
-
-    def uninstall(self):
-        for u in self.unhooks:
-            try:
-                self.plugin.unhook_method(u)
-            except Exception:
-                pass
-        self.unhooks.clear()
-        self.audio_hook_installed = False
 
 
 class ImportResultHook(MethodHook):
@@ -1288,8 +1029,7 @@ class SoundpadOverlay:
 
     def _on_sound_click(self, path: str, gain: float, mode: str):
         self.last_clicked_path = path
-        key = (path, sound_engine.target_sample_rate)
-        cached_value = sound_engine._samples_cache.get(key)
+        cached_value = sound_engine._samples_cache.get(path)
         already_cached = cached_value is not None and len(cached_value) > 0
         if not already_cached:
             with SoundpadOverlay._pending_clicks_lock:
@@ -1305,6 +1045,8 @@ class SoundpadOverlay:
                 SoundpadOverlay._pending_clicks.discard(path)
 
         if mode == "both":
+            # Динамик взводится заранее, а play() на нём дёргает writeFrame-хук
+            # в момент, когда сэмпл реально попадает в запись (см. mix_into).
             def _fire_synced():
                 try:
                     samples = sound_engine.load_sample(path)
@@ -1598,111 +1340,6 @@ class SoundpadOverlay:
                 debug_log(f"_apply_status: ОШИБКА: {e}\n{traceback.format_exc()}")
 
 
-class CornerOverlay:
-    def __init__(self, plugin: "VoiceSoundpadPlugin"):
-        self.plugin = plugin
-        self.decor_root = None
-        self.container: Optional[FrameLayout] = None
-        self.status_view = None
-        self.visible = False
-        self._status_thread = None
-        self._status_stop = threading.Event()
-
-    def _build_view(self, context) -> View:
-        view = TextView(context)
-        view.setText("●")
-        view.setTextColor(Color.parseColor(STATUS_COLOR_IDLE))
-        view.setTextSize(24.0)
-        view.setPadding(dp(8), dp(4), dp(8), dp(4))
-        view.setShadowLayer(4.0, 0.0, 0.0, Color.parseColor("#B0000000"))
-        self.status_view = view
-        return view
-
-    def show(self):
-        if not self.plugin.get_setting("corner_overlay_enabled", True):
-            return
-        if self.visible:
-            return
-        activity = self.plugin.get_context()
-        if activity is None:
-            debug_log("CornerOverlay: нет Activity — показать нельзя")
-            return
-
-        try:
-            decor_view = activity.getWindow().getDecorView()
-            from android import R as AndroidR
-            content_root = decor_view.findViewById(AndroidR.id.content)
-        except Exception as e:
-            debug_log(f"CornerOverlay: не удалось получить DecorView: {e}")
-            return
-
-        try:
-            self.decor_root = content_root
-            self.container = FrameLayout(activity)
-
-            view = self._build_view(activity)
-
-            from android.widget import FrameLayout as JFrameLayout
-            lp = JFrameLayout.LayoutParams(
-                JFrameLayout.LayoutParams.WRAP_CONTENT,
-                JFrameLayout.LayoutParams.WRAP_CONTENT,
-            )
-            lp.gravity = Gravity.TOP | Gravity.START
-            lp.topMargin = dp(64)
-            lp.leftMargin = dp(10)
-            self.container.addView(view, lp)
-
-            content_root.addView(self.container)
-            self.visible = True
-            debug_log("CornerOverlay показан (DecorView)")
-            self._start_status_updater()
-        except Exception as e:
-            debug_log(f"CornerOverlay: addView не сработал: {e}")
-
-    def hide(self):
-        self._status_stop.set()
-        if not self.visible or self.container is None:
-            return
-        try:
-            if self.decor_root is not None:
-                self.decor_root.removeView(self.container)
-        except Exception as e:
-            debug_log(f"CornerOverlay: ошибка при скрытии: {e}")
-        self.visible = False
-        self.container = None
-        self.status_view = None
-
-    def _start_status_updater(self):
-        self._status_stop.clear()
-
-        def _loop():
-            while not self._status_stop.is_set():
-                level = mic_level_monitor.get_level()
-                run_on_ui_thread(lambda lvl=level: self._apply_status(lvl))
-                self._status_stop.wait(0.1)
-
-        self._status_thread = threading.Thread(target=_loop, daemon=True)
-        self._status_thread.start()
-
-    def _apply_status(self, level: Optional[float]):
-        try:
-            if self.status_view is None:
-                return
-            
-            if level is None or level < 0.005:
-                color = STATUS_COLOR_IDLE
-            elif level < MIC_LEVEL_GREEN_MAX:
-                color = STATUS_COLOR_ACTIVE
-            elif level < MIC_LEVEL_YELLOW_MAX:
-                color = STATUS_COLOR_LOADING
-            else:
-                color = STATUS_COLOR_INACTIVE
-            
-            self.status_view.setTextColor(Color.parseColor(color))
-        except Exception:
-            pass
-
-
 def get_reflect_class(fqcn: str):
     from java.lang import Class as JClass
     return JClass.forName(fqcn)
@@ -1720,6 +1357,8 @@ _theme_color_warned = set()
 
 
 def get_theme_color(key_name: str, fallback: int) -> int:
+    """Цвет текущей темы Telegram через Theme.getColor(). При отсутствии
+    ключа (другая версия клиента) — fallback, один раз с логом."""
     try:
         from org.telegram.ui.ActionBar import Theme
         key = getattr(Theme, key_name, None)
@@ -1765,6 +1404,7 @@ def get_current_activity_via_reflection():
 
 
 def _migrate_legacy_path(old_path: str, new_path: str, is_dir: bool):
+    """Переносит данные из старых путей с 'test_' в имени (ранние версии плагина)."""
     try:
         if not os.path.exists(old_path) or os.path.exists(new_path):
             return
@@ -1791,6 +1431,7 @@ def debug_log_path() -> str:
     return new_path
 
 
+# По умолчанию пишется только logcat; файл-лог включается тумблером в настройках.
 _debug_file_logging_enabled = False
 
 
@@ -1823,6 +1464,9 @@ def read_debug_log(last_n: int = 15) -> str:
 
 
 def capture_blurred_background(content_root):
+    """Снимок экрана, уменьшенный в ~16 раз (даёт блюр за счёт билинейной
+    фильтрации) и растянутый обратно как Drawable. Статичный, не живой блюр.
+    Возвращает Drawable или None."""
     try:
         from android.graphics import Bitmap, Canvas
         from android.graphics.drawable import BitmapDrawable
@@ -1854,24 +1498,6 @@ class VoiceSoundpadPlugin(BasePlugin):
         debug_log("=== on_plugin_load: старт ===")
         debug_log(f"audioop доступен: {HAS_AUDIOOP}")
         self.current_activity = None
-        self.in_call = False
-        self.record_hooks = None
-        self.import_hooks = None
-        self.voip_hooks = None
-        self.overlay = SoundpadOverlay(self)
-        self.corner_overlay = CornerOverlay(self)
-
-        self.add_on_send_message_hook()
-
-        if self.get_setting("plugin_enabled", True):
-            self._install_feature_hooks()
-        else:
-            debug_log("Плагин выключен в настройках — хуки не устанавливаются")
-
-        debug_log("=== on_plugin_load: завершено ===")
-        self.log("Voice Soundpad загружен")
-
-    def _install_feature_hooks(self):
         try:
             self.record_hooks = RecordHooks(self)
             self.record_hooks.install()
@@ -1886,183 +1512,19 @@ class VoiceSoundpadPlugin(BasePlugin):
             import traceback
             debug_log(f"ОШИБКА при установке ImportHooks: {e}\n{traceback.format_exc()}")
 
-        try:
-            self.voip_hooks = VoipHooks(self)
-            self.voip_hooks.install()
-        except Exception as e:
-            import traceback
-            debug_log(f"ОШИБКА при установке VoipHooks: {e}\n{traceback.format_exc()}")
-
+        self.overlay = SoundpadOverlay(self)
+        debug_log("=== on_plugin_load: завершено ===")
+        self.log("Voice Soundpad загружен")
         self.preload_enabled_samples()
 
-    def _uninstall_feature_hooks(self):
-        if self.record_hooks is not None:
-            self.record_hooks.uninstall()
-            self.record_hooks = None
-        if self.import_hooks is not None:
-            self.import_hooks.uninstall()
-            self.import_hooks = None
-        if self.voip_hooks is not None:
-            self.voip_hooks.uninstall()
-            self.voip_hooks = None
-        self.hide_overlay()
-        self.hide_corner_overlay()
-        sound_engine.clear()
-
-    def _on_plugin_enabled_change(self, enabled: bool):
-        if enabled:
-            self._install_feature_hooks()
-            self.notify("Voice Soundpad включён")
-        else:
-            self._uninstall_feature_hooks()
-            self.notify("Voice Soundpad выключен")
-
     def on_plugin_unload(self):
-        self._uninstall_feature_hooks()
-
-    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        if not isinstance(getattr(params, "message", None), str):
-            return HookResult()
-
-        text = params.message.strip()
-
-        if text == ".soundpad":
-            enabled = self.get_setting("plugin_enabled", True)
-            self.set_setting("plugin_enabled", not enabled, reload_settings=True)
-            if enabled:
-                self._uninstall_feature_hooks()
-                self.notify("Voice Soundpad выключен")
-            else:
-                self._install_feature_hooks()
-                self.notify("Voice Soundpad включён")
-            return HookResult(strategy=HookStrategy.CANCEL)
-
-        if not self.get_setting("plugin_enabled", True):
-            return HookResult()
-
-        if text.startswith(".sounds"):
-            parts = text.split(" ", 1)
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            if not arg.isdigit() or not (1 <= int(arg) <= MAX_SLOTS):
-                params.message = f"Использование: .sounds 1-{MAX_SLOTS}"
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-
-            slot_index = int(arg) - 1
-            filename = self.get_setting(f"slot_{slot_index}_file", "")
-            if not filename:
-                params.message = f"Слот {arg} пуст — назначьте звук в настройках плагина"
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-
-            path = os.path.join(sounds_dir(), filename)
-            if not os.path.exists(path):
-                params.message = f"Файл для слота {arg} не найден: {filename}"
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-
-            peer_id = getattr(params, "peer", None)
-            if peer_id is None:
-                params.message = "Не удалось определить чат для отправки"
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-
-            try:
-                field_names = [f.getName() for f in params.getClass().getDeclaredFields()]
-                debug_log(f".sounds: поля SendMessageParams: {field_names}")
-            except Exception as e:
-                debug_log(f".sounds: не удалось получить поля params: {e}")
-
-            threading.Thread(
-                target=self._send_slot_as_voice, args=(peer_id, path), daemon=True
-            ).start()
-            return HookResult(strategy=HookStrategy.CANCEL)
-
-        return HookResult()
-
-    def _send_slot_as_voice(self, peer_id, path: str):
-        if not self._try_send_as_true_voice(peer_id, path):
-            debug_log(".sounds: отправка голосового сообщения не удалась.")
-            run_on_ui_thread(
-                lambda: self.notify("Не удалось отправить звук как голосовое сообщение")
-            )
-
-    def _try_send_as_true_voice(self, peer_id, path: str) -> bool:
-        try:
-            from org.telegram.tgnet import TLRPC
-            from client_utils import send_message
-            import mimetypes
-
-            samples = sound_engine.load_sample(path)
-            sample_rate = sound_engine.target_sample_rate
-            
-            duration = 0
-            waveform_bytes = bytearray()
-            
-            if samples and len(samples) > 0 and sample_rate > 0:
-                duration = int(len(samples) / sample_rate)
-                waveform_bytes = self._generate_waveform_bytes(samples)
-            
-            document = TLRPC.TL_document()
-            document.id = 0
-            document.access_hash = 0
-            document.date = int(time.time())
-            
-            document.mime_type = "audio/ogg"
-            
-            document.size = os.path.getsize(path)
-            document.dc_id = 0
-            document.file_reference = bytearray()
-
-            audio_attr = TLRPC.TL_documentAttributeAudio()
-            audio_attr.voice = True
-            audio_attr.duration = duration
-            
-            if waveform_bytes:
-                try:
-                    tl_bytes = TLRPC.TL_bytes()
-                    tl_bytes.bytes = waveform_bytes
-                    audio_attr.waveform = tl_bytes
-                except Exception:
-                    try:
-                        audio_attr.waveform = waveform_bytes
-                    except Exception as e:
-                        debug_log(f"waveform: не удалось установить значение ({e})")
-            
-            document.attributes.add(audio_attr)
-
-            filename_attr = TLRPC.TL_documentAttributeFilename()
-            filename_attr.file_name = os.path.basename(path)
-            document.attributes.add(filename_attr)
-
-            send_message({"peer": peer_id, "document": document, "path": path})
-            debug_log(f".sounds: отправлено через send_message (voice=True, mime={mime_type}, dur={duration})")
-            return True
-        except Exception as e:
-            debug_log(f".sounds: ручная сборка ГС не удалась, откатываюсь на send_audio: {e}")
-            return False
-
-    def _generate_waveform_bytes(self, samples: array) -> bytearray:
-        if not samples or len(samples) == 0:
-            return bytearray([0] * 50)
-        
-        num_bars = 50
-        chunk_size = max(1, len(samples) // num_bars)
-        waveform = bytearray(num_bars)
-        
-        for i in range(num_bars):
-            start = i * chunk_size
-            end = start + chunk_size
-            if end > len(samples):
-                end = len(samples)
-            
-            peak = 0
-            step = max(1, (end - start) // 100)
-            for j in range(start, end, step):
-                s = abs(samples[j])
-                if s > peak:
-                    peak = s
-                    
-            val = min(31, int(peak / 1057))
-            waveform[i] = val
-            
-        return waveform
+        if hasattr(self, "record_hooks"):
+            self.record_hooks.uninstall()
+        if hasattr(self, "import_hooks"):
+            self.import_hooks.uninstall()
+        self.hide_overlay()
+        sound_engine.clear()
+        stop_all_speaker_playback()
 
     def notify(self, text: str):
         try:
@@ -2078,23 +1540,12 @@ class VoiceSoundpadPlugin(BasePlugin):
             pass
 
     def show_overlay(self):
-        if not self.get_setting("plugin_enabled", True):
-            return
         self.overlay.show()
 
     def hide_overlay(self):
         if hasattr(self, "overlay"):
             self.overlay.hide()
         stop_all_speaker_playback()
-
-    def show_corner_overlay(self):
-        if not self.get_setting("plugin_enabled", True):
-            return
-        self.corner_overlay.show()
-
-    def hide_corner_overlay(self):
-        if hasattr(self, "corner_overlay"):
-            self.corner_overlay.hide()
 
     def get_context(self):
         if getattr(self, "current_activity", None) is not None:
@@ -2110,16 +1561,13 @@ class VoiceSoundpadPlugin(BasePlugin):
             return ApplicationLoader.applicationContext
 
     def get_playback_mode(self) -> str:
-        if getattr(self, "in_call", False):
-            idx = self.get_setting("call_playback_mode_index", 0)
-        else:
-            idx = self.get_setting("playback_mode_index", 2)
+        idx = self.get_setting("playback_mode_index", 2)
         return {0: "mic", 1: "speaker", 2: "both"}.get(idx, "both")
 
     def assign_to_first_free_slot(self, filename: str) -> Optional[int]:
         for i in range(MAX_SLOTS):
             if self.get_setting(f"slot_{i}_file", "") == filename:
-                return None
+                return None  # уже назначен на какой-то слот, повторно не трогаем
         for i in range(MAX_SLOTS):
             if not self.get_setting(f"slot_{i}_file", ""):
                 self.set_setting(f"slot_{i}_file", filename)
@@ -2198,9 +1646,7 @@ class VoiceSoundpadPlugin(BasePlugin):
         try:
             if os.path.exists(path):
                 os.remove(path)
-            keys_to_remove = [k for k in sound_engine._samples_cache if k[0] == path]
-            for k in keys_to_remove:
-                sound_engine._samples_cache.pop(k, None)
+            sound_engine._samples_cache.pop(path, None)
             sound_engine._loading_locks.pop(path, None)
 
             freed_slots = []
@@ -2230,21 +1676,6 @@ class VoiceSoundpadPlugin(BasePlugin):
 
         rows: List[Any] = [
             Header(text="Voice Soundpad"),
-            Switch(
-                key="plugin_enabled",
-                text="Включить плагин",
-                subtext="Если выключено — плагин не устанавливает хуки и не "
-                        "показывает оверлеи. Команда .soundpad делает то же самое.",
-                default=True,
-                on_change=self._on_plugin_enabled_change,
-            ),
-            Text(
-                text="Команды в чате",
-                subtext=f".sounds 1-{MAX_SLOTS} — отправить звук из слота "
-                        "голосовым сообщением. .soundpad — выключить плагин.",
-                icon="msg_info",
-            ),
-            Divider(),
             Text(
                 text="Импортировать звук",
                 icon="msg_addbot",
@@ -2264,19 +1695,20 @@ class VoiceSoundpadPlugin(BasePlugin):
             ),
             Text(
                 text=f"Найдено файлов: {len(files)}",
-                subtext="WAV (PCM16) и mp3/aac/m4a/ogg.",
+                subtext="WAV (PCM16) и mp3/aac/m4a/ogg. Крупные/длинные файлы "
+                        "обрабатываются заметно дольше.",
             ),
             Divider(),
-            Header(text="Отладка"),
+            Header(text="Отладка (без ПК/ADB)"),
             Switch(
                 key="debug_file_logging",
                 text="Писать файл-лог на диск",
-                subtext="По умолчанию выключено. Простым смертным он не нужен.",
+                subtext="По умолчанию выключено. Логи в logcat идут всегда.",
                 default=False,
                 on_change=self._on_debug_logging_change,
             ),
             Text(
-                text="Лог отладки",
+                text="Лог отладки (превью, может обрезаться)",
                 subtext=read_debug_log(20),
                 icon="msg_log",
             ),
@@ -2297,46 +1729,27 @@ class VoiceSoundpadPlugin(BasePlugin):
                 key="glass_blur_enabled",
                 text="Эффект стекла (блюр фона)",
                 subtext="Красиво, но при каждом открытии оверлея делает снимок "
-                        "экрана. На слабых устройствах будет небольшая "
+                        "экрана — на слабых устройствах может ощущаться небольшая "
                         "задержка. Блюр статичный (не живой), фон подстраивается "
                         "под текущую тему.",
                 default=False,
             ),
-            Switch(
-                key="corner_overlay_enabled",
-                text="Индикатор громкости",
-                subtext="Отдельный прозрачный индикатор громкости микрофона: "
-                        "зелёный — тихо, жёлтый — умеренно, красный — перегруз, "
-                        "может искажать бас.",
-                default=True,
-            ),
             Divider(),
-            Header(text="Голосовые сообщения"),
+            Header(text="Куда играть звук при нажатии"),
             Selector(
                 key="playback_mode_index",
                 text="Режим вывода",
                 default=2,
                 items=[
-                    "Только в микрофон",
-                    "Только через динамик",
-                    "Оба",
-                ],
-            ),
-            Divider(),
-            Header(text="Звонки и войс-чаты"),
-            Selector(
-                key="call_playback_mode_index",
-                text="Режим вывода",
-                default=0,
-                items=[
-                    "Только в микрофон",
-                    "Только через динамик",
-                    "Оба",
+                    "Только в микрофон (слышно в самом ГС)",
+                    "Только через динамик (слышно только вам)",
+                    "И туда, и туда",
                 ],
             ),
             Divider(
-                text="В режиме «Оба» при звонках может дать задержку."
-                     "Лучше оставьте только микрофон."
+                text="В режиме «И туда, и туда» звук на динамике запускается "
+                     "в момент реального попадания в запись — держите телефон "
+                     "как обычно."
             ),
             Header(text="Общая громкость подмеса"),
             Selector(
