@@ -1,0 +1,672 @@
+# Made with ❤️ by #!/bin/bash
+# @binbash_ch
+
+from base_plugin import BasePlugin, MethodHook
+
+from android_utils import log as _log, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+
+from android.graphics import Rect
+from android.view import View
+from org.telegram.messenger import AndroidUtilities, MediaController, R
+from org.telegram.ui.ActionBar import Theme
+from com.google.android.exoplayer2 import PlaybackParameters
+from java import dynamic_proxy, jarray, jint
+from java.lang import Integer
+
+
+__id__ = "music_speed"
+__name__ = "Music Speed"
+__description__ = "Добавляет музыке штатную кнопку изменения скорости + дает возможность включать pitch и reverb"
+__author__ = "@binbash_0"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+
+# Классы всех плееров, в которых Telegram прячет кнопку скорости
+MINI_PLAYER_CLASS = "org.telegram.ui.Components.FragmentContextView"
+FULL_PLAYER_CLASS = "org.telegram.ui.Components.AudioPlayerAlert"
+MEDIA_CONTROLLER_CLASS = "org.telegram.messenger.MediaController"
+VIDEO_PLAYER_CLASS = "org.telegram.ui.Components.VideoPlayer"
+ACTION_BAR_MENU_ITEM_CLASS = "org.telegram.ui.ActionBar.ActionBarMenuItem"
+
+REVERB_ITEM_ID = 51001
+PITCH_ITEM_ID = 51002
+
+SETTING_REVERB = "reverb_enabled"
+SETTING_PITCH = "voice_pitch_enabled"
+
+
+def log(*args, sep: str = " ") -> None:
+    _log("[Music Speed Plugin] " + sep.join(map(str, args)))
+
+
+class ClickListener(dynamic_proxy(View.OnClickListener)):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, view):
+        self.callback(view)
+
+
+# Хук для мини-плеера над чатом
+class MiniPlayerHook(MethodHook):
+    def __init__(self, plugin: "MusicSpeedPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.show_speed_button(param.thisObject, reserve_title_space=True)
+        except Exception as e:
+            log("Mini-player hook error:", e)
+
+
+# Хук для полного музыкального плеера
+class FullPlayerHook(MethodHook):
+    def __init__(self, plugin: "MusicSpeedPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.show_speed_button(param.thisObject)
+        except Exception as e:
+            log("Full-player hook error:", e)
+
+
+# При переключении трека Telegram создает новый плеер со скоростью 1x, но в настройках оставляет выбранную скорость
+class MusicPlaybackHook(MethodHook):
+    def __init__(self, plugin: "MusicSpeedPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            message = param.args[0] if param.args else None
+            if self.plugin.is_supported_audio(message):
+                self.plugin.sync_audio_state(message)
+        except Exception as e:
+            log("Music playback hook error:", e)
+
+
+class PlaybackQualityHook(MethodHook):
+    def __init__(self, plugin: "MusicSpeedPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            speed = float(param.args[0])
+            if self.plugin.apply_playback_parameters(param.thisObject, speed):
+                param.setResult(None)
+        except Exception as e:
+            log("Playback quality hook error:", e)
+
+
+# Учитываем две добавленные строки до штатного открытия popup
+class PopupPositionHook(MethodHook):
+    def __init__(self, plugin: "MusicSpeedPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            button = self.plugin.get_field(param.thisObject, "playbackSpeedButton")
+            if button is not None:
+                self.plugin.adjust_popup_position(button)
+        except Exception as e:
+            log("Popup position hook error:", e)
+
+class MusicSpeedPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.hook_unhooks = []
+        self.reverb = None
+        self.reverb_session_id = 0
+        self.effect_buttons = []
+        self.popup_offsets = []
+        self.layout_lazy_items_method = None
+
+    def on_plugin_load(self):
+        log("Loaded!")
+        self.install_player_hooks()
+
+    def on_plugin_unload(self):
+        self.release_reverb()
+        self.effect_buttons = []
+        self.popup_offsets = []
+        self.layout_lazy_items_method = None
+        for unhook in self.hook_unhooks:
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self.hook_unhooks = []
+        log("Unloaded!")
+
+    # Устанавливаем хуки на обновление обоих плееров
+    def install_player_hooks(self):
+        self.install_player_hook(
+            MINI_PLAYER_CLASS,
+            "checkPlayer",
+            MiniPlayerHook(self),
+        )
+        self.install_player_hook(
+            FULL_PLAYER_CLASS,
+            "updateTitle",
+            FullPlayerHook(self),
+        )
+        self.install_music_playback_hook()
+        self.install_playback_quality_hook()
+        self.install_popup_position_hooks()
+
+        log("Player hooks installed:", len(self.hook_unhooks))
+
+    def install_player_hook(self, class_name: str, method_name: str, hook: MethodHook):
+        try:
+            method = self.find_boolean_method(class_name, method_name)
+            if method is None:
+                log("Method not found:", f"{class_name}.{method_name}(boolean)")
+                return
+
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+
+            unhook = self.hook_method(method, hook)
+            if unhook is not None:
+                self.hook_unhooks.append(unhook)
+        except Exception as e:
+            log("Hook install error:", f"{class_name}.{method_name}", e)
+
+    # Хукаем основную перегрузку playMessage(MessageObject, boolean)
+    def install_music_playback_hook(self):
+        try:
+            method = self.find_method(
+                MEDIA_CONTROLLER_CLASS,
+                "playMessage",
+                ("org.telegram.messenger.MessageObject", "boolean"),
+            )
+            if method is None:
+                log("Method not found:", "MediaController.playMessage(MessageObject, boolean)")
+                return
+
+            try:
+                method.setAccessible(True)
+            except Exception:
+                pass
+
+            unhook = self.hook_method(method, MusicPlaybackHook(self))
+            if unhook is not None:
+                self.hook_unhooks.append(unhook)
+        except Exception as e:
+            log("Music playback hook install error:", e)
+
+    # Перехватываем установку скорости до того, как Telegram применит pitch 0.98
+    def install_playback_quality_hook(self):
+        try:
+            method = self.find_method(
+                VIDEO_PLAYER_CLASS,
+                "setPlaybackSpeed",
+                ("float",),
+            )
+            if method is None:
+                log("Method not found:", "VideoPlayer.setPlaybackSpeed(float)")
+                return
+
+            unhook = self.hook_method(method, PlaybackQualityHook(self))
+            if unhook is not None:
+                self.hook_unhooks.append(unhook)
+        except Exception as e:
+            log("Playback quality hook install error:", e)
+
+    def install_popup_position_hooks(self):
+        hooks = (
+            (MINI_PLAYER_CLASS, "lambda$createPlaybackSpeedButton$14", ("android.view.View",)),
+            (
+                FULL_PLAYER_CLASS,
+                "lambda$new$4",
+                (
+                    "org.telegram.ui.ActionBar.Theme$ResourcesProvider",
+                    "android.view.View",
+                ),
+            ),
+        )
+
+        for class_name, method_name, parameter_names in hooks:
+            try:
+                method = self.find_method(class_name, method_name, parameter_names)
+                if method is None:
+                    log("Popup open method not found:", class_name, method_name)
+                    continue
+                unhook = self.hook_method(method, PopupPositionHook(self))
+                if unhook is not None:
+                    self.hook_unhooks.append(unhook)
+            except Exception as e:
+                log("Popup position hook install error:", class_name, method_name, e)
+
+    # Ищем метод по имени и сигнатуре
+    def find_boolean_method(self, class_name: str, method_name: str):
+        return self.find_method(class_name, method_name, ("boolean",))
+
+    def find_method(self, class_name: str, method_name: str, parameter_names):
+        player_class = find_class(class_name)
+        if player_class is None:
+            return None
+
+        try:
+            declared = player_class.getClass().getDeclaredMethods()
+        except Exception:
+            declared = player_class.getDeclaredMethods()
+
+        for method in declared:
+            try:
+                params = method.getParameterTypes()
+                if (
+                    method.getName() == method_name
+                    and len(params) == len(parameter_names)
+                    and all(
+                        params[index].getName() == parameter_name
+                        for index, parameter_name in enumerate(parameter_names)
+                    )
+                ):
+                    return method
+            except Exception:
+                continue
+        return None
+
+    def is_supported_audio(self, message) -> bool:
+        if message is None:
+            return False
+        return bool(message.isMusic() or message.isVoice() or message.isRoundVideo())
+
+    # Повторно применяем сохраненную скорость и эффекты к новому плееру
+    def sync_audio_state(self, message):
+        run_on_ui_thread(lambda: self.apply_audio_state(message), 50)
+
+    def apply_audio_state(self, message):
+        try:
+            media_controller = MediaController.getInstance()
+            current_message = media_controller.getPlayingMessageObject()
+            if not self.is_supported_audio(current_message):
+                return
+            if not media_controller.isPlayingMessage(message):
+                return
+
+            is_music = bool(current_message.isMusic())
+            speed = media_controller.getPlaybackSpeed(is_music)
+            media_controller.setPlaybackSpeed(is_music, speed)
+
+            # Audio session появляется немного позже самого VideoPlayer
+            run_on_ui_thread(self.apply_reverb, 100)
+        except Exception as e:
+            log("Audio state sync error:", e)
+
+    # Возвращает True, если параметры были применены и оригинальный метод не нужен
+    def apply_playback_parameters(self, video_player, speed: float) -> bool:
+        media_controller = MediaController.getInstance()
+        message = media_controller.getPlayingMessageObject()
+        if not self.is_supported_audio(message):
+            return False
+
+        audio_player = self.get_field(media_controller, "audioPlayer")
+        round_player = self.get_field(media_controller, "videoPlayer")
+        if video_player != audio_player and video_player != round_player:
+            return False
+
+        exo_player = self.get_field(video_player, "player")
+        if exo_player is None:
+            return False
+
+        pitch = speed if self.get_setting(SETTING_PITCH, False) else 1.0
+        exo_player.setPlaybackParameters(PlaybackParameters(float(speed), float(pitch)))
+        return True
+
+    # Добавляем переключатели в уже существующее меню скорости
+    def add_effect_menu_items(self, button):
+        if self.find_effect_button(button) is not None:
+            self.refresh_effect_menu_items(button)
+            return
+
+        self.materialize_lazy_items(button)
+
+        items = (
+            (REVERB_ITEM_ID, SETTING_REVERB, "Reverb", R.drawable.msg_voice_speaker),
+            (PITCH_ITEM_ID, SETTING_PITCH, "Pitch", R.drawable.msg_filled_data_voice),
+        )
+        refs = {}
+        listeners = {}
+
+        for item_id, setting_key, title, icon in items:
+            try:
+                # После reload у кнопки могут остаться строки старого
+                if button.hasSubItem(item_id):
+                    self.remove_existing_effect_item(button, item_id)
+
+                text = self.effect_item_text(title, setting_key)
+                ref = button.addSubItem(
+                    item_id,
+                    icon,
+                    None,
+                    text,
+                    False,
+                    False,
+                )
+
+                if ref is None:
+                    log("Unable to add effect menu item:", title)
+                    continue
+
+                listener = ClickListener(
+                    lambda view, target_button=button, target_id=item_id: (
+                        self.toggle_audio_effect(target_button, target_id)
+                    )
+                )
+                ref.setOnClickListener(listener)
+                refs[item_id] = ref
+                listeners[item_id] = listener
+            except Exception as e:
+                log("Unable to add effect menu item:", title, e)
+
+        self.effect_buttons.append(
+            {
+                "button": button,
+                "refs": refs,
+                "listeners": listeners,
+            }
+        )
+        self.refresh_effect_menu_items(button)
+
+    def remove_existing_effect_item(self, button, item_id: int):
+        key = Integer.valueOf(item_id)
+        lazy_map = self.get_field(button, "lazyMap")
+        lazy_item = None
+        if lazy_map is not None:
+            lazy_item = lazy_map.remove(key)
+
+        lazy_list = self.get_field(button, "lazyList")
+        if lazy_list is not None and lazy_item is not None:
+            try:
+                lazy_list.remove(lazy_item)
+            except Exception:
+                pass
+
+        # По факту строки лежат во внутреннем LinearLayout popup, а не являются непосредственными дочерними элементами popupLayout
+        for _ in range(16):
+            row = self.find_effect_row(button, item_id)
+            if row is None:
+                break
+            try:
+                parent = row.getParent()
+                if parent is None:
+                    break
+                parent.removeView(row)
+            except Exception:
+                break
+
+    def materialize_lazy_items(self, button):
+        try:
+            method = self.layout_lazy_items_method
+            if method is None:
+                method = self.find_method(
+                    ACTION_BAR_MENU_ITEM_CLASS,
+                    "layoutLazyItems",
+                    (),
+                )
+                if method is None:
+                    raise RuntimeError("ActionBarMenuItem.layoutLazyItems() not found")
+                method.setAccessible(True)
+                self.layout_lazy_items_method = method
+            method.invoke(button)
+        except Exception as e:
+            log("Unable to materialize speed menu:", e)
+
+    def find_effect_row(self, button, item_id: int):
+        popup = self.get_field(button, "popupLayout")
+        if popup is None:
+            return None
+
+        row = popup.findViewWithTag(Integer.valueOf(item_id))
+        if row is not None:
+            return row
+
+        # Fallback для сборок, где мост не сопоставляет java.lang.Integer
+        try:
+            for index in range(int(popup.getItemsCount())):
+                candidate = popup.getItemAt(index)
+                tag = candidate.getTag()
+                if tag is not None and int(tag) == item_id:
+                    return candidate
+        except Exception:
+            pass
+        return None
+
+    def refresh_effect_menu_items(self, button):
+        entry = self.find_effect_button(button)
+        popup = self.get_field(button, "popupLayout")
+
+        items = (
+            (REVERB_ITEM_ID, SETTING_REVERB, "Reverb"),
+            (PITCH_ITEM_ID, SETTING_PITCH, "Pitch"),
+        )
+        for item_id, setting_key, title in items:
+            try:
+                enabled = bool(self.get_setting(setting_key, False))
+                text = self.effect_item_text(title, setting_key)
+                color = self.effect_item_color(enabled)
+                ref = entry["refs"].get(item_id) if entry is not None else None
+                if ref is not None:
+                    ref.setText(text)
+                    ref.setColors(color, color)
+
+                if popup is not None:
+                    row = self.find_effect_row(button, item_id)
+                    if row is not None:
+                        row.setText(text)
+                        row.setColors(color, color)
+            except Exception:
+                pass
+
+    def effect_item_color(self, enabled: bool) -> int:
+        key = (
+            Theme.key_featuredStickers_addButtonPressed
+            if enabled
+            else Theme.key_actionBarDefaultSubmenuItem
+        )
+        return Theme.getColor(key)
+
+    def find_effect_button(self, button):
+        for entry in self.effect_buttons:
+            try:
+                if entry["button"] == button or entry["button"].equals(button):
+                    return entry
+            except Exception:
+                continue
+        return None
+
+    def adjust_popup_position(self, button):
+        visible_frame = Rect()
+        button.getWindowVisibleDisplayFrame(visible_frame)
+        button_location = jarray(jint)([0, 0])
+        button.getLocationOnScreen(button_location)
+
+        button_center = int(button_location[1]) + (button.getHeight() // 2)
+        screen_center = (visible_frame.top + visible_frame.bottom) // 2
+        entry = self.find_popup_offset(button)
+        if entry is None:
+            entry = {
+                "button": button,
+                "base": int(self.get_field(button, "additionalYOffset") or 0),
+            }
+            self.popup_offsets.append(entry)
+
+        # Каждый ActionBarMenuSubItem имеет штатную высоту 48dp, исходный offset якорит к кнопке "Сверхбыстро", а две новые строки требуют ровно 96dp дополнительного сдвига вверх
+        effects_height = AndroidUtilities.dp(96.0)
+        offset = entry["base"] - effects_height if button_center > screen_center else entry["base"]
+        button.setAdditionalYOffset(offset)
+
+    def find_popup_offset(self, button):
+        for entry in self.popup_offsets:
+            try:
+                if entry["button"] == button or entry["button"].equals(button):
+                    return entry
+            except Exception:
+                continue
+        return None
+
+    def toggle_audio_effect(self, button, item_id: int):
+        if item_id == REVERB_ITEM_ID:
+            setting_key = SETTING_REVERB
+            title = "Reverb"
+        else:
+            setting_key = SETTING_PITCH
+            title = "Pitch"
+
+        enabled = not self.get_setting(setting_key, False)
+        self.set_setting(setting_key, enabled, reload_settings=False)
+        self.update_effect_item(button, item_id, title, enabled)
+
+        if setting_key == SETTING_REVERB:
+            if enabled:
+                self.apply_reverb()
+            else:
+                self.release_reverb()
+        else:
+            self.reapply_current_speed()
+
+        log(title, "enabled" if enabled else "disabled")
+
+    def effect_item_text(self, title: str, setting_key: str) -> str:
+        enabled = self.get_setting(setting_key, False)
+        return f"{title} · {'Вкл' if enabled else 'Выкл'}"
+
+    def update_effect_item(self, button, item_id: int, title: str, enabled: bool):
+        text = f"{title} · {'Вкл' if enabled else 'Выкл'}"
+        color = self.effect_item_color(enabled)
+        entry = self.find_effect_button(button)
+        ref = entry["refs"].get(item_id) if entry is not None else None
+        if ref is not None:
+            ref.setText(text)
+            ref.setColors(color, color)
+
+        popup = self.get_field(button, "popupLayout")
+        if popup is not None:
+            row = self.find_effect_row(button, item_id)
+            if row is not None:
+                row.setText(text)
+                row.setColors(color, color)
+
+    def reapply_current_speed(self):
+        try:
+            media_controller = MediaController.getInstance()
+            message = media_controller.getPlayingMessageObject()
+            if not self.is_supported_audio(message):
+                return
+            is_music = bool(message.isMusic())
+            speed = media_controller.getPlaybackSpeed(is_music)
+            media_controller.setPlaybackSpeed(is_music, speed)
+        except Exception as e:
+            log("Unable to reapply pitch:", e)
+
+    def apply_reverb(self):
+        if not self.get_setting(SETTING_REVERB, False):
+            self.release_reverb()
+            return
+
+        try:
+            media_controller = MediaController.getInstance()
+            message = media_controller.getPlayingMessageObject()
+            if not self.is_supported_audio(message):
+                self.release_reverb()
+                return
+
+            video_player = self.get_field(media_controller, "audioPlayer")
+            if message.isRoundVideo():
+                video_player = self.get_field(media_controller, "videoPlayer")
+            exo_player = self.get_field(video_player, "player")
+            session_id = self.get_field(exo_player, "audioSessionId")
+            if not session_id or int(session_id) <= 0:
+                return
+
+            session_id = int(session_id)
+            if self.reverb is not None and self.reverb_session_id == session_id:
+                self.reverb.setEnabled(True)
+                return
+
+            self.release_reverb()
+            from android.media.audiofx import PresetReverb
+
+            self.reverb = PresetReverb(0, session_id)
+            self.reverb.setPreset(PresetReverb.PRESET_MEDIUMROOM)
+            self.reverb.setEnabled(True)
+            self.reverb_session_id = session_id
+        except Exception as e:
+            self.release_reverb()
+            log("Reverb is not supported on this device:", e)
+
+    def release_reverb(self):
+        if self.reverb is not None:
+            try:
+                self.reverb.setEnabled(False)
+                self.reverb.release()
+            except Exception:
+                pass
+        self.reverb = None
+        self.reverb_session_id = 0
+
+    # Возвращаем уже готовую штатную кнопку, не создавая свой UI
+    def show_speed_button(self, player_view, reserve_title_space: bool = False):
+        message = MediaController.getInstance().getPlayingMessageObject()
+        if not self.is_supported_audio(message):
+            return
+
+        # checkPlayer вызывается еще и для панели звонка, ее не трогаем
+        if reserve_title_space:
+            current_style = self.get_field(player_view, "currentStyle")
+            is_visible = self.get_field(player_view, "visible")
+            if current_style is not None and int(current_style) != 0:
+                return
+            if is_visible is not None and not bool(is_visible):
+                return
+
+        button = self.get_field(player_view, "playbackSpeedButton")
+        if button is None:
+            return
+
+        self.add_effect_menu_items(button)
+
+        # Для голосовых Telegram и так показывает кнопку, возвращаем только меню
+        if not message.isMusic():
+            return
+
+        button.setVisibility(View.VISIBLE)
+        button.setAlpha(1.0)
+        button.setEnabled(True)
+
+        if reserve_title_space:
+            self.reserve_title_space(player_view)
+
+    # Оставляем место под кнопку, что бы она не перекрывала название трека
+    def reserve_title_space(self, player_view):
+        title = self.get_field(player_view, "titleTextView")
+        if title is None:
+            return
+
+        join_button_width = self.get_field(player_view, "joinButtonWidth") or 0
+        right_padding = AndroidUtilities.dp(44.0) + int(join_button_width)
+        title.setPadding(
+            title.getPaddingLeft(),
+            title.getPaddingTop(),
+            right_padding,
+            title.getPaddingBottom(),
+        )
+
+    # На новых сборках поле может быть доступно напрямую, на старых берем его через reflection
+    def get_field(self, instance, name: str):
+        try:
+            return getattr(instance, name)
+        except Exception:
+            try:
+                return get_private_field(instance, name)
+            except Exception:
+                return None
