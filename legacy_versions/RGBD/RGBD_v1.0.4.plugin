@@ -1,0 +1,414 @@
+import io
+import os
+import time
+from typing import Any, List, Optional
+
+import requests
+from PIL import Image
+
+from android_utils import log
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import (
+    PLUGINS_QUEUE,
+    get_file_loader,
+    get_last_fragment,
+    run_on_queue,
+    send_document,
+    send_photo,
+)
+from file_utils import ensure_dir_exists, get_cache_dir
+from org.telegram.messenger import FileLoader, ImageLocation, AndroidUtilities
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Text
+
+__id__ = "RGBD"
+__name__ = "RGBD"
+__description__ = "Reply .d to a photo"
+__author__ = "@RoflPlugins"
+__version__ = "1.0.4"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+__icon__ = "RoflPlugins/19"
+
+TRIGGER = ".d"
+
+
+class MediaTo3DRGBDPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.log("RGBD loaded")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Depth API"),
+            Input(
+                key="depth_api_url",
+                text="Depth API URL",
+                default="http://penis.nothalk.fun:1488/depth",
+                subtext="POST endpoint that accepts multipart field 'image' "
+                        "and returns a grayscale PNG/JPEG depth map. "
+                        "See depth_server.py for a ready-made server.",
+                icon="msg_link",
+            ),
+            Input(
+                key="depth_api_key",
+                text="API key (optional)",
+                default="",
+                subtext="Sent as 'Authorization: Bearer <key>' if set.",
+                icon="msg_pin",
+            ),
+            Header(text="Processing"),
+            Input(
+                key="max_size",
+                text="Max image side (px)",
+                default="3000",
+                subtext="Larger = better quality but slower on-device processing.",
+                icon="msg_photo_settings",
+            ),
+            Input(
+                key="shift_strength",
+                text="3D shift strength (px)",
+                default="26",
+                subtext="How strong the parallax / 3D effect is (anaglyph only).",
+                icon="msg_shuffle",
+            ),
+            Switch(
+                key="invert_depth",
+                text="Invert depth (near ↔ far)",
+                default=True,
+            ),
+            Header(text="What to send"),
+            Switch(key="send_depth", text="Grayscale depth map (B&W photo)", default=True),
+            Switch(key="send_anaglyph", text="Red/cyan 3D anaglyph", default=False),
+            Switch(key="send_sbs", text="Side-by-side RGB | Depth preview", default=False),
+            Switch(key="send_rgbd", text="Packed RGBD PNG (as file, depth in alpha)", default=False),
+            Switch(key="send_captions", text="Add captions to results", default=False),
+            Text(
+                text="Usage",
+                subtext=f'Reply to a photo with "{TRIGGER}"',
+                icon="msg_info",
+            ),
+        ]
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        text = message.strip()
+        if text != TRIGGER and not text.startswith(TRIGGER + " "):
+            return HookResult()
+
+        reply_msg = getattr(params, "replyToMsg", None)
+        if reply_msg is None:
+            BulletinHelper.show_error(f'Reply to a photo with "{TRIGGER}"')
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        dialog_id = self._resolve_dialog_id(params)
+        if dialog_id is None:
+            BulletinHelper.show_error("Could not resolve the current chat")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        BulletinHelper.show_info("Building 3D / RGBD, please wait...")
+        run_on_queue(lambda: self._process(account, dialog_id, reply_msg), PLUGINS_QUEUE)
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _resolve_dialog_id(self, params: Any) -> Optional[int]:
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                return fragment.getDialogId()
+        except Exception as e:
+            self.log(f"resolve_dialog_id via fragment failed: {e}")
+        peer = getattr(params, "peer", None)
+        if isinstance(peer, int):
+            return peer
+        return None
+
+    def _reply_photo_local_path(self, reply_msg: Any, account: int) -> Optional[str]:
+        try:
+            message_owner = reply_msg.messageOwner
+        except Exception as e:
+            self.log(f"no messageOwner on replied message: {e}")
+            return None
+
+        try:
+            file_loader = get_file_loader(account)
+        except Exception as e:
+            self.log(f"get_file_loader failed: {e}")
+            return None
+
+        try:
+            attach = getattr(message_owner, "attachPath", None) or ""
+            if attach and os.path.isfile(attach) and os.path.getsize(attach) > 0:
+                self.log(f"using attachPath: {attach}")
+                return attach
+        except Exception as e:
+            self.log(f"attachPath check failed: {e}")
+
+        try:
+            file_obj = file_loader.getPathToMessage(message_owner)
+            if file_obj is not None and file_obj.exists() and file_obj.length() > 0:
+                path = str(file_obj.getAbsolutePath())
+                self.log(f"using getPathToMessage: {path}")
+                return path
+        except Exception as e:
+            self.log(f"getPathToMessage failed: {e}")
+
+        media = getattr(message_owner, "media", None)
+        if media is None:
+            self.log("messageOwner.media is None")
+            return None
+
+        photo = getattr(media, "photo", None)
+        if photo is None:
+            document = getattr(media, "document", None)
+            if document is not None:
+                try:
+                    file_obj = file_loader.getPathToAttach(document, True)
+                    if file_obj is not None:
+                        if not file_obj.exists() or file_obj.length() == 0:
+                            try:
+                                file_loader.loadFile(
+                                    document, reply_msg, FileLoader.PRIORITY_HIGH, 0
+                                )
+                            except Exception:
+                                pass
+                            for _ in range(30):
+                                if file_obj.exists() and file_obj.length() > 0:
+                                    break
+                                time.sleep(0.5)
+                        if file_obj.exists() and file_obj.length() > 0:
+                            path = str(file_obj.getAbsolutePath())
+                            self.log(f"using document path: {path}")
+                            return path
+                except Exception as e:
+                    self.log(f"document path failed: {e}")
+            self.log("replied media has neither .photo nor usable .document")
+            return None
+
+        sizes = None
+        try:
+            thumbs = getattr(reply_msg, "photoThumbs", None)
+            if thumbs is not None and len(thumbs) > 0:
+                sizes = list(thumbs)
+        except Exception:
+            pass
+        if not sizes:
+            try:
+                sizes = list(photo.sizes)
+            except Exception as e:
+                self.log(f"could not read photo.sizes: {e}")
+                return None
+        if not sizes:
+            self.log("photo has empty sizes list")
+            return None
+
+        best = None
+        try:
+            best = FileLoader.getClosestPhotoSizeWithSize(
+                sizes, AndroidUtilities.getPhotoSize()
+            )
+        except Exception:
+            pass
+        if best is None:
+            candidates = [
+                s
+                for s in sizes
+                if getattr(s, "w", 0)
+                and getattr(s, "type", "") not in ("i", "s")
+                and not type(s).__name__.endswith("StrippedSize")
+                and not type(s).__name__.endswith("PathSize")
+            ]
+            if not candidates:
+                candidates = [
+                    s for s in sizes if getattr(s, "w", 0) or getattr(s, "size", 0)
+                ]
+            if not candidates:
+                candidates = list(sizes)
+            best = max(
+                candidates,
+                key=lambda s: (getattr(s, "w", 0) or 0) * (getattr(s, "h", 0) or 1),
+            )
+
+        try:
+            file_obj = file_loader.getPathToAttach(best, True)
+        except Exception as e:
+            self.log(f"getPathToAttach failed: {e}")
+            return None
+        if file_obj is None:
+            self.log("getPathToAttach returned None")
+            return None
+
+        if not file_obj.exists() or file_obj.length() == 0:
+            try:
+                location = ImageLocation.getForPhoto(best, photo)
+                file_loader.loadFile(
+                    location, reply_msg, "jpg", FileLoader.PRIORITY_HIGH, 1
+                )
+            except Exception as e:
+                self.log(f"loadFile(ImageLocation) failed: {e}")
+                try:
+                    file_loader.loadFile(best, reply_msg, FileLoader.PRIORITY_HIGH, 1)
+                except Exception as e2:
+                    self.log(f"loadFile(PhotoSize) also failed: {e2}")
+
+            for _ in range(40):
+                if file_obj.exists() and file_obj.length() > 0:
+                    break
+                time.sleep(0.5)
+
+        if not file_obj.exists() or file_obj.length() == 0:
+            self.log("photo still not on disk after forcing download")
+            return None
+
+        path = str(file_obj.getAbsolutePath())
+        self.log(f"using PhotoSize path: {path}")
+        return path
+
+    def _fetch_depth_png(self, image_bytes: bytes) -> bytes:
+        url = (self.get_setting("depth_api_url", "http://penis.nothalk.fun:1488/depth") or "").strip()
+        if not url:
+            raise RuntimeError("Depth API URL is not configured in plugin settings")
+
+        headers = {}
+        api_key = (self.get_setting("depth_api_key", "") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        files = {"image": ("image.jpg", image_bytes, "image/jpeg")}
+        resp = requests.post(url, files=files, headers=headers, timeout=90)
+        resp.raise_for_status()
+        return resp.content
+
+    def _build_outputs(
+        self,
+        rgb_path: str,
+        depth_bytes: bytes,
+        max_size: int,
+        shift: int,
+        invert: bool = False,
+    ):
+        rgb = Image.open(rgb_path).convert("RGB")
+        w, h = rgb.size
+        scale = min(1.0, max_size / float(max(w, h)))
+        if scale < 1.0:
+            rgb = rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+        depth = Image.open(io.BytesIO(depth_bytes))
+        if depth.mode != "L":
+            depth = depth.convert("L")
+        depth = depth.resize(rgb.size, Image.LANCZOS)
+
+        if invert:
+            depth = Image.eval(depth, lambda p: 255 - p)
+
+        w, h = rgb.size
+        rgb_px = rgb.load()
+        depth_px = depth.load()
+
+        left = Image.new("RGB", (w, h))
+        right = Image.new("RGB", (w, h))
+        left_px = left.load()
+        right_px = right.load()
+
+        for y in range(h):
+            for x in range(w):
+                d = depth_px[x, y] / 255.0
+                s = int(d * shift)
+                lx = min(x + s, w - 1)
+                rx = max(x - s, 0)
+                left_px[x, y] = rgb_px[lx, y]
+                right_px[x, y] = rgb_px[rx, y]
+
+        anaglyph = Image.new("RGB", (w, h))
+        ana_px = anaglyph.load()
+        for y in range(h):
+            for x in range(w):
+                lr, _lg, _lb = left_px[x, y]
+                _rr, rg, rb = right_px[x, y]
+                ana_px[x, y] = (lr, rg, rb)
+
+        depth_gray_rgb = Image.merge("RGB", (depth, depth, depth))
+        sbs = Image.new("RGB", (w * 2, h))
+        sbs.paste(rgb, (0, 0))
+        sbs.paste(depth_gray_rgb, (w, 0))
+
+        rgba = rgb.convert("RGBA")
+        rgba.putalpha(depth)
+
+        return depth, anaglyph, sbs, rgba
+
+    def _caption(self, text: str) -> str:
+        if self.get_setting("send_captions", False):
+            return text
+        return ""
+
+    def _process(self, account: int, dialog_id: int, reply_msg: Any):
+        try:
+            local_path = self._reply_photo_local_path(reply_msg, account)
+            if local_path is None:
+                BulletinHelper.show_error(
+                    "Couldn't read the photo. Open it in the chat once so it's "
+                    "cached locally, then reply .d again."
+                )
+                return
+
+            with open(local_path, "rb") as f:
+                image_bytes = f.read()
+
+            depth_bytes = self._fetch_depth_png(image_bytes)
+
+            max_size = int(self.get_setting("max_size", "3000") or "3000")
+            shift = int(self.get_setting("shift_strength", "26") or "26")
+            invert = bool(self.get_setting("invert_depth", True))
+            self.log(f"settings: max_size={max_size} shift={shift} invert={invert}")
+
+            depth, anaglyph, sbs, rgba = self._build_outputs(
+                local_path, depth_bytes, max_size, shift, invert
+            )
+
+            out_dir = os.path.join(get_cache_dir(), "media_to_3d_rgbd")
+            ensure_dir_exists(out_dir)
+            stamp = int(time.time() * 1000)
+
+            if self.get_setting("send_depth", True):
+                depth_path = os.path.join(out_dir, f"depth{stamp}.jpg")
+                depth.convert("L").save(depth_path, "JPEG", quality=90, optimize=True)
+                send_photo(
+                    dialog_id,
+                    depth_path,
+                    caption=self._caption("Depth map"),
+                )
+
+            if self.get_setting("send_anaglyph", False):
+                ana_path = os.path.join(out_dir, f"anaglyph{stamp}.jpg")
+                anaglyph.convert("RGB").save(ana_path, "JPEG", quality=90, optimize=True)
+                send_photo(
+                    dialog_id,
+                    ana_path,
+                    caption=self._caption("3D anaglyph (red/cyan glasses)"),
+                )
+
+            if self.get_setting("send_sbs", False):
+                sbs_path = os.path.join(out_dir, f"sbs{stamp}.jpg")
+                sbs.save(sbs_path, "JPEG", quality=88, optimize=True)
+                send_photo(
+                    dialog_id,
+                    sbs_path,
+                    caption=self._caption("RGB | Depth"),
+                )
+
+            if self.get_setting("send_rgbd", False):
+                rgbd_path = os.path.join(out_dir, f"rgbd{stamp}.png")
+                rgba.save(rgbd_path, "PNG", optimize=True)
+                send_document(
+                    dialog_id,
+                    rgbd_path,
+                    caption=self._caption("RGBD (depth in alpha)"),
+                )
+
+            BulletinHelper.show_success("Done")
+        except Exception as e:
+            log(f"RGBD error: {e}")
+            BulletinHelper.show_error(f"Failed: {e}")

@@ -1,13 +1,13 @@
 import io
 import os
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from PIL import Image
 
 from android_utils import log
-from base_plugin import BasePlugin, HookResult, HookStrategy
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
 from client_utils import (
     PLUGINS_QUEUE,
     get_file_loader,
@@ -18,74 +18,952 @@ from client_utils import (
 )
 from file_utils import ensure_dir_exists, get_cache_dir
 from org.telegram.messenger import FileLoader, ImageLocation, AndroidUtilities
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Input, Switch, Text
+from ui.settings import Header, Input, Selector, Switch, Text
+
+# Кнопка генерации в фоторедакторе опирается на хуки Java-методов клиента.
+# Всё загружается мягко: если версия SDK старее и API хуков нет, плагин
+# работает без кнопки, а команда .d и меню сообщения остаются на месте.
+try:
+    from base_plugin import MethodHook as _MethodHook
+except Exception:
+    _MethodHook = None
+try:
+    from hook_utils import find_class as _find_class
+except Exception:
+    _find_class = None
+try:
+    from android_utils import run_on_ui_thread as _run_on_ui
+except Exception:
+    _run_on_ui = None
+try:
+    from android_utils import OnClickListener as _OnClickListener
+except Exception:
+    _OnClickListener = None
+
+
+class _PairingNeeded(RuntimeError):
+    """Depth API требует подтвердить аккаунт через бота RSec.
+
+    Сама привязка здесь не начинается: из-под полноэкранного редактора бот
+    открывается незаметно, и подтвердить вход невозможно. Вызывающий сам
+    решает, как провести привязку на виду у человека.
+    """
+
+
+if _MethodHook is not None:
+
+    class _SendProbeHook(_MethodHook):
+        """Пишет в журнал, какие пути уходят в отправку фото.
+
+        Чисто наблюдательный хук: по его строкам видно, ушёл ли в отправку
+        обработанный файл (`imagePath`) или оригинал (`path`).
+        """
+
+        def __init__(self, plugin):
+            self.plugin = plugin
+
+        def before_hooked_method(self, param):
+            try:
+                self.plugin._log_send_args(param.args)
+            except Exception:
+                pass
+
+    class _EditorToolbarHook(_MethodHook):
+        """Дожидается сборки панели фоторедактора и вставляет свою кнопку.
+
+        Панель инструментов (обрезка, поворот, кисть, HD, фильтры) собирается в
+        ``PhotoViewer.setParentActivity``. После его выполнения ``itemsLayout``
+        уже наполнен, и туда можно добавить ещё одну кнопку.
+        """
+
+        def __init__(self, plugin):
+            self.plugin = plugin
+            self._told = False
+
+        def after_hooked_method(self, param):
+            try:
+                self.plugin._inject_editor_button(param.thisObject)
+            except Exception as e:
+                if not self._told:
+                    self._told = True
+                    self.plugin.log(f"editor button inject failed: {e}")
+
+else:
+    _EditorToolbarHook = None
+    _SendProbeHook = None
+
 
 __id__ = "RGBD"
 __name__ = "RGBD"
 __description__ = "Reply .d to a photo"
 __author__ = "@RoflPlugins"
-__version__ = "1.0.4"
+__version__ = "1.3.7"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
 __icon__ = "RoflPlugins/19"
 
 TRIGGER = ".d"
+DEPTH_URL_DEFAULT = "https://rsec.nothalk.fun/server/mcr4yusvb3ws48rck4s8v7dt/depth"
+
+LANG_RU = 0
+LANG_EN = 1
+
+STRINGS = {
+    "header_language": ("Язык", "Language"),
+    "selector_language": ("Язык интерфейса", "Interface language"),
+    "header_depth_api": ("Depth API", "Depth API"),
+    "depth_api_url_text": ("URL Depth API", "Depth API URL"),
+    "depth_api_url_subtext": (
+        "POST-эндпоинт, принимающий multipart-поле 'image' и возвращающий "
+        "чёрно-белую depth-карту в PNG/JPEG. Готовый сервер — см. depth_server.py.",
+        "POST endpoint that accepts multipart field 'image' "
+        "and returns a grayscale PNG/JPEG depth map. "
+        "See depth_server.py for a ready-made server.",
+    ),
+    "depth_api_key_text": ("API-ключ (опционально)", "API key (optional)"),
+    "depth_api_key_subtext": (
+        "Отправляется как 'Authorization: Bearer <key>', если указан.",
+        "Sent as 'Authorization: Bearer <key>' if set.",
+    ),
+    "header_processing": ("Обработка", "Processing"),
+    "max_size_text": ("Макс. сторона изображения (px)", "Max image side (px)"),
+    "max_size_subtext": (
+        "Ограничивает длинную сторону. Этот же размер уходит в нейросеть: "
+        "меньше — быстрее ответ и легче запрос, больше — подробнее глубина.",
+        "Limits the longer side. The same size is sent to the neural network: "
+        "smaller means a faster, lighter request, larger means finer depth.",
+    ),
+    "shift_strength_text": ("Сила 3D-смещения (px)", "3D shift strength (px)"),
+    "shift_strength_subtext": (
+        "Насколько сильным будет эффект параллакса / 3D (только для анаглифа).",
+        "How strong the parallax / 3D effect is (anaglyph only).",
+    ),
+    "invert_depth_text": (
+        "Инвертировать глубину (ближе ↔ дальше)",
+        "Invert depth (near ↔ far)",
+    ),
+    "header_what_to_send": ("Что отправлять", "What to send"),
+    "send_depth_text": (
+        "Чёрно-белая карта глубины (фото)",
+        "Grayscale depth map (B&W photo)",
+    ),
+    "send_anaglyph_text": ("Красно-голубой 3D-анаглиф", "Red/cyan 3D anaglyph"),
+    "send_sbs_text": (
+        "RGB и Depth рядом (side-by-side)",
+        "Side-by-side RGB | Depth preview",
+    ),
+    "send_rgbd_text": (
+        "RGBD PNG-файл (глубина в альфа-канале)",
+        "Packed RGBD PNG (as file, depth in alpha)",
+    ),
+    "send_captions_text": ("Добавлять подписи к результатам", "Add captions to results"),
+    "usage_text": ("Использование", "Usage"),
+    "usage_subtext": (
+        f'Ответьте на фото командой "{TRIGGER}"',
+        f'Reply to a photo with "{TRIGGER}"',
+    ),
+    "err_reply_photo": (
+        f'Ответьте на фото командой "{TRIGGER}"',
+        f'Reply to a photo with "{TRIGGER}"',
+    ),
+    "err_no_chat": (
+        "Не удалось определить текущий чат",
+        "Could not resolve the current chat",
+    ),
+    "info_building": (
+        "Строим 3D / RGBD, подождите...",
+        "Building 3D / RGBD, please wait...",
+    ),
+    "err_no_local_photo": (
+        f'Не удалось прочитать фото. Откройте его в чате, чтобы оно закэшировалось '
+        f'локально, затем снова ответьте на него командой "{TRIGGER}".',
+        "Couldn't read the photo. Open it in the chat once so it's "
+        "cached locally, then reply .d again.",
+    ),
+    "caption_depth": ("Карта глубины", "Depth map"),
+    "caption_anaglyph": (
+        "3D-анаглиф (красно-голубые очки)",
+        "3D anaglyph (red/cyan glasses)",
+    ),
+    "caption_sbs": ("RGB | Глубина", "RGB | Depth"),
+    "caption_rgbd": ("RGBD (глубина в альфа-канале)", "RGBD (depth in alpha)"),
+    "success_done": ("Готово", "Done"),
+    "err_failed": ("Ошибка: {error}", "Failed: {error}"),
+    "menu_dialog_title": ("RGBD — выберите действие", "RGBD — choose action"),
+    "menu_action_all": (
+        "Как в настройках (по умолчанию)",
+        "As in settings (default)",
+    ),
+    "err_menu_no_photo": ("Это работает только с фото", "This only works with photos"),
+    "dialog_cancel": ("Отмена", "Cancel"),
+    "err_nothing_selected": (
+        "Нечего отправлять — включите хотя бы один вывод в настройках",
+        "Nothing to send — enable at least one output in settings",
+    ),
+    "state_on": ("Вкл", "On"),
+    "state_off": ("Выкл", "Off"),
+    "header_editor": ("Фоторедактор", "Photo editor"),
+    "editor_button_text": (
+        "Кнопка генерации в фоторедакторе",
+        "Generation button in the photo editor",
+    ),
+    "editor_button_subtext": (
+        "Добавляет кнопку рядом с обрезкой и фильтрами. По нажатию заменяет "
+        "редактируемое фото сгенерированным (анаглиф или карта глубины) — "
+        "отправится уже оно.",
+        "Adds a button next to crop and filters. Tapping it replaces the photo "
+        "being edited with the generated one (anaglyph or depth map) — that is "
+        "what gets sent.",
+    ),
+    "err_editor_no_photo": (
+        "Кнопка работает только с фото из галереи",
+        "The button only works with gallery photos",
+    ),
+    "pair_title": ("RGBD — нужен доступ", "RGBD — access needed"),
+    "pair_message": (
+        "Нужно подтвердить аккаунт через бота. Редактор закроется и откроется "
+        "бот — нажмите в нём «Запустить», затем откройте фото и повторите.",
+        "Your account must be confirmed via the bot. The editor will close and "
+        "the bot will open — press Start there, then reopen the photo and retry.",
+    ),
+    "pair_go": ("Продолжить", "Continue"),
+    "pair_done": (
+        "Подключено — откройте фото и повторите",
+        "Connected — reopen the photo and retry",
+    ),
+}
 
 
 class MediaTo3DRGBDPlugin(BasePlugin):
     def on_plugin_load(self):
         self.add_on_send_message_hook()
+        self._menu_item_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="RGBD",
+                on_click=self._on_menu_click,
+                icon="msg_photo_settings",
+                priority=10,
+            )
+        )
+        self._editor_unhooks = []
+        self._hook_photo_editor()
+        self._hook_send_probe()
         self.log("RGBD loaded")
+
+    def on_plugin_unload(self):
+        for handle in getattr(self, "_editor_unhooks", []):
+            try:
+                self.unhook_method(handle)
+            except Exception as e:
+                self.log(f"unhook editor failed: {e}")
+        self._editor_unhooks = []
+        item_id = getattr(self, "_menu_item_id", None)
+        if item_id is None:
+            return
+        try:
+            self.remove_menu_item(item_id)
+        except Exception as e:
+            self.log(f"remove_menu_item failed: {e}")
+
+    # ---- кнопка генерации в фоторедакторе -------------------------------
+
+    def _hook_photo_editor(self):
+        """Ставит хук на сборку панели фоторедактора.
+
+        Ничего не требует от версии клиента жёстко: если API хуков нет, просто
+        пишет об этом в журнал и выходит — остальной плагин работает.
+        """
+        if _EditorToolbarHook is None or _find_class is None:
+            self.log("editor button: hook API unavailable, skipping")
+            return
+        try:
+            photo_viewer = _find_class("org.telegram.ui.PhotoViewer")
+            if photo_viewer is None:
+                self.log("editor button: PhotoViewer class not found")
+                return
+            handles = self.hook_all_methods(
+                photo_viewer, "setParentActivity", _EditorToolbarHook(self)
+            )
+            if handles:
+                self._editor_unhooks += list(handles)
+                self.log("editor button: hooked PhotoViewer.setParentActivity")
+            else:
+                self.log("editor button: hook returned no handle")
+        except Exception as e:
+            self.log(f"editor button: hook failed: {e}")
+
+    def _hook_send_probe(self):
+        """Наблюдательные хуки на методы отправки фото.
+
+        Ничего не меняют — только пишут в журнал, какой путь у каждой записи
+        в момент отправки. Имя лямбды приколочено к текущей сборке клиента;
+        если в новой сборке её не окажется, хук просто не встанет.
+        """
+        if _SendProbeHook is None or _find_class is None:
+            return
+        try:
+            chat = _find_class("org.telegram.ui.ChatActivity")
+            if chat is None:
+                return
+            for name in ("sendPhotosGroup", "lambda$sendMedia$383"):
+                try:
+                    handles = self.hook_all_methods(chat, name, _SendProbeHook(self))
+                    if handles:
+                        self._editor_unhooks += list(handles)
+                        self.log(f"send probe hooked: {name}")
+                except Exception as e:
+                    self.log(f"send probe hook {name} failed: {e}")
+        except Exception as e:
+            self.log(f"send probe install failed: {e}")
+
+    def _log_send_args(self, args):
+        """Пишет в журнал пути фотографий, уходящих в отправку."""
+        if not args:
+            return
+        first = args[0]
+        try:
+            entries = [first.get(i) for i in range(int(first.size()))]
+        except Exception:
+            entries = [first]
+        for item in entries:
+            try:
+                self.log(
+                    "send probe: imagePath=%s path=%s isFiltered=%s"
+                    % (
+                        getattr(item, "imagePath", None),
+                        getattr(item, "path", None),
+                        getattr(item, "isFiltered", None),
+                    )
+                )
+            except Exception:
+                pass
+
+    def _priv(self, obj, name):
+        """Читает закрытое поле объекта клиента через рефлексию."""
+        field = obj.getClass().getDeclaredField(name)
+        field.setAccessible(True)
+        return field.get(obj)
+
+    def _inject_editor_button(self, photo_viewer):
+        """Добавляет кнопку в ряд инструментов редактора, если её там ещё нет."""
+        if not bool(self.get_setting("editor_button", True)):
+            return
+        from android.widget import ImageView, LinearLayout
+
+        items = self._priv(photo_viewer, "itemsLayout")
+        if items is None:
+            return
+        for i in range(items.getChildCount()):
+            try:
+                if str(items.getChildAt(i).getTag()) == "rgbd_gen":
+                    return
+            except Exception:
+                pass
+
+        context = items.getContext()
+        button = ImageView(context)
+        button.setTag("rgbd_gen")
+        icon_kind = self._apply_editor_icon(button)
+
+        # Фон — тот же скруглённый кружок, что у штатных кнопок ряда. Помимо
+        # единого вида он делает кнопку заметной, даже если значок не встал:
+        # пустой ImageView без фона на тёмной панели неотличим от отсутствующего.
+        try:
+            from org.telegram.ui.ActionBar import Theme
+
+            button.setBackground(
+                Theme.createInsetRoundRectDrawable(
+                    0x10FFFFFF,
+                    float(AndroidUtilities.dp(22)),
+                    AndroidUtilities.dp(4),
+                    AndroidUtilities.dp(6),
+                )
+            )
+        except Exception as e:
+            self.log(f"editor button background failed: {e}")
+
+        # Размеры, отступы и распределение по ширине — как у соседней кнопки
+        # фильтров, чтобы ряд не разъехался.
+        layout = None
+        try:
+            tune = self._priv(photo_viewer, "tuneItem")
+        except Exception:
+            tune = None
+        if tune is not None:
+            try:
+                button.setScaleType(tune.getScaleType())
+            except Exception:
+                pass
+            try:
+                button.setPadding(tune.getPaddingLeft(), tune.getPaddingTop(),
+                                  tune.getPaddingRight(), tune.getPaddingBottom())
+            except Exception:
+                pass
+            try:
+                source = tune.getLayoutParams()
+                layout = LinearLayout.LayoutParams(source)
+                try:
+                    layout.weight = source.weight
+                except Exception:
+                    pass
+                try:
+                    layout.gravity = source.gravity
+                except Exception:
+                    pass
+            except Exception:
+                layout = None
+        if tune is None:
+            # Без образца соседней кнопки значок нельзя оставлять на FIT_CENTER:
+            # он растянется на всю кнопку. CENTER рисует его в натуральную величину.
+            try:
+                from java import jclass
+
+                button.setScaleType(jclass("android.widget.ImageView$ScaleType").CENTER)
+            except Exception:
+                pass
+        if layout is None:
+            side = AndroidUtilities.dp(48)
+            layout = LinearLayout.LayoutParams(side, side)
+            try:
+                layout.weight = 1.0
+            except Exception:
+                pass
+
+        if _OnClickListener is not None:
+            button.setOnClickListener(
+                _OnClickListener(lambda v=None: self._on_editor_click(photo_viewer))
+            )
+        items.addView(button, layout)
+        self.log(f"editor button injected, icon={icon_kind}")
+
+    def _apply_editor_icon(self, button) -> str:
+        """Ставит значок на кнопку и возвращает, какой именно встал.
+
+        Сначала — рисованная искра. Если рисование сорвалось, значок берётся
+        из штатных ресурсов клиента: пустая кнопка недопустима, её не видно.
+        Возвращаемое имя попадает в журнал и показывает, каким путём пошли.
+        """
+        try:
+            button.setImageBitmap(self._make_editor_icon())
+            return "drawn"
+        except Exception as e:
+            self.log(f"editor icon draw failed: {e}")
+        try:
+            from java import jclass
+
+            drawables = jclass("org.telegram.messenger.R$drawable")
+            for name in ("media_magic_cut", "msg_photo_settings", "media_draw"):
+                res_id = int(getattr(drawables, name, 0) or 0)
+                if res_id:
+                    button.setImageResource(res_id)
+                    return name
+        except Exception as e:
+            self.log(f"editor icon resource failed: {e}")
+        return "none"
+
+    def _make_editor_icon(self):
+        """Рисует значок кнопки: белая искра — привычный знак «сгенерировать».
+
+        Нарисована только линиями (``drawLine``): восемь лучей из центра,
+        длинные по осям и короткие по диагоналям. Ошибки рисования уходят
+        наружу — у вызывающего есть запасной ресурсный значок, и лучше он,
+        чем прозрачный битмап, который выглядит как отсутствие кнопки.
+        """
+        import math
+
+        from android.graphics import Bitmap, Canvas, Color, Paint
+
+        size = int(AndroidUtilities.dp(24))
+        icon = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(icon)
+        paint = Paint()
+        paint.setAntiAlias(True)
+        paint.setColor(Color.WHITE)
+        paint.setStrokeWidth(float(AndroidUtilities.dp(2)))
+        try:
+            paint.setStrokeCap(Paint.Cap.ROUND)
+        except Exception:
+            pass
+        cx = size * 0.5
+        cy = size * 0.5
+        rays = (
+            (0, 0.42), (90, 0.42), (180, 0.42), (270, 0.42),
+            (45, 0.22), (135, 0.22), (225, 0.22), (315, 0.22),
+        )
+        for degrees, frac in rays:
+            angle = degrees * math.pi / 180.0
+            reach = size * frac
+            canvas.drawLine(cx, cy, cx + reach * math.cos(angle),
+                            cy + reach * math.sin(angle), paint)
+        return icon
+
+    def _on_editor_click(self, photo_viewer):
+        # Без ключа RSec нет смысла запускать генерацию: сразу предлагается
+        # привязка. Вести её из-под редактора нельзя — бот открывается под
+        # полноэкранным окном, поэтому редактор сперва закрывается.
+        try:
+            if self._depth_via_rsec(self._depth_url()) and self._rsec_saved_key() is None:
+                self._editor_offer_pairing(photo_viewer)
+                return
+        except Exception as e:
+            self.log(f"editor pairing pre-check failed: {e}")
+        # Модальная крутилка на время генерации. Пока она открыта, кнопка
+        # отправки редактора недоступна — нельзя отправить оригинал, не
+        # дождавшись замены. Закрытие крутилки кнопкой «назад» — отмена:
+        # опоздавший результат отбрасывается и фото не подменяет.
+        state = {"finished": False, "cancelled": False}
+        dialog = None
+        try:
+            activity = self._priv(photo_viewer, "parentActivity")
+            if activity is not None:
+                dialog = self._open_spinner(photo_viewer, activity, state)
+        except Exception as e:
+            self.log(f"editor spinner failed: {e}")
+        if dialog is None:
+            BulletinHelper.show_info(self._t("info_building"))
+        run_on_queue(
+            lambda: self._editor_work(photo_viewer, dialog, state), PLUGINS_QUEUE
+        )
+
+    def _open_spinner(self, photo_viewer, context, state):
+        """Крутилка поверх окна редактора. Видна до конца генерации.
+
+        Диалог, показанный обычным ``show()``, оказывается под окном
+        PhotoViewer, поэтому он проводится через ``showAlertDialog`` самого
+        вьюера, а настоящий AlertDialog забирается из ``visibleDialog`` —
+        без этого ``dismiss()`` не срабатывает и крутилка остаётся навсегда.
+        """
+        dialog = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        dialog.set_message(self._t("info_building"))
+
+        def on_dismiss(*_args):
+            if not state["finished"]:
+                state["cancelled"] = True
+
+        try:
+            dialog.set_on_dismiss_listener(on_dismiss)
+        except Exception:
+            pass
+        shown = False
+        try:
+            photo_viewer.showAlertDialog(dialog._java_builder)
+            dialog._alert_dialog = self._priv(photo_viewer, "visibleDialog")
+            shown = dialog._alert_dialog is not None
+        except Exception as e:
+            self.log(f"editor spinner over viewer failed: {e}")
+        if not shown:
+            dialog.show()
+        try:
+            dialog.set_canceled_on_touch_outside(False)
+        except Exception:
+            pass
+        return dialog
+
+    def _editor_offer_pairing(self, photo_viewer):
+        """Предлагает подтвердить аккаунт: диалог поверх редактора.
+
+        По согласию редактор закрывается и только после этого открывается
+        бот — иначе тот оказывается под полноэкранным окном, и подтвердить
+        вход невозможно.
+        """
+
+        def _do():
+            activity = None
+            try:
+                activity = self._priv(photo_viewer, "parentActivity")
+            except Exception as e:
+                self.log(f"pairing dialog: no activity: {e}")
+            if activity is None:
+                BulletinHelper.show_error(self._t("pair_message"))
+                return
+
+            def go(bld, _which):
+                bld.dismiss()
+                try:
+                    photo_viewer.closePhoto(True, False)
+                except Exception as e:
+                    self.log(f"closePhoto before pairing failed: {e}")
+                run_on_queue(self._run_pairing, PLUGINS_QUEUE)
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title(self._t("pair_title"))
+            builder.set_message(self._t("pair_message"))
+            builder.set_positive_button(self._t("pair_go"), go)
+            builder.set_negative_button(
+                self._t("dialog_cancel"), lambda b, w: b.dismiss()
+            )
+            try:
+                photo_viewer.showAlertDialog(builder._java_builder)
+                builder._alert_dialog = self._priv(photo_viewer, "visibleDialog")
+            except Exception as e:
+                self.log(f"pairing dialog over viewer failed: {e}")
+                builder.show()
+
+        if _run_on_ui is not None:
+            _run_on_ui(_do)
+        else:
+            _do()
+
+    def _editor_notify_error(self, photo_viewer, text: str):
+        """Показывает ошибку поверх редактора; если тот закрыт — бюллетенем.
+
+        Бюллетени рисуются на фрагменте и под полноэкранным вьюером не видны:
+        молчаливый отказ выглядит как вечная загрузка, поэтому в редакторе
+        ошибка поднимается диалогом через ``showAlertDialog``.
+        """
+
+        def _do():
+            try:
+                visible = True
+                try:
+                    visible = bool(photo_viewer.isVisible())
+                except Exception:
+                    pass
+                activity = self._priv(photo_viewer, "parentActivity")
+                if visible and activity is not None:
+                    builder = AlertDialogBuilder(activity)
+                    builder.set_title("RGBD")
+                    builder.set_message(text)
+                    builder.set_positive_button("OK", lambda b, w: b.dismiss())
+                    photo_viewer.showAlertDialog(builder._java_builder)
+                    builder._alert_dialog = self._priv(photo_viewer, "visibleDialog")
+                    return
+            except Exception as e:
+                self.log(f"editor error dialog failed: {e}")
+            BulletinHelper.show_error(text)
+
+        if _run_on_ui is not None:
+            _run_on_ui(_do)
+        else:
+            _do()
+
+    def _close_spinner(self, dialog):
+        if dialog is None:
+            return
+
+        def _do():
+            try:
+                dialog.dismiss()
+            except Exception:
+                pass
+
+        if _run_on_ui is not None:
+            _run_on_ui(_do)
+        else:
+            _do()
+
+    def _editor_current_entry(self, photo_viewer):
+        """Текущее фото редактора из закрытого списка локальных снимков."""
+        try:
+            entries = self._priv(photo_viewer, "imagesArrLocals")
+            index = int(self._priv(photo_viewer, "currentIndex"))
+        except Exception as e:
+            self.log(f"editor: cannot read current entry: {e}")
+            return None
+        if entries is None or index < 0 or index >= entries.size():
+            return None
+        return entries.get(index)
+
+    def _apply_exif_orientation(self, source_path: str, image):
+        """Впекает в снимок поворот, записанный в EXIF исходника.
+
+        Карта глубины считается по пикселям файла как они есть, поэтому и
+        выводы собираются в исходной раскладке — иначе глубина легла бы
+        боком. Поворот применяется в самом конце, к готовому снимку: свой
+        EXIF мы не пишем, и без этого шага портретные снимки с камеры
+        уходили бы получателю лежащими на боку.
+        """
+        turns = {
+            2: Image.FLIP_LEFT_RIGHT,
+            3: Image.ROTATE_180,
+            4: Image.FLIP_TOP_BOTTOM,
+            5: Image.TRANSPOSE,
+            6: Image.ROTATE_270,
+            7: Image.TRANSVERSE,
+            8: Image.ROTATE_90,
+        }
+        try:
+            with Image.open(source_path) as original:
+                tag = int(original.getexif().get(274, 1) or 1)
+        except Exception as e:
+            self.log(f"exif orientation unreadable: {e}")
+            return image
+        turn = turns.get(tag)
+        if turn is None:
+            return image
+        try:
+            return image.transpose(turn)
+        except Exception as e:
+            self.log(f"exif orientation not applied: {e}")
+            return image
+
+    def _editor_output_choice(self) -> str:
+        """Что подставлять вместо фото. Один снимок — значит один вывод."""
+        if bool(self.get_setting("send_anaglyph", False)):
+            return "anaglyph"
+        if bool(self.get_setting("send_depth", True)):
+            return "depth"
+        if bool(self.get_setting("send_sbs", False)):
+            return "sbs"
+        return "anaglyph"
+
+    def _editor_work(self, photo_viewer, dialog=None, state=None):
+        if state is None:
+            state = {"finished": False, "cancelled": False}
+        try:
+            entry = self._editor_current_entry(photo_viewer)
+            if entry is None:
+                self._editor_notify_error(photo_viewer, self._t("err_editor_no_photo"))
+                return
+            try:
+                if bool(entry.isVideo):
+                    self._editor_notify_error(
+                        photo_viewer, self._t("err_editor_no_photo")
+                    )
+                    return
+            except Exception:
+                pass
+
+            # Генерируем всегда из исходного файла, а не из уже подставленного
+            # результата: иначе повторное нажатие считало бы глубину анаглифа.
+            source = None
+            try:
+                source = entry.path
+            except Exception:
+                source = None
+            if not source or not os.path.isfile(source):
+                try:
+                    source = entry.imagePath
+                except Exception:
+                    source = None
+            if not source or not os.path.isfile(source):
+                self._editor_notify_error(photo_viewer, self._t("err_no_local_photo"))
+                return
+
+            max_size = int(self.get_setting("max_size", "1500") or "1500")
+            depth_bytes = self._fetch_depth_png(
+                self._encode_for_depth(source, max_size)
+            )
+            if state["cancelled"]:
+                self.log("editor: generation cancelled, result dropped")
+                return
+
+            shift = int(self.get_setting("shift_strength", "26") or "26")
+            invert = bool(self.get_setting("invert_depth", True))
+            choice = self._editor_output_choice()
+
+            depth, anaglyph, sbs, _rgba = self._build_outputs(
+                source, depth_bytes, max_size, shift, invert, needed={choice}
+            )
+            picked = {"anaglyph": anaglyph, "depth": depth, "sbs": sbs}[choice]
+
+            # Глубина считается по тем же пикселям, что лежат в файле, поэтому
+            # выводы собираются в исходной раскладке, а поворот из EXIF
+            # впекается уже в готовый снимок: у нашего файла своего EXIF нет,
+            # и получатель увидит его ровно таким, каким он нарисован.
+            picked = self._apply_exif_orientation(source, picked.convert("RGB"))
+
+            out_dir = os.path.join(get_cache_dir(), "media_to_3d_rgbd")
+            ensure_dir_exists(out_dir)
+            stamp = int(time.time() * 1000)
+            # Файла два, и это не расточительность. Перед отправкой в режиме
+            # HD клиент вызывает PhotoEntry.rebuildPhoto: тот удаляет файл
+            # imagePath и пересобирает снимок заново из filterPath. Один файл
+            # на оба поля означал бы, что источник исчезает после первой же
+            # пересборки, поэтому источник и готовый снимок разведены.
+            source_path = os.path.join(out_dir, f"source{stamp}.jpg")
+            out_path = os.path.join(out_dir, f"editor{stamp}.jpg")
+            picked.save(source_path, "JPEG", quality=92, optimize=True)
+            picked.save(out_path, "JPEG", quality=92, optimize=True)
+
+            if state["cancelled"]:
+                self.log("editor: generation cancelled, result dropped")
+                return
+            if _run_on_ui is not None:
+                _run_on_ui(
+                    lambda: self._editor_apply(
+                        photo_viewer, entry, source_path, out_path
+                    )
+                )
+            else:
+                self._editor_apply(photo_viewer, entry, source_path, out_path)
+        except _PairingNeeded:
+            if state["cancelled"]:
+                self.log("editor: pairing needed, but request was cancelled")
+            else:
+                self._editor_offer_pairing(photo_viewer)
+        except Exception as e:
+            log(f"RGBD editor error: {e}")
+            if state["cancelled"]:
+                self.log("editor: error after cancel, not shown")
+            else:
+                self._editor_notify_error(
+                    photo_viewer, self._t("err_failed", error=e)
+                )
+        finally:
+            # Сначала отмечается завершение, потом гасится крутилка: иначе её
+            # dismiss-слушатель принял бы штатное закрытие за отмену. Успех
+            # планирует показ картинки раньше — она успевает отрисоваться до
+            # закрытия индикатора.
+            state["finished"] = True
+            self._close_spinner(dialog)
+
+    def _editor_apply(self, photo_viewer, entry, source_path, out_path):
+        """Ставит результат вместо фото и обновляет предпросмотр. Только UI-поток.
+
+        Полей заполняется два, и оба обязательны. ``imagePath`` — готовый
+        снимок, его берёт обычная отправка. ``filterPath`` — источник, из
+        которого клиент пересобирает снимок перед отправкой в режиме HD
+        (``PhotoEntry.rebuildPhoto`` читает ``filterPath``, а при пустом
+        значении — исходный ``path``, и на ``imagePath`` не смотрит вовсе,
+        только удаляет его). Пока ``filterPath`` оставался пустым, HD-отправка
+        пересобирала снимок из нетронутого оригинала — он и уходил.
+        """
+        try:
+            # Пока шла генерация, пользователь мог перелистнуть или закрыть
+            # редактор. Подменять уже не показываемую запись нельзя: свежая
+            # правка всплыла бы при следующей отправке этого же фото.
+            current = self._editor_current_entry(photo_viewer)
+            if current is None or not bool(current.equals(entry)):
+                self.log("editor: photo changed before apply, result dropped")
+                return
+        except Exception as e:
+            self.log(f"editor: current entry check failed: {e}")
+            return
+        try:
+            from android.graphics import BitmapFactory
+
+            # Наш файл становится и готовым снимком, и источником пересборки,
+            # а прежние правки снимаются, чтобы поверх ничего не накладывалось.
+            entry.imagePath = out_path
+            entry.filterPath = source_path
+            for name in ("paintPath", "fullPaintPath", "croppedPaintPath",
+                         "thumbPath", "savedFilterState", "cropState",
+                         "mediaEntities", "stickers"):
+                try:
+                    setattr(entry, name, None)
+                except Exception:
+                    pass
+            # Флаги — как у настоящей правки фильтром (`applyCurrentEditMode`
+            # клиента ставит isFiltered вместе с imagePath): везде, где клиент
+            # решает «есть ли правки», фото должно считаться отредактированным,
+            # иначе он вправе предпочесть оригинал.
+            try:
+                entry.isFiltered = True
+            except Exception:
+                pass
+            for name in ("isPainted", "isCropped"):
+                try:
+                    setattr(entry, name, False)
+                except Exception:
+                    pass
+            # Наш результат уже в нужной ориентации пикселей — поворот не нужен.
+            try:
+                entry.orientation = 0
+                entry.invert = 0
+            except Exception:
+                pass
+
+            # Контрольное чтение из Java-полей: по этой строке в журнале видно,
+            # что подмена действительно записана в отправляемую запись.
+            try:
+                self.log(
+                    "editor apply: imagePath=%s filterPath=%s isFiltered=%s"
+                    % (entry.imagePath, entry.filterPath, entry.isFiltered)
+                )
+            except Exception as e:
+                self.log(f"editor apply: fields re-read failed: {e}")
+
+            bitmap = BitmapFactory.decodeFile(out_path)
+            if bitmap is not None:
+                try:
+                    photo_viewer.centerImage.setImageBitmap(bitmap)
+                except Exception as e:
+                    self.log(f"editor: preview refresh failed: {e}")
+            BulletinHelper.show_success(self._t("success_done"))
+        except Exception as e:
+            log(f"RGBD editor apply error: {e}")
+            BulletinHelper.show_error(self._t("err_failed", error=e))
+
+    def _lang(self) -> int:
+        idx = self.get_setting("language", LANG_RU)
+        return idx if idx in (LANG_RU, LANG_EN) else LANG_RU
+
+    def _t(self, key: str, **kwargs) -> str:
+        pair = STRINGS.get(key)
+        if pair is None:
+            return key
+        text = pair[self._lang()]
+        return text.format(**kwargs) if kwargs else text
+
+    def _on_language_change(self, new_index: int):
+        self.set_setting("language", new_index, reload_settings=True)
 
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="Depth API"),
+            Header(text=self._t("header_language")),
+            Selector(
+                key="language",
+                text=self._t("selector_language"),
+                default=LANG_RU,
+                items=["Русский", "English"],
+                icon="msg_translate",
+                on_change=self._on_language_change,
+            ),
+            Header(text=self._t("header_depth_api")),
             Input(
                 key="depth_api_url",
-                text="Depth API URL",
-                default="http://penis.nothalk.fun:1488/depth",
-                subtext="POST endpoint that accepts multipart field 'image' "
-                        "and returns a grayscale PNG/JPEG depth map. "
-                        "See depth_server.py for a ready-made server.",
+                text=self._t("depth_api_url_text"),
+                default="https://rsec.nothalk.fun/server/mcr4yusvb3ws48rck4s8v7dt/depth",
+                subtext=self._t("depth_api_url_subtext"),
                 icon="msg_link",
             ),
             Input(
                 key="depth_api_key",
-                text="API key (optional)",
+                text=self._t("depth_api_key_text"),
                 default="",
-                subtext="Sent as 'Authorization: Bearer <key>' if set.",
+                subtext=self._t("depth_api_key_subtext"),
                 icon="msg_pin",
             ),
-            Header(text="Processing"),
+            Header(text=self._t("header_processing")),
             Input(
                 key="max_size",
-                text="Max image side (px)",
-                default="3000",
-                subtext="Larger = better quality but slower on-device processing.",
+                text=self._t("max_size_text"),
+                default="1500",
+                subtext=self._t("max_size_subtext"),
                 icon="msg_photo_settings",
             ),
             Input(
                 key="shift_strength",
-                text="3D shift strength (px)",
+                text=self._t("shift_strength_text"),
                 default="26",
-                subtext="How strong the parallax / 3D effect is (anaglyph only).",
+                subtext=self._t("shift_strength_subtext"),
                 icon="msg_shuffle",
             ),
             Switch(
                 key="invert_depth",
-                text="Invert depth (near ↔ far)",
+                text=self._t("invert_depth_text"),
                 default=True,
             ),
-            Header(text="What to send"),
-            Switch(key="send_depth", text="Grayscale depth map (B&W photo)", default=True),
-            Switch(key="send_anaglyph", text="Red/cyan 3D anaglyph", default=False),
-            Switch(key="send_sbs", text="Side-by-side RGB | Depth preview", default=False),
-            Switch(key="send_rgbd", text="Packed RGBD PNG (as file, depth in alpha)", default=False),
-            Switch(key="send_captions", text="Add captions to results", default=False),
+            Header(text=self._t("header_what_to_send")),
+            Switch(key="send_depth", text=self._t("send_depth_text"), default=True),
+            Switch(key="send_anaglyph", text=self._t("send_anaglyph_text"), default=False),
+            Switch(key="send_sbs", text=self._t("send_sbs_text"), default=False),
+            Switch(key="send_rgbd", text=self._t("send_rgbd_text"), default=False),
+            Switch(key="send_captions", text=self._t("send_captions_text"), default=False),
+            Header(text=self._t("header_editor")),
+            Switch(
+                key="editor_button",
+                text=self._t("editor_button_text"),
+                subtext=self._t("editor_button_subtext"),
+                default=True,
+            ),
             Text(
-                text="Usage",
-                subtext=f'Reply to a photo with "{TRIGGER}"',
+                text=self._t("usage_text"),
+                subtext=self._t("usage_subtext"),
                 icon="msg_info",
             ),
         ]
@@ -101,15 +979,15 @@ class MediaTo3DRGBDPlugin(BasePlugin):
 
         reply_msg = getattr(params, "replyToMsg", None)
         if reply_msg is None:
-            BulletinHelper.show_error(f'Reply to a photo with "{TRIGGER}"')
+            BulletinHelper.show_error(self._t("err_reply_photo"))
             return HookResult(strategy=HookStrategy.CANCEL)
 
         dialog_id = self._resolve_dialog_id(params)
         if dialog_id is None:
-            BulletinHelper.show_error("Could not resolve the current chat")
+            BulletinHelper.show_error(self._t("err_no_chat"))
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        BulletinHelper.show_info("Building 3D / RGBD, please wait...")
+        BulletinHelper.show_info(self._t("info_building"))
         run_on_queue(lambda: self._process(account, dialog_id, reply_msg), PLUGINS_QUEUE)
         return HookResult(strategy=HookStrategy.CANCEL)
 
@@ -124,6 +1002,100 @@ class MediaTo3DRGBDPlugin(BasePlugin):
         if isinstance(peer, int):
             return peer
         return None
+
+    def _on_menu_click(self, context: Dict[str, Any]):
+        message = context.get("message")
+        if message is None or not self._message_has_photo(message):
+            BulletinHelper.show_error(self._t("err_menu_no_photo"))
+            return
+
+        fragment = context.get("fragment")
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            BulletinHelper.show_error(self._t("err_no_chat"))
+            return
+
+        dialog_id = context.get("dialog_id")
+        if dialog_id is None:
+            BulletinHelper.show_error(self._t("err_no_chat"))
+            return
+
+        account = self._account_from_context(context, fragment)
+
+        on_state = self._t("state_on")
+        off_state = self._t("state_off")
+        invert_on = bool(self.get_setting("invert_depth", True))
+        captions_on = bool(self.get_setting("send_captions", False))
+
+        actions = [
+            ("all", self._t("menu_action_all")),
+            ("depth", self._t("caption_depth")),
+            ("anaglyph", self._t("caption_anaglyph")),
+            ("sbs", self._t("caption_sbs")),
+            ("rgbd", self._t("caption_rgbd")),
+            (
+                "toggle_invert",
+                self._t("invert_depth_text") + ": " + (on_state if invert_on else off_state),
+            ),
+            (
+                "toggle_captions",
+                self._t("send_captions_text") + ": " + (on_state if captions_on else off_state),
+            ),
+        ]
+        labels = [label for _, label in actions]
+
+        def on_pick(bld: AlertDialogBuilder, which: int):
+            bld.dismiss()
+            action_id = actions[which][0]
+            if action_id == "toggle_invert":
+                self.set_setting("invert_depth", not invert_on)
+                BulletinHelper.show_success(self._t("success_done"))
+                return
+            if action_id == "toggle_captions":
+                self.set_setting("send_captions", not captions_on)
+                BulletinHelper.show_success(self._t("success_done"))
+                return
+            force = None if action_id == "all" else {action_id}
+            BulletinHelper.show_info(self._t("info_building"))
+            run_on_queue(
+                lambda: self._process(account, dialog_id, message, force),
+                PLUGINS_QUEUE,
+            )
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title(self._t("menu_dialog_title"))
+        builder.set_items(labels, on_pick)
+        builder.set_negative_button(self._t("dialog_cancel"), lambda b, w: b.dismiss())
+        builder.show()
+
+    def _account_from_context(self, context: Dict[str, Any], fragment: Any) -> int:
+        acc = context.get("account")
+        try:
+            return int(acc)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if fragment is not None:
+                return int(fragment.getCurrentAccount())
+        except Exception as e:
+            self.log(f"getCurrentAccount failed: {e}")
+        return 0
+
+    def _message_has_photo(self, message: Any) -> bool:
+        try:
+            media = getattr(message.messageOwner, "media", None)
+        except Exception:
+            return False
+        if media is None:
+            return False
+        if getattr(media, "photo", None) is not None:
+            return True
+        document = getattr(media, "document", None)
+        if document is not None:
+            mime = str(getattr(document, "mime_type", "") or "")
+            if mime.startswith("image/"):
+                return True
+        return False
 
     def _reply_photo_local_path(self, reply_msg: Any, account: int) -> Optional[str]:
         try:
@@ -266,8 +1238,100 @@ class MediaTo3DRGBDPlugin(BasePlugin):
         self.log(f"using PhotoSize path: {path}")
         return path
 
+    # ---- RSec: явное управление ключом и привязкой -----------------------
+
+    def _rsec_client(self):
+        """RSec-клиент из вставки в конце файла либо ``None``."""
+        return globals().get("_rsec")
+
+    def _rsec_saved_key(self):
+        """Сохранённый ключ текущего аккаунта с диска, без блокирующей привязки."""
+        client = self._rsec_client()
+        if client is None:
+            return None
+        try:
+            return client._read(client._account_uid())
+        except Exception as e:
+            self.log(f"rsec key read failed: {e}")
+            return None
+
+    def _depth_url(self) -> str:
+        return (self.get_setting("depth_api_url", DEPTH_URL_DEFAULT) or "").strip()
+
+    def _depth_via_rsec(self, url: str) -> bool:
+        """Идёт ли этот адрес через RSec (то есть требует ключа)."""
+        client = self._rsec_client()
+        if client is None:
+            return False
+        try:
+            return client.reroute(url) is not None
+        except Exception:
+            return False
+
+    def _run_pairing(self):
+        """Проводит привязку через бота. Звать только с фоновой очереди и
+        только когда бота ничто не заслоняет.
+
+        Вставка RSec бывает двух видов: в одной ``credentials`` ждёт человека
+        и возвращает ключ, в другой — сразу отказывает, уводя привязку в свой
+        фоновый поток. Ошибка второй означает «привязка началась», а не
+        «ничего не вышло», поэтому пугать ею не нужно.
+        """
+        client = self._rsec_client()
+        if client is None:
+            return
+        try:
+            client.credentials()
+            BulletinHelper.show_success(self._t("pair_done"))
+        except Exception as e:
+            if getattr(client, "_pairing", None) is not None:
+                self.log(f"rsec pairing runs in background: {e}")
+                return
+            BulletinHelper.show_error(str(e))
+
+    @staticmethod
+    def _scaled_size(width: int, height: int, max_size: int):
+        """Размер после ограничения длинной стороны, пропорции сохраняются.
+
+        Считается в одном месте, потому что этим размером пользуются двое:
+        снимок, уходящий в нейросеть, и снимок, из которого собираются
+        выводы. Разойдись они — глубина легла бы на картинку со сдвигом.
+        """
+        longest = max(width, height)
+        if max_size <= 0 or longest <= max_size:
+            return width, height
+        scale = max_size / float(longest)
+        return max(1, int(width * scale)), max(1, int(height * scale))
+
+    def _encode_for_depth(self, rgb_path: str, max_size: int) -> bytes:
+        """Готовит снимок для нейросети: ограничивает сторону и жмёт в JPEG.
+
+        Сеть считает глубину ровно по тому, что ей прислали, поэтому размер
+        из настроек применяется здесь, до отправки. Заодно снимается EXIF:
+        выводы собираются по пикселям как они лежат в файле, и сеть должна
+        видеть ту же раскладку, иначе глубина вернулась бы повёрнутой.
+        """
+        with Image.open(rgb_path) as opened:
+            rgb = opened.convert("RGB")
+        size = self._scaled_size(rgb.width, rgb.height, max_size)
+        if size != rgb.size:
+            rgb = rgb.resize(size, Image.LANCZOS)
+        buffer = io.BytesIO()
+        rgb.save(buffer, "JPEG", quality=92, optimize=True)
+        data = buffer.getvalue()
+        self.log(f"depth request: {size[0]}x{size[1]}, {len(data)} bytes")
+        return data
+
     def _fetch_depth_png(self, image_bytes: bytes) -> bytes:
-        url = (self.get_setting("depth_api_url", "http://penis.nothalk.fun:1488/depth") or "").strip()
+        """Считает карту глубины по фото.
+
+        Обращение к RSec-адресу идёт напрямую с сохранённым ключом, минуя
+        прослойку: та при негодном ключе молча уходит в привязку на три
+        минуты, что из редактора выглядит как вечная загрузка. Здесь вместо
+        этого бросается ``_PairingNeeded``, и вызывающий проводит привязку
+        на виду у человека.
+        """
+        url = self._depth_url()
         if not url:
             raise RuntimeError("Depth API URL is not configured in plugin settings")
 
@@ -275,8 +1339,29 @@ class MediaTo3DRGBDPlugin(BasePlugin):
         api_key = (self.get_setting("depth_api_key", "") or "").strip()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-
         files = {"image": ("image.jpg", image_bytes, "image/jpeg")}
+
+        client = self._rsec_client()
+        if client is not None and self._depth_via_rsec(url):
+            saved = self._rsec_saved_key()
+            if saved is None:
+                raise _PairingNeeded()
+            headers["X-RSec-Uid"] = str(saved[1])
+            headers["X-RSec-Key"] = saved[0]
+            transport = globals().get("_requests") or requests
+            resp = transport.post(url, files=files, headers=headers, timeout=90)
+            if resp.status_code in (401, 403):
+                needs = False
+                try:
+                    needs = client.wants_pairing(resp.status_code, resp.content)
+                except Exception:
+                    pass
+                if needs:
+                    client.forget()
+                    raise _PairingNeeded()
+            resp.raise_for_status()
+            return resp.content
+
         resp = requests.post(url, files=files, headers=headers, timeout=90)
         resp.raise_for_status()
         return resp.content
@@ -288,12 +1373,15 @@ class MediaTo3DRGBDPlugin(BasePlugin):
         max_size: int,
         shift: int,
         invert: bool = False,
+        needed: Optional[set] = None,
     ):
+        if needed is None:
+            needed = {"depth", "anaglyph", "sbs", "rgbd"}
+
         rgb = Image.open(rgb_path).convert("RGB")
-        w, h = rgb.size
-        scale = min(1.0, max_size / float(max(w, h)))
-        if scale < 1.0:
-            rgb = rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        size = self._scaled_size(rgb.width, rgb.height, max_size)
+        if size != rgb.size:
+            rgb = rgb.resize(size, Image.LANCZOS)
 
         depth = Image.open(io.BytesIO(depth_bytes))
         if depth.mode != "L":
@@ -303,112 +1391,782 @@ class MediaTo3DRGBDPlugin(BasePlugin):
         if invert:
             depth = Image.eval(depth, lambda p: 255 - p)
 
-        w, h = rgb.size
-        rgb_px = rgb.load()
-        depth_px = depth.load()
+        anaglyph = None
+        if "anaglyph" in needed:
+            w, h = rgb.size
+            rgb_px = rgb.load()
+            depth_px = depth.load()
 
-        left = Image.new("RGB", (w, h))
-        right = Image.new("RGB", (w, h))
-        left_px = left.load()
-        right_px = right.load()
+            left = Image.new("RGB", (w, h))
+            right = Image.new("RGB", (w, h))
+            left_px = left.load()
+            right_px = right.load()
 
-        for y in range(h):
-            for x in range(w):
-                d = depth_px[x, y] / 255.0
-                s = int(d * shift)
-                lx = min(x + s, w - 1)
-                rx = max(x - s, 0)
-                left_px[x, y] = rgb_px[lx, y]
-                right_px[x, y] = rgb_px[rx, y]
+            for y in range(h):
+                for x in range(w):
+                    d = depth_px[x, y] / 255.0
+                    s = int(d * shift)
+                    lx = min(x + s, w - 1)
+                    rx = max(x - s, 0)
+                    left_px[x, y] = rgb_px[lx, y]
+                    right_px[x, y] = rgb_px[rx, y]
 
-        anaglyph = Image.new("RGB", (w, h))
-        ana_px = anaglyph.load()
-        for y in range(h):
-            for x in range(w):
-                lr, _lg, _lb = left_px[x, y]
-                _rr, rg, rb = right_px[x, y]
-                ana_px[x, y] = (lr, rg, rb)
+            anaglyph = Image.new("RGB", (w, h))
+            ana_px = anaglyph.load()
+            for y in range(h):
+                for x in range(w):
+                    lr, _lg, _lb = left_px[x, y]
+                    _rr, rg, rb = right_px[x, y]
+                    ana_px[x, y] = (lr, rg, rb)
 
-        depth_gray_rgb = Image.merge("RGB", (depth, depth, depth))
-        sbs = Image.new("RGB", (w * 2, h))
-        sbs.paste(rgb, (0, 0))
-        sbs.paste(depth_gray_rgb, (w, 0))
+        sbs = None
+        if "sbs" in needed:
+            w, h = rgb.size
+            depth_gray_rgb = Image.merge("RGB", (depth, depth, depth))
+            sbs = Image.new("RGB", (w * 2, h))
+            sbs.paste(rgb, (0, 0))
+            sbs.paste(depth_gray_rgb, (w, 0))
 
-        rgba = rgb.convert("RGBA")
-        rgba.putalpha(depth)
+        rgba = None
+        if "rgbd" in needed:
+            rgba = rgb.convert("RGBA")
+            rgba.putalpha(depth)
 
         return depth, anaglyph, sbs, rgba
 
-    def _caption(self, text: str) -> str:
+    def _wants(
+        self,
+        name: str,
+        force_outputs: Optional[set],
+        setting_key: str,
+        setting_default: bool,
+    ) -> bool:
+        if force_outputs is not None:
+            return name in force_outputs
+        return bool(self.get_setting(setting_key, setting_default))
+
+    def _caption(self, key: str) -> str:
         if self.get_setting("send_captions", False):
-            return text
+            return self._t(key)
         return ""
 
-    def _process(self, account: int, dialog_id: int, reply_msg: Any):
+    def _process(
+        self,
+        account: int,
+        dialog_id: int,
+        reply_msg: Any,
+        force_outputs: Optional[set] = None,
+    ):
         try:
-            local_path = self._reply_photo_local_path(reply_msg, account)
-            if local_path is None:
-                BulletinHelper.show_error(
-                    "Couldn't read the photo. Open it in the chat once so it's "
-                    "cached locally, then reply .d again."
+            wanted = {
+                name
+                for name, setting_key, setting_default in (
+                    ("depth", "send_depth", True),
+                    ("anaglyph", "send_anaglyph", False),
+                    ("sbs", "send_sbs", False),
+                    ("rgbd", "send_rgbd", False),
                 )
+                if self._wants(name, force_outputs, setting_key, setting_default)
+            }
+            if not wanted:
+                BulletinHelper.show_error(self._t("err_nothing_selected"))
                 return
 
-            with open(local_path, "rb") as f:
-                image_bytes = f.read()
+            local_path = self._reply_photo_local_path(reply_msg, account)
+            if local_path is None:
+                BulletinHelper.show_error(self._t("err_no_local_photo"))
+                return
 
-            depth_bytes = self._fetch_depth_png(image_bytes)
+            max_size = int(self.get_setting("max_size", "1500") or "1500")
+            image_bytes = self._encode_for_depth(local_path, max_size)
 
-            max_size = int(self.get_setting("max_size", "3000") or "3000")
+            try:
+                depth_bytes = self._fetch_depth_png(image_bytes)
+            except _PairingNeeded:
+                # В чате привязку можно провести сразу: бот откроется поверх,
+                # его ничто не заслоняет. После неё — один повтор.
+                client = self._rsec_client()
+                if client is None:
+                    raise
+                client.credentials()
+                depth_bytes = self._fetch_depth_png(image_bytes)
+
             shift = int(self.get_setting("shift_strength", "26") or "26")
             invert = bool(self.get_setting("invert_depth", True))
-            self.log(f"settings: max_size={max_size} shift={shift} invert={invert}")
+            self.log(
+                f"settings: max_size={max_size} shift={shift} invert={invert} wanted={sorted(wanted)}"
+            )
 
             depth, anaglyph, sbs, rgba = self._build_outputs(
-                local_path, depth_bytes, max_size, shift, invert
+                local_path, depth_bytes, max_size, shift, invert, needed=wanted
             )
 
             out_dir = os.path.join(get_cache_dir(), "media_to_3d_rgbd")
             ensure_dir_exists(out_dir)
             stamp = int(time.time() * 1000)
 
-            if self.get_setting("send_depth", True):
+            if "depth" in wanted:
                 depth_path = os.path.join(out_dir, f"depth{stamp}.jpg")
                 depth.convert("L").save(depth_path, "JPEG", quality=90, optimize=True)
                 send_photo(
                     dialog_id,
                     depth_path,
-                    caption=self._caption("Depth map"),
+                    caption=self._caption("caption_depth"),
                 )
 
-            if self.get_setting("send_anaglyph", False):
+            if "anaglyph" in wanted:
                 ana_path = os.path.join(out_dir, f"anaglyph{stamp}.jpg")
                 anaglyph.convert("RGB").save(ana_path, "JPEG", quality=90, optimize=True)
                 send_photo(
                     dialog_id,
                     ana_path,
-                    caption=self._caption("3D anaglyph (red/cyan glasses)"),
+                    caption=self._caption("caption_anaglyph"),
                 )
 
-            if self.get_setting("send_sbs", False):
+            if "sbs" in wanted:
                 sbs_path = os.path.join(out_dir, f"sbs{stamp}.jpg")
                 sbs.save(sbs_path, "JPEG", quality=88, optimize=True)
                 send_photo(
                     dialog_id,
                     sbs_path,
-                    caption=self._caption("RGB | Depth"),
+                    caption=self._caption("caption_sbs"),
                 )
 
-            if self.get_setting("send_rgbd", False):
+            if "rgbd" in wanted:
                 rgbd_path = os.path.join(out_dir, f"rgbd{stamp}.png")
                 rgba.save(rgbd_path, "PNG", optimize=True)
                 send_document(
                     dialog_id,
                     rgbd_path,
-                    caption=self._caption("RGBD (depth in alpha)"),
+                    caption=self._caption("caption_rgbd"),
                 )
 
-            BulletinHelper.show_success("Done")
+            BulletinHelper.show_success(self._t("success_done"))
         except Exception as e:
             log(f"RGBD error: {e}")
-            BulletinHelper.show_error(f"Failed: {e}")
+            BulletinHelper.show_error(self._t("err_failed", error=e))
+
+
+# ─── RSec: начало вставки, не редактируйте вручную ───
+# ═══════════════════════════════════════════════════════════════════════════
+#  RSec — подключение плагина. Вставьте этот блок в конец ваших импортов.
+#  Впишите адрес из панели @RoflSecBot — больше обычно менять нечего.
+# ═══════════════════════════════════════════════════════════════════════════
+RSEC = "https://rsec.nothalk.fun/server/mcr4yusvb3ws48rck4s8v7dt"
+
+# Если плагин ходит не только к своему бэкенду, перечислите здесь его узлы —
+# остальные пойдут напрямую, как раньше. Пустая строка означает «через RSec
+# идёт всё», и для плагина с одним бэкендом это верно.
+RSEC_ONLY = ""          # например: "example.com, api.example.com:8080"
+
+import http.client as _http
+import json as _json
+import os as _os
+import time as _time
+import urllib.parse as _urlparse
+import urllib.request as _urlreq
+
+from android_utils import log as _log
+from file_utils import ensure_dir_exists as _ensure_dir
+from file_utils import get_cache_dir as _cache_dir
+from ui.bulletin import BulletinHelper as _Bulletin
+
+try:
+    import requests as _requests
+except Exception:
+    _requests = None
+
+
+class _RSec:
+    """Направляет обращения плагина через RSec.
+
+    Блок выполняется в пространстве имён плагина, поэтому переписывает имена
+    только в нём: другие плагины в том же клиенте ничего не замечают. Подменять
+    библиотеки глобально было бы недопустимо — через чужой сервер пошёл бы
+    чужой трафик.
+
+    Ключ берётся сам. При первом обращении плагин просит у службы разовый
+    пропуск, открывает бота по ссылке, человек нажимает «Запустить» — и ключ
+    приезжает прямо сюда. Копировать шестьдесят четыре знака не нужно, и в
+    переписке ключ не оседает.
+    """
+
+    WAIT = 180
+    STEP = 2
+
+    def __init__(self, base, only="", closed=False):
+        self.base = base.rstrip("/")
+        self.root = self.base.split("/server/")[0]
+        self.prefix = self.base[len(self.root):]
+        parsed = _urlparse.urlsplit(self.root)
+        self.host = parsed.hostname
+        self.port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self.secure = parsed.scheme == "https"
+        self.only = [h.strip().lower()
+                     for h in str(only or "").replace(",", " ").split() if h.strip()]
+        # Закрытый режим включает сборка. В зашитом плагине адрес бэкенда уже
+        # заменён ссылкой RSec, поэтому узнавать узлы по имени не нужно и вредно:
+        # чтобы назвать узел, пришлось бы вписать его настоящий адрес обратно.
+        # В этом режиме уводится только то, что уже адресовано RSec, а прочие
+        # узлы не трогаются.
+        self.closed = bool(closed)
+        self._key = None
+        self._uid = None
+        self._account = None
+
+    # --- куда отправлять --------------------------------------------------
+
+    def mine(self, host):
+        """Наш ли это узел.
+
+        В закрытом режиме — ничей: в зашитом плагине к RSec всё уже адресовано
+        напрямую, а посторонние узлы трогать нельзя. Иначе без перечня наш
+        любой (у плагина с одним бэкендом других и нет), а с перечнем — только
+        перечисленные.
+        """
+        if self.closed:
+            return False
+        host = str(host or "").lower()
+        if not host or host == "%s:%d" % (self.host, self.port) or host == self.host:
+            return False
+        return not self.only or host in self.only
+
+    def reroute(self, url):
+        """Куда отправить обращение либо ``None``, если трогать не нужно.
+
+        Три случая. Адрес уже указывает на RSec — берём как есть, к нему только
+        приложим ключ. Адрес ведёт к нашему бэкенду — уводим на RSec. Чужой —
+        не трогаем. Первый случай нужен «зашитым» плагинам: в них адрес бэкенда
+        уже подменён ссылкой службы, и приставлять префикс второй раз нельзя.
+        """
+        text = str(url)
+        if text == self.base or text.startswith(self.base + "/") \
+                or text.startswith(self.base + "?"):
+            return text
+        parsed = _urlparse.urlsplit(text)
+        if not parsed.netloc or not self.mine(parsed.netloc):
+            return None
+        tail = parsed.path or "/"
+        if parsed.query:
+            tail += "?" + parsed.query
+        return self.base + tail
+
+    def headers_for(self, headers=None):
+        """Добавляет к заголовкам подтверждение аккаунта."""
+        out = dict(headers or {})
+        key, uid = self.credentials()
+        out["X-RSec-Uid"] = str(uid)
+        out["X-RSec-Key"] = key
+        return out
+
+    # --- ключ -------------------------------------------------------------
+
+    def credentials(self):
+        """Ключ и аккаунт для текущего активного аккаунта Telegram.
+
+        Ключ хранится по аккаунту, а не на весь плагин: у клиента аккаунтов
+        может быть несколько, и подставлять ключ одного под другой нельзя —
+        иначе незарегистрированный аккаунт ездил бы на чужом ключе. Незнакомый
+        аккаунт проходит собственную привязку.
+        """
+        account = self._account_uid()
+        if self._key and self._uid and self._account == account:
+            return self._key, self._uid
+        saved = self._read(account)
+        if saved:
+            self._account, (self._key, self._uid) = account, saved
+            return saved
+        return self._pair(account)
+
+    @staticmethod
+    def _account_uid():
+        """Идентификатор текущего аккаунта Telegram либо ``None``.
+
+        ``None`` означает, что аккаунт узнать не удалось — клиент без
+        мультиаккаунта или запуск вне клиента. Тогда ключ хранится общий, как
+        раньше.
+        """
+        try:
+            from client_utils import get_user_config
+            uid = int(get_user_config().getClientUserId())
+            if uid > 0:
+                return uid
+        except Exception:
+            pass
+        try:
+            from org.telegram.messenger import UserConfig
+            uid = int(UserConfig.getInstance(
+                UserConfig.selectedAccount).getClientUserId())
+            if uid > 0:
+                return uid
+        except Exception:
+            pass
+        return None
+
+    def _path(self, account=None):
+        directory = _os.path.join(_cache_dir(), "rsec")
+        _ensure_dir(directory)
+        code = self.base.rsplit("/", 1)[-1]
+        name = ("%s-%d" % (code, account)) if account else code
+        return _os.path.join(directory, name + ".json")
+
+    @staticmethod
+    def _read_file(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                saved = _json.load(handle)
+            key, uid = str(saved.get("key") or ""), int(saved.get("uid") or 0)
+            return (key, uid) if len(key) == 64 and uid else None
+        except Exception:
+            return None
+
+    def _read(self, account=None):
+        saved = self._read_file(self._path(account))
+        if saved:
+            return saved
+        # Переход со старого хранения без разбивки по аккаунтам: если общий файл
+        # принадлежит как раз этому аккаунту, забираем его, чтобы не заставлять
+        # уже привязанного проходить привязку заново.
+        if account:
+            legacy = self._read_file(self._path(None))
+            if legacy and legacy[1] == account:
+                self._write(account, legacy[0], legacy[1])
+                return legacy
+        return None
+
+    def forget(self):
+        """Забывает ключ текущего аккаунта: он отозван или больше не годится.
+
+        Общий файл со старого хранения вычищается тоже, если ключ в нём
+        принадлежит этому аккаунту: иначе ``_read`` воскресил бы отозванный
+        ключ из него, и привязка заново так и не началась бы — сервер вечно
+        отвечал бы отказом на один и тот же негодный ключ.
+        """
+        account = self._account
+        self._key = None
+        self._uid = None
+        try:
+            _os.remove(self._path(account))
+        except Exception:
+            pass
+        if account:
+            legacy = self._read_file(self._path(None))
+            if legacy and legacy[1] == account:
+                try:
+                    _os.remove(self._path(None))
+                except Exception:
+                    pass
+
+    def wants_pairing(self, status, body):
+        """Просит ли служба привязаться заново.
+
+        Отказ отказу рознь: отозванный ключ лечится новой привязкой, а запрет
+        доступа — нет, и звать человека в бота там незачем.
+        """
+        if status not in (401, 403):
+            return False
+        try:
+            return _json.loads(body or b"{}").get("retry") == "pair"
+        except Exception:
+            return False
+
+    def _write(self, account, key, uid):
+        try:
+            with open(self._path(account), "w", encoding="utf-8") as handle:
+                _json.dump({"key": key, "uid": int(uid)}, handle)
+        except Exception as error:
+            _log("RSec: ключ не сохранён: %s" % error)
+
+    def _ask(self, path, body=None, params=""):
+        """Обращение к самой службе, минуя всякую подмену."""
+        url = self.root + path + (("?" + params) if params else "")
+        data = _json.dumps(body).encode("utf-8") if body is not None else None
+        request = _urlreq.Request(url, data=data, method="POST" if data else "GET")
+        request.add_header("Accept", "application/json")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        with _urlreq.urlopen(request, timeout=20) as answer:
+            return _json.loads(answer.read().decode("utf-8"))
+
+    def _pair(self, account=None):
+        """Проводит привязку: пропуск, бот, ожидание, ключ.
+
+        Ждёт человека, поэтому первое обращение не должно идти из потока,
+        рисующего окно. Плагины и так лезут в сеть из отдельной очереди.
+
+        :param account: аккаунт, который мы обслуживаем; ``None`` — аккаунт
+            узнать не удалось, ключ хранится общим
+        """
+        code = self.base.rsplit("/", 1)[-1]
+        answer = self._ask("/v1/pair/start", {"code": code})
+        if not answer.get("ok"):
+            raise RuntimeError("RSec: %s" % answer.get("err", "привязка не начата"))
+
+        _Bulletin.show_info("Подтвердите вход в Telegram — откроется бот")
+        self._open(answer["link"])
+
+        deadline = _time.time() + self.WAIT
+        while _time.time() < deadline:
+            _time.sleep(self.STEP)
+            got = self._ask("/v1/pair/poll",
+                            params=_urlparse.urlencode({"pair": answer["pair"]}))
+            if got.get("state") == "ready":
+                paired = int(got["uid"])
+                # Куда записать ключ. Аккаунт известен и он же подтвердил вход —
+                # под него. Подтвердил другой аккаунт — ключ принадлежит ему, и
+                # обслуживаемый так и останется без ключа (попросит привязаться
+                # снова), чтобы не ездить на чужом. Аккаунт неизвестен — общий.
+                if account is None or account == paired:
+                    owner = account
+                else:
+                    owner = paired
+                self._key, self._uid = got["key"], paired
+                self._account = owner
+                self._write(owner, self._key, paired)
+                _Bulletin.show_success("Подключено")
+                return self._key, self._uid
+            if got.get("state") == "unknown":
+                break
+        raise RuntimeError("RSec: вход не подтверждён. Откройте бота и нажмите "
+                           "«Запустить», затем повторите")
+
+    @staticmethod
+    def _open(url):
+        """Открывает бота — обязательно с главного потока.
+
+        Ссылку вида ``t.me/бот`` клиент не отдаёт браузеру, а проводит через
+        своё главное окно (``LaunchActivity.onNewIntent``). Это работа с
+        окном: из очереди привязки, которая по устройству фоновая, она молча
+        не выполняется, и человек видит обещание открыть бота, но не самого
+        бота. Поэтому открытие переносится на главный поток, а неудача
+        каждого способа попадает в журнал, а не глохнет.
+        """
+
+        def _show():
+            try:
+                from client_utils import get_last_fragment
+                from org.telegram.messenger.browser import Browser
+                fragment = get_last_fragment()
+                activity = (fragment.getParentActivity()
+                            if fragment is not None else None)
+                if activity is not None:
+                    Browser.openUrl(activity, url)
+                    return
+            except Exception as error:
+                _log("RSec: не вышло открыть бота окном клиента: %s" % error)
+            try:
+                # Запасной путь мимо клиента: обычное намерение системы. Оно
+                # уходит из-под приложения, поэтому требует своей задачи.
+                from android.content import Intent
+                from android.net import Uri
+                from org.telegram.messenger import ApplicationLoader
+                intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ApplicationLoader.applicationContext.startActivity(intent)
+                return
+            except Exception as error:
+                _log("RSec: не вышло открыть бота намерением: %s" % error)
+            # Открыть не вышло: показываем ссылку, её можно скопировать и открыть.
+            _Bulletin.show_info("Откройте ссылку и нажмите «Запустить»: " + url)
+
+        try:
+            from android_utils import run_on_ui_thread
+        except Exception:
+            _show()
+            return
+        run_on_ui_thread(_show)
+
+
+# ─── подмены для разных способов ходить в сеть ─────────────────────────────
+
+def _needs_pairing(client, answer):
+    """Просит ли служба привязаться заново, судя по ответу requests.
+
+    Тело читается только у коротких ответов и только если это JSON: у
+    потокового ответа читать его нельзя, оно нужно самому плагину.
+    """
+    if getattr(answer, "status_code", 0) not in (401, 403):
+        return False
+    if "json" not in str(answer.headers.get("Content-Type", "")).lower():
+        return False
+    try:
+        return client.wants_pairing(answer.status_code, answer.content)
+    except Exception:
+        return False
+
+
+class _Requests:
+    """Замена модуля requests. Незнакомое берётся у настоящего."""
+
+    def __init__(self, client):
+        self._rsec = client
+
+    def __getattr__(self, name):
+        return getattr(_requests, name)
+
+    def request(self, method, url, **kw):
+        target = self._rsec.reroute(url)
+        if target is None:
+            return _requests.request(method, url, **kw)
+        given = kw.pop("headers", None)
+        answer = _requests.request(method, target,
+                                   headers=self._rsec.headers_for(given), **kw)
+        if _needs_pairing(self._rsec, answer):
+            # Ключ отозвали, пока плагин им пользовался: привязываемся заново
+            # и повторяем обращение один раз.
+            self._rsec.forget()
+            answer = _requests.request(method, target,
+                                       headers=self._rsec.headers_for(given), **kw)
+        return answer
+
+    def post(self, url, **kw):
+        return self.request("POST", url, **kw)
+
+    def get(self, url, **kw):
+        return self.request("GET", url, **kw)
+
+    def put(self, url, **kw):
+        return self.request("PUT", url, **kw)
+
+    def patch(self, url, **kw):
+        return self.request("PATCH", url, **kw)
+
+    def delete(self, url, **kw):
+        return self.request("DELETE", url, **kw)
+
+    def head(self, url, **kw):
+        return self.request("HEAD", url, **kw)
+
+    def options(self, url, **kw):
+        return self.request("OPTIONS", url, **kw)
+
+    def Session(self):
+        return _Session(self._rsec)
+
+
+class _Session:
+    """Сессия requests, ведущая себя так же."""
+
+    def __init__(self, client):
+        self._rsec = client
+        self._real = _requests.Session()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def request(self, method, url, **kw):
+        target = self._rsec.reroute(url)
+        if target is None:
+            return self._real.request(method, url, **kw)
+        given = kw.pop("headers", None)
+        answer = self._real.request(method, target,
+                                    headers=self._rsec.headers_for(given), **kw)
+        if _needs_pairing(self._rsec, answer):
+            self._rsec.forget()
+            answer = self._real.request(method, target,
+                                        headers=self._rsec.headers_for(given), **kw)
+        return answer
+
+    def post(self, url, **kw):
+        return self.request("POST", url, **kw)
+
+    def get(self, url, **kw):
+        return self.request("GET", url, **kw)
+
+    def put(self, url, **kw):
+        return self.request("PUT", url, **kw)
+
+    def patch(self, url, **kw):
+        return self.request("PATCH", url, **kw)
+
+    def delete(self, url, **kw):
+        return self.request("DELETE", url, **kw)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._real.close()
+        return False
+
+
+def _make_urlopen(client):
+    """urlopen, уводящий свои адреса в RSec."""
+
+    def urlopen(url, data=None, *args, **kw):
+        try:
+            return _through(url, data, *args, **kw)
+        except _urlreq.HTTPError as error:
+            if not client.wants_pairing(error.code, error.read()):
+                raise
+            # Ключ отозвали: привязываемся заново и повторяем один раз.
+            client.forget()
+            return _through(url, data, *args, **kw)
+
+    def _through(url, data=None, *args, **kw):
+        if isinstance(url, _urlreq.Request):
+            target = client.reroute(url.full_url)
+            if target is None:
+                return _urlreq.urlopen(url, data, *args, **kw)
+            fresh = _urlreq.Request(target, data=data if data is not None else url.data,
+                                    method=url.get_method())
+            for name, value in url.header_items():
+                fresh.add_header(name, value)
+            for name, value in client.headers_for().items():
+                fresh.add_header(name, value)
+            return _urlreq.urlopen(fresh, None, *args, **kw)
+        target = client.reroute(url)
+        if target is None:
+            return _urlreq.urlopen(url, data, *args, **kw)
+        fresh = _urlreq.Request(target, data=data)
+        for name, value in client.headers_for().items():
+            fresh.add_header(name, value)
+        return _urlreq.urlopen(fresh, None, *args, **kw)
+
+    return urlopen
+
+
+class _UrlRequestModule:
+    """Замена urllib.request. Отличается только urlopen."""
+
+    def __init__(self, client):
+        self.urlopen = _make_urlopen(client)
+
+    def __getattr__(self, name):
+        return getattr(_urlreq, name)
+
+
+class _UrllibModule:
+    """Замена urllib: подменён только request."""
+
+    def __init__(self, client):
+        self.request = _UrlRequestModule(client)
+
+    def __getattr__(self, name):
+        import urllib as real
+        return getattr(real, name)
+
+
+def _make_connection(client, secure):
+    """Соединение http.client, уводящее свои узлы в RSec.
+
+    Настоящее соединение держится внутри, а не наследуется: служба может
+    работать по TLS, тогда как плагин просил обычное, и подменить базовый класс
+    после создания уже нельзя.
+    """
+    base = _http.HTTPSConnection if secure else _http.HTTPConnection
+
+    class Connection(object):
+        def __init__(self, host, port=None, *args, **kw):
+            netloc = host if port is None else "%s:%s" % (host, port)
+            self._rsec_on = client.mine(netloc)
+            if self._rsec_on:
+                maker = (_http.HTTPSConnection if client.secure
+                         else _http.HTTPConnection)
+                self._real = maker(client.host, client.port, *args, **kw)
+            else:
+                self._real = base(host, port, *args, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def request(self, method, url, body=None, headers=None, **kw):
+            if not self._rsec_on:
+                return self._real.request(method, url, body, headers or {}, **kw)
+            path = url if str(url).startswith("/") else "/" + str(url)
+            return self._real.request(method, client.prefix + path, body,
+                                      client.headers_for(headers), **kw)
+
+    return Connection
+
+
+class _HttpClientModule:
+    """Замена http.client: подменены только классы соединений."""
+
+    def __init__(self, client):
+        self.HTTPConnection = _make_connection(client, False)
+        self.HTTPSConnection = _make_connection(client, True)
+
+    def __getattr__(self, name):
+        return getattr(_http, name)
+
+
+class _HttpModule:
+    """Замена пакета http: подменён только client.
+
+    При ``import http.client`` в пространство имён попадает сам пакет ``http``,
+    а не подмодуль, поэтому подменять надо и его.
+    """
+
+    def __init__(self, client):
+        self.client = _HttpClientModule(client)
+
+    def __getattr__(self, name):
+        import http as real
+        return getattr(real, name)
+
+
+def _install(namespace, client):
+    """Переписывает в пространстве плагина всё, чем он ходит в сеть.
+
+    Ищет по совпадению самих объектов, а не по именам: плагин мог написать
+    ``import requests as rq`` или ``from requests import post``, и никакое
+    угадывание имён это не покроет.
+
+    :return: список того, что удалось перехватить
+    """
+    caught = []
+    shims = {}
+    if _requests is not None:
+        shims["requests"] = _Requests(client)
+    shims["urllib"] = _UrllibModule(client)
+    shims["urllib.request"] = shims["urllib"].request
+    shims["http"] = _HttpModule(client)
+    shims["http.client"] = shims["http"].client
+
+    # Модули, привязанные под любым именем.
+    modules = []
+    if _requests is not None:
+        modules.append((_requests, shims["requests"]))
+    import http as _http_real
+    import urllib as _urllib_real
+    modules.append((_urllib_real, shims["urllib"]))
+    modules.append((_urlreq, shims["urllib.request"]))
+    modules.append((_http_real, shims["http"]))
+    modules.append((_http, shims["http.client"]))
+
+    # Отдельные имена, вытащенные из модулей.
+    members = []
+    if _requests is not None:
+        for name in ("request", "post", "get", "put", "patch", "delete",
+                     "head", "options", "Session"):
+            if hasattr(_requests, name):
+                members.append((getattr(_requests, name),
+                                getattr(shims["requests"], name)))
+    members.append((_urlreq.urlopen, shims["urllib.request"].urlopen))
+    members.append((_http.HTTPConnection, shims["http.client"].HTTPConnection))
+    members.append((_http.HTTPSConnection, shims["http.client"].HTTPSConnection))
+
+    for name, value in list(namespace.items()):
+        if name.startswith("_"):
+            continue
+        for original, replacement in modules:
+            if value is original:
+                namespace[name] = replacement
+                caught.append(name)
+                break
+        else:
+            for original, replacement in members:
+                if value is original:
+                    namespace[name] = replacement
+                    caught.append(name)
+                    break
+    return caught
+
+
+_rsec = _RSec(RSEC, RSEC_ONLY, closed=True)
+if _requests is not None:
+    requests = _Requests(_rsec)
+_log("RSec: перехвачено — %s" % (", ".join(_install(globals(), _rsec)) or "нечего"))
+# ═══════════════════════════════ конец блока ══════════════════════════════
+# ─── RSec: конец вставки ───
