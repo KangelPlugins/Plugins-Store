@@ -1,0 +1,516 @@
+import json
+import os
+import re
+import socket
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any, List
+
+from base_plugin import BasePlugin, MethodReplacement, MethodHook
+from client_utils import run_on_queue, get_last_fragment
+from android_utils import copy_to_clipboard, run_on_ui_thread, log
+from ui.settings import Header, Input, Selector, Switch, Text, Divider
+from ui.bulletin import BulletinHelper
+
+from hook_utils import find_class, get_private_field, set_private_field
+from java.util import HashMap, Objects
+
+__id__ = "extera_stt"
+__name__ = "ExteraSTT"
+__description__ = "Расшифровка и LLM коррекция голосовых/кружочков через любого провайдера (OpenRouter по умолчанию)."
+__author__ = "Qybic"
+__version__ = "1.1.1"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+DEFAULT_API_KEY = ""
+DEFAULT_STT_MODEL = "openai/whisper-large-v3-turbo"
+DEFAULT_LLM_MODEL = "meta-llama/llama-4-scout"
+DEFAULT_TRANSCRIBE_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+DEFAULT_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+LOG_PATH = "/storage/emulated/0/Download/exteraGram/extera-stt.log"
+
+MIME_BY_EXT = {
+    ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "video/mp4",
+    ".wav": "audio/wav", ".flac": "audio/flac", ".webm": "audio/webm",
+}
+
+WHISPER_PROMPT_HINT = (
+    "блять, ёбаный, пиздец, сука, хуй, ебать, нахуй, блядь, мудак, залупа, "
+    "шо, щас, вобщем, короч, ладно, ничо, типу, типа, деес, дискорд, окей, го"
+)
+
+LANGUAGES = [
+    ("none", "🚫 Не переводить"),
+    ("ru", "🇷🇺 Русский"),
+    ("en", "🇬🇧 English"),
+    ("uk", "🇺🇦 Українська"),
+    ("zh", "🇨🇳 中文"),
+    ("es", "🇪🇸 Español"),
+    ("de", "🇩🇪 Deutsch"),
+    ("fr", "🇫🇷 Français"),
+    ("ja", "🇯🇵 日本語"),
+    ("ko", "🇰🇷 한국어"),
+]
+
+
+class ExteraSTTPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+
+    def on_plugin_load(self):
+        self._log("================== ExteraSTT v1.1.1 ЗАГРУЖЕН ==================")
+        
+        TranscribeButton = find_class("org.telegram.ui.Components.TranscribeButton")
+        ChatMessageCell  = find_class("org.telegram.ui.Cells.ChatMessageCell")
+
+        if TranscribeButton is not None:
+            on_tap_method          = TranscribeButton.getClass().getDeclaredMethod("onTap")
+            update_waveform_method = ChatMessageCell.getClass().getDeclaredMethod("updateWaveform")
+            self.hook_method(on_tap_method, self.CreateTranscribeButtonHook(self))
+            self.hook_method(update_waveform_method, self.CreateUpdateWaveformHook())
+
+        return super().on_plugin_load()
+
+    def on_plugin_unload(self):
+        self._log("================== ExteraSTT ВЫГРУЖЕН ==================")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="OpenRouter API"),
+            Input(key="api_key", text="API Key", default=DEFAULT_API_KEY,
+                  subtext="openrouter.ai/keys", icon="msg_key"),
+            Input(key="stt_model", text="Модель STT", default=DEFAULT_STT_MODEL,
+                  subtext="openai/whisper-large-v3-turbo", icon="msg_work"),
+            Input(key="llm_model", text="Модель LLM", default=DEFAULT_LLM_MODEL,
+                  subtext="meta-llama/llama-4-scout", icon="msg_work"),
+            Input(key="stt_url", text="STT endpoint", default=DEFAULT_TRANSCRIBE_URL,
+                  subtext="URL распознавания", icon="msg_link"),
+            Input(key="llm_url", text="LLM endpoint", default=DEFAULT_CHAT_URL,
+                  subtext="URL обработки текста", icon="msg_link"),
+
+            Divider(),
+            Header(text="Обработка текста"),
+            Switch(key="enable_correction", text="Исправлять ослышки", default=True,
+                   subtext="Коррекция по смыслу через LLM", icon="msg_edit"),
+            Switch(key="enable_punctuation", text="Знаки препинания", default=True,
+                   subtext="Точки и запятые через LLM", icon="msg_edit"),
+            Selector(key="target_language", text="Язык перевода", default=0,
+                     items=[l[1] for l in LANGUAGES], icon="msg_language"),
+
+            Divider(),
+            Header(text="Отладка"),
+            Switch(key="enable_logging", text="Лог в файл", default=True,
+                   subtext="extera-stt.log в Download/exteraGram", icon="msg_log",
+                   on_change=self._on_logging_setting_change),
+        ]
+
+    def _on_logging_setting_change(self, value: bool):
+        if not value:
+            try:
+                if os.path.exists(LOG_PATH):
+                    os.remove(LOG_PATH)
+            except Exception:
+                pass
+
+    # ── Перехват кнопки ──────────────────────────────
+    class CreateTranscribeButtonHook(MethodReplacement):
+        def __init__(self, plugin_instance):
+            super().__init__()
+            self.plugin = plugin_instance
+
+        def replace_hooked_method(self, param):
+            run_on_queue(lambda: self.onTap(param))
+
+        def onTap(self, param):
+            this         = param.thisObject
+            parent       = get_private_field(this, "parent")
+            shouldBeOpen = get_private_field(this, "shouldBeOpen")
+            loading      = get_private_field(this, "loading")
+
+            if parent is None:
+                return
+
+            set_private_field(this, "clickedToOpen", False)
+            toOpen = not shouldBeOpen
+
+            if not shouldBeOpen:
+                if not loading:
+                    this.setLoading(True, True)
+                else:
+                    set_private_field(this, "pressed", False)
+                    return
+            else:
+                this.setOpen(False, True)
+                this.setLoading(False, True)
+
+            set_private_field(this, "pressed", False)
+
+            if toOpen:
+                set_private_field(this, "clickedToOpen", True)
+
+            self.transcribePressed(param, parent.getMessageObject(), toOpen)
+
+        def transcribePressed(self, param, messageObject, open):
+            api_key = str(self.plugin.get_setting("api_key", "") or "").strip()
+
+            if not api_key:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    "Укажи OpenRouter API Key в настройках."
+                ))
+                return
+
+            TranscribeButton   = find_class("org.telegram.ui.Components.TranscribeButton")
+            MessagesStorage    = find_class("org.telegram.messenger.MessagesStorage")
+            DialogObject       = find_class("org.telegram.messenger.DialogObject")
+            MessagesController = find_class("org.telegram.messenger.MessagesController")
+            NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+
+            this = param.thisObject
+            transcribeOperationsByDialogPosition = get_private_field(this, "transcribeOperationsByDialogPosition")
+            transcribeOperationsById             = get_private_field(this, "transcribeOperationsById")
+
+            if messageObject is None or messageObject.messageOwner is None or not messageObject.isSent():
+                return
+
+            account   = messageObject.currentAccount
+            peer      = MessagesController.getInstance(account).getInputPeer(messageObject.messageOwner.peer_id)
+            dialogId  = DialogObject.getPeerDialogId(peer)
+            messageId = messageObject.messageOwner.id
+
+            if open:
+                if (messageObject.messageOwner.voiceTranscription is not None
+                        and messageObject.messageOwner.voiceTranscriptionFinal):
+                    TranscribeButton.openVideoTranscription(messageObject)
+                    messageObject.messageOwner.voiceTranscriptionOpen = True
+                    MessagesStorage.getInstance(account).updateMessageVoiceTranscriptionOpen(
+                        dialogId, messageId, messageObject.messageOwner
+                    )
+                    run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
+                        NotificationCenter.voiceTranscriptionUpdate,
+                        messageObject, None, None, True, True
+                    ))
+                    return
+
+                if transcribeOperationsByDialogPosition is None:
+                    set_private_field(this, "transcribeOperationsByDialogPosition", HashMap())
+                transcribeOperationsByDialogPosition = get_private_field(this, "transcribeOperationsByDialogPosition")
+                transcribeOperationsByDialogPosition.put(int(self.reqInfoHash(messageObject)), messageObject)
+
+                if transcribeOperationsById is None:
+                    set_private_field(this, "transcribeOperationsById", HashMap())
+                transcribeOperationsById = get_private_field(this, "transcribeOperationsById")
+                transcribeOperationsById.put(int(self.reqInfoHash(messageObject)), messageObject)
+
+                messageObject.messageOwner.voiceTranscriptionId = messageId
+
+                path = self.get_audio_path(messageObject)
+                if isinstance(path, Exception) or not path:
+                    err_text = f"Не удалось получить аудио: {path}"
+                    self.plugin._log(f"[ОШИБКА] {err_text}")
+                    self.stop_transcription_with_error(this, messageObject, err_text, transcribeOperationsByDialogPosition)
+                    return
+
+                text = self.plugin._process_audio(path, api_key)
+                if isinstance(text, Exception):
+                    err_text = f"Ошибка: {str(text)}"
+                    self.plugin._log(f"[ОШИБКА STT/LLM]: {err_text}")
+                    self.stop_transcription_with_error(this, messageObject, err_text, transcribeOperationsByDialogPosition)
+                    return
+
+                self.finish_ui(this, TranscribeButton, MessagesStorage, NotificationCenter, messageObject, account, dialogId, messageId, text, transcribeOperationsByDialogPosition)
+
+            else:
+                if transcribeOperationsByDialogPosition is not None:
+                    transcribeOperationsByDialogPosition.remove(int(self.reqInfoHash(messageObject)))
+                messageObject.messageOwner.voiceTranscriptionOpen = False
+                MessagesStorage.getInstance(account).updateMessageVoiceTranscriptionOpen(
+                    dialogId, messageId, messageObject.messageOwner
+                )
+                run_on_ui_thread(lambda: NotificationCenter.getInstance(account).postNotificationName(
+                    NotificationCenter.voiceTranscriptionUpdate,
+                    messageObject, None, None, False, None
+                ))
+
+        def stop_transcription_with_error(self, this, messageObject, err_text, transcribeOperationsByDialogPosition):
+            run_on_ui_thread(lambda: this.setLoading(False, True))
+            run_on_ui_thread(lambda: this.setOpen(False, True))
+            if transcribeOperationsByDialogPosition is not None:
+                transcribeOperationsByDialogPosition.remove(int(self.reqInfoHash(messageObject)))
+            run_on_ui_thread(lambda: self.show_error_alert(err_text))
+
+        def show_error_alert(self, err_text):
+            try:
+                AlertDialogBuilder = find_class("ui.alert.AlertDialogBuilder")
+                fragment = get_last_fragment()
+                if not fragment or not fragment.getParentActivity():
+                    BulletinHelper.show_error(err_text[:150])
+                    return
+                act = fragment.getParentActivity()
+                b = AlertDialogBuilder(act, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+                b.set_title("Ошибка")
+                b.set_message(err_text)
+                b.set_negative_button("Закрыть", lambda bld, w: bld.dismiss())
+                b.set_positive_button("Скопировать", lambda bld, w: (copy_to_clipboard(err_text), bld.dismiss()))
+                b.show()
+            except Exception as e:
+                BulletinHelper.show_error(err_text[:150])
+
+        def finish_ui(self, this, TranscribeButton, MessagesStorage, NotificationCenter, messageObject, account, dialogId, messageId, finalText, transcribeOperationsByDialogPosition):
+            TranscribeButton.openVideoTranscription(messageObject)
+            messageObject.messageOwner.voiceTranscriptionOpen  = True
+            messageObject.messageOwner.voiceTranscriptionFinal = True
+            MessagesStorage.getInstance(account).updateMessageVoiceTranscription(
+                dialogId, messageId, finalText, messageObject.messageOwner
+            )
+            run_on_ui_thread(lambda: this.finishTranscription(messageObject, messageId, finalText))
+            transcribeOperationsByDialogPosition.remove(self.reqInfoHash(messageObject))
+
+        def reqInfoHash(self, messageObject):
+            if messageObject is None:
+                return 0
+            return Objects.hash(
+                messageObject.currentAccount,
+                messageObject.getDialogId(),
+                messageObject.getId()
+            )
+
+        def get_audio_path(self, msg):
+            try:
+                UserConfig = find_class("org.telegram.messenger.UserConfig")
+                FileLoader = find_class("org.telegram.messenger.FileLoader")
+
+                current_account = UserConfig.selectedAccount
+                file_loader     = FileLoader.getInstance(current_account)
+                file_path_obj   = file_loader.getPathToMessage(msg.messageOwner)
+
+                if not file_path_obj.exists():
+                    document = msg.messageOwner.media.document
+                    file_loader.loadFile(document, msg, 1, 0)
+
+                for _ in range(30):
+                    if file_path_obj.exists():
+                        break
+                    time.sleep(1)
+                else:
+                    raise TimeoutError("Превышено время ожидания скачивания файла.")
+
+                return str(file_path_obj.getAbsolutePath())
+
+            except Exception as e:
+                return e
+
+    class CreateUpdateWaveformHook(MethodHook):
+        def after_hooked_method(self, param):
+            this = param.thisObject
+            set_private_field(this, "useTranscribeButton", True)
+
+    # ── Выполнение запросов ──────────────────────────
+    def _is_empty_stt(self, text: str) -> bool:
+        if not text:
+            return True
+        # Удаляем всю пунктуацию, пробелы и служебные знаки
+        cleaned = re.sub(r"[^\w\s]", "", text).strip()
+        return len(cleaned) == 0
+
+    def _process_audio(self, path, api_key):
+        try:
+            stt_model = str(self.get_setting("stt_model", DEFAULT_STT_MODEL) or DEFAULT_STT_MODEL).strip()
+            stt_url = str(self.get_setting("stt_url", DEFAULT_TRANSCRIBE_URL) or DEFAULT_TRANSCRIBE_URL).strip()
+
+            self._log(f"Запрос к STT ({stt_model})...")
+            raw = self._safe_http_post_multipart(stt_url, path, api_key, stt_model)
+
+            # Проверка на пустой результат или галлюцинацию (точки, запятые)
+            if self._is_empty_stt(raw):
+                self._log("STT вернул пустой текст или мусорные знаки препинания.")
+                return "[ НЕ РАСПОЗНАНО ]"
+
+            corr = self.get_setting("enable_correction", True)
+            punct = self.get_setting("enable_punctuation", True)
+
+            lang_idx = self.get_setting("target_language", 0)
+            if isinstance(lang_idx, int) and 0 <= lang_idx < len(LANGUAGES):
+                target_lang = LANGUAGES[lang_idx][0]
+            else:
+                target_lang = "none"
+
+            need_translate = target_lang != "none"
+
+            # Если все опции LLM выключены — возвращаем почищенный сырой текст
+            if not corr and not punct and not need_translate:
+                self._log("LLM-функции отключены, возвращаем сырой текст STT.")
+                return raw
+
+            llm_model = str(self.get_setting("llm_model", DEFAULT_LLM_MODEL) or DEFAULT_LLM_MODEL).strip()
+            llm_url = str(self.get_setting("llm_url", DEFAULT_CHAT_URL) or DEFAULT_CHAT_URL).strip()
+
+            self._log(f"Запрос к LLM ({llm_model})...")
+            final = self._call_llm(raw, api_key, llm_model, llm_url, corr, punct, need_translate, target_lang)
+
+            if self._is_empty_stt(final) or final.strip() == "[ НЕ РАСПОЗНАНО ]":
+                return "[ НЕ РАСПОЗНАНО ]"
+
+            return final
+        except Exception as e:
+            return e
+
+    def _safe_http_post_multipart(self, url, path, api_key, model):
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(f"Файл {path} отсутствует или пуст.")
+
+        filename = os.path.basename(path) or "audio.ogg"
+        ext = os.path.splitext(path)[1].lower()
+        mime = MIME_BY_EXT.get(ext, "application/octet-stream")
+
+        with open(path, "rb") as f:
+            data = f.read()
+
+        boundary = uuid.uuid4().hex
+        body = bytearray()
+        def w(s): body.extend(s.encode("utf-8"))
+
+        safe_fn = filename.replace('"', "%22")
+        w(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_fn}\"\r\nContent-Type: {mime}\r\n\r\n")
+        body.extend(data)
+        w(f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}")
+        w(f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{WHISPER_PROMPT_HINT}")
+        w(f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n--{boundary}--\r\n")
+
+        req = urllib.request.Request(
+            url,
+            data=bytes(body),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "User-Agent": "ExteraSTT/1.1.1"
+            },
+            method="POST"
+        )
+
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(30)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_text = resp.read().decode("utf-8", "replace")
+                result = json.loads(resp_text)
+                return " ".join(str(result.get("text", "")).strip().split())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(self._format_http_error(e)) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Ошибка сети/таймаут: {getattr(e, 'reason', e)}") from e
+        finally:
+            socket.setdefaulttimeout(old_timeout)
+
+    def _call_llm(self, raw, api_key, model, url, corr, punct, transl, target_lang):
+        rules = []
+        if corr:
+            rules.append("1. ИСПРАВЛЕНИЕ ОШИБОК: Исправляй фонетические ослышки и неверно распознанные слова по контексту.")
+        else:
+            rules.append("1. ИСПРАВЛЕНИЕ ОШИБОК: НЕ меняй оригинальные слова.")
+
+        if punct:
+            rules.append("2. ПУНКТУАЦИЯ: Расставь необходимые знаки препинания и заглавные буквы.")
+        else:
+            rules.append("2. ПУНКТУАЦИЯ: НЕ добавляй знаки препинания.")
+
+        if transl:
+            lang_dict = dict(LANGUAGES)
+            lang_name = lang_dict.get(target_lang, target_lang)
+            rules.append(f"3. ПЕРЕВОД: Переведи итоговый текст на язык: {lang_name}.")
+        else:
+            rules.append("3. ПЕРЕВОД: Сохраняй исходный язык текста.")
+
+        prompt = (
+            "Ты — модуль форматирования текста голосовых сообщений.\n"
+            "ПРАВИЛА ОБРАБОТКИ:\n" + "\n".join(rules) +
+            "\n\nКРИТИЧЕСКОЕ ПРАВИЛО:\n"
+            "- Если входной текст не содержит слов, не имеет смысла или равен '[ НЕ РАСПОЗНАНО ]', выведи строго '[ НЕ РАСПОЗНАНО ]'. Ничего не придумывай!\n"
+            "\nОГРАНИЧЕНИЯ:\n"
+            "- Сохраняй разговорный стиль и мат.\n"
+            "- Категорически запрещено вести диалог, здороваться, фантазировать или писать вступления.\n"
+            "- Выдай ИСКЛЮЧИТЕЛЬНО готовый отредактированный текст без кавычек."
+        )
+
+        payload = {
+            "model": model,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": raw},
+            ],
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "ExteraSTT/1.1.1"
+            },
+            method="POST"
+        )
+
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(15)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+                choices = data.get("choices") or []
+                if not choices:
+                    return raw
+                message = choices[0].get("message") or {}
+                return str(message.get("content") or "").strip()
+        except Exception as e:
+            self._log(f"[ОШИБКА LLM] Возвращаем сырой текст STT: {e}")
+            return raw
+        finally:
+            socket.setdefaulttimeout(old_timeout)
+
+    # ── Утилиты ───────────────────────
+    def _format_http_error(self, error):
+        status = getattr(error, "code", 0)
+        raw = ""
+        try:
+            raw = error.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        message = raw.strip()
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                err = payload.get("error", {})
+                if isinstance(err, dict):
+                    message = str(err.get("message") or message)
+        except Exception:
+            pass
+        message = message[:500]
+
+        if status == 401: return "Неверный OpenRouter API key (401)."
+        if status == 403: return f"Доступ запрещён (403). {message}"
+        if status == 404: return f"Модель не найдена (404). {message}"
+        if status == 429: return "Лимит запросов (429)."
+        if status >= 500: return f"Сервер OpenRouter недоступен (HTTP {status})."
+        return f"HTTP {status}: {message}"
+
+    def _log(self, text):
+        try:
+            log(text)
+        except Exception:
+            pass
+        try:
+            if not self.get_setting("enable_logging", True):
+                return
+            os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {text}\n")
+        except Exception:
+            pass
