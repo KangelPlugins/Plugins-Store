@@ -1,0 +1,309 @@
+from typing import Any, List
+
+from android import R
+from android.view import View
+from android.widget import LinearLayout, ProgressBar, TextView
+from org.telegram.messenger import AndroidUtilities, MessagesController, UserConfig
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui.ActionBar import Theme
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import get_last_fragment, run_on_queue, send_request
+from hook_utils import find_class
+from ui.alert import AlertDialogBuilder
+from ui.settings import Custom, Divider, Header, SimpleSettingFactory, Text
+
+__id__ = "all_chats_loader"
+__name__ = "All Chats Loader"
+__description__ = "Безопасно догружает список диалогов через штатный обработчик Telegram."
+__author__ = "@nufxa"
+__version__ = "2.0.4"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+class AllChatsLoaderPlugin(BasePlugin):
+    BATCH_SIZE = 100
+
+    def on_plugin_load(self):
+        self._is_loading = False
+        self._cancelled = False
+        self._loaded = 0
+        self._total = 0
+        self._batches = 0
+        self._status = "Готово к загрузке"
+        self._progress_views = []
+        self._install_chat_guard()
+        self._progress_factory = SimpleSettingFactory(
+            self._create_progress_view,
+            self._bind_progress_view,
+            is_clickable=False,
+            is_shadow=False,
+            attached_view=self._attach_progress_view,
+        )
+        log("[AllChatsLoader] v2.0.4 loaded")
+
+    def on_plugin_unload(self):
+        self._cancelled = True
+        self._is_loading = False
+        self._progress_views = []
+
+    def _create_progress_view(self, context, list_view, current_account, class_guid, resources_provider):
+        box = LinearLayout(context)
+        box.setOrientation(LinearLayout.VERTICAL)
+        box.setPadding(AndroidUtilities.dp(24), AndroidUtilities.dp(12), AndroidUtilities.dp(24), AndroidUtilities.dp(16))
+
+        title = TextView(context)
+        title.setTextSize(16)
+        title.setSingleLine(False)
+        title.setMaxLines(2)
+        title.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        box.addView(title, LinearLayout.LayoutParams(-1, -2))
+
+        bar = ProgressBar(context, None, R.attr.progressBarStyleHorizontal)
+        bar.setMax(100)
+        box.addView(bar, LinearLayout.LayoutParams(-1, AndroidUtilities.dp(6)))
+
+        detail = TextView(context)
+        detail.setTextSize(13)
+        detail.setSingleLine(False)
+        detail.setMaxLines(4)
+        detail.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        box.addView(detail, LinearLayout.LayoutParams(-1, -2))
+        return box
+
+    def _bind_progress_view(self, view, item, divider, adapter, list_view):
+        self._render_progress(view)
+
+    def _attach_progress_view(self, list_view, view, item):
+        if view not in self._progress_views:
+            self._progress_views.append(view)
+        self._render_progress(view)
+
+    def _render_progress(self, view):
+        try:
+            title, bar, detail = view.getChildAt(0), view.getChildAt(1), view.getChildAt(2)
+            if self._total > 0:
+                percent = min(100, int(self._loaded * 100 / self._total))
+                if self._is_loading:
+                    title.setText("Загрузка диалогов: {}%".format(percent))
+                    detail.setText("{} из {} диалогов, пакет {}\n{}".format(self._loaded, self._total, self._batches, self._status))
+                    bar.setVisibility(View.VISIBLE)
+                    bar.setIndeterminate(False)
+                    bar.setProgress(percent)
+                else:
+                    title.setText("Синхронизация завершена")
+                    detail.setText(self._status)
+                    bar.setVisibility(View.GONE)
+            elif self._is_loading:
+                title.setText("Загрузка диалогов...")
+                detail.setText("Обработано: {}, пакет {}\n{}".format(self._loaded, self._batches, self._status))
+                bar.setVisibility(View.VISIBLE)
+                bar.setIndeterminate(True)
+            else:
+                title.setText("Загрузка диалогов завершена" if self._loaded else "Загрузка диалогов")
+                detail.setText(self._status)
+                bar.setVisibility(View.GONE)
+        except Exception as error:
+            log("[AllChatsLoader] progress render: {}".format(error))
+
+    def _refresh_progress(self):
+        def update():
+            alive = []
+            for view in self._progress_views:
+                try:
+                    self._render_progress(view)
+                    alive.append(view)
+                except Exception:
+                    pass
+            self._progress_views = alive
+            self.reload_settings()
+        run_on_ui_thread(update)
+
+    def create_settings(self) -> List[Any]:
+        if self._is_loading:
+            action = Text(
+                text="Загрузка выполняется",
+                subtext="Чаты временно недоступны.",
+                icon="msg_working",
+            )
+        else:
+            action = Text(
+                text="Загрузить все чаты",
+                subtext="Список диалогов без чтения сообщений и закреплений.",
+                icon="msg_download",
+                on_click=self._start_click,
+            )
+        return [
+            Header(text="Синхронизация диалогов"),
+            action,
+            Custom(factory=self._progress_factory.instance.java),
+            Divider(text="Во время загрузки переход в чаты заблокирован."),
+            Header(text="Восстановление"),
+            Text(
+                text="Экстренно повторить синхронизацию",
+                subtext="Только при проблемах; ничего не удаляет.",
+                icon="msg_refresh",
+                red=True,
+                on_click=self._emergency_resync_click,
+            ),
+            Divider(),
+            Header(text="О плагине"),
+            Text(text="All Chats Loader v2.0.4", subtext="Безопасная синхронизация диалогов.", icon="msg_info"),
+        ]
+
+    def _start_click(self, view=None):
+        if self._is_loading:
+            return
+        self._is_loading = True
+        self._cancelled = False
+        self._loaded = 0
+        self._total = 0
+        self._batches = 0
+        self._status = "Подключение к Telegram..."
+        self._refresh_progress()
+        run_on_queue(self._start)
+
+    def _start(self):
+        account = getattr(UserConfig, "selectedAccount", 0)
+        self._request_batch(account, 0, 0, TLRPC.TL_inputPeerEmpty())
+
+    def _request_batch(self, account, offset_date, offset_id, offset_peer):
+        if self._cancelled or not self._is_loading:
+            return
+        request = TLRPC.TL_messages_getDialogs()
+        request.offset_date = offset_date
+        request.offset_id = offset_id
+        request.offset_peer = offset_peer
+        request.limit = self.BATCH_SIZE
+        request.exclude_pinned = True
+        request.hash = 0
+        self._status = "Запрос пакета {}...".format(self._batches + 1)
+        self._refresh_progress()
+        send_request(request, lambda response, error: self._on_dialogs(account, request, response, error), account=account)
+
+    def _on_dialogs(self, account, request, response, error):
+        if self._cancelled or not self._is_loading:
+            return
+        if error or response is None:
+            self._finish(False, "Ошибка Telegram: {}".format(getattr(error, "text", error or "пустой ответ")))
+            return
+        dialogs = getattr(response, "dialogs", None)
+        count = dialogs.size() if dialogs else 0
+        self._total = max(self._total, int(getattr(response, "count", 0) or 0), self._loaded + count)
+        try:
+            MessagesController.getInstance(account).processLoadedDialogs(
+                response, None, None, 0, 0, self.BATCH_SIZE, 0, False, False, False
+            )
+        except Exception as exception:
+            self._finish(False, "Не удалось применить пакет: {}".format(exception))
+            return
+
+        self._loaded += count
+        self._batches += 1
+        self._status = "Обработан пакет {} (+{} чатов)".format(self._batches, count)
+        self._refresh_progress()
+
+        is_slice = isinstance(response, TLRPC.TL_messages_dialogsSlice) or count >= request.limit
+        if not is_slice or count == 0:
+            self._finish(True, "Готово: загружено {} чатов.".format(self._loaded))
+            return
+
+        last_dialog = dialogs.get(count - 1)
+        last_message = self._find_message(response, getattr(last_dialog, "top_message", 0))
+        self._request_batch(
+            account,
+            int(getattr(last_message, "date", 0) if last_message else 0),
+            int(getattr(last_dialog, "top_message", 0)),
+            self._input_peer(last_dialog.peer, response),
+        )
+
+    def _find_message(self, response, message_id):
+        messages = getattr(response, "messages", None)
+        if messages:
+            for index in range(messages.size()):
+                message = messages.get(index)
+                if getattr(message, "id", 0) == message_id:
+                    return message
+        return None
+
+    def _input_peer(self, peer, response):
+        if isinstance(peer, TLRPC.TL_peerUser):
+            result = TLRPC.TL_inputPeerUser()
+            result.user_id = peer.user_id
+            result.access_hash = self._access_hash(getattr(response, "users", None), peer.user_id)
+            return result
+        if isinstance(peer, TLRPC.TL_peerChat):
+            result = TLRPC.TL_inputPeerChat()
+            result.chat_id = peer.chat_id
+            return result
+        if isinstance(peer, TLRPC.TL_peerChannel):
+            result = TLRPC.TL_inputPeerChannel()
+            result.channel_id = peer.channel_id
+            result.access_hash = self._access_hash(getattr(response, "chats", None), peer.channel_id)
+            return result
+        return TLRPC.TL_inputPeerEmpty()
+
+    def _access_hash(self, objects, object_id):
+        if objects:
+            for index in range(objects.size()):
+                item = objects.get(index)
+                if getattr(item, "id", 0) == object_id:
+                    return getattr(item, "access_hash", 0)
+        return 0
+
+    def _finish(self, success, status):
+        self._is_loading = False
+        self._status = status
+        self._refresh_progress()
+        if success:
+            self._show_alert(
+                "Синхронизация завершена",
+                "{}\n\nДля корректного отображения чатов, папок и счётчиков "
+                "непрочитанных рекомендуется перезапустить ExteraGram вручную.".format(status),
+            )
+        else:
+            self._show_alert("Синхронизация остановлена", status)
+
+    def _emergency_resync_click(self, view=None):
+        if self._is_loading:
+            return
+        fragment = get_last_fragment()
+        if not fragment or not fragment.getParentActivity():
+            return
+        dialog = AlertDialogBuilder(fragment.getParentActivity())
+        dialog.set_title("Экстренная синхронизация")
+        dialog.set_message("Это повторно запросит список диалогов. Локальная БД, папки, файлы и сообщения не удаляются.")
+        dialog.set_positive_button("Продолжить", lambda box, which: (box.dismiss(), self._start_click()))
+        dialog.set_negative_button("Отмена", lambda box, which: box.dismiss())
+        dialog.show()
+
+    def _show_alert(self, title, message):
+        def show():
+            fragment = get_last_fragment()
+            if fragment and fragment.getParentActivity():
+                dialog = AlertDialogBuilder(fragment.getParentActivity())
+                dialog.set_title(title)
+                dialog.set_message(message)
+                dialog.set_positive_button("OK", lambda box, which: box.dismiss())
+                dialog.show()
+        run_on_ui_thread(show)
+
+    def _install_chat_guard(self):
+        try:
+            chat_class = find_class("org.telegram.ui.ChatActivity")
+            method = chat_class.getDeclaredMethod("onFragmentCreate")
+            method.setAccessible(True)
+            self.hook_method(method, before=self._guard_chat_open)
+        except Exception as error:
+            log("[AllChatsLoader] chat guard unavailable: {}".format(error))
+
+    def _guard_chat_open(self, param):
+        if self._is_loading:
+            param.setResult(False)
+            AndroidUtilities.runOnUIThread(lambda: AndroidUtilities.showToast("Загрузка диалогов ещё выполняется. Открытие чатов временно недоступно."))
+
+
+plugin = AllChatsLoaderPlugin()
