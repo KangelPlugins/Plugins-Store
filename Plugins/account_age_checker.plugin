@@ -1,0 +1,2809 @@
+r"""
+/============================================================\
+||• ▌ ▄ ·. ▪  .▄▄ ·  ▄ .▄ ▄▄▄· ▄▄▄▄·       ▄▄▄▄▄       ▌ ▐· ||
+||·██ ▐███▪██ ▐█ ▀. ██▪▐█▐█ ▀█ ▐█ ▀█▪▪     •██  ▪     ▪█·█▌ ||
+||▐█ ▌▐▌▐█·▐█·▄▀▀▀█▄██▀▐█▄█▀▀█ ▐█▀▀█▄ ▄█▀▄  ▐█.▪ ▄█▀▄ ▐█▐█• ||
+||██ ██▌▐█▌▐█▌▐█▄▪▐███▌▐▀▐█ ▪▐▌██▄▪▐█▐█▌.▐▌ ▐█▌·▐█▌.▐▌ ███  ||
+||▀▀  █▪▀▀▀▀▀▀ ▀▀▀▀ ▀▀▀ · ▀  ▀ ·▀▀▀▀  ▀█▄▀▪ ▀▀▀  ▀█▄▀▪. ▀   ||
+\============================================================/
+
+Перед копированием/изменением кода уведомите @itskotovski
+"""
+
+import copy
+import html
+import json
+import os
+import random
+import re
+import threading
+import time
+import traceback
+from collections import namedtuple
+from datetime import datetime
+
+from android.content.res import ColorStateList
+from android.graphics import Color
+from android.graphics.drawable import GradientDrawable, RippleDrawable
+from android.util import TypedValue
+from android.view import Gravity, View
+from android.widget import FrameLayout, ImageView, LinearLayout, ScrollView, TextView
+from com.exteragram.messenger.plugins import PluginsController
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from java.lang import Integer
+from java.util import ArrayList, Locale
+from org.telegram.messenger import AndroidUtilities, R, SendMessagesHelper, UserObject
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+from org.telegram.tgnet.tl import TL_fragment
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import LayoutHelper
+
+import requests
+from android_utils import OnClickListener, log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import (
+    RequestCallback,
+    get_connections_manager,
+    get_last_fragment,
+    get_messages_controller,
+    get_send_messages_helper,
+    get_user_config,
+    run_on_queue,
+    send_message,
+    send_request,
+)
+from extera_utils.text_formatting import parse_text
+from file_utils import ensure_dir_exists, get_plugins_dir
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+__id__ = "account_age_checker"
+__name__ = "Account Age [AAC]"
+__description__ = "определяет дату регистрации телеграм-аккаунта"
+__author__ = "@mihailkotovski & @mew_help"
+__version__ = "5.2 [inline fixes]"
+__icon__ = "mishaplugins_by_fStikBot/0"
+
+INLINE_BOT = "dateregbot"
+INLINE_METHOD = "inline"
+INLINE_TIMEOUT = 12.0
+# @dateregbot отвечает на inline-запрос заглушкой «Загружаю данные...», а настоящий текст
+# подставляет через editMessageText уже в отправленное сообщение. Поэтому результат
+# приходится отправить в «Избранное», дождаться правки, прочитать и удалить.
+SAVED_PROBE_TIMEOUT = 10.0
+SAVED_PROBE_POLL = 0.7
+COLLECTIBLE_TIMEOUT = 8.0
+COLLECTIBLE_LIMIT = 5
+STRONG_MATCH_SCORE = 240
+
+API_URL = "https://api.datereg.pro/api/v1"
+API_TIMEOUT = 20
+
+CACHE_TTL = 86400
+CACHE_PRESETS = [3600, 21600, 43200, 86400, 172800, 604800, 0]
+CACHE_CUSTOM_INDEX = len(CACHE_PRESETS)
+CACHE_DEFAULT_INDEX = CACHE_PRESETS.index(CACHE_TTL)
+
+COMMAND_RE = re.compile(r"^\.(age|cache)(?:\s+(.*))?$", re.IGNORECASE | re.DOTALL)
+USERNAME_URL_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/(?:(?:s|c)/)?([A-Za-z0-9_]{3,})",
+    re.IGNORECASE,
+)
+MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,})")
+PROFILE_URL_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{3,})/?$",
+    re.IGNORECASE,
+)
+TRAILING_MENTION_RE = re.compile(r"\s*\(\s*@[A-Za-z0-9_]+\s*\)?\s*$")
+RESERVED_USERNAMES = {"joinchat", "addlist", "addstickers", "share", "iv", "s", "c"}
+
+DC_REGIONS = {
+    1: "Miami, FL",
+    2: "Amsterdam, NL",
+    3: "Miami, FL",
+    4: "Amsterdam, NL",
+    5: "Singapore, SG",
+}
+MONTHS_RU = [
+    "",
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+]
+MONTHS_EN = [
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+]
+MONTHS_RU_NOMINATIVE = [
+    "",
+    "январь",
+    "февраль",
+    "март",
+    "апрель",
+    "май",
+    "июнь",
+    "июль",
+    "август",
+    "сентябрь",
+    "октябрь",
+    "ноябрь",
+    "декабрь",
+]
+MONTHS_RU_PREPOSITIONAL = [
+    "",
+    "январе",
+    "феврале",
+    "марте",
+    "апреле",
+    "мае",
+    "июне",
+    "июле",
+    "августе",
+    "сентябре",
+    "октябре",
+    "ноябре",
+    "декабре",
+]
+MONTHS_BY_NAME = {}
+for _index in range(1, 13):
+    for _names in (MONTHS_EN, MONTHS_RU, MONTHS_RU_NOMINATIVE, MONTHS_RU_PREPOSITIONAL):
+        MONTHS_BY_NAME[_names[_index].lower()] = _index
+
+PREMIUM_EMOJI = {
+    "📊": 5936017305585586269,
+    "👤": 5886412370347036129,
+    "🆔": 5884366771913233289,
+    "🖥": 5839354140261619193,
+    "🌍": 6021458653373013164,
+    "🔗": 5877465816030515018,
+    "📅": 5967412305338568701,
+    "⏳": 5891211339170326418,
+    "🎯": 5944940516754853337,
+    "⚙️": 6021582331251268218,
+    "🆓": 5316902932417885675,
+    "📱": 6021360186952783943,
+    "🎂": 5864128984798730231,
+    "💎": 5963312935148195483,
+    "🟢": 5951665890079544884,
+    "🟡": 6019102674832595118,
+    "🟠": 5873121512445187130,
+    "🔴": 5872829476143894491,
+}
+
+DEBUG = False
+
+Row = namedtuple("Row", ("emoji", "label", "value", "mono", "value_emoji"))
+ReplyTarget = namedtuple("ReplyTarget", ("peer", "reply_to_msg", "reply_to_top_msg"))
+
+
+def make_row(emoji, label, value, mono=True, value_emoji=""):
+    return Row(emoji, label, str(value), mono, value_emoji)
+
+
+def is_russian():
+    try:
+        return Locale.getDefault().getLanguage() == "ru"
+    except Exception:
+        return True
+
+
+def localize(ru_text, en_text):
+    return ru_text if is_russian() else en_text
+
+
+def debug_log(message):
+    if DEBUG:
+        log(f"[{__id__}] {message}")
+
+
+def esc(value):
+    return html.escape(str(value if value is not None else ""))
+
+
+def unknown_text():
+    return localize("Неизвестно", "Unknown")
+
+
+def plural_ru(count, one, few, many):
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} {one}"
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return f"{count} {few}"
+    return f"{count} {many}"
+
+
+def format_date(timestamp):
+    if not timestamp:
+        return unknown_text()
+    dt = datetime.fromtimestamp(int(timestamp))
+    if is_russian():
+        return f"{dt.day} {MONTHS_RU[dt.month]} {dt.year}"
+    return f"{MONTHS_EN[dt.month]} {dt.day}, {dt.year}"
+
+
+def format_age(value):
+    try:
+        month, year = (int(part) for part in str(value or "").split("."))
+    except Exception:
+        return unknown_text()
+
+    now = datetime.now()
+    years = now.year - year
+    months = now.month - month
+    if months < 0:
+        years -= 1
+        months += 12
+
+    if years <= 0 and months <= 0:
+        return localize("меньше месяца", "less than a month")
+
+    parts = []
+    if is_russian():
+        if years > 0:
+            parts.append(plural_ru(years, "год", "года", "лет"))
+        if months > 0:
+            parts.append(plural_ru(months, "месяц", "месяца", "месяцев"))
+        return " и ".join(parts)
+
+    if years > 0:
+        parts.append(f"{years} year" + ("s" if years != 1 else ""))
+    if months > 0:
+        parts.append(f"{months} month" + ("s" if months != 1 else ""))
+    return " and ".join(parts)
+
+
+def format_size(size):
+    try:
+        size = int(size)
+    except Exception:
+        return "0 B"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.2f} MB"
+
+
+def format_seconds(seconds):
+    seconds = max(0, int(seconds or 0))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, _ = divmod(seconds, 60)
+    if is_russian():
+        if days:
+            return f"{days} д. {hours} ч."
+        if hours:
+            return f"{hours} ч. {minutes} мин."
+        return f"{minutes} мин."
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def describe_cache_ttl(ttl):
+    ttl = max(0, int(ttl or 0))
+    if ttl <= 0:
+        return localize("Кеш выключен", "Cache disabled")
+
+    presets = {
+        3600: localize("1 час", "1 hour"),
+        21600: localize("6 часов", "6 hours"),
+        43200: localize("12 часов", "12 hours"),
+        86400: localize("24 часа", "24 hours"),
+        172800: localize("2 дня", "2 days"),
+        604800: localize("7 дней", "7 days"),
+    }
+    return presets.get(ttl) or format_seconds(ttl)
+
+
+def accuracy_emoji(percent):
+    try:
+        percent = int(percent)
+    except Exception:
+        return "🟠"
+    if percent >= 87:
+        return "🟢"
+    if percent >= 70:
+        return "🟡"
+    if percent >= 50:
+        return "🟠"
+    return "🔴"
+
+
+def accuracy_label(percent):
+    try:
+        percent = int(percent)
+    except Exception:
+        percent = 0
+    if percent >= 87:
+        return localize("Очень высокая", "Very high")
+    if percent >= 70:
+        return localize("Высокая", "High")
+    if percent >= 50:
+        return localize("Средняя", "Medium")
+    return localize("Низкая", "Low")
+
+
+def java_list(value):
+    if value is None:
+        return []
+    try:
+        return [value.get(index) for index in range(value.size())]
+    except Exception:
+        pass
+    try:
+        return list(value)
+    except Exception:
+        return []
+
+
+def set_java_boolean_field(obj, name, value):
+    obj.getClass().getField(name).setBoolean(obj, bool(value))
+
+
+def get_user(user_id):
+    try:
+        return get_messages_controller().getUser(int(user_id))
+    except Exception:
+        return None
+
+
+def get_user_full(user_id):
+    try:
+        return get_messages_controller().getUserFull(int(user_id))
+    except Exception:
+        return None
+
+
+def get_public_username(user):
+    if user is None:
+        return ""
+    try:
+        return str(UserObject.getPublicUsername(user) or "").strip()
+    except Exception:
+        return str(getattr(user, "username", "") or "").strip()
+
+
+def get_account_name(user_id):
+    user = get_user(user_id)
+    if user is None:
+        return unknown_text()
+
+    first_name = str(getattr(user, "first_name", "") or "").strip()
+    last_name = str(getattr(user, "last_name", "") or "").strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+    if full_name and full_name != "DELETED":
+        return full_name
+
+    username = get_public_username(user)
+    return f"@{username}" if username else unknown_text()
+
+
+def get_all_usernames(user_id):
+    user = get_user(user_id)
+    if user is None:
+        return []
+
+    result = []
+    for item in java_list(getattr(user, "usernames", None)):
+        username = str(getattr(item, "username", "") or "").strip()
+        if username:
+            result.append(
+                {
+                    "username": username,
+                    "active": bool(getattr(item, "active", True)),
+                    "editable": bool(getattr(item, "editable", True)),
+                }
+            )
+
+    if not result:
+        username = get_public_username(user)
+        if username:
+            result.append({"username": username, "active": True, "editable": True})
+    return result
+
+
+def join_usernames(user_id):
+    usernames = get_all_usernames(user_id)
+    active = [f"@{item['username']}" for item in usernames if item["active"]]
+    if active:
+        return ", ".join(active)
+    return ", ".join(f"@{item['username']}" for item in usernames)
+
+
+def get_nft_usernames(user_id):
+    return [item["username"] for item in get_all_usernames(user_id) if item["active"] and not item["editable"]]
+
+
+def get_phone(user_id):
+    user = get_user(user_id)
+    phone = str(getattr(user, "phone", "") or "").strip() if user is not None else ""
+    if phone and not phone.startswith("+"):
+        phone = "+" + phone
+    return phone
+
+
+def get_birthday(user_id):
+    birthday = getattr(get_user_full(user_id), "birthday", None)
+    if birthday is None:
+        return ""
+
+    day = int(getattr(birthday, "day", 0) or 0)
+    month = int(getattr(birthday, "month", 0) or 0)
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return ""
+
+    month_name = MONTHS_RU[month] if is_russian() else MONTHS_EN[month]
+    year = int(getattr(birthday, "year", 0) or 0)
+    if year > 0 and int(getattr(birthday, "flags", 0) or 0) & 1:
+        return f"{day} {month_name} {year}"
+    return f"{day} {month_name}"
+
+
+def get_dc_id(user_id):
+    user = get_user(user_id)
+    photo = getattr(user, "photo", None) if user is not None else None
+    dc_id = int(getattr(photo, "dc_id", 0) or 0) if photo is not None else 0
+    if dc_id > 0:
+        return dc_id
+
+    user_full = get_user_full(user_id)
+    for field_name in ("profile_photo", "personal_photo", "fallback_photo"):
+        photo = getattr(user_full, field_name, None) if user_full is not None else None
+        dc_id = int(getattr(photo, "dc_id", 0) or 0) if photo is not None else 0
+        if dc_id > 0:
+            return dc_id
+    return 0
+
+
+def get_region(dc_id):
+    return DC_REGIONS.get(int(dc_id or 0), unknown_text())
+
+
+def is_self_user(user_id):
+    try:
+        return int(user_id) == int(get_user_config().getClientUserId())
+    except Exception:
+        return False
+
+
+def earliest_photo_month(user_id):
+    dates = []
+
+    user_full = get_user_full(user_id)
+    photo = getattr(user_full, "profile_photo", None) if user_full is not None else None
+    date = int(getattr(photo, "date", 0) or 0) if photo is not None else 0
+    if date > 0:
+        dates.append(date)
+
+    try:
+        dialog_photos = get_messages_controller().getDialogPhotos(int(user_id))
+        for item in java_list(getattr(dialog_photos, "photos", None)):
+            date = int(getattr(item, "date", 0) or 0)
+            if date > 0:
+                dates.append(date)
+    except Exception as error:
+        debug_log(f"getDialogPhotos failed: {error}")
+
+    if not dates:
+        return ""
+    dt = datetime.fromtimestamp(min(dates))
+    return f"{dt.month:02d}.{dt.year}"
+
+
+def clean_username(value):
+    value = str(value or "").strip().lstrip("@")
+    if not value:
+        return ""
+
+    username = ""
+    for char in value:
+        if not (char.isalnum() or char == "_"):
+            break
+        username += char
+
+    if len(username) < 3 or not any(char.isalpha() for char in username):
+        return ""
+    if username.lower() in RESERVED_USERNAMES:
+        return ""
+    return username
+
+
+def mention_from_text(value):
+    text = str(value or "")
+    match = USERNAME_URL_RE.search(text)
+    if match:
+        username = clean_username(match.group(1))
+        if username:
+            return username
+    match = MENTION_RE.search(text)
+    return clean_username(match.group(1)) if match else ""
+
+
+def mention_from_entities(entities):
+    for entity in java_list(entities):
+        match = PROFILE_URL_RE.match(str(getattr(entity, "url", "") or "").strip())
+        if not match:
+            continue
+        username = clean_username(match.group(1))
+        if username and username.lower() != INLINE_BOT.lower():
+            return username
+    return ""
+
+
+def username_from_text(value):
+    username = mention_from_text(value)
+    if username:
+        return username
+    text = str(value or "").strip()
+    if text and not any(char in text for char in " /:@"):
+        return clean_username(text)
+    return ""
+
+
+def labeled_value(text, labels):
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"^[^\w@]+", "", raw_line.strip(), flags=re.UNICODE)
+        lower = line.lower()
+        for label in labels:
+            if not lower.startswith(label):
+                continue
+            parts = re.split(r"\s*[:\-]\s*", line, maxsplit=1)
+            value = parts[1].strip() if len(parts) == 2 else line[len(label):].strip(" :\t")
+            value = value.strip("`*_[]() ")
+            if value:
+                return value
+    return ""
+
+
+def month_year_from_text(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    candidates = []
+    full_date = re.search(r"\b(?:0?[1-9]|[12]\d|3[01])\.(0?[1-9]|1[0-2])\.(20\d{2})\b", text)
+    if full_date:
+        candidates.append((full_date.start(), f"{int(full_date.group(1)):02d}.{full_date.group(2)}"))
+
+    short_date = re.search(r"(?<!\d\.)\b(0?[1-9]|1[0-2])\.(20\d{2})\b", text)
+    if short_date:
+        candidates.append((short_date.start(), f"{int(short_date.group(1)):02d}.{short_date.group(2)}"))
+
+    month_name = re.search(r"([A-Za-zА-Яа-яЁё]+)\s+(20\d{2})", text)
+    if month_name:
+        month = MONTHS_BY_NAME.get(month_name.group(1).lower())
+        if month:
+            candidates.append((month_name.start(), f"{month:02d}.{month_name.group(2)}"))
+
+    return min(candidates)[1] if candidates else ""
+
+
+def creation_date_from_text(text):
+    text = str(text or "")
+    value = month_year_from_text(
+        labeled_value(text, ("регистрация", "дата регистрации", "registration", "creation date", "date created"))
+    )
+    if value:
+        return value
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"^[^\w@]+", "", raw_line.strip(), flags=re.UNICODE)
+        if not line:
+            continue
+        if line.lower().startswith(("появление", "appearance", "last seen", "был")):
+            continue
+        value = month_year_from_text(line)
+        if value:
+            return value
+    return ""
+
+
+def accuracy_percent_from_text(text):
+    match = re.search(r"(\d{1,3})\s*%", str(text or ""))
+    if not match:
+        return 0
+    return max(0, min(100, int(match.group(1))))
+
+
+def sanitize_accuracy_text(text):
+    value = re.sub(r"\(\s*\d{1,3}\s*%\s*\)", "", str(text or ""))
+    value = re.sub(r"\(\s*$", "", value)
+    return re.sub(r"\s+", " ", value).strip(" -:|()[]{}.,")
+
+
+def accuracy_text_from_text(text, percent=0):
+    value = sanitize_accuracy_text(re.sub(r"\b\d{1,3}\s*%", "", labeled_value(text, ("точность", "accuracy"))))
+    if value:
+        return value
+
+    source = str(text or "").lower()
+    for markers, label in (
+        (("very high", "очень высок"), localize("Очень высокая", "Very high")),
+        (("high", "высок"), localize("Высокая", "High")),
+        (("medium", "средн"), localize("Средняя", "Medium")),
+        (("low", "низк"), localize("Низкая", "Low")),
+    ):
+        if any(marker in source for marker in markers):
+            return label
+    return accuracy_label(percent)
+
+
+def account_name_from_text(text, title="", username=""):
+    value = TRAILING_MENTION_RE.sub("", labeled_value(text, ("имя", "account name", "name")))
+    if value:
+        return value
+
+    cleaned_title = str(title or "").strip().strip("`*_[]() ")
+    username = str(username or "").lower()
+    if cleaned_title and cleaned_title.lower() not in {username, f"@{username}"}:
+        return cleaned_title
+    return ""
+
+
+def parse_report(message, query, resolved, entities=None, title="", description="", url=""):
+    message = str(message or "").strip()
+    title = str(title or "").strip()
+    description = str(description or "").strip()
+    url = str(url or "").strip()
+
+    combined = "\n".join(part for part in (title, description, message, url) if part)
+    creation_date = creation_date_from_text(combined)
+    if not creation_date:
+        return {}, 0
+
+    result_username = ""
+    for candidate in (mention_from_text(url), mention_from_text(message), mention_from_entities(entities),
+                      mention_from_text(description), mention_from_text(title)):
+        if candidate and candidate.lower() != INLINE_BOT.lower():
+            result_username = candidate
+            break
+
+    result_id = labeled_value(combined, ("id", "user id"))
+    if not result_id.isdigit():
+        result_id = ""
+
+    query_text = str(query or "").strip()
+    target_id = str(resolved.get("user_id", "") or "").strip()
+    target_username = clean_username(resolved.get("username"))
+
+    percent = accuracy_percent_from_text(combined) or 80
+    username = result_username or target_username
+    data = {
+        "user_id": result_id or target_id or (query_text if query_text.isdigit() else ""),
+        "username": username,
+        "creation_date": creation_date,
+        "accuracy_percent": percent,
+        "accuracy_text": accuracy_text_from_text(combined, percent),
+        "account_name": account_name_from_text(combined, title=title, username=username),
+    }
+
+    score = 100
+    combined_lower = combined.lower()
+    if target_id and result_id == target_id:
+        score += 180
+    elif target_id and target_id in combined_lower:
+        score += 90
+    if target_username and result_username.lower() == target_username.lower():
+        score += 140
+    if query_text and query_text.lower() in combined_lower:
+        score += 40
+    return data, score
+
+
+def parse_inline_result(result, query, resolved):
+    inline_message = getattr(result, "send_message", None)
+    return parse_report(
+        getattr(inline_message, "message", "") if inline_message is not None else "",
+        query,
+        resolved,
+        entities=getattr(inline_message, "entities", None) if inline_message is not None else None,
+        title=getattr(result, "title", ""),
+        description=getattr(result, "description", ""),
+        url=getattr(result, "url", ""),
+    )
+
+
+def sent_message_id(updates):
+    direct_id = int(getattr(updates, "id", 0) or 0)
+    if direct_id > 0:
+        return direct_id
+    for update in java_list(getattr(updates, "updates", None)):
+        message = getattr(update, "message", None)
+        message_id = int(getattr(message, "id", 0) or 0) if message is not None else 0
+        if message_id > 0:
+            return message_id
+    return 0
+
+
+class CacheStore:
+    def __init__(self):
+        cache_dir = os.path.join(get_plugins_dir(), "cache")
+        ensure_dir_exists(cache_dir)
+        self.path = os.path.join(cache_dir, f"{__id__}_cache.json")
+        self._lock = threading.RLock()
+        self.data = self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return {}
+            return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        except Exception:
+            return {}
+
+    def _save_locked(self):
+        temp_path = self.path + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(self.data, handle, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.path)
+        except Exception as error:
+            debug_log(f"Failed to save cache: {error}")
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    def _delete_keys_locked(self, keys):
+        removed = sum(1 for key in keys if self.data.pop(key, None) is not None)
+        if removed:
+            self._save_locked()
+        return removed
+
+    def get(self, user_id, method, ttl):
+        if ttl <= 0 or not user_id:
+            return None
+        cache_key = f"{user_id}:{method}"
+        with self._lock:
+            entry = self.data.get(cache_key)
+            if not isinstance(entry, dict):
+                return None
+            if time.time() - int(entry.get("timestamp", 0) or 0) >= ttl:
+                self._delete_keys_locked([cache_key])
+                return None
+            return copy.deepcopy(entry.get("data"))
+
+    def set(self, user_id, method, value, meta=None):
+        if not user_id:
+            return
+        with self._lock:
+            self.data[f"{user_id}:{method}"] = {
+                "timestamp": int(time.time()),
+                "data": copy.deepcopy(value),
+                "meta": copy.deepcopy(meta or {}),
+            }
+            self._save_locked()
+
+    def delete_user(self, user_id):
+        prefix = f"{user_id}:"
+        with self._lock:
+            return self._delete_keys_locked([key for key in list(self.data) if key.startswith(prefix)])
+
+    def delete_entry(self, user_id, method):
+        with self._lock:
+            return self._delete_keys_locked([f"{user_id}:{method}"])
+
+    def prune(self, ttl):
+        with self._lock:
+            if ttl <= 0:
+                removed = len(self.data)
+                self.data = {}
+                self._save_locked()
+                return removed
+
+            now = time.time()
+            expired = [
+                key
+                for key, entry in self.data.items()
+                if now - int(entry.get("timestamp", 0) or 0) >= ttl
+            ]
+            return self._delete_keys_locked(expired)
+
+    def clear(self):
+        with self._lock:
+            self.data = {}
+            self._save_locked()
+
+    def entries(self, ttl):
+        with self._lock:
+            snapshot = copy.deepcopy(self.data)
+
+        now = time.time()
+        result = []
+        for key, entry in snapshot.items():
+            user_id, _, method = key.partition(":")
+            if not method:
+                continue
+
+            timestamp = int(entry.get("timestamp", 0) or 0)
+            remaining = max(0, int(ttl - (now - timestamp))) if ttl > 0 else 0
+            result.append(
+                {
+                    "user_id": user_id,
+                    "method": method,
+                    "timestamp": timestamp,
+                    "remaining": remaining,
+                    "expired": ttl <= 0 or remaining <= 0,
+                    "data": entry.get("data") or {},
+                    "meta": entry.get("meta") or {},
+                }
+            )
+        result.sort(key=lambda item: item["timestamp"], reverse=True)
+        return result
+
+    def stats(self, ttl):
+        entries = self.entries(ttl)
+        methods = [str(item["method"]).lower() for item in entries]
+        try:
+            size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        except OSError:
+            size = 0
+        return {
+            "total": len(entries),
+            "unique_users": len({item["user_id"] for item in entries}),
+            "expired": sum(1 for item in entries if item["expired"]),
+            "active": sum(1 for item in entries if not item["expired"]),
+            "fast": methods.count("fast"),
+            "smart": methods.count("smart"),
+            "inline": methods.count(INLINE_METHOD),
+            "size": format_size(size),
+        }
+
+
+class DateRegApi:
+    def __init__(self, token, base_url=""):
+        self.token = str(token or "").strip()
+        self.base_url = (str(base_url or "").strip() or API_URL).rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": f"ExteraGram/{__id__}/{__version__}"})
+
+    def _request(self, path, **params):
+        try:
+            response = self.session.get(
+                f"{self.base_url}{path}",
+                params={"token": self.token, **params},
+                timeout=API_TIMEOUT,
+            )
+        except requests.RequestException as error:
+            return {"ok": False, "error": str(error), "data": {}}
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if response.status_code == 200:
+            return {"ok": True, "error": "", "data": payload}
+
+        messages = {
+            401: localize("Неверный API-ключ.", "Invalid API key."),
+            402: localize("Недостаточно баланса.", "Insufficient balance."),
+            404: localize("Пользователь не найден.", "User not found."),
+        }
+        message = messages.get(response.status_code) or (
+            payload.get("detail") or payload.get("error") or f"HTTP {response.status_code}"
+        )
+        return {"ok": False, "error": str(message), "data": payload}
+
+    def resolve_username(self, username):
+        username = clean_username(username)
+        if not username:
+            return {"ok": False, "error": localize("Юзернейм пуст.", "Username is empty."), "data": {}}
+
+        result = self._request("/users/resolveUsername", username=username)
+        if result["ok"] and result["data"].get("id"):
+            return result
+        error = result["error"] or localize("Не удалось разрешить юзернейм.", "Failed to resolve username.")
+        return {"ok": False, "error": error, "data": result["data"]}
+
+    def get_info(self, user_id, method):
+        path = "/users/getCreationDateSmart" if method == "smart" else "/users/getCreationDateFast"
+        result = self._request(path, user_id=str(user_id))
+        if result["ok"] and result["data"].get("creation_date"):
+            return result
+        error = (
+            result["error"]
+            or result["data"].get("error")
+            or localize("Дата регистрации не найдена.", "Creation date was not found.")
+        )
+        return {"ok": False, "error": str(error), "data": result["data"]}
+
+
+class AccountAgePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.api = None
+        self.cache = CacheStore()
+        self.loading_dialog = None
+        self.drawer_settings_item = None
+        self.chat_settings_item = None
+        self.profile_menu_item = None
+        self.inline_bot_user_id = 0
+        self._busy_lock = threading.Lock()
+        self._busy = False
+        self._active = False
+
+    def on_plugin_load(self):
+        self._active = True
+        self._migrate_settings()
+        self.load_config()
+        self.add_on_send_message_hook()
+        self.cache.prune(self._cache_ttl())
+        if self.get_setting("show_settings_buttons", True):
+            self._add_settings_buttons()
+        self._add_profile_button()
+        debug_log("Plugin loaded")
+
+    def on_plugin_unload(self):
+        self._active = False
+        for attr in ("drawer_settings_item", "chat_settings_item", "profile_menu_item"):
+            item = getattr(self, attr)
+            if item:
+                try:
+                    self.remove_menu_item(item)
+                except Exception as error:
+                    debug_log(f"Failed to remove {attr}: {error}")
+            setattr(self, attr, None)
+        self._dismiss_loading()
+        debug_log("Plugin unloaded")
+
+    def load_config(self, _=None):
+        global DEBUG
+        DEBUG = bool(self.get_setting("debug_mode", False))
+        token = str(self.get_setting("api_key", "") or "").strip()
+        base_url = str(self.get_setting("custom_api_url", "") or "").strip()
+        self.api = DateRegApi(token, base_url) if token else None
+
+    def _migrate_settings(self):
+        if self.get_setting("cache_ttl_preset", None) is not None:
+            return
+
+        legacy = self.get_setting("cache_duration", None)
+        if legacy is None:
+            self.set_setting("cache_ttl_preset", CACHE_DEFAULT_INDEX)
+            return
+
+        try:
+            ttl = max(0, int(str(legacy).strip()))
+        except Exception:
+            ttl = CACHE_TTL
+
+        if ttl in CACHE_PRESETS:
+            self.set_setting("cache_ttl_preset", CACHE_PRESETS.index(ttl))
+        else:
+            self.set_setting("cache_ttl_preset", CACHE_CUSTOM_INDEX)
+            self.set_setting("cache_ttl_custom", str(ttl))
+
+    def create_settings(self):
+        return [
+            Header(text=localize("Разделы", "Sections")),
+            Text(
+                text=localize("Режим поиска", "Lookup mode"),
+                subtext=self._settings_mode_summary(),
+                icon="msg_calendar_solar",
+                accent=True,
+                create_sub_fragment=self._create_lookup_settings,
+            ),
+            Text(
+                text="API",
+                subtext=self._settings_api_summary(),
+                icon="msg_pin_code",
+                accent=True,
+                create_sub_fragment=self._create_api_settings,
+            ),
+            Text(
+                text=localize("Кеш", "Cache"),
+                subtext=self._settings_cache_summary(),
+                icon="files_storage",
+                accent=True,
+                create_sub_fragment=self._create_cache_settings,
+            ),
+            Text(
+                text=localize("Интерфейс", "Interface"),
+                subtext=self._settings_interface_summary(),
+                icon="msg_settings",
+                accent=True,
+                create_sub_fragment=self._create_interface_settings,
+            ),
+            Text(
+                text=localize("Справка по командам", "Command help"),
+                icon="msg_info",
+                on_click=lambda _: self._show_faq_sheet(),
+            ),
+        ]
+
+    def _settings_mode_summary(self):
+        if self.get_setting("free_mode", True):
+            return localize("Inline-бот и локальные данные", "Inline bot and local data")
+        if self.api is None:
+            return localize("Нужен API-ключ", "API key required")
+        return localize("API fast/smart", "API fast/smart")
+
+    def _settings_api_summary(self):
+        endpoint = str(self.get_setting("custom_api_url", "") or "").strip() or API_URL
+        endpoint = re.sub(r"^https?://", "", endpoint).rstrip("/")
+        status = localize("ключ задан", "key set") if self.api is not None else localize("ключ не задан", "key missing")
+        return f"{status} · {endpoint}"
+
+    def _settings_cache_summary(self):
+        ttl = self._cache_ttl()
+        stats = self.cache.stats(ttl)
+        return localize(
+            f"{describe_cache_ttl(ttl)} · {stats['unique_users']} польз. · {stats['total']} записей",
+            f"{describe_cache_ttl(ttl)} · {stats['unique_users']} users · {stats['total']} entries",
+        )
+
+    def _settings_interface_summary(self):
+        menu = (
+            localize("кнопки в меню", "menu buttons")
+            if self.get_setting("show_settings_buttons", True)
+            else localize("кнопки скрыты", "buttons hidden")
+        )
+        logs = (
+            localize("логи вкл.", "logs on")
+            if self.get_setting("debug_mode", False)
+            else localize("логи выкл.", "logs off")
+        )
+        return f"{menu} · {logs}"
+
+    def _create_lookup_settings(self):
+        return [
+            Header(text=localize("Режим поиска", "Lookup mode")),
+            Switch(
+                key="free_mode",
+                text=localize("Использовать free mode", "Use free mode"),
+                subtext=localize(
+                    f"команда .age спрашивает @{INLINE_BOT} через inline вместо платного API",
+                    f".age queries @{INLINE_BOT} inline instead of the paid API",
+                ),
+                default=True,
+                on_change=self.load_config,
+                icon="msg_calendar_solar",
+            ),
+            Divider(),
+            Header(text=localize("Ответ", "Reply")),
+            Switch(
+                key="show_nft_usernames",
+                text=localize("Показывать NFT-юзернеймы", "Show NFT usernames"),
+                subtext=localize(
+                    "добавляет коллекционные юзернеймы из Fragment, если они есть",
+                    "adds collectible usernames from Fragment if available",
+                ),
+                default=True,
+                icon="menu_feature_premium",
+            ),
+            Switch(
+                key="use_collapsible_quote",
+                text=localize("Сворачивать ответ", "Use collapsible quote"),
+                subtext=localize(
+                    "отправляет результат как сворачиваемую цитату",
+                    "sends the result as a collapsible quote",
+                ),
+                default=True,
+                icon="menu_quote_solar",
+            ),
+            Switch(
+                key="use_premium_emoji",
+                text=localize("Премиум-эмодзи", "Premium emoji"),
+                subtext=localize(
+                    "заменяет обычные эмодзи в ответах на премиум",
+                    "replaces regular emojis in responses with premium ones",
+                ),
+                default=False,
+                icon="menu_feature_reactions_remix",
+            ),
+        ]
+
+    def _create_api_settings(self):
+        return [
+            Header(text="API"),
+            Input(
+                key="api_key",
+                text=localize("API-ключ", "API key"),
+                subtext=localize(
+                    "Нужен для fast/smart режима, когда free mode выключен.",
+                    "Required for fast/smart mode when free mode is disabled.",
+                ),
+                default="",
+                on_change=self.load_config,
+                icon="msg_pin_code",
+            ),
+            Input(
+                key="custom_api_url",
+                text=localize("Свой URL API", "Custom API URL"),
+                subtext=localize(
+                    "Оставьте пустым, чтобы использовать datereg.pro.",
+                    "Leave empty to use datereg.pro.",
+                ),
+                default="",
+                on_change=self.load_config,
+                icon="msg_link",
+            ),
+        ]
+
+    def _create_cache_settings(self):
+        stats = self.cache.stats(self._cache_ttl())
+        return [
+            Header(text=localize("Кеш", "Cache")),
+            Selector(
+                key="cache_ttl_preset",
+                text=localize("Время хранения", "Cache lifetime"),
+                default=CACHE_DEFAULT_INDEX,
+                items=[describe_cache_ttl(value) for value in CACHE_PRESETS]
+                + [localize("Свой интервал", "Custom")],
+                icon="msg_stories_timer",
+                on_change=self._on_cache_ttl_preset_change,
+            ),
+            Input(
+                key="cache_ttl_custom",
+                text=localize("Свой интервал", "Custom interval"),
+                subtext=localize(
+                    "Применяется, только когда выше выбран «Свой интервал». Значение в секундах, 0 выключает кеш.",
+                    "Used only when «Custom» is selected above. Value is in seconds, 0 disables caching.",
+                ),
+                default=str(CACHE_TTL),
+                icon="msg_stories_timer",
+                on_change=self._on_cache_ttl_custom_change,
+            ),
+            Divider(),
+            Text(
+                text=localize("Содержимое", "Contents"),
+                subtext=localize(
+                    f"{stats['unique_users']} пользователей · {stats['total']} записей · {stats['size']}",
+                    f"{stats['unique_users']} users · {stats['total']} entries · {stats['size']}",
+                ),
+                icon="files_storage",
+                on_click=lambda _: self._show_cache_stats_dialog(),
+            ),
+            Text(
+                text=localize("Пользователи", "Users"),
+                subtext=self._cache_users_summary(stats),
+                icon="msg_contacts",
+                on_click=lambda _: self._show_cache_users_dialog(),
+            ),
+            Divider(),
+            Text(
+                text=localize("Удалить просроченное", "Prune expired"),
+                subtext=(
+                    localize("Сейчас удалять нечего", "Nothing to remove right now")
+                    if stats["expired"] <= 0
+                    else localize(
+                        f"{stats['expired']} просроченных записей",
+                        f"{stats['expired']} expired entries",
+                    )
+                ),
+                icon="msg_clearcache",
+                on_click=lambda _: self._confirm_prune_cache(),
+            ),
+            Text(
+                text=localize("Очистить весь кеш", "Clear all cache"),
+                subtext=(
+                    localize("Кеш уже пуст", "Cache is already empty")
+                    if stats["total"] <= 0
+                    else localize(
+                        f"{stats['total']} записей · {stats['size']}",
+                        f"{stats['total']} entries · {stats['size']}",
+                    )
+                ),
+                icon="msg_delete",
+                red=True,
+                on_click=lambda _: self._confirm_clear_cache(),
+            ),
+        ]
+
+    def _cache_users_summary(self, stats):
+        if stats["unique_users"] <= 0:
+            return localize("Кеш пуст", "Cache is empty")
+        if stats["expired"] > 0:
+            return localize(
+                f"{stats['unique_users']} пользователей · {stats['expired']} просроченных записей",
+                f"{stats['unique_users']} users · {stats['expired']} expired entries",
+            )
+        return localize(
+            f"{stats['unique_users']} пользователей в кеше",
+            f"{stats['unique_users']} users cached",
+        )
+
+    def _create_interface_settings(self):
+        return [
+            Header(text=localize("Интерфейс", "Interface")),
+            Switch(
+                key="show_settings_buttons",
+                text=localize("Кнопка настроек в меню", "Settings button in menu"),
+                subtext=localize(
+                    "Добавляет быстрый переход к настройкам плагина в drawer и меню чата.",
+                    "Adds a quick link to plugin settings in the drawer and chat menu.",
+                ),
+                default=True,
+                on_change=self._toggle_settings_buttons,
+                icon="filled_add_sticker",
+            ),
+            Switch(
+                key="debug_mode",
+                text=localize("Подробные логи", "Verbose logs"),
+                subtext=localize(
+                    "Пишет внутренние сообщения в лог exteraGram.",
+                    "Writes internal messages to the exteraGram log.",
+                ),
+                default=False,
+                on_change=self.load_config,
+                icon="msg_log",
+            ),
+        ]
+
+    def _cache_ttl(self):
+        try:
+            index = int(self.get_setting("cache_ttl_preset", CACHE_DEFAULT_INDEX))
+        except Exception:
+            index = CACHE_DEFAULT_INDEX
+        if 0 <= index < len(CACHE_PRESETS):
+            return CACHE_PRESETS[index]
+        try:
+            return max(0, int(str(self.get_setting("cache_ttl_custom", CACHE_TTL)).strip()))
+        except Exception:
+            return CACHE_TTL
+
+    def _on_cache_ttl_preset_change(self, index):
+        try:
+            index = int(index)
+        except Exception:
+            return
+        if not 0 <= index < len(CACHE_PRESETS):
+            BulletinHelper.show_info(
+                localize(
+                    "Задайте свой интервал в секундах в поле ниже.",
+                    "Set a custom interval in seconds in the field below.",
+                )
+            )
+            return
+        BulletinHelper.show_success(
+            localize(
+                f"Время хранения: {describe_cache_ttl(CACHE_PRESETS[index])}.",
+                f"Cache lifetime: {describe_cache_ttl(CACHE_PRESETS[index])}.",
+            )
+        )
+
+    def _on_cache_ttl_custom_change(self, value):
+        try:
+            ttl = max(0, int(str(value).strip()))
+        except Exception:
+            BulletinHelper.show_error(
+                localize("Нужно целое число секунд.", "An integer number of seconds is required.")
+            )
+            return
+        self.set_setting("cache_ttl_preset", CACHE_CUSTOM_INDEX)
+        BulletinHelper.show_success(
+            localize(f"Время хранения: {describe_cache_ttl(ttl)}.", f"Cache lifetime: {describe_cache_ttl(ttl)}.")
+        )
+
+    def on_send_message_hook(self, account, params):
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        match = COMMAND_RE.match(message.strip())
+        if match is None:
+            return HookResult()
+
+        command = match.group(1).lower()
+        argument = (match.group(2) or "").strip()
+
+        if command == "cache":
+            self._handle_cache_command(argument)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        reply_target = ReplyTarget(
+            int(getattr(params, "peer", 0) or 0),
+            getattr(params, "replyToMsg", None),
+            getattr(params, "replyToTopMsg", None),
+        )
+        try:
+            self._handle_age_command(reply_target, argument)
+        except Exception as error:
+            self._set_busy(False)
+            self._dismiss_loading()
+            debug_log(f"Hook error: {traceback.format_exc()}")
+            self._reply(reply_target, self._error_text(str(error)))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _handle_age_command(self, reply_target, argument):
+        if argument.lower() == "faq":
+            self._show_faq_sheet()
+            return
+
+        lowered = argument.lower()
+        smart = lowered == "smart" or lowered.startswith("smart ")
+        if smart:
+            argument = argument[len("smart"):].strip()
+
+        target = argument or self._reply_user_id(reply_target)
+        if not target:
+            self._reply(reply_target, self._usage_text())
+            return
+
+        free_mode = bool(self.get_setting("free_mode", True))
+        if not free_mode and self.api is None:
+            self._reply(
+                reply_target,
+                self._error_text(
+                    localize("Укажите API-ключ в настройках.", "Set the API key in settings."),
+                    localize("Ошибка API", "API error"),
+                ),
+            )
+            return
+
+        if not self._set_busy(True):
+            BulletinHelper.show_info(localize("Запрос уже выполняется.", "A request is already running."))
+            return
+
+        self._show_loading()
+        if free_mode:
+            run_on_queue(lambda: self._process_free_request(reply_target, target))
+        else:
+            run_on_queue(lambda: self._process_api_request(reply_target, target, "smart" if smart else "fast"))
+
+    def _handle_cache_command(self, argument):
+        if not argument:
+            self._show_cache_stats_dialog()
+            return
+
+        removed = self.cache.delete_user(argument)
+        if removed:
+            BulletinHelper.show_success(localize(f"Удалено записей: {removed}.", f"Removed entries: {removed}."))
+        else:
+            BulletinHelper.show_info(
+                localize("Записей для этого ID не найдено.", "No entries were found for this ID.")
+            )
+
+    def _reply_user_id(self, reply_target):
+        reply_to = reply_target.reply_to_msg
+        owner = getattr(reply_to, "messageOwner", None) if reply_to is not None else None
+        from_id = getattr(owner, "from_id", None) if owner is not None else None
+        user_id = int(getattr(from_id, "user_id", 0) or 0) if from_id is not None else 0
+        return str(user_id) if user_id > 0 else ""
+
+    def _set_busy(self, value):
+        with self._busy_lock:
+            if value and self._busy:
+                return False
+            self._busy = value
+            return True
+
+    def _process_free_request(self, reply_target, target):
+        try:
+            report = self._free_lookup(target)
+            self._reply(reply_target, report)
+        except Exception as error:
+            debug_log(f"Free mode error: {traceback.format_exc()}")
+            self._reply(reply_target, self._error_text(str(error)))
+        finally:
+            self._set_busy(False)
+            self._dismiss_loading()
+
+    def _free_lookup(self, target):
+        resolved = self._resolve_free_target(target)
+        user_id = str(resolved.get("user_id", "") or "")
+        ttl = self._cache_ttl()
+
+        cached = self.cache.get(user_id, INLINE_METHOD, ttl) if user_id else None
+        from_cache = isinstance(cached, dict) and bool(str(cached.get("creation_date", "") or "").strip())
+
+        if from_cache:
+            data, error = dict(cached), ""
+        else:
+            data, error = self._lookup_inline(target, resolved)
+            error = error or str(resolved.get("error", "") or "")
+
+        if not user_id:
+            user_id = str(data.get("user_id", "") or "")
+        if user_id:
+            data.setdefault("user_id", user_id)
+        if resolved.get("username"):
+            data.setdefault("username", resolved["username"])
+
+        if not from_cache and user_id and data.get("creation_date"):
+            self.cache.set(user_id, INLINE_METHOD, data, meta=self._cache_meta(user_id, data, resolved.get("username")))
+
+        if not data.get("creation_date") and user_id:
+            data["not_later_than"] = earliest_photo_month(user_id)
+
+        if not user_id and not data.get("creation_date"):
+            return self._error_text(error or self._free_lookup_hint(target))
+
+        return self._build_report(
+            user_id=user_id,
+            data=data,
+            method=localize("Inline", "Inline") if data.get("creation_date") else "",
+            free_badge=True,
+            from_cache=from_cache,
+            note=error if not data.get("creation_date") else "",
+        )
+
+    def _process_api_request(self, params, target, method):
+        try:
+            api_error_title = localize("Ошибка API", "API error")
+            resolved = self._resolve_api_target(target)
+            if not resolved["ok"]:
+                self._reply(params, self._error_text(resolved["error"], api_error_title))
+                return
+
+            user_id = resolved["user_id"]
+            cached = self.cache.get(user_id, method, self._cache_ttl())
+            if cached is None:
+                result = self.api.get_info(user_id, method)
+                if not result["ok"]:
+                    self._reply(params, self._error_text(result["error"], api_error_title))
+                    return
+                cached = result["data"]
+                self.cache.set(user_id, method, cached, meta=self._cache_meta(user_id, cached))
+                from_cache = False
+            else:
+                from_cache = True
+
+            self._reply(
+                params,
+                self._build_report(user_id=user_id, data=cached, method=method, from_cache=from_cache),
+            )
+        except Exception as error:
+            debug_log(f"API mode error: {traceback.format_exc()}")
+            self._reply(params, self._error_text(str(error)))
+        finally:
+            self._set_busy(False)
+            self._dismiss_loading()
+
+    def _resolve_api_target(self, target):
+        target = str(target or "").strip()
+        if target.isdigit():
+            return {"ok": True, "user_id": target, "error": ""}
+
+        username = username_from_text(target) or clean_username(target)
+        if not username:
+            return {
+                "ok": False,
+                "user_id": "",
+                "error": localize("Некорректный ID или юзернейм.", "Invalid ID or username."),
+            }
+
+        result = self.api.resolve_username(username)
+        if not result["ok"]:
+            return {"ok": False, "user_id": "", "error": result["error"]}
+        return {"ok": True, "user_id": str(result["data"]["id"]), "error": ""}
+
+    def _send_sync(self, request, timeout_seconds=INLINE_TIMEOUT):
+        event = threading.Event()
+        holder = {"response": None, "error": None}
+
+        def on_result(response, error):
+            holder["response"] = response
+            holder["error"] = error
+            event.set()
+
+        proxy = RequestCallback(on_result)
+        token = self._dispatch_request(request, proxy)
+        if token is None:
+            return {"success": False, "response": None, "error": localize("Запрос не отправлен.", "Request was not sent.")}
+
+        if not event.wait(timeout_seconds):
+            self._cancel_request(token)
+            return {
+                "success": False,
+                "response": None,
+                "error": localize("Таймаут запроса.", "Request timeout."),
+            }
+
+        error = holder["error"]
+        if error is not None:
+            return {"success": False, "response": holder["response"], "error": self._error_message(error)}
+        return {"success": True, "response": holder["response"], "error": ""}
+
+    def _dispatch_request(self, request, proxy):
+        manager = get_connections_manager()
+        if manager is not None:
+            try:
+                return int(manager.sendRequest(request, proxy, ConnectionsManager.RequestFlagFailOnServerErrors))
+            except Exception as error:
+                debug_log(f"sendRequest with flags failed, falling back: {error}")
+        try:
+            return int(send_request(request, proxy))
+        except Exception as error:
+            debug_log(f"send_request failed: {error}")
+            return None
+
+    def _cancel_request(self, token):
+        manager = get_connections_manager()
+        if manager is None:
+            return
+        try:
+            manager.cancelRequest(int(token), False)
+        except Exception as error:
+            debug_log(f"cancelRequest failed: {error}")
+
+    def _error_message(self, error):
+        text = str(getattr(error, "text", "") or "").strip()
+        if not text:
+            text = str(error or "").strip()
+        return text or localize("Запрос не удался.", "Request failed.")
+
+    def _put_entities(self, response):
+        controller = get_messages_controller()
+        if controller is None or response is None:
+            return
+        for field, method in (("users", "putUsers"), ("chats", "putChats")):
+            value = getattr(response, field, None)
+            if value is None:
+                continue
+            try:
+                getattr(controller, method)(value, False)
+            except Exception as error:
+                debug_log(f"{method} failed: {error}")
+
+    def _resolve_username(self, username):
+        username = clean_username(username)
+        if not username:
+            return {"user_id": "", "username": "", "error": ""}
+
+        request = TLRPC.TL_contacts_resolveUsername()
+        request.flags = 0
+        request.username = username
+        result = self._send_sync(request)
+        if not result["success"]:
+            return {"user_id": "", "username": username, "error": result["error"]}
+
+        response = result["response"]
+        self._put_entities(response)
+        peer = getattr(response, "peer", None)
+        user_id = int(getattr(peer, "user_id", 0) or 0) if peer is not None else 0
+        if user_id <= 0:
+            return {
+                "user_id": "",
+                "username": username,
+                "error": localize(
+                    "Команда работает только с аккаунтами пользователей.",
+                    "This command only works with user accounts.",
+                ),
+            }
+        return {"user_id": str(user_id), "username": username, "error": ""}
+
+    def _resolve_free_target(self, target):
+        target = str(target or "").strip()
+        if not target:
+            return {"user_id": "", "username": "", "error": ""}
+        if target.isdigit():
+            return {"user_id": target, "username": "", "error": ""}
+
+        username = username_from_text(target) or clean_username(target)
+        if not username:
+            return {"user_id": "", "username": "", "error": ""}
+
+        controller = get_messages_controller()
+        if controller is not None:
+            try:
+                cached_user = controller.getUser(username)
+            except Exception:
+                cached_user = None
+            user_id = int(getattr(cached_user, "id", 0) or 0) if cached_user is not None else 0
+            if user_id > 0:
+                return {"user_id": str(user_id), "username": username, "error": ""}
+
+        return self._resolve_username(username)
+
+    def _inline_bot(self):
+        controller = get_messages_controller()
+        if controller is None:
+            return None
+
+        if self.inline_bot_user_id > 0:
+            user = get_user(self.inline_bot_user_id)
+            if user is not None and getattr(user, "bot", False):
+                return user
+            self.inline_bot_user_id = 0
+
+        try:
+            cached = controller.getUser(INLINE_BOT)
+        except Exception:
+            cached = None
+        if cached is not None and getattr(cached, "bot", False):
+            self.inline_bot_user_id = int(getattr(cached, "id", 0) or 0)
+            return cached
+
+        request = TLRPC.TL_contacts_resolveUsername()
+        request.flags = 0
+        request.username = INLINE_BOT
+        result = self._send_sync(request)
+        if not result["success"]:
+            debug_log(f"Failed to resolve @{INLINE_BOT}: {result['error']}")
+            return None
+
+        response = result["response"]
+        self._put_entities(response)
+        peer = getattr(response, "peer", None)
+        bot_id = int(getattr(peer, "user_id", 0) or 0) if peer is not None else 0
+        for user in java_list(getattr(response, "users", None)):
+            if bot_id and int(getattr(user, "id", 0) or 0) != bot_id:
+                continue
+            self.inline_bot_user_id = int(getattr(user, "id", 0) or 0)
+            return user
+        return None
+
+    def _inline_results(self, query):
+        bot_user = self._inline_bot()
+        if bot_user is None:
+            return None, localize(
+                f"Не удалось найти бота @{INLINE_BOT}.",
+                f"Failed to resolve the @{INLINE_BOT} bot.",
+            )
+
+        controller = get_messages_controller()
+        try:
+            input_user = controller.getInputUser(bot_user) if controller is not None else None
+        except Exception as error:
+            debug_log(f"getInputUser failed: {error}")
+            input_user = None
+        if input_user is None:
+            return None, localize("Не удалось обратиться к боту.", "Failed to reach the bot.")
+
+        request = TLRPC.TL_messages_getInlineBotResults()
+        request.flags = 0
+        request.bot = input_user
+        request.peer = TLRPC.TL_inputPeerEmpty()
+        request.query = str(query or "")
+        request.offset = ""
+
+        result = self._send_sync(request)
+        if not result["success"]:
+            return None, result["error"]
+
+        self._put_entities(result["response"])
+        return result["response"], ""
+
+    def _inline_queries(self, initial_target, resolved):
+        queries = []
+        seen = set()
+
+        for value in (resolved.get("user_id"), resolved.get("username"), initial_target):
+            item = str(value or "").strip()
+            if not item:
+                continue
+            if not item.isdigit():
+                item = username_from_text(item) or clean_username(item)
+            if not item or item.lower() in seen:
+                continue
+            seen.add(item.lower())
+            queries.append(item)
+        return queries
+
+    def _lookup_inline(self, initial_target, resolved):
+        best_data, best_score = {}, 0
+        error = ""
+        probe_response, probe_query = None, ""
+
+        for query in self._inline_queries(initial_target, resolved):
+            response, request_error = self._inline_results(query)
+            if response is None:
+                debug_log(f"inline query {query!r} failed: {request_error!r}")
+                error = error or request_error
+                continue
+
+            results = java_list(getattr(response, "results", None))
+            if not results:
+                error = error or self._empty_results_error(response)
+                continue
+
+            for item in results:
+                data, score = parse_inline_result(item, query, resolved)
+                if not data:
+                    if probe_response is None:
+                        probe_response, probe_query = response, query
+                    continue
+                if score > best_score:
+                    best_data, best_score = data, score
+
+            if best_score >= STRONG_MATCH_SCORE or probe_response is not None:
+                break
+
+        if best_data:
+            return best_data, ""
+
+        if probe_response is not None:
+            return self._lookup_via_saved_messages(probe_response, probe_query, resolved)
+        return {}, error
+
+    def _lookup_via_saved_messages(self, response, query, resolved):
+        query_id = int(getattr(response, "query_id", 0) or 0)
+        results = java_list(getattr(response, "results", None))
+        result_id = str(getattr(results[0], "id", "") or "").strip() if results else ""
+        if not query_id or not result_id:
+            return {}, localize(
+                "Бот вернул результат без идентификатора.",
+                "The bot returned a result without an id.",
+            )
+
+        message_id = self._send_inline_result(query_id, result_id)
+        if not message_id:
+            return {}, localize(
+                "Не удалось отправить дозапрос в «Избранное».",
+                "Failed to send the probe to Saved Messages.",
+            )
+
+        debug_log(f"probe message sent: id={message_id}")
+        try:
+            return self._await_bot_reply(message_id, query, resolved)
+        finally:
+            self._delete_own_message(message_id)
+
+    def _send_inline_result(self, query_id, result_id):
+        request = TLRPC.TL_messages_sendInlineBotResult()
+        request.peer = TLRPC.TL_inputPeerSelf()
+        request.query_id = query_id
+        request.id = result_id
+        request.random_id = self._random_id()
+        request.silent = True
+
+        result = self._send_sync(request)
+        if not result["success"]:
+            debug_log(f"sendInlineBotResult failed: {result['error']}")
+            return 0
+        self._put_entities(result["response"])
+        return sent_message_id(result["response"])
+
+    def _random_id(self):
+        helper = get_send_messages_helper()
+        if helper is not None:
+            try:
+                return int(helper.getNextRandomId())
+            except Exception as error:
+                debug_log(f"getNextRandomId failed: {error}")
+        return random.SystemRandom().randint(-(2 ** 63), 2 ** 63 - 1)
+
+    def _await_bot_reply(self, message_id, query, resolved):
+        deadline = time.time() + SAVED_PROBE_TIMEOUT
+        last_text = ""
+        while True:
+            text, entities = self._fetch_own_message(message_id)
+            if text and text != last_text:
+                last_text = text
+                data, _score = parse_report(text, query, resolved, entities=entities)
+                if data:
+                    return data, ""
+            if time.time() >= deadline:
+                break
+            time.sleep(SAVED_PROBE_POLL)
+
+        debug_log(f"probe timed out, last text: {last_text[:200]!r}")
+        return {}, localize(
+            f"@{INLINE_BOT} не успел прислать данные.",
+            f"@{INLINE_BOT} did not deliver the data in time.",
+        )
+
+    def _fetch_own_message(self, message_id):
+        request = TLRPC.TL_messages_getMessages()
+        request.id.add(Integer(int(message_id)))
+
+        result = self._send_sync(request, timeout_seconds=SAVED_PROBE_TIMEOUT)
+        if not result["success"]:
+            debug_log(f"getMessages failed: {result['error']}")
+            return "", None
+
+        response = result["response"]
+        self._put_entities(response)
+        for message in java_list(getattr(response, "messages", None)):
+            if int(getattr(message, "id", 0) or 0) == int(message_id):
+                return str(getattr(message, "message", "") or ""), getattr(message, "entities", None)
+        return "", None
+
+    def _delete_own_message(self, message_id):
+        request = TLRPC.TL_messages_deleteMessages()
+        request.revoke = True
+        request.id.add(Integer(int(message_id)))
+
+        result = self._send_sync(request, timeout_seconds=COLLECTIBLE_TIMEOUT)
+        if result["success"]:
+            debug_log(f"probe message deleted: id={message_id}")
+        else:
+            debug_log(f"Failed to delete probe message {message_id}: {result['error']}")
+
+    def _empty_results_error(self, response):
+        if getattr(response, "switch_pm", None) is not None or getattr(response, "switch_webview", None) is not None:
+            return localize(
+                f"Откройте @{INLINE_BOT} и нажмите «Запустить», затем повторите команду.",
+                f"Open @{INLINE_BOT}, press Start and run the command again.",
+            )
+        return localize("Бот не вернул результатов.", "The bot returned no results.")
+
+    def _free_lookup_hint(self, target):
+        safe_target = str(target or "").replace("`", "").strip()
+        return localize(
+            f"Не удалось получить данные по «{safe_target}». Попробуйте точный ID, ответ на сообщение или API-режим.",
+            f"Failed to get data for «{safe_target}». Try an exact ID, a reply, or API mode.",
+        )
+
+    def _collect_context(self, user_id, data=None):
+        data = data if isinstance(data, dict) else {}
+        fallback_name = str(data.get("account_name", "") or "").strip()
+        fallback_username = str(data.get("username", "") or "").strip()
+
+        name = get_account_name(user_id) if user_id else ""
+        if not name or name == unknown_text():
+            name = fallback_name or unknown_text()
+
+        usernames = join_usernames(user_id) if user_id else ""
+        if not usernames and fallback_username:
+            usernames = self._normalize_usernames(fallback_username)
+
+        dc_id = get_dc_id(user_id) if user_id else 0
+        return {
+            "name": name,
+            "user_id": str(user_id or unknown_text()),
+            "usernames": usernames,
+            "birthday": get_birthday(user_id) if user_id else "",
+            "phone": get_phone(user_id) if user_id and not is_self_user(user_id) else "",
+            "dc": str(dc_id) if dc_id > 0 else unknown_text(),
+            "region": get_region(dc_id) if dc_id > 0 else unknown_text(),
+            "nft": get_nft_usernames(user_id) if user_id else [],
+        }
+
+    def _normalize_usernames(self, value):
+        parts = [clean_username(part) for part in str(value or "").split(",")]
+        return ", ".join(f"@{part}" for part in parts if part)
+
+    def _build_rows(self, context, data, method=""):
+        rows = [
+            make_row("👤", localize("Имя", "Name"), context["name"]),
+            make_row("🆔", "ID", context["user_id"]),
+            make_row("🖥", "DC", context["dc"]),
+            make_row("🌍", localize("Регион", "Region"), context["region"]),
+            make_row(
+                "🔗",
+                localize("Юзернейм", "Username"),
+                context["usernames"] or localize("отсутствует", "not available"),
+                mono=bool(context["usernames"]),
+            ),
+        ]
+        if context["phone"]:
+            rows.append(make_row("📱", localize("Телефон", "Phone"), context["phone"]))
+        if context["birthday"]:
+            rows.append(make_row("🎂", localize("День рождения", "Birthday"), context["birthday"]))
+
+        creation_date = str(data.get("creation_date", "") or "").strip()
+        if creation_date:
+            percent = int(data.get("accuracy_percent", 0) or 0)
+            accuracy = sanitize_accuracy_text(data.get("accuracy_text")) or accuracy_label(percent)
+            rows.append(make_row("📅", localize("Дата создания", "Creation date"), creation_date))
+            rows.append(make_row("⏳", localize("Возраст аккаунта", "Account age"), format_age(creation_date)))
+            rows.append(
+                make_row(
+                    "🎯",
+                    localize("Точность", "Accuracy"),
+                    accuracy,
+                    mono=False,
+                    value_emoji=accuracy_emoji(percent),
+                )
+            )
+            if method:
+                rows.append(make_row("⚙️", localize("Метод", "Method"), method.capitalize()))
+        elif data.get("not_later_than"):
+            rows.append(
+                make_row(
+                    "📅",
+                    localize("Создан не позже", "Created no later than"),
+                    data["not_later_than"],
+                )
+            )
+            rows.append(
+                make_row(
+                    "🎯",
+                    localize("Точность", "Accuracy"),
+                    localize("оценка по первому фото профиля", "estimated from the first profile photo"),
+                    mono=False,
+                    value_emoji="🔴",
+                )
+            )
+        return rows
+
+    def _build_report(self, user_id, data, method="", free_badge=False, from_cache=False, note=""):
+        data = data if isinstance(data, dict) else {}
+        context = self._collect_context(user_id, data)
+
+        title = localize("Информация об аккаунте", "Account information")
+        header = f"{self._emoji('📊')} <b>{esc(title)}</b>"
+        if free_badge:
+            header += f" ({self._emoji('🆓')})"
+
+        lines = [header]
+        if from_cache:
+            lines.append(f"<i>{esc(localize('Из кэша', 'From cache'))}</i>")
+        lines.append("")
+        lines.extend(self._render_row_html(row) for row in self._build_rows(context, data, method))
+
+        if note:
+            lines.append("")
+            lines.append(f"<i>{esc(note)}</i>")
+
+        nft_section = self._build_nft_section(context["nft"])
+        if nft_section:
+            lines.append("")
+            lines.extend(nft_section)
+        return "\n".join(lines)
+
+    def _render_row_html(self, row):
+        prefix = f"{self._emoji(row.emoji)} " if row.emoji else ""
+        value = f"<code>{esc(row.value)}</code>" if row.mono else esc(row.value)
+        if row.value_emoji:
+            value = f"{self._emoji(row.value_emoji)} {value}"
+        return f"{prefix}<b>{esc(row.label)}:</b> {value}"
+
+    def _build_nft_section(self, usernames):
+        if not usernames or not self.get_setting("show_nft_usernames", True):
+            return []
+
+        lines = [f"{self._emoji('💎')} <b>{esc(localize('NFT-юзернеймы', 'NFT usernames'))}</b>"]
+        for username in usernames[:COLLECTIBLE_LIMIT]:
+            info = self._collectible_info(username)
+            if info is None:
+                lines.append(f"• <code>@{esc(username)}</code>")
+                continue
+
+            pieces = [f"• <code>@{esc(username)}</code>", esc(format_date(info["purchase_date"]))]
+            for price in (self._format_price(info["amount"], info["currency"], 100, 2),
+                          self._format_price(info["crypto_amount"], info["crypto_currency"], 10 ** 9, 4)):
+                if price:
+                    pieces.append(esc(price))
+
+            line = " — ".join(pieces)
+            if info["url"]:
+                line += f' <a href="{esc(info["url"])}">Fragment</a>'
+            lines.append(line)
+        return lines
+
+    def _format_price(self, amount, currency, divisor, digits):
+        amount = int(amount or 0)
+        currency = str(currency or "").strip()
+        if not amount or not currency:
+            return ""
+        return f"{amount / divisor:.{digits}f} {currency}"
+
+    def _collectible_info(self, username):
+        request = TL_fragment.TL_getCollectibleInfo()
+        collectible = TL_fragment.TL_inputCollectibleUsername()
+        collectible.username = username
+        request.collectible = collectible
+
+        result = self._send_sync(request, timeout_seconds=COLLECTIBLE_TIMEOUT)
+        response = result["response"]
+        if not result["success"] or response is None:
+            return None
+        return {
+            "purchase_date": int(getattr(response, "purchase_date", 0) or 0),
+            "currency": str(getattr(response, "currency", "") or ""),
+            "amount": int(getattr(response, "amount", 0) or 0),
+            "crypto_currency": str(getattr(response, "crypto_currency", "") or ""),
+            "crypto_amount": int(getattr(response, "crypto_amount", 0) or 0),
+            "url": str(getattr(response, "url", "") or ""),
+        }
+
+    def _build_plain_report(self, user_id, data, method="", note=""):
+        data = data if isinstance(data, dict) else {}
+        context = self._collect_context(user_id, data)
+
+        lines = []
+        for row in self._build_rows(context, data, method):
+            value = f"{row.value_emoji} {row.value}" if row.value_emoji else row.value
+            lines.append(f"{row.label}: {value}")
+
+        nft = context["nft"]
+        if nft and self.get_setting("show_nft_usernames", True):
+            lines.append("")
+            lines.append(localize("NFT-юзернеймы:", "NFT usernames:"))
+            lines.extend(f"• @{username}" for username in nft)
+
+        if note:
+            lines.append("")
+            lines.append(note)
+        return "\n".join(lines)
+
+    def _reply(self, reply_target, text):
+        try:
+            parsed = parse_text(text, parse_mode="HTML")
+            message = str(parsed.get("message", "") or "")
+            entities = list(parsed.get("entities") or [])
+        except Exception as error:
+            debug_log(f"HTML parse failed: {error}")
+            message = html.unescape(re.sub(r"<[^>]+>", "", text))
+            entities = []
+
+        if self.get_setting("use_collapsible_quote", True):
+            quote = TLRPC.TL_messageEntityBlockquote()
+            quote.offset = 0
+            quote.length = len(message.encode("utf-16-le")) // 2
+            quote.collapsed = True
+            entities.insert(0, quote)
+
+        run_on_ui_thread(lambda: self._send(reply_target, message, entities))
+
+    def _send(self, reply_target, message, entities):
+        if not reply_target.peer:
+            debug_log("send skipped: peer is empty")
+            BulletinHelper.show_error(localize("Не удалось определить чат.", "Failed to resolve the chat."))
+            return
+
+        try:
+            self._send_direct(reply_target, message, entities)
+            return
+        except Exception as error:
+            debug_log(f"Direct send failed, falling back to SDK send_message: {error}")
+
+        payload = {
+            "peer": reply_target.peer,
+            "message": message,
+            "entities": entities or None,
+            "searchLinks": False,
+        }
+        if reply_target.reply_to_msg is not None:
+            payload["replyToMsg"] = reply_target.reply_to_msg
+        if reply_target.reply_to_top_msg is not None:
+            payload["replyToTopMsg"] = reply_target.reply_to_top_msg
+        try:
+            send_message(payload)
+        except Exception as error:
+            debug_log(f"Failed to send message: {error}")
+
+    def _send_direct(self, reply_target, message, entities):
+        helper = get_send_messages_helper()
+        if helper is None:
+            raise RuntimeError("SendMessagesHelper is unavailable")
+
+        send_params = SendMessagesHelper.SendMessageParams()
+        send_params.message = message
+        send_params.peer = int(reply_target.peer)
+        send_params.searchLinks = False
+        try:
+            set_java_boolean_field(send_params, "notify", True)
+        except Exception as error:
+            debug_log(f"Failed to set notify, message will be silent: {error}")
+        if entities:
+            java_entities = ArrayList()
+            for entity in entities:
+                java_entities.add(entity)
+            send_params.entities = java_entities
+        if reply_target.reply_to_msg is not None:
+            send_params.replyToMsg = reply_target.reply_to_msg
+        if reply_target.reply_to_top_msg is not None:
+            send_params.replyToTopMsg = reply_target.reply_to_top_msg
+        helper.sendMessage(send_params)
+
+    def _emoji(self, symbol):
+        document_id = PREMIUM_EMOJI.get(symbol) if self.get_setting("use_premium_emoji", False) else None
+        if document_id:
+            return f'<emoji id="{document_id}">{esc(symbol)}</emoji>'
+        return esc(symbol)
+
+    def _usage_text(self):
+        return (
+            f"{self._emoji('⚠️')} <b>{esc(localize('Использование', 'Usage'))}</b>\n"
+            "<code>.age [username/ID]</code>\n"
+            "<code>.age smart [username/ID]</code>\n"
+            + esc(
+                localize(
+                    "Можно отвечать на сообщение командой .age.",
+                    "You can also reply to a message with .age.",
+                )
+            )
+        )
+
+    def _error_text(self, message, title=None):
+        title = title or localize("Ошибка", "Error")
+        return f"{self._emoji('⚠️')} <b>{esc(title)}</b>\n\n{esc(str(message or '').strip())}"
+
+    def _cache_meta(self, user_id, data=None, fallback_username=""):
+        payload = data if isinstance(data, dict) else {}
+
+        display_name = get_account_name(user_id) if user_id else ""
+        if not display_name or display_name == unknown_text():
+            display_name = str(payload.get("account_name", "") or "").strip() or unknown_text()
+
+        usernames = join_usernames(user_id) if user_id else ""
+        if not usernames:
+            usernames = self._normalize_usernames(payload.get("username") or fallback_username)
+        return {"display_name": display_name, "username_text": usernames}
+
+    def _add_profile_button(self):
+        try:
+            self.profile_menu_item = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                    item_id="account_info_button",
+                    text=localize("Информация об аккаунте", "Account info"),
+                    icon="msg_info",
+                    on_click=self._handle_profile_click,
+                    condition="user != null",
+                )
+            )
+        except Exception as error:
+            debug_log(f"Failed to add profile menu item: {error}")
+
+    def _handle_profile_click(self, context):
+        user = context.get("user") if context else None
+        user_id = int(getattr(user, "id", 0) or 0) if user is not None else 0
+        if user_id <= 0:
+            BulletinHelper.show_error(localize("Пользователь не найден.", "User not found."))
+            return
+
+        if not self._set_busy(True):
+            BulletinHelper.show_info(localize("Запрос уже выполняется.", "A request is already running."))
+            return
+
+        self._show_loading()
+        run_on_queue(lambda: self._process_profile_request(str(user_id)))
+
+    def _process_profile_request(self, user_id):
+        title = localize("Информация об аккаунте", "Account information")
+        try:
+            if self.get_setting("free_mode", True) or self.api is None:
+                data, method, note = self._profile_free_data(user_id)
+            else:
+                data, method, note = self._profile_api_data(user_id)
+            text = self._build_plain_report(user_id, data, method, note)
+        except Exception as error:
+            debug_log(f"Profile request error: {traceback.format_exc()}")
+            title = localize("Ошибка", "Error")
+            text = str(error)
+        finally:
+            self._set_busy(False)
+            self._dismiss_loading()
+        self._show_alert(title, text)
+
+    def _profile_free_data(self, user_id):
+        cached = self.cache.get(user_id, INLINE_METHOD, self._cache_ttl())
+        if isinstance(cached, dict) and cached.get("creation_date"):
+            return cached, "Inline", localize("Из кэша", "From cache")
+
+        data, error = self._lookup_inline(user_id, {"user_id": user_id, "username": "", "error": ""})
+        if data.get("creation_date"):
+            self.cache.set(user_id, INLINE_METHOD, data, meta=self._cache_meta(user_id, data))
+            return data, "Inline", ""
+
+        return {"not_later_than": earliest_photo_month(user_id)}, "", error
+
+    def _profile_api_data(self, user_id):
+        cached = self.cache.get(user_id, "fast", self._cache_ttl())
+        if cached is not None:
+            return cached, "fast", localize("Из кэша", "From cache")
+
+        result = self.api.get_info(user_id, "fast")
+        if not result["ok"]:
+            return {}, "", f"{localize('Ошибка API', 'API error')}: {result['error']}"
+        self.cache.set(user_id, "fast", result["data"], meta=self._cache_meta(user_id, result["data"]))
+        return result["data"], "fast", ""
+
+    def _cache_method_label(self, method):
+        return {
+            INLINE_METHOD: "Inline",
+            "fast": "Fast API",
+            "smart": "Smart API",
+        }.get(str(method or "").lower(), str(method or "").strip() or unknown_text())
+
+    def _cache_user_groups(self):
+        groups = {}
+        for entry in self.cache.entries(self._cache_ttl()):
+            user_id = str(entry["user_id"]).strip()
+            if not user_id:
+                continue
+
+            group = groups.setdefault(
+                user_id,
+                {
+                    "user_id": user_id,
+                    "entries": [],
+                    "methods": [],
+                    "timestamp": 0,
+                    "remaining": 0,
+                    "expired": True,
+                    "creation_date": "",
+                    "display_name": "",
+                    "username_text": "",
+                },
+            )
+            group["entries"].append(entry)
+            group["remaining"] = max(group["remaining"], entry["remaining"])
+            group["expired"] = group["expired"] and entry["expired"]
+            if entry["timestamp"] >= group["timestamp"]:
+                group["timestamp"] = entry["timestamp"]
+                group["creation_date"] = str(entry["data"].get("creation_date", "") or "")
+
+            label = self._cache_method_label(entry["method"])
+            if label not in group["methods"]:
+                group["methods"].append(label)
+
+        for user_id, group in groups.items():
+            sample = group["entries"][0]
+            meta = sample["meta"]
+            data = sample["data"]
+
+            display_name = get_account_name(user_id)
+            if not display_name or display_name == unknown_text():
+                display_name = str(meta.get("display_name") or data.get("account_name") or "").strip() or unknown_text()
+            group["display_name"] = display_name
+            group["username_text"] = join_usernames(user_id) or self._normalize_usernames(
+                meta.get("username_text") or data.get("username")
+            )
+
+        return sorted(groups.values(), key=lambda item: item["timestamp"], reverse=True)
+
+    def _cache_sources_label(self, count):
+        count = max(0, int(count or 0))
+        if is_russian():
+            return plural_ru(count, "источник", "источника", "источников")
+        return f"{count} source" + ("s" if count != 1 else "")
+
+    def _show_cache_stats_dialog(self):
+        ttl = self._cache_ttl()
+        stats = self.cache.stats(ttl)
+        message = "\n".join(
+            [
+                f"{localize('Хранение', 'Lifetime')}: {describe_cache_ttl(ttl)}",
+                f"{localize('Пользователи', 'Users')}: {stats['unique_users']}",
+                localize(
+                    f"Записи: {stats['total']} ({stats['active']} активных, {stats['expired']} просроченных)",
+                    f"Entries: {stats['total']} ({stats['active']} active, {stats['expired']} expired)",
+                ),
+                f"Fast API: {stats['fast']} · Smart API: {stats['smart']} · Inline: {stats['inline']}",
+                f"{localize('Размер', 'Size')}: {stats['size']}",
+            ]
+        )
+        self._show_alert(localize("Статистика кеша", "Cache stats"), message)
+
+    def _show_cache_users_dialog(self):
+        users = self._cache_user_groups()
+        if not users:
+            self._show_alert(localize("Кеш", "Cache"), localize("Кеш пуст.", "Cache is empty."))
+            return
+
+        def build(builder):
+            builder.set_title(
+                localize(f"Пользователи в кеше ({len(users)})", f"Cached users ({len(users)})")
+            )
+            items = []
+            for group in users:
+                identity = group["username_text"] or f"ID {group['user_id']}"
+                ttl_text = (
+                    localize("просрочено", "expired")
+                    if group["expired"]
+                    else format_seconds(group["remaining"])
+                )
+                items.append(
+                    f"{group['display_name']}\n{identity} · {self._cache_sources_label(len(group['entries']))} · {ttl_text}"
+                )
+
+            def on_select(dialog, which):
+                dialog.dismiss()
+                if 0 <= which < len(users):
+                    self._show_cache_user_actions(users[which])
+
+            builder.set_items(items, on_select)
+            builder.set_negative_button(localize("Закрыть", "Close"), lambda dialog, _which: dialog.dismiss())
+
+        self._show_dialog(build, localize("Не удалось открыть список пользователей.", "Failed to open user list."))
+
+    def _show_cache_user_actions(self, group):
+        status = (
+            localize("все записи просрочены", "all entries are expired")
+            if group["expired"]
+            else localize(
+                f"осталось {format_seconds(group['remaining'])}",
+                f"{format_seconds(group['remaining'])} remaining",
+            )
+        )
+
+        lines = [f"ID: {group['user_id']}"]
+        if group["username_text"]:
+            lines.append(f"{localize('Юзернейм', 'Username')}: {group['username_text']}")
+        if group["creation_date"]:
+            lines.append(f"{localize('Дата регистрации', 'Creation date')}: {group['creation_date']}")
+        lines.append(f"{localize('Источники', 'Sources')}: {', '.join(group['methods'])}")
+        lines.append(f"{localize('Состояние', 'Status')}: {status}")
+        lines.append("")
+        lines.append(localize("По источникам:", "By source:"))
+        for entry in group["entries"]:
+            creation_date = str(entry["data"].get("creation_date", "") or "—")
+            remaining = localize("просрочено", "expired") if entry["expired"] else format_seconds(entry["remaining"])
+            lines.append(f"• {self._cache_method_label(entry['method'])} · {creation_date} · {remaining}")
+
+        actions = [localize("Очистить всё для пользователя", "Clear all for user")]
+        removable = []
+        if len(group["entries"]) > 1:
+            for entry in group["entries"]:
+                label = self._cache_method_label(entry["method"])
+                actions.append(localize(f"Удалить только {label}", f"Remove only {label}"))
+                removable.append(entry)
+
+        def build(builder):
+            builder.set_title(group["display_name"])
+            builder.set_message("\n".join(lines))
+
+            def on_select(dialog, which):
+                dialog.dismiss()
+                if which == 0:
+                    self._confirm_delete_user_cache(group["user_id"], group["display_name"])
+                    return
+                index = which - 1
+                if 0 <= index < len(removable):
+                    self._confirm_delete_cache_entry(
+                        group["user_id"], removable[index]["method"], group["display_name"]
+                    )
+
+            builder.set_items(actions, on_select)
+            builder.set_negative_button(localize("Закрыть", "Close"), lambda dialog, _which: dialog.dismiss())
+
+        self._show_dialog(build, localize("Не удалось открыть карточку пользователя.", "Failed to open user card."))
+
+    def _confirm_prune_cache(self):
+        stats = self.cache.stats(self._cache_ttl())
+        if stats["expired"] <= 0:
+            BulletinHelper.show_info(localize("Просроченных записей нет.", "There are no expired entries."))
+            return
+
+        self._confirm(
+            localize("Удалить просроченное?", "Prune expired entries?"),
+            localize(
+                f"Будут удалены {stats['expired']} просроченных записей.",
+                f"{stats['expired']} expired entries will be removed.",
+            ),
+            self._prune_cache,
+        )
+
+    def _confirm_clear_cache(self):
+        stats = self.cache.stats(self._cache_ttl())
+        if stats["total"] <= 0:
+            BulletinHelper.show_info(localize("Кеш уже пуст.", "Cache is already empty."))
+            return
+
+        self._confirm(
+            localize("Очистить весь кеш?", "Clear all cache?"),
+            localize(
+                f"Будут удалены {stats['total']} записей для {stats['unique_users']} пользователей.",
+                f"{stats['total']} entries for {stats['unique_users']} users will be removed.",
+            ),
+            self._clear_cache,
+            confirm_text=localize("Очистить", "Clear"),
+        )
+
+    def _confirm_delete_user_cache(self, user_id, display_name=""):
+        title = display_name or localize("Пользователь", "User")
+        self._confirm(
+            localize("Удалить пользователя из кеша?", "Remove user from cache?"),
+            localize(
+                f"Все записи для {title} будут удалены.",
+                f"All cache entries for {title} will be removed.",
+            ),
+            lambda: self._delete_cached_user(user_id),
+        )
+
+    def _confirm_delete_cache_entry(self, user_id, method, display_name=""):
+        label = self._cache_method_label(method)
+        title = display_name or localize("Пользователь", "User")
+        self._confirm(
+            localize("Удалить запись кеша?", "Remove cache entry?"),
+            localize(
+                f"Будет удалён только источник {label} для {title}.",
+                f"Only the {label} source will be removed for {title}.",
+            ),
+            lambda: self._delete_cached_entry(user_id, method),
+        )
+
+    def _prune_cache(self):
+        removed = self.cache.prune(self._cache_ttl())
+        BulletinHelper.show_success(
+            localize(f"Удалено {removed} просроченных записей.", f"Removed {removed} expired entries.")
+        )
+
+    def _clear_cache(self):
+        self.cache.clear()
+        BulletinHelper.show_success(localize("Кеш очищен.", "Cache cleared."))
+
+    def _delete_cached_user(self, user_id):
+        removed = self.cache.delete_user(user_id)
+        if removed:
+            BulletinHelper.show_success(localize(f"Удалено {removed} записей.", f"Removed {removed} entries."))
+        else:
+            BulletinHelper.show_info(localize("Записи уже удалены.", "Entries are already removed."))
+
+    def _delete_cached_entry(self, user_id, method):
+        label = self._cache_method_label(method)
+        if self.cache.delete_entry(user_id, method):
+            BulletinHelper.show_success(localize(f"Удалён источник {label}.", f"Removed the {label} source."))
+        else:
+            BulletinHelper.show_info(localize("Запись уже удалена.", "Entry is already removed."))
+
+    def _add_settings_buttons(self):
+        for attr, menu_type in (
+            ("drawer_settings_item", MenuItemType.DRAWER_MENU),
+            ("chat_settings_item", MenuItemType.CHAT_ACTION_MENU),
+        ):
+            if getattr(self, attr) is not None:
+                continue
+            try:
+                setattr(
+                    self,
+                    attr,
+                    self.add_menu_item(
+                        MenuItemData(
+                            menu_type=menu_type,
+                            text="AAC",
+                            icon="filled_sharing_off2_24",
+                            priority=5,
+                            on_click=lambda _: run_on_ui_thread(self._open_plugin_settings),
+                        )
+                    ),
+                )
+            except Exception as error:
+                debug_log(f"Failed to add {attr}: {error}")
+
+    def _toggle_settings_buttons(self, enabled):
+        def toggle():
+            if enabled:
+                self._add_settings_buttons()
+                return
+            for attr in ("drawer_settings_item", "chat_settings_item"):
+                item = getattr(self, attr)
+                if item:
+                    try:
+                        self.remove_menu_item(item)
+                    except Exception as error:
+                        debug_log(f"Failed to remove {attr}: {error}")
+                setattr(self, attr, None)
+
+        run_on_ui_thread(toggle)
+
+    def _open_plugin_settings(self):
+        try:
+            fragment = get_last_fragment()
+            java_plugin = PluginsController.getInstance().plugins.get(self.id)
+            if fragment is not None and java_plugin is not None:
+                fragment.presentFragment(PluginSettingsActivity(java_plugin))
+        except Exception as error:
+            debug_log(f"Failed to open settings: {error}")
+
+    def _show_dialog(self, build, error_message):
+        def show():
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                BulletinHelper.show_error(error_message)
+                return
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+            build(builder)
+            builder.show()
+
+        run_on_ui_thread(show)
+
+    def _show_alert(self, title, message):
+        def build(builder):
+            builder.set_title(title)
+            builder.set_message(message)
+            builder.set_positive_button(localize("Закрыть", "Close"), lambda dialog, _which: dialog.dismiss())
+
+        self._show_dialog(build, localize("Не удалось показать результат.", "Failed to show the result."))
+
+    def _confirm(self, title, message, on_confirm, confirm_text=None):
+        confirm_text = confirm_text or localize("Удалить", "Remove")
+
+        def build(builder):
+            builder.set_title(title)
+            builder.set_message(message)
+            builder.set_positive_button(confirm_text, lambda dialog, _which: (dialog.dismiss(), on_confirm()))
+            builder.set_negative_button(localize("Отмена", "Cancel"), lambda dialog, _which: dialog.dismiss())
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+
+        self._show_dialog(build, localize("Не удалось открыть подтверждение.", "Failed to open confirmation."))
+
+    def _show_loading(self):
+        def show():
+            if self.loading_dialog is not None or not self._active:
+                return
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                return
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            builder.set_title(localize("Загрузка", "Loading"))
+            builder.show()
+            builder.set_cancelable(False)
+            self.loading_dialog = builder
+
+        run_on_ui_thread(show)
+
+    def _dismiss_loading(self):
+        def dismiss():
+            dialog, self.loading_dialog = self.loading_dialog, None
+            if dialog is None:
+                return
+            try:
+                dialog.dismiss()
+            except Exception as error:
+                debug_log(f"Failed to dismiss loading dialog: {error}")
+
+        run_on_ui_thread(dismiss)
+
+    def _faq_sections(self):
+        return [
+            (
+                localize("Команды", "Commands"),
+                [
+                    (".age [username/ID]", localize("Быстрый запрос даты регистрации.", "Quick account age lookup.")),
+                    (".age smart [username/ID]", localize("Более точный режим через API.", "More accurate API-based lookup.")),
+                    (".age faq", localize("Открывает эту справку.", "Opens this help.")),
+                ],
+            ),
+            (
+                localize("Режимы", "Modes"),
+                [
+                    (
+                        "Free mode",
+                        localize(
+                            f"Спрашивает inline-бота @{INLINE_BOT}; если он молчит, показывает локальную оценку.",
+                            f"Queries the @{INLINE_BOT} inline bot; falls back to a local estimate.",
+                        ),
+                    ),
+                    (
+                        localize("Как берётся дата", "How the date is fetched"),
+                        localize(
+                            "Бот присылает её только после отправки результата в чат, поэтому плагин "
+                            "отправляет его в «Избранное» без звука и сразу удаляет.",
+                            "The bot only sends it after the result is posted to a chat, so the plugin "
+                            "posts it to Saved Messages silently and deletes it right away.",
+                        ),
+                    ),
+                    (
+                        localize("Ответ на сообщение", "Reply to a message"),
+                        localize(
+                            "Команду .age можно отправить ответом на сообщение пользователя.",
+                            "You can use .age as a reply to a user's message.",
+                        ),
+                    ),
+                ],
+            ),
+            (
+                localize("Кеш", "Cache"),
+                [
+                    (".cache", localize("Показывает статистику кеша.", "Shows cache statistics.")),
+                    (
+                        ".cache <user_id>",
+                        localize(
+                            "Удаляет записи кеша для выбранного ID пользователя.",
+                            "Removes cache entries for the selected user ID.",
+                        ),
+                    ),
+                ],
+            ),
+        ]
+
+    def _faq_text(self):
+        lines = [
+            localize(
+                ".age ищет дату регистрации аккаунта Telegram.",
+                ".age looks up the Telegram account creation date.",
+            )
+        ]
+        for section_title, items in self._faq_sections():
+            lines.append("")
+            lines.append(f"{section_title}:")
+            lines.extend(f"• {label} - {description}" for label, description in items)
+        return "\n".join(lines)
+
+    def _show_faq_sheet(self):
+        def show():
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                return
+
+            try:
+                sheet = BottomSheet(activity, False)
+                provider = sheet.getResourcesProvider()
+
+                def color(key):
+                    return Theme.getColor(key, provider)
+
+                accent = color(Theme.key_featuredStickers_addButton)
+                accent_text = color(Theme.key_windowBackgroundWhiteBlueText)
+                primary_text = color(Theme.key_dialogTextBlack)
+                secondary_text = color(Theme.key_dialogTextGray2)
+                card_color = color(Theme.key_windowBackgroundGray)
+                divider_color = color(Theme.key_listSelector)
+
+                root = LinearLayout(activity)
+                root.setOrientation(LinearLayout.VERTICAL)
+                root.setPadding(
+                    AndroidUtilities.dp(20),
+                    AndroidUtilities.dp(18),
+                    AndroidUtilities.dp(20),
+                    AndroidUtilities.dp(16),
+                )
+                root.setBackgroundColor(color(Theme.key_dialogBackground))
+
+                icon_background = GradientDrawable()
+                icon_background.setShape(GradientDrawable.OVAL)
+                icon_background.setColor(Theme.multAlpha(accent, 0.12))
+
+                icon_view = ImageView(activity)
+                icon_view.setImageResource(R.drawable.msg_info)
+                icon_view.setColorFilter(accent)
+                icon_view.setBackground(icon_background)
+                icon_padding = AndroidUtilities.dp(18)
+                icon_view.setPadding(icon_padding, icon_padding, icon_padding, icon_padding)
+                root.addView(icon_view, LayoutHelper.createLinear(72, 72, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14))
+
+                title_view = TextView(activity)
+                title_view.setText(localize("Как пользоваться", "How to use"))
+                title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+                title_view.setTypeface(AndroidUtilities.bold())
+                title_view.setTextColor(primary_text)
+                title_view.setGravity(Gravity.CENTER)
+                root.addView(title_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 6))
+
+                subtitle_view = TextView(activity)
+                subtitle_view.setText(
+                    localize(
+                        "Коротко про команды, режимы и кеш.",
+                        "Quick guide to commands, modes and cache.",
+                    )
+                )
+                subtitle_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                subtitle_view.setTextColor(secondary_text)
+                subtitle_view.setGravity(Gravity.CENTER)
+                root.addView(subtitle_view, LayoutHelper.createLinear(-1, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 14))
+
+                chips_row = LinearLayout(activity)
+                chips_row.setOrientation(LinearLayout.HORIZONTAL)
+                chips_row.setGravity(Gravity.CENTER)
+                for index, chip_label in enumerate((".age", "smart", ".cache")):
+                    chip = FrameLayout(activity)
+                    chip_background = GradientDrawable()
+                    chip_background.setCornerRadius(AndroidUtilities.dp(14))
+                    chip_background.setColor(Theme.multAlpha(accent, 0.10))
+                    chip.setBackground(chip_background)
+
+                    chip_text = TextView(activity)
+                    chip_text.setText(chip_label)
+                    chip_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                    chip_text.setTypeface(AndroidUtilities.bold())
+                    chip_text.setTextColor(accent_text)
+                    chip_text.setPadding(
+                        AndroidUtilities.dp(12),
+                        AndroidUtilities.dp(6),
+                        AndroidUtilities.dp(12),
+                        AndroidUtilities.dp(6),
+                    )
+                    chip.addView(chip_text)
+                    right_margin = 8 if index < 2 else 0
+                    chips_row.addView(
+                        chip,
+                        LayoutHelper.createLinear(-2, -2, Gravity.CENTER_VERTICAL, 0, 0, right_margin, 0),
+                    )
+                root.addView(chips_row, LayoutHelper.createLinear(-1, -2, Gravity.CENTER_HORIZONTAL, 0, 0, 0, 16))
+
+                body_scroll = ScrollView(activity)
+                body_scroll.setVerticalScrollBarEnabled(False)
+                body_scroll.setPadding(AndroidUtilities.dp(4), 0, AndroidUtilities.dp(4), 0)
+
+                body = LinearLayout(activity)
+                body.setOrientation(LinearLayout.VERTICAL)
+
+                for section_title, items in self._faq_sections():
+                    card = FrameLayout(activity)
+                    card_background = GradientDrawable()
+                    card_background.setCornerRadius(AndroidUtilities.dp(18))
+                    card_background.setColor(card_color)
+                    card_background.setStroke(AndroidUtilities.dp(1), divider_color)
+                    card.setBackground(card_background)
+
+                    card_content = LinearLayout(activity)
+                    card_content.setOrientation(LinearLayout.VERTICAL)
+                    card_content.setPadding(
+                        AndroidUtilities.dp(16),
+                        AndroidUtilities.dp(14),
+                        AndroidUtilities.dp(16),
+                        AndroidUtilities.dp(14),
+                    )
+
+                    section_view = TextView(activity)
+                    section_view.setText(section_title)
+                    section_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                    section_view.setTypeface(AndroidUtilities.bold())
+                    section_view.setTextColor(primary_text)
+                    card_content.addView(section_view, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 10))
+
+                    for index, (label, description) in enumerate(items):
+                        row = LinearLayout(activity)
+                        row.setOrientation(LinearLayout.VERTICAL)
+
+                        label_view = TextView(activity)
+                        label_view.setText(label)
+                        label_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                        label_view.setTypeface(AndroidUtilities.bold())
+                        label_view.setTextColor(accent_text)
+                        row.addView(label_view, LayoutHelper.createLinear(-1, -2))
+
+                        description_view = TextView(activity)
+                        description_view.setText(description)
+                        description_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                        description_view.setTextColor(secondary_text)
+                        description_view.setLineSpacing(float(AndroidUtilities.dp(2)), 1.1)
+                        row.addView(description_view, LayoutHelper.createLinear(-1, -2, 0, 0, 2, 0, 0))
+
+                        bottom_margin = 10 if index < len(items) - 1 else 0
+                        card_content.addView(row, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, bottom_margin))
+
+                    card.addView(card_content)
+                    body.addView(card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 12))
+
+                body_scroll.addView(body)
+                root.addView(body_scroll, LayoutHelper.createLinear(-1, 0, 1.0))
+
+                divider = View(activity)
+                divider.setBackgroundColor(divider_color)
+                root.addView(divider, LayoutHelper.createLinear(-1, 1, 0, 0, 16, 0, 12))
+
+                close_button = FrameLayout(activity)
+                close_background = GradientDrawable()
+                close_background.setCornerRadius(AndroidUtilities.dp(12))
+                close_background.setColor(accent_text)
+                try:
+                    close_button.setBackground(
+                        RippleDrawable(
+                            ColorStateList.valueOf(Theme.multAlpha(Color.WHITE, 0.20)),
+                            close_background,
+                            None,
+                        )
+                    )
+                except Exception:
+                    close_button.setBackground(close_background)
+                close_button.setPadding(0, AndroidUtilities.dp(14), 0, AndroidUtilities.dp(14))
+                close_button.setClickable(True)
+                close_button.setFocusable(True)
+
+                close_text = TextView(activity)
+                close_text.setText(localize("Понятно", "Got it"))
+                close_text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                close_text.setTypeface(AndroidUtilities.bold())
+                close_text.setTextColor(Color.WHITE)
+                close_text.setGravity(Gravity.CENTER)
+                close_button.addView(close_text, LayoutHelper.createFrame(-1, -2, Gravity.CENTER))
+                close_button.setOnClickListener(OnClickListener(lambda *_: sheet.dismiss()))
+
+                root.addView(close_button, LayoutHelper.createLinear(-1, -2))
+                sheet.setCustomView(root)
+                sheet.show()
+            except Exception as error:
+                debug_log(f"Failed to show FAQ sheet: {error}")
+                self._show_alert(localize("Справка", "FAQ"), self._faq_text())
+
+        run_on_ui_thread(show)
