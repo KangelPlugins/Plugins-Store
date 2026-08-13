@@ -1,13 +1,21 @@
 import ast
+import json
 import os
 import re
 import threading
+import time
 import traceback
+from collections import deque
 from typing import Any, List
 
 from android.os import Bundle
 
-from org.telegram.messenger import AndroidUtilities, FileLoader
+try:
+    from org.telegram.messenger import FileLoader, NotificationCenter
+except Exception:
+    from org.telegram.messenger import FileLoader
+    NotificationCenter = None
+
 from org.telegram.tgnet import TLRPC
 from org.telegram.ui import ChatActivity
 
@@ -15,23 +23,48 @@ from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin
 from client_utils import (
     PLUGINS_QUEUE,
+    RequestCallback,
     get_file_loader,
     get_last_fragment,
     get_messages_controller,
-    RequestCallback,
     run_on_queue,
     send_request,
 )
-from file_utils import get_plugins_dir, list_dir, read_file
+from file_utils import get_plugins_dir, list_dir
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 from ui.settings import Divider, EditText, Header, Switch, Text
+
+try:
+    from client_utils import EXTERNAL_NETWORK_QUEUE as WORK_QUEUE
+except Exception:
+    WORK_QUEUE = PLUGINS_QUEUE
+
+try:
+    from client_utils import get_connections_manager
+except Exception:
+    get_connections_manager = None
+
+try:
+    from client_utils import get_notification_center
+except Exception:
+    get_notification_center = None
+
+try:
+    from file_utils import get_cache_dir
+except Exception:
+    get_cache_dir = None
+
+try:
+    from java import dynamic_proxy
+except Exception:
+    dynamic_proxy = None
 
 __id__ = "plugin_update_checker"
 __name__ = "Plugin Update Checker"
 __description__ = "Checking for updates for your installed plugins from multiple channels."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "1.1"
+__version__ = "1.2"
 __icon__ = "MaxExteraPluginsStickers/24"
 __min_version__ = "12.5.1"
 __app_version__ = ">=12.5.1"
@@ -47,6 +80,45 @@ DEFAULT_CUSTOM_CHANNELS = [
     "MaxExteraPlugins",
 ]
 
+CACHE_FILE_NAME = "plugin_update_checker_cache.json"
+CACHE_VERSION = 1
+
+HISTORY_PAGE_LIMIT = 100
+MAX_HISTORY_PAGES = 50
+MAX_CHANNELS = 20
+
+POLL_INTERVAL_MS = 300
+FILES_PER_POLL = 8
+MAX_CONCURRENT_DOWNLOADS = 3
+MAX_DOWNLOAD_ATTEMPTS = 75
+RELOAD_EVERY_ATTEMPTS = 20
+DOWNLOAD_PHASE_TIMEOUT_S = 120.0
+
+CONNECTION_POLL_MS = 2000
+CONNECTION_WAIT_TIMEOUT_S = 45.0
+
+PROGRESS_THROTTLE_MS = 330.0
+
+
+if dynamic_proxy is not None and NotificationCenter is not None:
+
+    class _ConnectionStateDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+
+        def __init__(self, plugin):
+            self._plugin = plugin
+
+        def didReceivedNotification(self, nid, account, args):
+            try:
+                plugin = self._plugin
+                if plugin is not None:
+                    plugin._on_connection_state()
+            except Exception:
+                pass
+
+else:
+
+    _ConnectionStateDelegate = None
+
 
 class PluginUpdateCheckerPlugin(BasePlugin):
 
@@ -56,16 +128,49 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         self._lock = threading.Lock()
         self._loading_dialog = None
         self._progress = 0
+        self._progress_ts = 0
         self._total_files_to_download = 0
         self._files_downloaded = 0
+        self._download_failures = 0
         self._updates = []
         self._up_to_date = []
         self._not_found = []
         self._last_scan_exists = False
+        self._session = 0
+        self._session_at_start = 0
+        self._auto_check_pending = False
+        self._wait_pending = False
+        self._conn_delegate = None
+        self._cache_data = {"channels": {}}
+        self._channel_statuses = {}
+        self._local_plugins = {}
+        self._all_channel_files = []
+        self._pending_downloads = deque()
+        self._in_flight = {}
+        self._poll_scheduled = False
+        self._finalize_triggered = False
+        self._download_phase_started = 0.0
+        self._file_loader = None
+        self._current_channel_id = 0
+        self._current_channel_access_hash = 0
 
         if self.get_setting("auto_check", False):
             self._silent_mode = True
-            run_on_queue(self._start_check, PLUGINS_QUEUE, 5000)
+            self._auto_check_pending = True
+            self._start_auto_check_flow()
+
+    def on_plugin_unload(self):
+        self._auto_check_pending = False
+        self._wait_pending = False
+        self._session += 1
+        try:
+            if self._conn_delegate is not None and get_notification_center is not None and NotificationCenter is not None:
+                nc = get_notification_center()
+                if nc is not None:
+                    nc.removeObserver(self._conn_delegate, NotificationCenter.didUpdateConnectionState, 0)
+        except Exception:
+            pass
+        self._conn_delegate = None
 
     def create_settings(self) -> List[Any]:
         return [
@@ -124,16 +229,720 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         return self.get_setting("custom_channels", self._get_default_custom_channels_text())
 
     def _on_check_click(self, view):
-        if self._checking:
-            BulletinHelper.show_info("Already checking...")
-            return
-        self._checking = True
+        with self._lock:
+            if self._checking:
+                BulletinHelper.show_info("Already checking...")
+                return
         self._silent_mode = False
         self._progress = 0
-        self._total_files_to_download = 0
-        self._files_downloaded = 0
+        self._progress_ts = 0
         self._show_loading_dialog()
-        run_on_queue(self._start_check)
+        if self._is_online():
+            run_on_queue(self._start_check, WORK_QUEUE, 0)
+        else:
+            self._set_progress(1, "Waiting for connection...")
+            self._wait_for_connection(self._start_queued_check)
+
+    def _start_queued_check(self):
+        run_on_queue(self._start_check, WORK_QUEUE, 0)
+
+    def _start_auto_check_flow(self):
+        self._register_conn_observer()
+        if self._is_online():
+            self._begin_auto_check()
+            return
+        self._wait_for_connection(self._begin_auto_check)
+
+    def _register_conn_observer(self):
+        try:
+            if _ConnectionStateDelegate is None or get_notification_center is None or NotificationCenter is None:
+                return
+            nc = get_notification_center()
+            if nc is None:
+                return
+            self._conn_delegate = _ConnectionStateDelegate(self)
+            nc.addObserver(self._conn_delegate, NotificationCenter.didUpdateConnectionState, 0)
+        except Exception:
+            self._conn_delegate = None
+
+    def _wait_for_connection(self, callback):
+        attempts = max(int(CONNECTION_WAIT_TIMEOUT_S * 1000.0 / CONNECTION_POLL_MS), 1)
+
+        def tick(remaining):
+            if not self._wait_pending:
+                return
+            if self._is_online() or remaining <= 0:
+                self._wait_pending = False
+                callback()
+                return
+            run_on_queue(lambda: tick(remaining - 1), WORK_QUEUE, CONNECTION_POLL_MS)
+
+        self._wait_pending = True
+        if self._is_online():
+            self._wait_pending = False
+            callback()
+            return
+        run_on_queue(lambda: tick(attempts), WORK_QUEUE, 0)
+
+    def _on_connection_state(self):
+        if not self._auto_check_pending:
+            return
+        if self._is_online():
+            self._begin_auto_check()
+
+    def _begin_auto_check(self):
+        if not self._auto_check_pending:
+            return
+        self._auto_check_pending = False
+        run_on_queue(self._start_check, WORK_QUEUE, 0)
+
+    def _is_online(self):
+        try:
+            if get_connections_manager is None:
+                return True
+            manager = get_connections_manager()
+            if manager is None:
+                return True
+            get_state = getattr(manager, "getCurrentState", None)
+            if get_state is None:
+                return True
+            return int(get_state()) == 3
+        except Exception:
+            return True
+    def _start_check(self):
+        with self._lock:
+            if self._checking:
+                return
+            self._checking = True
+        self._session += 1
+        self._session_at_start = self._session
+        self._updates = []
+        self._up_to_date = []
+        self._not_found = []
+        self._channel_plugins = {}
+        self._channel_statuses = {}
+        self._all_channel_files = []
+        self._pending_downloads = deque()
+        self._in_flight = {}
+        self._poll_scheduled = False
+        self._finalize_triggered = False
+        self._files_downloaded = 0
+        self._total_files_to_download = 0
+        self._download_failures = 0
+
+        self._set_progress(2, "Reading installed plugins...")
+        try:
+            local_plugins = self._get_local_plugins()
+            self._cache_data = self._load_cache()
+        except Exception as e:
+            log(f"Error reading plugins: {e}\n{traceback.format_exc()}")
+            local_plugins = {}
+            self._cache_data = {"channels": {}}
+
+        if not local_plugins:
+            self._end_check()
+            if not self._silent_mode:
+                run_on_ui_thread(self._dismiss_loading_dialog)
+                run_on_ui_thread(lambda: self._show_simple_result("No installed plugins found."))
+            return
+
+        self._local_plugins = local_plugins
+        channels = self._get_channels_to_check()
+        if not channels:
+            self._end_check()
+            if not self._silent_mode:
+                run_on_ui_thread(self._dismiss_loading_dialog)
+                run_on_ui_thread(lambda: self._show_simple_result("No channels configured."))
+            return
+
+        self._channels_to_check = channels
+        self._total_channels = len(channels)
+        self._current_channel_index = 0
+        self._set_progress(5, f"Found {len(local_plugins)} plugins. Checking {self._total_channels} channel(s)...")
+        self._resolve_next_channel()
+
+    def _end_check(self):
+        with self._lock:
+            self._checking = False
+        self._wait_pending = False
+        self._session += 1
+
+    def _session_changed(self):
+        return self._session != self._session_at_start
+
+    def _resolve_next_channel(self):
+        if self._session_changed():
+            return
+        if self._current_channel_index >= len(self._channels_to_check):
+            self._start_downloading_all_files()
+            return
+
+        channel = self._channels_to_check[self._current_channel_index]
+        self._current_channel_username = channel
+        self._current_channel_fetched_messages = []
+        self._current_channel_error = None
+        self._current_channel_pages = 0
+
+        chan_pct = 5 + int(15 * self._current_channel_index / max(self._total_channels, 1))
+        self._set_progress(chan_pct, f"Resolving @{channel}... ({self._current_channel_index + 1}/{self._total_channels})")
+
+        try:
+            req = TLRPC.TL_contacts_resolveUsername()
+            req.username = channel
+            send_request(req, RequestCallback(self._on_channel_resolved))
+        except Exception as e:
+            log(f"Error resolving channel {channel}: {e}")
+            self._current_channel_error = "resolve error"
+            self._finish_current_channel()
+
+    def _on_channel_resolved(self, response, error):
+        if self._session_changed():
+            return
+        try:
+            if error is not None or response is None:
+                self._current_channel_error = self._error_text(error, "resolve failed")
+                self._finish_current_channel()
+                return
+
+            chats = getattr(response, "chats", None)
+            users = getattr(response, "users", None)
+
+            if chats is not None and chats.size() > 0:
+                get_messages_controller().putChats(chats, False)
+            if users is not None and users.size() > 0:
+                get_messages_controller().putUsers(users, False)
+
+            if chats is None or chats.size() == 0:
+                if users is not None and users.size() > 0:
+                    self._current_channel_error = "not a channel (bot or user)"
+                else:
+                    self._current_channel_error = "no access, join the channel if it is private"
+                self._finish_current_channel()
+                return
+
+            channel = chats.get(0)
+            self._current_channel_id = channel.id
+            self._current_channel_access_hash = channel.access_hash
+
+            chan_pct = 20 + int(15 * self._current_channel_index / max(self._total_channels, 1))
+            self._set_progress(chan_pct, f"Fetching files from @{self._current_channel_username}...")
+            self._fetch_channel_documents(0)
+
+        except Exception as e:
+            log(f"Error in channel resolution: {e}\n{traceback.format_exc()}")
+            self._current_channel_error = "resolve error"
+            self._finish_current_channel()
+
+    def _fetch_channel_documents(self, offset_id):
+        if self._session_changed():
+            return
+        self._current_channel_pages += 1
+        if self._current_channel_pages > MAX_HISTORY_PAGES:
+            self._current_channel_error = "too many messages"
+            self._finish_current_channel()
+            return
+
+        chan_pct = 20 + int(15 * self._current_channel_index / max(self._total_channels, 1))
+        self._set_progress(chan_pct, f"Fetching @{self._current_channel_username}... (page {self._current_channel_pages})")
+
+        try:
+            req = TLRPC.TL_messages_getHistory()
+            req.limit = HISTORY_PAGE_LIMIT
+            req.offset_id = offset_id
+            req.offset_date = 0
+            req.add_offset = 0
+            req.max_id = 0
+            req.min_id = 0
+            req.hash = 0
+
+            peer = TLRPC.TL_inputPeerChannel()
+            peer.channel_id = self._current_channel_id
+            peer.access_hash = self._current_channel_access_hash
+            req.peer = peer
+
+            send_request(req, RequestCallback(self._on_documents_fetched))
+        except Exception as e:
+            log(f"Error fetching documents: {e}")
+            self._current_channel_error = "history failed"
+            self._finish_current_channel()
+
+    def _on_documents_fetched(self, response, error):
+        if self._session_changed():
+            return
+        try:
+            if error is not None or response is None:
+                self._current_channel_error = self._error_text(error, "history failed")
+                self._finish_current_channel()
+                return
+
+            messages = response.messages
+            if messages is None:
+                self._finish_current_channel()
+                return
+
+            size = messages.size()
+            if size > 0:
+                for i in range(size):
+                    self._current_channel_fetched_messages.append(messages.get(i))
+
+            if size >= HISTORY_PAGE_LIMIT:
+                last_id = messages.get(size - 1).id
+                self._fetch_channel_documents(last_id)
+            else:
+                self._finish_current_channel()
+
+        except Exception as e:
+            log(f"Error processing documents: {e}")
+            self._current_channel_error = "history parse error"
+            self._finish_current_channel()
+
+    def _finish_current_channel(self):
+        if self._session_changed():
+            return
+        try:
+            username = self._current_channel_username or ""
+            files = self._collect_current_channel_files()
+            self._channel_statuses[username] = {
+                "error": self._current_channel_error,
+                "files": len(files),
+            }
+        except Exception as e:
+            log(f"Error finishing channel: {e}")
+        self._current_channel_index += 1
+        self._resolve_next_channel()
+
+    def _collect_current_channel_files(self):
+        seen = {}
+        try:
+            for msg in self._current_channel_fetched_messages:
+                media = getattr(msg, "media", None)
+                if media is None:
+                    continue
+                doc = getattr(media, "document", None)
+                if doc is None:
+                    continue
+
+                filename = self._get_document_filename(doc)
+                if not filename or not filename.lower().endswith(".plugin"):
+                    continue
+
+                existing = seen.get(filename)
+                if existing is None or msg.id > existing["message_id"]:
+                    seen[filename] = {
+                        "filename": filename,
+                        "doc_id": int(doc.id),
+                        "date": int(getattr(msg, "date", 0) or 0),
+                        "message_id": int(msg.id),
+                        "channel_id": self._current_channel_id,
+                        "channel_username": self._current_channel_username or "",
+                        "document": doc,
+                        "message": msg,
+                    }
+        except Exception as e:
+            log(f"Error collecting channel files: {e}")
+
+        username = self._current_channel_username or ""
+        fetch_ok = self._current_channel_error is None
+        old_channel_cache = self._cache_data.get("channels", {}).get(username, {})
+
+        if fetch_ok:
+            new_channel_cache = {}
+            for fname in seen:
+                entry = old_channel_cache.get(fname)
+                if entry is not None:
+                    new_channel_cache[fname] = entry
+            self._cache_data.setdefault("channels", {})[username] = new_channel_cache
+
+        for fname, e in seen.items():
+            cached = old_channel_cache.get(fname) if fetch_ok else None
+            if cached is not None and int(cached.get("doc_id", -1)) == e["doc_id"] and cached.get("plugin_id") and cached.get("version"):
+                e["cached"] = True
+                e["plugin_id"] = cached["plugin_id"]
+                e["version"] = cached["version"]
+                e["name"] = cached.get("name") or ""
+            else:
+                e["cached"] = False
+            self._all_channel_files.append(e)
+
+        return seen
+    def _start_downloading_all_files(self):
+        if self._session_changed():
+            return
+        try:
+            self._file_loader = get_file_loader()
+        except Exception:
+            self._file_loader = None
+
+        self._pending_downloads = deque()
+        self._in_flight = {}
+        self._poll_scheduled = False
+        self._finalize_triggered = False
+        self._download_phase_started = time.time()
+
+        seen_global = {}
+        for entry in self._all_channel_files:
+            try:
+                if entry.get("cached"):
+                    self._record_channel_result(entry, entry.get("version"), entry.get("name") or entry["filename"], entry.get("plugin_id"))
+                    continue
+                fname = entry["filename"]
+                current = seen_global.get(fname)
+                if current is None:
+                    seen_global[fname] = (entry["message_id"], entry)
+                elif entry["message_id"] > current[0]:
+                    seen_global[fname] = (entry["message_id"], entry)
+            except Exception:
+                continue
+
+        for _fname, (_mid, entry) in seen_global.items():
+            self._pending_downloads.append(entry)
+
+        self._total_files_to_download = len(self._pending_downloads)
+        self._files_downloaded = 0
+        self._download_failures = 0
+
+        if not self._pending_downloads:
+            self._finish_downloads_phase()
+            return
+
+        self._set_progress(35, f"Downloading {self._total_files_to_download} file(s)...")
+        self._schedule_poll()
+
+    def _schedule_poll(self):
+        if self._poll_scheduled or self._finalize_triggered:
+            return
+        self._poll_scheduled = True
+        run_on_queue(self._poll_downloads, WORK_QUEUE, POLL_INTERVAL_MS)
+
+    def _poll_downloads(self):
+        self._poll_scheduled = False
+        if self._session_changed() or self._finalize_triggered:
+            return
+
+        file_loader = self._file_loader
+        if file_loader is None:
+            try:
+                file_loader = get_file_loader()
+                self._file_loader = file_loader
+            except Exception:
+                file_loader = None
+        if file_loader is None:
+            self._finish_downloads_phase()
+            return
+
+        if time.time() - self._download_phase_started > DOWNLOAD_PHASE_TIMEOUT_S:
+            self._finish_downloads_phase()
+            return
+
+        processed = 0
+        while self._pending_downloads and processed < FILES_PER_POLL:
+            processed += 1
+            entry = self._pending_downloads[0]
+            doc = entry["document"]
+            try:
+                file_path = file_loader.getPathToAttach(doc)
+                if file_path is not None and file_path.exists():
+                    expected = max(int(getattr(doc, "size", 0) or 0), 1)
+                    if file_path.length() >= expected:
+                        self._pending_downloads.popleft()
+                        self._in_flight.pop(id(entry), None)
+                        self._handle_file_done(file_path, entry)
+                        continue
+            except Exception:
+                pass
+
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            if entry["attempts"] >= MAX_DOWNLOAD_ATTEMPTS:
+                self._pending_downloads.popleft()
+                self._in_flight.pop(id(entry), None)
+                self._files_downloaded += 1
+                self._download_failures += 1
+                continue
+
+            if id(entry) not in self._in_flight:
+                if len(self._in_flight) < MAX_CONCURRENT_DOWNLOADS:
+                    try:
+                        file_loader.loadFile(doc, entry["message"], FileLoader.PRIORITY_HIGH, 0)
+                        self._in_flight[id(entry)] = True
+                    except Exception as e:
+                        log(f"loadFile error: {e}")
+            elif entry["attempts"] % RELOAD_EVERY_ATTEMPTS == 0:
+                try:
+                    file_loader.loadFile(doc, entry["message"], FileLoader.PRIORITY_HIGH, 0)
+                except Exception:
+                    pass
+
+        finished = self._total_files_to_download - len(self._pending_downloads)
+        self._set_progress(
+            35 + int(60 * finished / max(self._total_files_to_download, 1)),
+            f"Downloading {finished}/{self._total_files_to_download} files...",
+        )
+
+        if not self._pending_downloads:
+            self._finish_downloads_phase()
+            return
+        self._schedule_poll()
+
+    def _handle_file_done(self, file_path, entry):
+        try:
+            content = self._read_plugin_file(str(file_path))
+            if content:
+                meta = self._parse_plugin_metadata(content)
+                if meta and meta.get("id") and meta.get("version"):
+                    self._record_channel_result(entry, meta["version"], meta.get("name") or meta["id"], meta["id"])
+                    return
+        except Exception as e:
+            log(f"Error parsing downloaded file: {e}")
+        self._download_failures += 1
+
+    def _record_channel_result(self, entry, version, name, plugin_id):
+        try:
+            existing = self._channel_plugins.get(plugin_id)
+            if existing is None or self._version_is_newer(str(version), str(existing.get("version", ""))):
+                self._channel_plugins[plugin_id] = {
+                    "version": str(version),
+                    "name": name,
+                    "channel_id": entry["channel_id"],
+                    "channel_username": entry["channel_username"],
+                    "message_id": entry["message_id"],
+                    "filename": entry["filename"],
+                }
+            try:
+                channel_cache = self._cache_data.setdefault("channels", {}).setdefault(entry["channel_username"], {})
+                channel_cache[entry["filename"]] = {
+                    "plugin_id": plugin_id,
+                    "version": str(version),
+                    "name": name,
+                    "doc_id": entry["doc_id"],
+                }
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"Error recording channel result: {e}")
+
+    def _finish_downloads_phase(self):
+        if self._finalize_triggered:
+            return
+        self._finalize_triggered = True
+        self._finalize_all_channels()
+
+    def _finalize_all_channels(self):
+        try:
+            self._save_cache()
+            self._set_progress(97, "Comparing versions...")
+            updates = []
+            up_to_date = []
+            not_found = []
+
+            for pid, local_info in self._local_plugins.items():
+                if pid == __id__:
+                    continue
+                if pid in self._channel_plugins:
+                    channel_info = self._channel_plugins[pid]
+                    local_ver = local_info["version"]
+                    channel_ver = channel_info["version"]
+                    if self._version_is_newer(channel_ver, local_ver):
+                        updates.append({
+                            "plugin_id": pid,
+                            "name": local_info["name"],
+                            "local_version": local_ver,
+                            "channel_version": channel_ver,
+                            "channel_id": channel_info["channel_id"],
+                            "channel_username": channel_info["channel_username"],
+                            "message_id": channel_info["message_id"],
+                        })
+                    else:
+                        up_to_date.append(local_info["name"])
+                else:
+                    not_found.append(local_info["name"])
+
+            self._updates = updates
+            self._up_to_date = up_to_date
+            self._not_found = not_found
+            self._last_scan_exists = True
+
+            if self._silent_mode:
+                if updates:
+                    run_on_ui_thread(self._show_results_dialog)
+            else:
+                self._set_progress(100, "Done!")
+                run_on_ui_thread(self._dismiss_loading_dialog)
+                run_on_ui_thread(self._show_results_dialog)
+
+        except Exception as e:
+            log(f"Error finalizing check: {e}\n{traceback.format_exc()}")
+            if not self._silent_mode:
+                run_on_ui_thread(self._dismiss_loading_dialog)
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Error comparing versions"))
+        finally:
+            self._end_check()
+
+    def _get_local_plugins(self):
+        plugins = {}
+        plugins_dir = get_plugins_dir()
+        if not plugins_dir or not os.path.isdir(str(plugins_dir)):
+            return plugins
+
+        files = list_dir(str(plugins_dir), extensions=[".py"])
+        if not files:
+            return plugins
+
+        for file_path in files:
+            try:
+                content = self._read_plugin_file(str(file_path))
+                if not content:
+                    continue
+                meta = self._parse_plugin_metadata(content)
+                if meta and meta.get("id"):
+                    plugins[meta["id"]] = {
+                        "name": meta.get("name", meta["id"]),
+                        "version": meta.get("version", "0"),
+                        "path": str(file_path),
+                    }
+            except Exception:
+                pass
+        return plugins
+
+    def _parse_plugin_metadata(self, source):
+        meta = {}
+
+        m = re.search(r'''__id__\s*=\s*(?:"|')([^"']+)(?:"|')''', source)
+        if m:
+            meta["id"] = m.group(1)
+        m = re.search(r'''__name__\s*=\s*(?:"|')([^"']+)(?:"|')''', source)
+        if m:
+            meta["name"] = m.group(1)
+        m = re.search(r'''__version__\s*=\s*(?:"|')([^"']+)(?:"|')''', source)
+        if m:
+            meta["version"] = m.group(1)
+
+        if not meta.get("id"):
+            try:
+                tree = ast.parse(source)
+                for node in ast.iter_child_nodes(tree):
+                    if isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and self._get_ast_value(node.value):
+                                val = self._get_ast_value(node.value)
+                                if target.id == "__id__" and not meta.get("id"):
+                                    meta["id"] = val
+                                elif target.id == "__name__" and not meta.get("name"):
+                                    meta["name"] = val
+                                elif target.id == "__version__" and not meta.get("version"):
+                                    meta["version"] = val
+            except Exception:
+                pass
+
+        return meta
+
+    def _get_ast_value(self, node):
+        if isinstance(node, ast.Constant):
+            return str(node.value)
+        return None
+
+    def _read_plugin_file(self, file_path):
+        for enc in ["utf-8", "latin-1"]:
+            try:
+                with open(file_path, "r", encoding=enc, errors="replace") as f:
+                    return f.read()
+            except Exception:
+                continue
+        return None
+
+    def _version_is_newer(self, new_ver, old_ver):
+        try:
+            new_parts = [int(x) for x in re.split(r"[._\-+]", str(new_ver)) if x.isdigit()]
+            old_parts = [int(x) for x in re.split(r"[._\-+]", str(old_ver)) if x.isdigit()]
+            if not new_parts or not old_parts:
+                return str(new_ver) != str(old_ver)
+            max_len = max(len(new_parts), len(old_parts))
+            while len(new_parts) < max_len:
+                new_parts.append(0)
+            while len(old_parts) < max_len:
+                old_parts.append(0)
+            return new_parts > old_parts
+        except (ValueError, AttributeError):
+            return str(new_ver) != str(old_ver)
+    def _get_document_filename(self, doc):
+        if not hasattr(doc, "attributes") or not doc.attributes:
+            return None
+        for j in range(doc.attributes.size()):
+            attr = doc.attributes.get(j)
+            if isinstance(attr, TLRPC.TL_documentAttributeFilename):
+                return attr.file_name
+        return None
+
+    def _load_cache(self):
+        try:
+            if get_cache_dir is None:
+                return {"channels": {}}
+            cache_dir = get_cache_dir()
+            if cache_dir is None:
+                return {"channels": {}}
+            path = os.path.join(str(cache_dir), CACHE_FILE_NAME)
+            if not os.path.isfile(path):
+                return {"channels": {}}
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if not raw:
+                return {"channels": {}}
+            data = json.loads(raw)
+            if data.get("version") != CACHE_VERSION:
+                return {"channels": {}}
+            if not isinstance(data.get("channels"), dict):
+                data["channels"] = {}
+            return data
+        except Exception:
+            return {"channels": {}}
+
+    def _save_cache(self):
+        try:
+            if get_cache_dir is None:
+                return
+            cache_dir = get_cache_dir()
+            if cache_dir is None:
+                return
+            cache_dir_path = str(cache_dir)
+            try:
+                os.makedirs(cache_dir_path, exist_ok=True)
+            except Exception:
+                pass
+            payload = {
+                "version": CACHE_VERSION,
+                "channels": self._cache_data.get("channels", {}),
+            }
+            with open(os.path.join(cache_dir_path, CACHE_FILE_NAME), "w", encoding="utf-8") as f:
+                f.write(json.dumps(payload))
+        except Exception:
+            pass
+
+    def _get_channels_to_check(self):
+        channels = [DEFAULT_CHANNEL]
+        custom = self._get_saved_custom_channels_text()
+        if custom:
+            normalized = custom.replace("\r", " ").replace("\n", " ")
+            for part in re.split(r"[\s,;]+", normalized):
+                line = part.strip()
+                if line.startswith("@"):
+                    line = line[1:]
+                if line and line not in channels:
+                    channels.append(line)
+        return channels[:MAX_CHANNELS]
+
+    def _error_text(self, error, fallback):
+        try:
+            text = getattr(error, "text", None)
+            if text:
+                return str(text)
+        except Exception:
+            pass
+        try:
+            s = str(error)
+            if s and s != "None":
+                return s
+        except Exception:
+            pass
+        return fallback
 
     def _show_loading_dialog(self):
         try:
@@ -172,7 +981,14 @@ class PluginUpdateCheckerPlugin(BasePlugin):
         if self._silent_mode:
             return
         try:
-            self._progress = min(percent, 100)
+            percent = min(int(percent), 100)
+            if percent < 100:
+                now = time.time() * 1000.0
+                if self._progress_ts and now - self._progress_ts < PROGRESS_THROTTLE_MS:
+                    return
+                self._progress_ts = now
+            self._progress = percent
+
             def update():
                 try:
                     if self._loading_dialog:
@@ -180,451 +996,10 @@ class PluginUpdateCheckerPlugin(BasePlugin):
                         self._loading_dialog.set_message(message)
                 except Exception:
                     pass
+
             run_on_ui_thread(update)
         except Exception:
             pass
-
-    def _get_channels_to_check(self):
-        channels = [DEFAULT_CHANNEL]
-        custom = self._get_saved_custom_channels_text()
-        if custom:
-            normalized = custom.replace("\r", " ").replace("\n", " ")
-            for part in re.split(r"[\s,;]+", normalized):
-                line = part.strip()
-                if line.startswith("@"):
-                    line = line[1:]
-                if line and line not in channels:
-                    channels.append(line)
-        return channels
-
-    def _start_check(self):
-        try:
-            self._checking = True
-            if not self._silent_mode:
-                self._set_progress(2, "Reading installed plugins...")
-            local_plugins = self._get_local_plugins()
-            if not local_plugins:
-                self._checking = False
-                if not self._silent_mode:
-                    run_on_ui_thread(self._dismiss_loading_dialog)
-                    run_on_ui_thread(lambda: self._show_simple_result("No installed plugins found."))
-                return
-
-            self._local_plugins = local_plugins
-            self._channel_plugins = {}
-
-            channels = self._get_channels_to_check()
-            self._channels_to_check = channels
-            self._total_channels = len(channels)
-            self._current_channel_index = 0
-            self._all_channel_files = []
-            self._set_progress(5, f"Found {len(local_plugins)} plugins. Checking {self._total_channels} channel(s)...")
-            self._resolve_next_channel()
-
-        except Exception as e:
-            log(f"Error starting update check: {e}\n{traceback.format_exc()}")
-            self._checking = False
-            if not self._silent_mode:
-                run_on_ui_thread(self._dismiss_loading_dialog)
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Error checking for updates"))
-
-    def _resolve_next_channel(self):
-        if self._current_channel_index >= len(self._channels_to_check):
-            self._start_downloading_all_files()
-            return
-
-        channel = self._channels_to_check[self._current_channel_index]
-        self._current_channel_username = channel
-
-        chan_pct = 5 + int(15 * self._current_channel_index / max(self._total_channels, 1))
-        self._set_progress(chan_pct, f"Resolving @{channel}... ({self._current_channel_index + 1}/{self._total_channels})")
-
-        try:
-            req = TLRPC.TL_contacts_resolveUsername()
-            req.username = channel
-            send_request(req, RequestCallback(self._on_channel_resolved))
-        except Exception as e:
-            log(f"Error resolving channel {channel}: {e}")
-            self._current_channel_index += 1
-            self._resolve_next_channel()
-
-    def _get_local_plugins(self):
-        plugins = {}
-        plugins_dir = get_plugins_dir()
-        if not plugins_dir or not os.path.isdir(str(plugins_dir)):
-            return plugins
-
-        files = list_dir(str(plugins_dir), extensions=[".py"])
-        if not files:
-            return plugins
-
-        for file_path in files:
-            try:
-                content = self._read_plugin_file(str(file_path))
-                if not content:
-                    content = read_file(str(file_path))
-                if not content:
-                    continue
-                meta = self._parse_plugin_metadata(content)
-                if meta and meta.get("id"):
-                    plugins[meta["id"]] = {
-                        "name": meta.get("name", meta["id"]),
-                        "version": meta.get("version", "0"),
-                        "path": str(file_path),
-                    }
-            except Exception:
-                pass
-        return plugins
-
-    def _parse_plugin_metadata(self, source):
-        meta = {}
-        try:
-            tree = ast.parse(source)
-            for node in ast.iter_child_nodes(tree):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            name = target.id
-                            if name == "__id__":
-                                val = self._get_ast_value(node.value)
-                                if val:
-                                    meta["id"] = val
-                            elif name == "__name__":
-                                val = self._get_ast_value(node.value)
-                                if val:
-                                    meta["name"] = val
-                            elif name == "__version__":
-                                val = self._get_ast_value(node.value)
-                                if val:
-                                    meta["version"] = val
-        except Exception:
-            pass
-
-        if not meta.get("id"):
-            m = re.search(r'''__id__\s*=\s*(?:"|')([^"']+)(?:"|')''', source)
-            if m:
-                meta["id"] = m.group(1)
-        if not meta.get("name"):
-            m = re.search(r'''__name__\s*=\s*(?:"|')([^"']+)(?:"|')''', source)
-            if m:
-                meta["name"] = m.group(1)
-        if not meta.get("version"):
-            m = re.search(r'''__version__\s*=\s*(?:"|')([^"']+)(?:"|')''', source)
-            if m:
-                meta["version"] = m.group(1)
-
-        return meta
-
-    def _get_ast_value(self, node):
-        if isinstance(node, ast.Constant):
-            return str(node.value)
-        return None
-
-    def _read_plugin_file(self, file_path):
-        for enc in ["utf-8", "latin-1"]:
-            try:
-                with open(file_path, "r", encoding=enc, errors="replace") as f:
-                    return f.read()
-            except Exception:
-                continue
-        return None
-
-    def _on_channel_resolved(self, response, error):
-        try:
-            if error or not response:
-                log(f"Failed to resolve channel: {self._current_channel_username}")
-                self._current_channel_index += 1
-                self._resolve_next_channel()
-                return
-
-            resolved = response
-            chats = resolved.chats
-            users = resolved.users
-
-            if chats and chats.size() > 0:
-                get_messages_controller().putChats(chats, False)
-            if users and users.size() > 0:
-                get_messages_controller().putUsers(users, False)
-
-            if not chats or chats.size() == 0:
-                self._current_channel_index += 1
-                self._resolve_next_channel()
-                return
-
-            channel = chats.get(0)
-            self._current_channel_id = channel.id
-            self._current_channel_access_hash = channel.access_hash
-            self._current_channel_fetched_messages = []
-
-            chan_pct = 20 + int(15 * self._current_channel_index / max(self._total_channels, 1))
-            self._set_progress(chan_pct, f"Fetching files from @{self._current_channel_username}...")
-            self._fetch_channel_documents(0)
-
-        except Exception as e:
-            log(f"Error in channel resolution: {e}\n{traceback.format_exc()}")
-            self._current_channel_index += 1
-            self._resolve_next_channel()
-
-    def _fetch_channel_documents(self, offset_id):
-        try:
-            req = TLRPC.TL_messages_search()
-            req.q = ""
-            req.filter = TLRPC.TL_inputMessagesFilterDocument()
-            req.limit = 100
-            req.offset_id = offset_id
-            req.min_date = 0
-            req.max_date = 0
-
-            peer = TLRPC.TL_inputPeerChannel()
-            peer.channel_id = self._current_channel_id
-            peer.access_hash = self._current_channel_access_hash
-            req.peer = peer
-
-            send_request(req, RequestCallback(self._on_documents_fetched))
-        except Exception as e:
-            log(f"Error fetching documents: {e}")
-            self._current_channel_index += 1
-            self._resolve_next_channel()
-
-    def _on_documents_fetched(self, response, error):
-        try:
-            if error or not response:
-                self._collect_current_channel_files()
-                return
-
-            messages = response.messages
-            if not messages or messages.size() == 0:
-                self._collect_current_channel_files()
-                return
-
-            last_id = 0
-            for i in range(messages.size()):
-                msg = messages.get(i)
-                self._current_channel_fetched_messages.append(msg)
-                last_id = msg.id
-
-            if messages.size() < 100:
-                self._collect_current_channel_files()
-            else:
-                self._fetch_channel_documents(last_id)
-
-        except Exception as e:
-            log(f"Error processing documents: {e}")
-            self._collect_current_channel_files()
-
-    def _collect_current_channel_files(self):
-        try:
-            seen = {}
-            for msg in self._current_channel_fetched_messages:
-                if not hasattr(msg, "media") or not msg.media:
-                    continue
-                if not hasattr(msg.media, "document") or not msg.media.document:
-                    continue
-
-                doc = msg.media.document
-                filename = self._get_document_filename(doc)
-                if not filename or not filename.endswith(".plugin"):
-                    continue
-
-                if filename not in seen or msg.date > seen[filename]["date"]:
-                    seen[filename] = {
-                        "date": msg.date,
-                        "document": doc,
-                        "message": msg,
-                        "filename": filename,
-                        "channel_id": self._current_channel_id,
-                        "channel_username": self._current_channel_username,
-                        "message_id": msg.id,
-                    }
-
-            self._all_channel_files.extend(seen.values())
-        except Exception as e:
-            log(f"Error collecting channel files: {e}")
-
-        self._current_channel_index += 1
-        self._resolve_next_channel()
-
-    def _get_document_filename(self, doc):
-        if not hasattr(doc, "attributes") or not doc.attributes:
-            return None
-        for j in range(doc.attributes.size()):
-            attr = doc.attributes.get(j)
-            if isinstance(attr, TLRPC.TL_documentAttributeFilename):
-                return attr.file_name
-        return None
-
-    def _start_downloading_all_files(self):
-        total = len(self._all_channel_files)
-        if total == 0:
-            self._set_progress(100, "Done")
-            self._updates = []
-            self._up_to_date = []
-            self._not_found = list(n["name"] for n in self._local_plugins.values() if n != __id__)
-            self._checking = False
-            run_on_ui_thread(self._dismiss_loading_dialog)
-            run_on_ui_thread(self._show_results_dialog)
-            return
-
-        self._total_files_to_download = total
-        self._files_downloaded = 0
-        self._download_retries = {}
-
-        self._set_progress(35, f"Downloading 0/{total} files...")
-
-        for info in self._all_channel_files:
-            self._download_retries[id(info)] = 0
-            self._download_plugin_file(info)
-
-    def _download_plugin_file(self, info):
-        try:
-            doc = info["document"]
-            file_loader = get_file_loader()
-            file_path = file_loader.getPathToAttach(doc)
-
-            if file_path and file_path.exists():
-                run_on_queue(lambda fp=str(file_path), i=info: self._on_file_downloaded(fp, i))
-                return
-
-            file_loader.loadFile(doc, info["message"], FileLoader.PRIORITY_HIGH, 0)
-
-            def check_download(d=doc, i=info):
-                try:
-                    fp = get_file_loader().getPathToAttach(d)
-                    if fp and fp.exists() and fp.length() > 0:
-                        self._on_file_downloaded(str(fp), i)
-                    else:
-                        key = id(i)
-                        with self._lock:
-                            self._download_retries[key] = self._download_retries.get(key, 0) + 1
-                            retries = self._download_retries[key]
-                        if retries < 40:
-                            run_on_queue(lambda: check_download(d, i), PLUGINS_QUEUE, 500)
-                        else:
-                            self._on_file_downloaded(None, i)
-                except Exception as e:
-                    log(f"Error checking download: {e}")
-                    self._on_file_downloaded(None, i)
-
-            run_on_queue(lambda: check_download(doc, info), PLUGINS_QUEUE, 500)
-
-        except Exception as e:
-            log(f"Error downloading file: {e}")
-            self._on_file_downloaded(None, info)
-
-    def _on_file_downloaded(self, file_path, info):
-        try:
-            if file_path:
-                try:
-                    content = self._read_plugin_file(file_path)
-                    if not content:
-                        content = read_file(file_path)
-                    if not content:
-                        raise ValueError("empty file")
-                    meta = self._parse_plugin_metadata(content)
-                    if meta and meta.get("id") and meta.get("version"):
-                        plugin_id = meta["id"]
-                        channel_version = meta["version"]
-
-                        if plugin_id in self._local_plugins:
-                            with self._lock:
-                                existing = self._channel_plugins.get(plugin_id)
-                                if not existing or self._version_is_newer(channel_version, existing["version"]):
-                                    self._channel_plugins[plugin_id] = {
-                                        "version": channel_version,
-                                        "name": meta.get("name", plugin_id),
-                                        "channel_id": info["channel_id"],
-                                        "channel_username": info["channel_username"],
-                                        "message_id": info["message_id"],
-                                        "file_path": file_path,
-                                        "filename": info["filename"],
-                                    }
-                except Exception as e:
-                    log(f"Error parsing plugin file: {e}")
-        except Exception as e:
-            log(f"Error in download callback: {e}")
-        finally:
-            should_finalize = False
-            with self._lock:
-                self._files_downloaded += 1
-                done = self._files_downloaded
-                total = self._total_files_to_download
-                if done >= total:
-                    should_finalize = True
-
-            pct = 35 + int(60 * done / max(total, 1))
-            self._set_progress(min(pct, 95), f"Downloading {done}/{total} files...")
-
-            if should_finalize:
-                run_on_queue(self._finalize_all_channels)
-
-    def _finalize_all_channels(self):
-        try:
-            self._set_progress(97, "Comparing versions...")
-            updates = []
-            up_to_date = []
-            not_found = []
-
-            for pid, local_info in self._local_plugins.items():
-                if pid == __id__:
-                    continue
-
-                if pid in self._channel_plugins:
-                    channel_info = self._channel_plugins[pid]
-                    local_ver = local_info["version"]
-                    channel_ver = channel_info["version"]
-
-                    if self._version_is_newer(channel_ver, local_ver):
-                        updates.append({
-                            "plugin_id": pid,
-                            "name": local_info["name"],
-                            "local_version": local_ver,
-                            "channel_version": channel_ver,
-                            "channel_id": channel_info["channel_id"],
-                            "channel_username": channel_info["channel_username"],
-                            "message_id": channel_info["message_id"],
-                            "file_path": channel_info["file_path"],
-                            "local_path": local_info["path"],
-                        })
-                    else:
-                        up_to_date.append(local_info["name"])
-                else:
-                    not_found.append(local_info["name"])
-
-            self._updates = updates
-            self._up_to_date = up_to_date
-            self._not_found = not_found
-            self._last_scan_exists = True
-
-            if self._silent_mode:
-                if updates:
-                    run_on_ui_thread(self._show_results_dialog)
-            else:
-                self._set_progress(100, "Done!")
-                run_on_ui_thread(self._dismiss_loading_dialog)
-                run_on_ui_thread(self._show_results_dialog)
-
-        except Exception as e:
-            log(f"Error finalizing check: {e}\n{traceback.format_exc()}")
-            if not self._silent_mode:
-                run_on_ui_thread(self._dismiss_loading_dialog)
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Error comparing versions"))
-        finally:
-            self._checking = False
-
-    def _version_is_newer(self, new_ver, old_ver):
-        try:
-            new_parts = [int(x) for x in str(new_ver).split(".")]
-            old_parts = [int(x) for x in str(old_ver).split(".")]
-
-            max_len = max(len(new_parts), len(old_parts))
-            while len(new_parts) < max_len:
-                new_parts.append(0)
-            while len(old_parts) < max_len:
-                old_parts.append(0)
-
-            return new_parts > old_parts
-        except (ValueError, AttributeError):
-            return str(new_ver) != str(old_ver)
 
     def _show_results_dialog(self):
         try:
@@ -642,26 +1017,37 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             up_to_date = self._up_to_date
             not_found = self._not_found
 
-            if not updates and not up_to_date and not not_found:
+            channel_errors = {}
+            for ch, status in self._channel_statuses.items():
+                if status and status.get("error"):
+                    channel_errors[ch] = status["error"]
+
+            if not updates and not up_to_date and not not_found and not channel_errors:
                 self._show_simple_result("No plugins to check.")
                 return
 
             parts = []
 
             if updates:
-                lines = [f"🔄 Updates available ({len(updates)}):"]
+                lines = [f"\U0001f504 Updates available ({len(updates)}):"]
                 for u in updates:
-                    lines.append(f"  • {u['name']}")
-                    lines.append(f"    {u['local_version']} → {u['channel_version']}  (@{u['channel_username']})")
+                    lines.append(f"  \u2022 {u['name']}")
+                    lines.append(f"    {u['local_version']} \u2192 {u['channel_version']}  (@{u['channel_username']})")
                 parts.append("\n".join(lines))
 
             if up_to_date:
-                parts.append(f"✅ Up to date: {len(up_to_date)} plugin(s)")
+                parts.append(f"\u2705 Up to date: {len(up_to_date)} plugin(s)")
 
             if not_found:
-                lines = [f"❓ Not in channels ({len(not_found)}):"]
+                lines = [f"\u2753 Not in channels ({len(not_found)}):"]
                 for n in not_found:
-                    lines.append(f"  • {n}")
+                    lines.append(f"  \u2022 {n}")
+                parts.append("\n".join(lines))
+
+            if channel_errors:
+                lines = ["\u26a0\ufe0f Channel errors:"]
+                for ch, err in channel_errors.items():
+                    lines.append(f"  \u26a0\ufe0f @{ch}: {err}")
                 parts.append("\n".join(lines))
 
             msg = "\n\n".join(parts)
@@ -699,7 +1085,7 @@ class PluginUpdateCheckerPlugin(BasePlugin):
 
             items = []
             for u in updates:
-                items.append(f"{u['name']}  ({u['local_version']} → {u['channel_version']})")
+                items.append(f"{u['name']}  ({u['local_version']} \u2192 {u['channel_version']})")
 
             def on_item_click(bld, index):
                 bld.dismiss()
@@ -746,18 +1132,18 @@ class PluginUpdateCheckerPlugin(BasePlugin):
             parts = []
 
             if updates:
-                lines = ["🔄 Updates available:"]
+                lines = ["\U0001f504 Updates available:"]
                 for u in updates:
-                    lines.append(f"• {u['name']}: {u['local_version']} → {u['channel_version']} (@{u['channel_username']})")
+                    lines.append(f"  \u2022 {u['name']}: {u['local_version']} \u2192 {u['channel_version']} (@{u['channel_username']})")
                 parts.append("\n".join(lines))
 
             if up_to_date:
-                parts.append(f"✅ Up to date: {len(up_to_date)} plugin(s)")
+                parts.append(f"\u2705 Up to date: {len(up_to_date)} plugin(s)")
 
             if not_found:
-                lines = [f"❓ Not in channels ({len(not_found)}):"]
+                lines = [f"\u2753 Not in channels ({len(not_found)}):"]
                 for n in not_found:
-                    lines.append(f"  • {n}")
+                    lines.append(f"  \u2022 {n}")
                 parts.append("\n".join(lines))
 
             if not parts:
