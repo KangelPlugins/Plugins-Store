@@ -1,0 +1,1298 @@
+import html
+import json
+import os
+import re
+import time
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
+
+from android_utils import log, run_on_ui_thread
+from android.widget import Toast
+from org.telegram.messenger import ApplicationLoader
+
+from client_utils import run_on_queue, send_text, send_photo
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Input, Divider, Switch, Text
+
+from java import jarray
+from java.net import URL
+from java.io import BufferedReader, InputStreamReader, FileOutputStream, OutputStreamWriter
+
+__id__ = "game_stat_informer"
+__name__ = "Game Stat Informer"
+__description__ = ("Информер статистики osu! (API v2) и статуса Minecraft-серверов. "
+                    "Команды: .osu, .osu recent, .osu top, .osu vs, .osumap [top/set/similar/random], .mc")
+__author__ = "@Tapokdurachek"
+__version__ = "5.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=11.12.0"
+
+# osu! API v2 ruleset ids, keyed by every alias a user might type after the nickname
+OSU_MODE_ALIASES = {
+    "osu": "osu", "std": "osu", "standard": "osu",
+    "taiko": "taiko",
+    "catch": "fruits", "fruits": "fruits", "ctb": "fruits",
+    "mania": "mania",
+}
+OSU_MODE_LABELS = {"osu": "osu!", "taiko": "osu!taiko", "fruits": "osu!catch", "mania": "osu!mania"}
+
+# osu! v2 grade strings -> (short label, emoji)
+GRADE_MAP = {
+    "XH": ("SS", "🟡"), "X": ("SS", "🟡"),
+    "SH": ("S", "⚪"), "S": ("S", "⚪"),
+    "A": ("A", "🟢"),
+    "B": ("B", "🔵"),
+    "C": ("C", "🟣"),
+    "D": ("D", "🔴"),
+    "F": ("F", "⚫"),
+}
+
+OSU_API_BASE = "https://osu.ppy.sh/api/v2"
+OSU_TOKEN_URL = "https://osu.ppy.sh/oauth/token"
+
+BEATMAP_LINK_PATTERNS = [
+    re.compile(r"osu\.ppy\.sh/beatmapsets/\d+#\w+/(\d+)"),
+    re.compile(r"osu\.ppy\.sh/b/(\d+)"),
+    re.compile(r"osu\.ppy\.sh/beatmaps/(\d+)"),
+]
+BEATMAPSET_LINK_RE = re.compile(r"osu\.ppy\.sh/beatmapsets/(\d+)")
+
+PROFILE_LINK_RE = re.compile(r"osu\.ppy\.(?:sh|me)/(?:users|u)/([^/?\s]+)(?:/(osu|taiko|fruits|mania|catch))?")
+
+STAR_RANGE_RE = re.compile(r"^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$")
+
+# для запросов к /beatmapsets/search
+OSU_MODE_SEARCH_NUM = {"osu": 0, "taiko": 1, "fruits": 2, "mania": 3}
+
+STATUS_LABELS = {
+    "graveyard": "⚪ Graveyard",
+    "wip": "🔧 WIP",
+    "pending": "🟠 Pending",
+    "ranked": "🟢 Ranked",
+    "approved": "🟢 Approved",
+    "qualified": "🔵 Qualified",
+    "loved": "❤️ Loved",
+}
+
+CACHE_TTL_SECONDS = 60
+
+
+class GameInformerPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._osu_token: Optional[str] = None
+        self._osu_token_expires_at: float = 0.0
+        self._osu_cache: Dict[Tuple[str, str], Tuple[float, dict]] = {}
+        self.add_on_send_message_hook()
+        self.log("Game Stat Informer загружен")
+
+    # ---------------------------------------------------------------- UI ---
+
+    def show_toast(self, text: str):
+        def run():
+            try:
+                Toast.makeText(ApplicationLoader.applicationContext, str(text), 0).show()
+            except Exception as e:
+                self.log(f"Toast error: {e}")
+        run_on_ui_thread(run)
+
+    def _debug_toast(self, text: str):
+        if self.get_setting("debug_toasts", True):
+            self.show_toast(text)
+
+    def create_settings(self) -> List:
+        return [
+            Header(text="osu! — авторизация (API v2, OAuth2)"),
+            Input(
+                key="osu_client_id",
+                text="osu! Client ID",
+                default="",
+                subtext="Создай OAuth-приложение на osu.ppy.sh/home/account/edit в разделе "
+                        "'OAuth' и вставь сюда Client ID. Legacy API v1 отключена в этой версии.",
+            ),
+            Input(
+                key="osu_client_secret",
+                text="osu! Client Secret",
+                default="",
+                subtext="Client Secret того же OAuth-приложения. Хранится только в настройках плагина.",
+            ),
+            Divider(),
+            Header(text="osu! — общее"),
+            Input(key="default_osu_player", text="Ник в osu! по умолчанию", default="Cookiezi"),
+            Input(
+                key="osu_favorites",
+                text="Избранные ники (алиасы)",
+                default="",
+                subtext="Формат: алиас=ник, через запятую. Пример: friend1=SomeNick,friend2=OtherNick. "
+                        "Потом можно писать .osu friend1 вместо полного ника.",
+            ),
+            Switch(key="osu_show_avatar", text="Прикреплять аватар как фото", default=True,
+                   subtext="Если фото не грузится или зависает — выключи, тогда останется просто ссылка на аватар."),
+            Divider(),
+            Header(text="osu! — какие поля показывать в карточке профиля"),
+            Switch(key="osu_show_rank", text="Глобал/страна ранг", default=True),
+            Switch(key="osu_show_pp", text="PP", default=True),
+            Switch(key="osu_show_accuracy", text="Точность", default=True),
+            Switch(key="osu_show_playcount", text="Кол-во игр", default=True),
+            Switch(key="osu_show_ranks", text="Счётчик SS/S/A", default=True),
+            Switch(key="osu_show_level", text="Уровень", default=True),
+            Switch(key="osu_show_playtime", text="Время в игре", default=True),
+            Switch(key="osu_show_joindate", text="Дата регистрации", default=True),
+            Divider(),
+            Header(text="osu! — карты"),
+            Input(
+                key="osu_map_favorites",
+                text="Избранные карты (алиасы)",
+                default="",
+                subtext="Формат: алиас=ссылка_или_id, через запятую. Пример: fav1=https://osu.ppy.sh/b/123,fav2=456. "
+                        "Потом можно писать .osumap fav1 вместо полной ссылки.",
+            ),
+            Divider(),
+            Header(text="Minecraft"),
+            Input(key="default_mc_server", text="IP сервера по умолчанию", default="hypixel.net"),
+            Switch(key="mc_show_icon", text="Прикреплять иконку сервера как фото", default=True),
+            Divider(),
+            Header(text="Отладка"),
+            Switch(key="debug_toasts", text="Показывать всплывающие сообщения об ошибках фото", default=True,
+                   subtext="Полезно, пока фото не прикрепляется — покажет причину прямо на экране."),
+            Divider(),
+            Text(
+                text="Использование",
+                subtext=".osu [ник] [режим] — профиль игрока\n"
+                        ".osu recent [ник] [режим] — последний скор\n"
+                        ".osu top [ник] [режим] — топ-5 скоров по pp\n"
+                        ".osu vs ник1 ник2 [режим] — сравнение двух игроков\n"
+                        ".osumap <ссылка на карту> — карточка карты (сложность, статус, обложка, оценка pp)\n"
+                        ".osumap top <ссылка> — топ-5 мировых скоров на карте\n"
+                        ".osumap set <ссылка> — список всех диффов сета\n"
+                        ".osumap similar <ссылка> — похожие карты\n"
+                        ".osumap random [звёзды] [режим] — случайная карта, напр. .osumap random 5-6 std\n"
+                        ".mc [ip] — статус Minecraft-сервера\n"
+                        "Режимы: std/taiko/catch/mania. Избранные ники и избранные карты работают везде "
+                        "вместо полного ника/ссылки.",
+            ),
+        ]
+
+    # ---------------------------------------------------------- networking ---
+
+    def _http_get_text(self, url_str: str, timeout_ms: int = 10000, headers: Optional[Dict[str, str]] = None):
+        """Возвращает (status_code, text) либо (None, None) при сетевой ошибке."""
+        try:
+            url = URL(url_str)
+            conn = url.openConnection()
+            conn.setRequestMethod("GET")
+            conn.setConnectTimeout(timeout_ms)
+            conn.setReadTimeout(timeout_ms)
+            conn.setRequestProperty("User-Agent", "exteraGram-GameStatInformer/4.0.0")
+            conn.setRequestProperty("Accept", "application/json")
+            if headers:
+                for k, v in headers.items():
+                    conn.setRequestProperty(k, v)
+
+            status = conn.getResponseCode()
+            stream = conn.getInputStream() if status == 200 else conn.getErrorStream()
+            if stream is None:
+                return status, ""
+
+            reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+            parts = []
+            line = reader.readLine()
+            while line is not None:
+                parts.append(line)
+                line = reader.readLine()
+            reader.close()
+            return status, "\n".join(parts)
+        except Exception as e:
+            self.log(f"HTTP error for {url_str}: {e}")
+            return None, None
+
+    def _http_post_json(self, url_str: str, body: dict, timeout_ms: int = 10000,
+                         headers: Optional[Dict[str, str]] = None):
+        """POST с JSON-телом. Возвращает (status_code, text) либо (None, None) при сетевой ошибке."""
+        try:
+            url = URL(url_str)
+            conn = url.openConnection()
+            conn.setRequestMethod("POST")
+            conn.setConnectTimeout(timeout_ms)
+            conn.setReadTimeout(timeout_ms)
+            conn.setDoOutput(True)
+            conn.setRequestProperty("User-Agent", "exteraGram-GameStatInformer/4.0.0")
+            conn.setRequestProperty("Accept", "application/json")
+            conn.setRequestProperty("Content-Type", "application/json")
+            if headers:
+                for k, v in headers.items():
+                    conn.setRequestProperty(k, v)
+
+            writer = OutputStreamWriter(conn.getOutputStream(), "UTF-8")
+            writer.write(json.dumps(body))
+            writer.flush()
+            writer.close()
+
+            status = conn.getResponseCode()
+            stream = conn.getInputStream() if status == 200 else conn.getErrorStream()
+            if stream is None:
+                return status, ""
+
+            reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+            parts = []
+            line = reader.readLine()
+            while line is not None:
+                parts.append(line)
+                line = reader.readLine()
+            reader.close()
+            return status, "\n".join(parts)
+        except Exception as e:
+            self.log(f"HTTP POST error for {url_str}: {e}")
+            return None, None
+
+    def _cache_file_path(self, filename: str) -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename)
+        cache_dir = ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath()
+        return f"{cache_dir}/{safe_name}"
+
+    def _download_to_file(self, url_str: str, dest_path: str, timeout_ms: int = 15000):
+        """Скачивает бинарный файл (картинку) напрямую поток -> файл, не трогая байты
+        через Python, чтобы не рисковать их порчей при конвертации между Java и Python.
+        Возвращает (True, None) при успехе или (False, "причина") при неудаче."""
+        conn = None
+        stream = None
+        out = None
+        try:
+            url = URL(url_str)
+            conn = url.openConnection()
+            conn.setRequestMethod("GET")
+            conn.setConnectTimeout(timeout_ms)
+            conn.setReadTimeout(timeout_ms)
+            conn.setRequestProperty("User-Agent", "exteraGram-GameStatInformer/4.0.0")
+
+            status = conn.getResponseCode()
+            if status != 200:
+                return False, f"HTTP {status}"
+
+            stream = conn.getInputStream()
+            out = FileOutputStream(dest_path)
+            buf = jarray('B')(8192)
+            n = stream.read(buf)
+            total = 0
+            while n != -1:
+                if n > 0:
+                    out.write(buf, 0, n)
+                    total += n
+                n = stream.read(buf)
+
+            if total == 0:
+                return False, "пустой ответ (0 байт)"
+            return True, None
+        except Exception as e:
+            self.log(f"Download error for {url_str}: {e}\n{traceback.format_exc()}")
+            return False, f"{type(e).__name__}: {e}"
+        finally:
+            for closable in (stream, out):
+                try:
+                    if closable is not None:
+                        closable.close()
+                except Exception:
+                    pass
+
+    def _cleanup_cache_file(self, path: Optional[str]):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            self.log(f"Cache cleanup error: {e}")
+
+    def _fetch_json(self, url_str: str, headers: Optional[Dict[str, str]] = None) -> Any:
+        status, text = self._http_get_text(url_str, headers=headers)
+        if status is None:
+            return {"http_error_status": "network"}
+        if status != 200:
+            return {"http_error_status": status}
+        try:
+            return json.loads(text)
+        except Exception as e:
+            self.log(f"JSON parse error for {url_str}: {e}")
+            return {"http_error_status": "parse"}
+
+    # ------------------------------------------------------------- sending ---
+
+    def _send_result(self, params: Any, html_text: str, photo_path: Optional[str] = None):
+        """Единая точка отправки: HTML-режим форматирования, экранирование обязательно
+        выполняется до вызова этого метода. Если передан photo_path — пробуем отправить
+        фото с подписью, при любой ошибке откатываемся на обычный текст."""
+        reply_kwargs = {}
+        reply_obj = getattr(params, "replyToMsg", None)
+        if reply_obj is not None:
+            reply_kwargs["replyToMsg"] = reply_obj
+
+        if photo_path:
+            file_ok = False
+            try:
+                file_ok = os.path.exists(photo_path) and os.path.getsize(photo_path) > 0
+            except Exception as e:
+                self.log(f"File check error for {photo_path}: {e}")
+
+            if not file_ok:
+                self._debug_toast(f"⚠️ Файл фото отсутствует или пуст: {photo_path}")
+            else:
+                try:
+                    send_photo(params.peer, photo_path, caption=html_text, parse_mode="HTML", **reply_kwargs)
+                    self._cleanup_cache_file(photo_path)
+                    return
+                except TypeError as e:
+                    # На случай если send_photo в этой версии SDK не принимает replyToMsg
+                    self._debug_toast(f"⚠️ send_photo: неверные параметры ({e}), пробую без replyToMsg")
+                    try:
+                        send_photo(params.peer, photo_path, caption=html_text, parse_mode="HTML")
+                        self._cleanup_cache_file(photo_path)
+                        return
+                    except Exception as e2:
+                        self.log(f"send_photo failed (без replyToMsg): {e2}\n{traceback.format_exc()}")
+                        self._debug_toast(f"⚠️ Фото не отправилось: {type(e2).__name__}: {e2}")
+                except Exception as e:
+                    self.log(f"send_photo failed: {e}\n{traceback.format_exc()}")
+                    self._debug_toast(f"⚠️ Фото не отправилось: {type(e).__name__}: {e}")
+            self._cleanup_cache_file(photo_path)
+
+        try:
+            send_text(params.peer, html_text, parse_mode="HTML", **reply_kwargs)
+        except Exception as e:
+            self.log(f"send_text failed: {e}\n{traceback.format_exc()}")
+
+    def _reply_error(self, params: Any, text: str):
+        self._send_result(params, text)
+
+    # --------------------------------------------------------------- hook ---
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+
+        text = params.message.strip()
+        if not text:
+            return HookResult()
+
+        parts = text.split()
+        cmd = parts[0].lower()
+
+        if cmd == ".osu":
+            return self._handle_osu_command(params, parts[1:])
+        if cmd == ".osumap":
+            return self._handle_osumap_command(params, parts[1:])
+        if cmd == ".mc":
+            return self._handle_mc_command(params, parts[1:])
+
+        return HookResult()
+
+    # ---------------------------------------------------------- osu! utils ---
+
+    def _extract_mode(self, args: List[str]) -> Tuple[str, List[str]]:
+        """Достаёт режим, если он указан последним аргументом, возвращает (mode, оставшиеся_аргументы)."""
+        rest = list(args)
+        if rest and rest[-1].lower() in OSU_MODE_ALIASES:
+            return OSU_MODE_ALIASES[rest[-1].lower()], rest[:-1]
+        return "osu", rest
+
+    def _get_favorites(self) -> Dict[str, str]:
+        raw = self.get_setting("osu_favorites", "") or ""
+        favorites = {}
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk or "=" not in chunk:
+                continue
+            alias, _, nick = chunk.partition("=")
+            alias = alias.strip().lower()
+            nick = nick.strip()
+            if alias and nick:
+                favorites[alias] = nick
+        return favorites
+
+    def _resolve_username_and_mode(self, rest: List[str]) -> Tuple[str, str]:
+        """Из списка аргументов (без сабкоманды) достаёт (ник, режим) с учётом
+        избранных ников, ссылок на профиль (с авто-режимом из URL) и алиасов режима."""
+        mode, rest = self._extract_mode(rest)
+
+        if rest:
+            raw = " ".join(rest)
+            link_match = PROFILE_LINK_RE.search(raw)
+            if link_match:
+                username = link_match.group(1).replace("%20", " ").strip()
+                url_mode = link_match.group(2)
+                if url_mode:
+                    url_mode = "fruits" if url_mode in ("catch", "fruits") else url_mode
+                    mode = OSU_MODE_ALIASES.get(url_mode, mode)
+            else:
+                username = raw.strip()
+        else:
+            username = self.get_setting("default_osu_player", "Cookiezi").strip()
+
+        favorites = self._get_favorites()
+        username = favorites.get(username.lower(), username)
+        return username, mode
+
+    def _get_osu_token(self) -> Optional[str]:
+        if self._osu_token and time.time() < self._osu_token_expires_at - 30:
+            return self._osu_token
+
+        client_id = self.get_setting("osu_client_id", "").strip()
+        client_secret = self.get_setting("osu_client_secret", "").strip()
+        if not client_id or not client_secret:
+            return None
+
+        body = {
+            "client_id": int(client_id) if client_id.isdigit() else client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+            "scope": "public",
+        }
+        status, text = self._http_post_json(OSU_TOKEN_URL, body)
+        if status != 200 or not text:
+            self.log(f"osu token error: status={status}")
+            return None
+        try:
+            data = json.loads(text)
+            token = data.get("access_token")
+            expires_in = int(data.get("expires_in", 3600))
+            if token:
+                self._osu_token = token
+                self._osu_token_expires_at = time.time() + expires_in
+                return token
+        except Exception as e:
+            self.log(f"osu token parse error: {e}")
+        return None
+
+    def _osu_api_get(self, path: str, retry: bool = True) -> Any:
+        token = self._get_osu_token()
+        if not token:
+            return {"http_error_status": "no_auth"}
+
+        url = f"{OSU_API_BASE}{path}"
+        status, text = self._http_get_text(url, headers={
+            "Authorization": f"Bearer {token}",
+            "x-api-version": "20231121",
+        })
+        if status == 401 and retry:
+            # токен мог протухнуть раньше времени — сбрасываем и пробуем один раз заново
+            self._osu_token = None
+            self._osu_token_expires_at = 0
+            return self._osu_api_get(path, retry=False)
+        if status is None:
+            return {"http_error_status": "network"}
+        if status != 200:
+            return {"http_error_status": status}
+        try:
+            return json.loads(text)
+        except Exception as e:
+            self.log(f"JSON parse error for {url}: {e}")
+            return {"http_error_status": "parse"}
+
+    def _is_api_error(self, data: Any) -> bool:
+        return not data or (isinstance(data, dict) and "http_error_status" in data)
+
+    def _api_error_text(self, data: Any) -> str:
+        code = data.get("http_error_status") if isinstance(data, dict) else "unknown"
+        if code == "no_auth":
+            return ("❌ Не настроена авторизация osu! API v2. Открой настройки плагина и укажи "
+                    "Client ID и Client Secret (создаются на osu.ppy.sh/home/account/edit).")
+        if code == "network":
+            return "❌ Ошибка сети при запросе к API osu!."
+        if code == 404:
+            return "❌ Не найдено."
+        return f"❌ Ошибка API osu! (код: {code})."
+
+    def _fetch_osu_profile(self, username: str, mode: str) -> Any:
+        cache_key = (username.lower(), mode)
+        cached = self._osu_cache.get(cache_key)
+        if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
+            return cached[1]
+
+        data = self._osu_api_get(f"/users/{quote(username)}/{mode}?key=username")
+        if not self._is_api_error(data):
+            self._osu_cache[cache_key] = (time.time(), data)
+        return data
+
+    def _grade_str(self, grade_raw: Optional[str]) -> str:
+        label, emoji = GRADE_MAP.get(str(grade_raw), (str(grade_raw or "?"), "❔"))
+        return f"{emoji} {label}"
+
+    def _mods_str(self, mods: Any) -> str:
+        if not mods:
+            return "No Mod"
+        names = []
+        for m in mods:
+            if isinstance(m, dict):
+                names.append(str(m.get("acronym", "?")))
+            else:
+                names.append(str(m))
+        return "+" + "".join(names) if names else "No Mod"
+
+    def _score_stat(self, stats: dict, *keys: str) -> int:
+        for k in keys:
+            if k in stats:
+                try:
+                    return int(stats.get(k) or 0)
+                except Exception:
+                    return 0
+        return 0
+
+    def _format_iso_date(self, raw: str) -> str:
+        if not raw:
+            return "Неизвестно"
+        try:
+            date_part = raw[:19]
+            dt = time.strptime(date_part, "%Y-%m-%dT%H:%M:%S")
+            return time.strftime("%d/%m/%Y %H:%M", dt)
+        except Exception:
+            return html.escape(str(raw))
+
+    def _format_seconds_len(self, seconds: int) -> str:
+        seconds = int(seconds or 0)
+        m, s = divmod(seconds, 60)
+        return f"{m}:{s:02d}"
+
+    # --------------------------------------------------------- osu! dispatch ---
+
+    def _handle_osu_command(self, params: Any, args: List[str]) -> HookResult:
+        if args and args[0].lower() == "recent":
+            username, mode = self._resolve_username_and_mode(args[1:])
+            self.show_toast(f"🔎 Запрос последнего скора: {username}...")
+            run_on_queue(lambda: self._get_osu_recent(params, username, mode))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if args and args[0].lower() == "top":
+            username, mode = self._resolve_username_and_mode(args[1:])
+            self.show_toast(f"🔎 Запрос топ скоров: {username}...")
+            run_on_queue(lambda: self._get_osu_top(params, username, mode))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if args and args[0].lower() == "vs":
+            vs_args = args[1:]
+            mode, vs_args = self._extract_mode(vs_args)
+            if len(vs_args) < 2:
+                self._reply_error(params, "❌ Использование: .osu vs ник1 ник2 [режим]")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            favorites = self._get_favorites()
+            nick1 = favorites.get(vs_args[0].lower(), vs_args[0])
+            nick2 = favorites.get(vs_args[1].lower(), vs_args[1])
+            self.show_toast(f"🔎 Сравниваю {nick1} и {nick2}...")
+            run_on_queue(lambda: self._get_osu_vs(params, nick1, nick2, mode))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        username, mode = self._resolve_username_and_mode(args)
+        if not username:
+            return HookResult()
+
+        self.show_toast(f"🔎 Запрос профиля osu!: {username}...")
+        run_on_queue(lambda: self._get_osu_stats(params, username, mode))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _get_map_favorites(self) -> Dict[str, str]:
+        raw = self.get_setting("osu_map_favorites", "") or ""
+        favorites = {}
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk or "=" not in chunk:
+                continue
+            alias, _, value = chunk.partition("=")
+            alias = alias.strip().lower()
+            value = value.strip()
+            if alias and value:
+                favorites[alias] = value
+        return favorites
+
+    def _resolve_map_link(self, args: List[str]) -> str:
+        raw = " ".join(args).strip()
+        if not raw:
+            return raw
+        favorites = self._get_map_favorites()
+        # алиас распознаём только если это одно слово, полностью совпадающее с алиасом
+        if len(args) == 1 and raw.lower() in favorites:
+            return favorites[raw.lower()]
+        return raw
+
+    def _handle_osumap_command(self, params: Any, args: List[str]) -> HookResult:
+        if not args:
+            self._reply_error(
+                params,
+                "❌ Использование:\n"
+                ".osumap <ссылка> — карточка карты\n"
+                ".osumap top <ссылка> — топ мировых скоров\n"
+                ".osumap set <ссылка> — все диффы сета\n"
+                ".osumap similar <ссылка> — похожие карты\n"
+                ".osumap random [звёзды] [режим] — случайная карта",
+            )
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        sub = args[0].lower()
+
+        if sub == "top":
+            link = self._resolve_map_link(args[1:])
+            if not link:
+                self._reply_error(params, "❌ Использование: .osumap top <ссылка на карту>")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self.show_toast("🔎 Запрос лидерборда карты...")
+            run_on_queue(lambda: self._get_osu_map_top(params, link))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if sub in ("set", "diffs"):
+            link = self._resolve_map_link(args[1:])
+            if not link:
+                self._reply_error(params, "❌ Использование: .osumap set <ссылка на карту или сет>")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self.show_toast("🔎 Запрос диффов сета...")
+            run_on_queue(lambda: self._get_osu_map_set(params, link))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if sub == "similar":
+            link = self._resolve_map_link(args[1:])
+            if not link:
+                self._reply_error(params, "❌ Использование: .osumap similar <ссылка на карту>")
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self.show_toast("🔎 Ищу похожие карты...")
+            run_on_queue(lambda: self._get_osu_map_similar(params, link))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if sub == "random":
+            rest = args[1:]
+            mode = "osu"
+            star_min, star_max = 4.0, 6.0
+            for token in rest:
+                low = token.lower()
+                if low in OSU_MODE_ALIASES:
+                    mode = OSU_MODE_ALIASES[low]
+                    continue
+                m = STAR_RANGE_RE.match(token)
+                if m:
+                    star_min, star_max = float(m.group(1)), float(m.group(2))
+                    continue
+                try:
+                    single = float(token)
+                    star_min, star_max = max(0.0, single - 0.5), single + 0.5
+                except ValueError:
+                    pass
+            self.show_toast(f"🎲 Ищу случайную карту {star_min:.1f}-{star_max:.1f}★...")
+            run_on_queue(lambda: self._get_osu_map_random(params, star_min, star_max, mode))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        link = self._resolve_map_link(args)
+        if not link:
+            self._reply_error(params, "❌ Использование: .osumap <ссылка на карту>")
+            return HookResult(strategy=HookStrategy.CANCEL)
+        self.show_toast("🔎 Запрос данных карты...")
+        run_on_queue(lambda: self._get_osu_map(params, link))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _handle_mc_command(self, params: Any, args: List[str]) -> HookResult:
+        server_ip = args[0] if args else self.get_setting("default_mc_server", "hypixel.net")
+        server_ip = (server_ip or "").strip()
+        if not server_ip:
+            return HookResult()
+
+        self.show_toast(f"📡 Опрашиваю сервер {server_ip}...")
+        run_on_queue(lambda: self._get_minecraft_stats(params, server_ip))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    # ------------------------------------------------------------ osu! ---
+
+    def _build_profile_card(self, user: dict, mode: str) -> Tuple[str, str, Optional[str]]:
+        """Возвращает (html_карточка, user_id, avatar_url)."""
+        username_real = html.escape(str(user.get("username", "?")))
+        user_id = str(user.get("id", "0"))
+        country = html.escape(str(user.get("country_code", "??")))
+        mode_label = OSU_MODE_LABELS.get(mode, "osu!")
+
+        stats = user.get("statistics", {}) or {}
+        g_rank = stats.get("global_rank")
+        c_rank = stats.get("country_rank")
+        global_rank = f"#{int(g_rank):,}" if g_rank else "Без ранга"
+        country_rank = f"#{int(c_rank):,}" if c_rank else "Без ранга"
+
+        pp = f"{float(stats.get('pp') or 0):,.2f}"
+        accuracy = f"{float(stats.get('hit_accuracy') or 0):.2f}%"
+        playcount = f"{int(stats.get('play_count') or 0):,}"
+
+        grade_counts = stats.get("grade_counts", {}) or {}
+        ss_count = int(grade_counts.get("ss", 0) or 0) + int(grade_counts.get("ssh", 0) or 0)
+        s_count = int(grade_counts.get("s", 0) or 0) + int(grade_counts.get("sh", 0) or 0)
+        a_count = int(grade_counts.get("a", 0) or 0)
+        ranks_str = f"🟡 SS: {ss_count} / ⚪ S: {s_count} / 🟢 A: {a_count}"
+
+        level = int((stats.get("level", {}) or {}).get("current", 0) or 0)
+        hours_played = int(stats.get("play_time") or 0) // 3600
+        join_date = self._format_iso_date(user.get("join_date", ""))
+
+        profile_url = f"https://osu.ppy.sh/users/{user_id}"
+
+        lines = [
+            f"👤 <b>Никнейм:</b> <a href=\"{profile_url}\">{username_real}</a> [{country}]",
+            f"🎮 <b>Режим:</b> {mode_label}",
+            f"🪪 <b>ID:</b> <code>{user_id}</code>",
+        ]
+        if self.get_setting("osu_show_rank", True):
+            lines.append(f"🏆 <b>Глобал ранг:</b> {global_rank}")
+            lines.append(f"🎖 <b>Ранг в стране:</b> {country_rank}")
+        if self.get_setting("osu_show_pp", True):
+            lines.append(f"🔥 <b>PP:</b> {pp}")
+        if self.get_setting("osu_show_accuracy", True):
+            lines.append(f"📈 <b>Точность:</b> {accuracy}")
+        if self.get_setting("osu_show_playcount", True):
+            lines.append(f"🎮 <b>Всего игр:</b> {playcount}")
+        if self.get_setting("osu_show_ranks", True):
+            lines.append(f"🥇 <b>Ранги:</b> {ranks_str}")
+        if self.get_setting("osu_show_level", True):
+            lines.append(f"🆙 <b>Уровень:</b> {level}")
+        if self.get_setting("osu_show_playtime", True):
+            lines.append(f"⏳ <b>Время в игре:</b> {hours_played} ч.")
+        if self.get_setting("osu_show_joindate", True):
+            lines.append(f"📅 <b>Дата регистрации:</b> {join_date}")
+
+        return "\n".join(lines), user_id, user.get("avatar_url")
+
+    def _get_osu_stats(self, params: Any, username: str, mode: str):
+        try:
+            user = self._fetch_osu_profile(username, mode)
+            if self._is_api_error(user):
+                self._reply_error(params, self._api_error_text(user))
+                return
+            if isinstance(user, dict) and not user.get("id"):
+                self._reply_error(params, f"❌ Игрок «{html.escape(username)}» не найден.")
+                return
+
+            card, user_id, avatar_url = self._build_profile_card(user, mode)
+
+            avatar_path = None
+            if self.get_setting("osu_show_avatar", True):
+                avatar_src = avatar_url or f"https://a.ppy.sh/{user_id}"
+                dest = self._cache_file_path(f"osu_avatar_{user_id}.jpg")
+                ok, err = self._download_to_file(avatar_src, dest)
+                if ok:
+                    avatar_path = dest
+                else:
+                    self._debug_toast(f"⚠️ Аватар не скачался: {err}")
+
+            self._send_result(params, card, photo_path=avatar_path)
+        except Exception as e:
+            self.log(f"osu error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _build_score_line(self, score: dict, index: Optional[int] = None) -> str:
+        beatmapset = score.get("beatmapset", {}) or {}
+        beatmap = score.get("beatmap", {}) or {}
+        title = html.escape(f"{beatmapset.get('artist', '?')} - {beatmapset.get('title', '?')}")
+        version = html.escape(str(beatmap.get("version", "?")))
+        stars = beatmap.get("difficulty_rating")
+        stars_str = f"{float(stars):.2f}★" if stars else "?★"
+
+        grade = self._grade_str(score.get("rank"))
+        mods = self._mods_str(score.get("mods"))
+        acc = f"{float(score.get('accuracy') or 0) * 100:.2f}%"
+        combo = score.get("max_combo", 0)
+        pp = score.get("pp")
+        pp_str = f"{float(pp):.2f}pp" if pp else "—pp"
+
+        stats = score.get("statistics", {}) or {}
+        misses = self._score_stat(stats, "miss", "count_miss")
+        created = self._format_iso_date(score.get("created_at", ""))
+
+        prefix = f"<b>{index}.</b> " if index is not None else ""
+        return (
+            f"{prefix}🎵 <b>{title}</b> [{version}] ({stars_str})\n"
+            f"{grade} · {mods} · {acc} · {combo}x · {misses} miss · {pp_str}\n"
+            f"🕒 {created}"
+        )
+
+    def _get_osu_recent(self, params: Any, username: str, mode: str):
+        try:
+            user = self._fetch_osu_profile(username, mode)
+            if self._is_api_error(user):
+                self._reply_error(params, self._api_error_text(user))
+                return
+            user_id = user.get("id")
+            if not user_id:
+                self._reply_error(params, f"❌ Игрок «{html.escape(username)}» не найден.")
+                return
+
+            scores = self._osu_api_get(f"/users/{user_id}/scores/recent?mode={mode}&limit=1&include_fails=1")
+            if self._is_api_error(scores):
+                self._reply_error(params, self._api_error_text(scores))
+                return
+            if not scores:
+                self._reply_error(params, f"❌ У «{html.escape(str(user.get('username', username)))}» "
+                                           "нет недавних скоров.")
+                return
+
+            username_real = html.escape(str(user.get("username", username)))
+            card = f"🕹 <b>Последний скор — {username_real}</b> [{OSU_MODE_LABELS.get(mode, 'osu!')}]\n\n"
+            card += self._build_score_line(scores[0])
+            self._send_result(params, card)
+        except Exception as e:
+            self.log(f"osu recent error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _get_osu_top(self, params: Any, username: str, mode: str):
+        try:
+            user = self._fetch_osu_profile(username, mode)
+            if self._is_api_error(user):
+                self._reply_error(params, self._api_error_text(user))
+                return
+            user_id = user.get("id")
+            if not user_id:
+                self._reply_error(params, f"❌ Игрок «{html.escape(username)}» не найден.")
+                return
+
+            scores = self._osu_api_get(f"/users/{user_id}/scores/best?mode={mode}&limit=5")
+            if self._is_api_error(scores):
+                self._reply_error(params, self._api_error_text(scores))
+                return
+            if not scores:
+                self._reply_error(params, f"❌ У «{html.escape(str(user.get('username', username)))}» "
+                                           "нет топ-скоров.")
+                return
+
+            username_real = html.escape(str(user.get("username", username)))
+            card_lines = [f"🏅 <b>Топ скоры — {username_real}</b> [{OSU_MODE_LABELS.get(mode, 'osu!')}]\n"]
+            for i, score in enumerate(scores, start=1):
+                card_lines.append(self._build_score_line(score, index=i))
+            self._send_result(params, "\n\n".join(card_lines))
+        except Exception as e:
+            self.log(f"osu top error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _get_osu_vs(self, params: Any, nick1: str, nick2: str, mode: str):
+        try:
+            user1 = self._fetch_osu_profile(nick1, mode)
+            user2 = self._fetch_osu_profile(nick2, mode)
+
+            if self._is_api_error(user1):
+                self._reply_error(params, self._api_error_text(user1))
+                return
+            if self._is_api_error(user2):
+                self._reply_error(params, self._api_error_text(user2))
+                return
+            if not user1.get("id"):
+                self._reply_error(params, f"❌ Игрок «{html.escape(nick1)}» не найден.")
+                return
+            if not user2.get("id"):
+                self._reply_error(params, f"❌ Игрок «{html.escape(nick2)}» не найден.")
+                return
+
+            s1 = user1.get("statistics", {}) or {}
+            s2 = user2.get("statistics", {}) or {}
+
+            def cmp_row(label: str, v1: float, v2: float, fmt: str, higher_is_better: bool = True) -> str:
+                a_wins = (v1 > v2) if higher_is_better else (v1 < v2)
+                b_wins = (v2 > v1) if higher_is_better else (v2 < v1)
+                left = f"{'🟢' if a_wins else ''}{fmt.format(v1)}"
+                right = f"{fmt.format(v2)}{'🟢' if b_wins else ''}"
+                return f"{label}: {left}  —  {right}"
+
+            n1 = html.escape(str(user1.get("username", nick1)))
+            n2 = html.escape(str(user2.get("username", nick2)))
+
+            g1 = s1.get("global_rank") or 0
+            g2 = s2.get("global_rank") or 0
+            pp1 = float(s1.get("pp") or 0)
+            pp2 = float(s2.get("pp") or 0)
+            acc1 = float(s1.get("hit_accuracy") or 0)
+            acc2 = float(s2.get("hit_accuracy") or 0)
+            pc1 = int(s1.get("play_count") or 0)
+            pc2 = int(s2.get("play_count") or 0)
+
+            card = (
+                f"⚔️ <b>{n1}</b> vs <b>{n2}</b> [{OSU_MODE_LABELS.get(mode, 'osu!')}]\n\n"
+                + cmp_row("🏆 Глобал ранг", g1 or 999999999, g2 or 999999999, "#{:,.0f}", higher_is_better=False) + "\n"
+                + cmp_row("🔥 PP", pp1, pp2, "{:,.2f}") + "\n"
+                + cmp_row("📈 Точность", acc1, acc2, "{:.2f}%") + "\n"
+                + cmp_row("🎮 Игр сыграно", pc1, pc2, "{:,.0f}")
+            )
+            self._send_result(params, card)
+        except Exception as e:
+            self.log(f"osu vs error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _extract_beatmap_id(self, link: str) -> Optional[str]:
+        for pattern in BEATMAP_LINK_PATTERNS:
+            m = pattern.search(link)
+            if m:
+                return m.group(1)
+        # если прислали просто число — считаем, что это id карты
+        if link.strip().isdigit():
+            return link.strip()
+        return None
+
+    def _extract_beatmapset_id(self, link: str) -> Optional[str]:
+        m = BEATMAPSET_LINK_RE.search(link)
+        if m:
+            return m.group(1)
+        if link.strip().isdigit():
+            return link.strip()
+        return None
+
+    def _estimate_pp_ss(self, stars: float) -> Dict[str, float]:
+        """Очень грубая прикидка pp за SS без ошибок, разными модами.
+        Это НЕ настоящий алгоритм расчёта pp osu! (там участвуют aim/speed/acc
+        скиллы, объекты карты и т.д.) — только оценка порядка величины для ориентира."""
+        base = (5 * max(1.0, stars - 0.75)) ** 2 / 2
+        return {
+            "nomod": base,
+            "hd": base * 1.05,
+            "hr": base * 1.08,
+            "dt": base * 1.20,
+            "hddt": base * 1.28,
+        }
+
+    def _object_breakdown(self, data: dict) -> str:
+        circles = int(data.get("count_circles", 0) or 0)
+        sliders = int(data.get("count_sliders", 0) or 0)
+        spinners = int(data.get("count_spinners", 0) or 0)
+        total = circles + sliders + spinners
+        length = int(data.get("total_length", 0) or 0)
+        obj_per_sec = (total / length) if length > 0 else 0
+
+        if total == 0:
+            return "🎯 <b>Объекты:</b> нет данных"
+
+        tag = ""
+        if total and (circles / total) > 0.75 and obj_per_sec > 3.2:
+            tag = " (похоже на стрим-карту)"
+        elif total and (sliders / total) > 0.4:
+            tag = " (много слайдеров)"
+
+        return (
+            f"🎯 <b>Объекты:</b> ⭕{circles} / 🟰{sliders} / 🌀{spinners} "
+            f"(≈{obj_per_sec:.1f} об/сек{tag})"
+        )
+
+    def _build_beatmap_card(self, data: dict, beatmap_id: str) -> str:
+        beatmapset = data.get("beatmapset", {}) or {}
+        title = html.escape(f"{beatmapset.get('artist', '?')} - {beatmapset.get('title', '?')}")
+        version = html.escape(str(data.get("version", "?")))
+        mapper = html.escape(str(beatmapset.get("creator", "?")))
+
+        stars_val = data.get("difficulty_rating")
+        stars_str = f"{float(stars_val):.2f}★" if stars_val else "?★"
+        bpm = data.get("bpm")
+        bpm_str = f"{float(bpm):.0f}" if bpm else "?"
+        ar = data.get("ar", "?")
+        od = data.get("accuracy", "?")
+        cs = data.get("cs", "?")
+        hp = data.get("drain", "?")
+        length = self._format_seconds_len(data.get("total_length", 0))
+        max_combo = data.get("max_combo", "?")
+
+        status_raw = str(data.get("status") or beatmapset.get("status") or "").lower()
+        status_str = STATUS_LABELS.get(status_raw, status_raw or "?")
+        ranked_date = beatmapset.get("ranked_date")
+        ranked_date_str = self._format_iso_date(ranked_date) if ranked_date else None
+
+        playcount = data.get("playcount")
+        favourite_count = beatmapset.get("favourite_count")
+        popularity_line = ""
+        if playcount is not None or favourite_count is not None:
+            pc_str = f"{int(playcount or 0):,}"
+            fav_str = f"{int(favourite_count or 0):,}"
+            popularity_line = f"▶️ <b>Сыграно:</b> {pc_str} раз · ⭐ <b>В избранном:</b> {fav_str}\n"
+
+        map_url = f"https://osu.ppy.sh/beatmaps/{beatmap_id}"
+
+        lines = [
+            f"🗺 <a href=\"{map_url}\">{title}</a>",
+            f"🎼 <b>Диф:</b> {version} ({stars_str})",
+            f"🎨 <b>Маппер:</b> {mapper}",
+            f"🚦 <b>Статус:</b> {status_str}" + (f" (с {ranked_date_str})" if ranked_date_str else ""),
+            "───",
+            f"🥁 <b>BPM:</b> {bpm_str}",
+            f"🅰 <b>AR:</b> {ar}  🅾 <b>OD:</b> {od}  🇨 <b>CS:</b> {cs}  🆗 <b>HP:</b> {hp}",
+            f"⏱ <b>Длина:</b> {length}",
+            f"🔗 <b>Макс. комбо:</b> {max_combo}x",
+            self._object_breakdown(data),
+        ]
+        if popularity_line:
+            lines.append(popularity_line.strip())
+
+        if stars_val:
+            pp_est = self._estimate_pp_ss(float(stars_val))
+            lines.append(
+                "🔥 <b>Оценка pp за SS</b> (грубо, не точный расчёт):\n"
+                f"NoMod: ~{pp_est['nomod']:.0f} · HD: ~{pp_est['hd']:.0f} · "
+                f"HR: ~{pp_est['hr']:.0f} · DT: ~{pp_est['dt']:.0f} · HDDT: ~{pp_est['hddt']:.0f}"
+            )
+
+        return "\n".join(lines)
+
+    def _get_osu_map(self, params: Any, link: str):
+        try:
+            beatmap_id = self._extract_beatmap_id(link)
+            if not beatmap_id:
+                self._reply_error(params, "❌ Не удалось распознать ссылку на карту osu!.")
+                return
+
+            data = self._osu_api_get(f"/beatmaps/lookup?id={beatmap_id}")
+            if self._is_api_error(data):
+                self._reply_error(params, self._api_error_text(data))
+                return
+
+            card = self._build_beatmap_card(data, beatmap_id)
+
+            cover_path = None
+            covers = (data.get("beatmapset", {}) or {}).get("covers", {}) or {}
+            cover_url = covers.get("card@2x") or covers.get("card") or covers.get("cover")
+            if cover_url:
+                dest = self._cache_file_path(f"osu_map_{beatmap_id}.jpg")
+                ok, err = self._download_to_file(cover_url, dest)
+                if ok:
+                    cover_path = dest
+                else:
+                    self._debug_toast(f"⚠️ Обложка карты не скачалась: {err}")
+
+            self._send_result(params, card, photo_path=cover_path)
+        except Exception as e:
+            self.log(f"osu map error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _get_osu_map_top(self, params: Any, link: str):
+        try:
+            beatmap_id = self._extract_beatmap_id(link)
+            if not beatmap_id:
+                self._reply_error(params, "❌ Не удалось распознать ссылку на карту osu!.")
+                return
+
+            beatmap = self._osu_api_get(f"/beatmaps/lookup?id={beatmap_id}")
+            if self._is_api_error(beatmap):
+                self._reply_error(params, self._api_error_text(beatmap))
+                return
+
+            scores_data = self._osu_api_get(f"/beatmaps/{beatmap_id}/scores")
+            if self._is_api_error(scores_data):
+                self._reply_error(params, self._api_error_text(scores_data))
+                return
+
+            scores = scores_data.get("scores", []) if isinstance(scores_data, dict) else scores_data
+            if not scores:
+                self._reply_error(params, "❌ На этой карте пока нет скоров в лидерборде.")
+                return
+
+            beatmapset = beatmap.get("beatmapset", {}) or {}
+            title = html.escape(f"{beatmapset.get('artist', '?')} - {beatmapset.get('title', '?')}")
+            version = html.escape(str(beatmap.get("version", "?")))
+
+            lines = [f"🏆 <b>Топ скоры на карте</b>\n🎵 {title} [{version}]\n"]
+            for i, score in enumerate(scores[:5], start=1):
+                user = score.get("user", {}) or {}
+                nick = html.escape(str(user.get("username", "?")))
+                grade = self._grade_str(score.get("rank"))
+                mods = self._mods_str(score.get("mods"))
+                acc = f"{float(score.get('accuracy') or 0) * 100:.2f}%"
+                pp = score.get("pp")
+                pp_str = f"{float(pp):.2f}pp" if pp else "—pp"
+                lines.append(f"<b>{i}.</b> {nick} — {grade} · {mods} · {acc} · {pp_str}")
+
+            self._send_result(params, "\n".join(lines))
+        except Exception as e:
+            self.log(f"osu map top error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _get_osu_map_set(self, params: Any, link: str):
+        try:
+            set_id = self._extract_beatmapset_id(link)
+            if not set_id:
+                diff_id = self._extract_beatmap_id(link)
+                if diff_id:
+                    lookup = self._osu_api_get(f"/beatmaps/lookup?id={diff_id}")
+                    if not self._is_api_error(lookup):
+                        set_id = str((lookup.get("beatmapset", {}) or {}).get("id") or "")
+            if not set_id:
+                self._reply_error(params, "❌ Не удалось распознать ссылку на карту/сет osu!.")
+                return
+
+            data = self._osu_api_get(f"/beatmapsets/{set_id}")
+            if self._is_api_error(data):
+                self._reply_error(params, self._api_error_text(data))
+                return
+
+            title = html.escape(f"{data.get('artist', '?')} - {data.get('title', '?')}")
+            beatmaps = data.get("beatmaps", []) or []
+            if not beatmaps:
+                self._reply_error(params, "❌ В этом сете нет диффов.")
+                return
+
+            beatmaps_sorted = sorted(beatmaps, key=lambda b: b.get("difficulty_rating") or 0)
+            lines = [f"📀 <b>Диффы сета</b>\n🎵 {title}\n"]
+            for b in beatmaps_sorted:
+                mode_label = OSU_MODE_LABELS.get(b.get("mode", "osu"), b.get("mode", "?"))
+                version = html.escape(str(b.get("version", "?")))
+                stars = b.get("difficulty_rating")
+                stars_str = f"{float(stars):.2f}★" if stars else "?★"
+                lines.append(f"• [{mode_label}] {version} — {stars_str} (id: {b.get('id')})")
+
+            self._send_result(params, "\n".join(lines))
+        except Exception as e:
+            self.log(f"osu map set error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _search_beatmapsets(self, query: str, mode: str) -> List[dict]:
+        mode_num = OSU_MODE_SEARCH_NUM.get(mode, 0)
+        data = self._osu_api_get(f"/beatmapsets/search?q={quote(query)}&m={mode_num}&s=ranked")
+        if self._is_api_error(data):
+            return []
+        return data.get("beatmapsets", []) or []
+
+    def _get_osu_map_similar(self, params: Any, link: str):
+        try:
+            beatmap_id = self._extract_beatmap_id(link)
+            if not beatmap_id:
+                self._reply_error(params, "❌ Не удалось распознать ссылку на карту osu!.")
+                return
+
+            source = self._osu_api_get(f"/beatmaps/lookup?id={beatmap_id}")
+            if self._is_api_error(source):
+                self._reply_error(params, self._api_error_text(source))
+                return
+
+            mode = source.get("mode", "osu")
+            src_stars = float(source.get("difficulty_rating") or 0)
+            src_bpm = float(source.get("bpm") or 0)
+            src_set_id = (source.get("beatmapset", {}) or {}).get("id")
+
+            genre = ((source.get("beatmapset", {}) or {}).get("genre", {}) or {}).get("name", "")
+            query = f"stars>={max(0.0, src_stars - 0.3):.2f} stars<={src_stars + 0.3:.2f} {genre}".strip()
+
+            candidates = self._search_beatmapsets(query, mode)
+            matches = []
+            for cand_set in candidates:
+                if cand_set.get("id") == src_set_id:
+                    continue
+                for b in cand_set.get("beatmaps", []) or []:
+                    if b.get("mode") != mode:
+                        continue
+                    stars = b.get("difficulty_rating") or 0
+                    bpm = cand_set.get("bpm") or 0
+                    if abs(stars - src_stars) <= 0.35 and (not src_bpm or abs(bpm - src_bpm) <= 15):
+                        matches.append((cand_set, b))
+                        break
+                if len(matches) >= 5:
+                    break
+
+            if not matches:
+                self._reply_error(params, "❌ Похожих карт не нашлось (попробуй другую карту).")
+                return
+
+            lines = [f"🔎 <b>Похожие карты</b> (±0.35★ от {src_stars:.2f}★)\n"]
+            for cand_set, b in matches:
+                title = html.escape(f"{cand_set.get('artist', '?')} - {cand_set.get('title', '?')}")
+                version = html.escape(str(b.get("version", "?")))
+                stars = b.get("difficulty_rating")
+                stars_str = f"{float(stars):.2f}★" if stars else "?★"
+                map_url = f"https://osu.ppy.sh/beatmaps/{b.get('id')}"
+                lines.append(f"• <a href=\"{map_url}\">{title}</a> [{version}] — {stars_str}")
+
+            self._send_result(params, "\n".join(lines))
+        except Exception as e:
+            self.log(f"osu map similar error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    def _get_osu_map_random(self, params: Any, star_min: float, star_max: float, mode: str):
+        try:
+            import random as _random
+            query = f"stars>={star_min:.2f} stars<={star_max:.2f}"
+            candidates = self._search_beatmapsets(query, mode)
+            if not candidates:
+                self._reply_error(params, "❌ Ничего не нашлось в этом диапазоне сложности.")
+                return
+
+            matching = []
+            for cand_set in candidates:
+                for b in cand_set.get("beatmaps", []) or []:
+                    if b.get("mode") != mode:
+                        continue
+                    stars = b.get("difficulty_rating") or 0
+                    if star_min <= stars <= star_max:
+                        matching.append(b.get("id"))
+
+            if not matching:
+                self._reply_error(params, "❌ Ничего не нашлось в этом диапазоне сложности.")
+                return
+
+            chosen_id = _random.choice(matching)
+            data = self._osu_api_get(f"/beatmaps/lookup?id={chosen_id}")
+            if self._is_api_error(data):
+                self._reply_error(params, self._api_error_text(data))
+                return
+
+            card = "🎲 <b>Случайная карта</b>\n\n" + self._build_beatmap_card(data, str(chosen_id))
+
+            cover_path = None
+            covers = (data.get("beatmapset", {}) or {}).get("covers", {}) or {}
+            cover_url = covers.get("card@2x") or covers.get("card") or covers.get("cover")
+            if cover_url:
+                dest = self._cache_file_path(f"osu_map_{chosen_id}.jpg")
+                ok, err = self._download_to_file(cover_url, dest)
+                if ok:
+                    cover_path = dest
+
+            self._send_result(params, card, photo_path=cover_path)
+        except Exception as e:
+            self.log(f"osu map random error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка плагина: {html.escape(str(e))}")
+
+    # ------------------------------------------------------- Minecraft ---
+
+    def _get_minecraft_stats(self, params: Any, server_ip: str):
+        safe_ip = html.escape(server_ip)
+        data = self._fetch_json(f"https://api.mcsrvstat.us/3/{quote(server_ip)}")
+
+        if not data or (isinstance(data, dict) and "http_error_status" in data):
+            self._reply_error(params, f"❌ Не удалось связаться с API для <code>{safe_ip}</code>.")
+            return
+
+        online = data.get("online", False)
+        if not online:
+            self._reply_error(
+                params,
+                f"🔴 <b>Сервер Minecraft оффлайн</b>\n🌐 Адрес: <code>{safe_ip}</code>",
+            )
+            return
+
+        try:
+            version = html.escape(str(data.get("version", "Неизвестно")))
+            players = data.get("players", {}) or {}
+            current_players = players.get("online", 0)
+            max_players = players.get("max", 0)
+
+            motd_list = (data.get("motd", {}) or {}).get("clean", [])
+            motd = html.escape("\n".join(motd_list).strip()) if motd_list else "Нет описания"
+
+            players_list = players.get("list", []) or []
+            players_str = ""
+            if players_list:
+                visible = [
+                    html.escape(p.get("name", str(p)) if isinstance(p, dict) else str(p))
+                    for p in players_list[:10]
+                ]
+                players_str = "\n👥 <b>Игроки онлайн:</b> " + ", ".join(visible)
+                remaining = len(players_list) - len(visible)
+                if remaining > 0:
+                    players_str += f" и ещё {remaining}"
+
+            card = (
+                f"🟢 <b>Статус Minecraft сервера</b>\n"
+                f"🌐 <b>IP:</b> <code>{safe_ip}</code>\n"
+                f"───\n"
+                f"⚙️ <b>Версия:</b> {version}\n"
+                f"👥 <b>Онлайн:</b> <code>{current_players} / {max_players}</code>\n"
+                f"📝 <b>MOTD:</b>\n<i>{motd}</i>\n"
+                f"{players_str}"
+            )
+            icon_path = None
+            if self.get_setting("mc_show_icon", True):
+                dest = self._cache_file_path(f"mc_icon_{server_ip}.png")
+                ok, err = self._download_to_file(f"https://api.mcsrvstat.us/icon/{quote(server_ip)}", dest)
+                if ok:
+                    icon_path = dest
+                else:
+                    self._debug_toast(f"⚠️ Иконка сервера не скачалась: {err}")
+
+            self._send_result(params, card, photo_path=icon_path)
+        except Exception as e:
+            self.log(f"MC parse error: {e}\n{traceback.format_exc()}")
+            self._reply_error(params, f"❌ Ошибка парсинга статуса <code>{safe_ip}</code>")
