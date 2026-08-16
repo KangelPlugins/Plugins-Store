@@ -1,0 +1,364 @@
+import os
+import shutil
+import threading
+import time
+
+from base_plugin import BasePlugin
+from java import jclass
+
+__id__ = "unlinked_stickers"
+__name__ = "Unlinked Stickers"
+__description__ = ("Send stickers from any pack as your own uploaded documents, "
+                    "detached from the original sticker set. Works with static "
+                    "(webp), animated (tgs) and video (webm) stickers.")
+__author__ = "@itNotMax - @MaxExteraPlugins"
+__version__ = "1.0"
+__icon__ = "MaxExteraPluginsStickers/26"
+__min_version__ = "12.1.1"
+__app_version__ = ">=12.1.1"
+
+TL_document = jclass("org.telegram.tgnet.TLRPC$TL_document")
+TL_documentAttributeSticker = jclass("org.telegram.tgnet.TLRPC$TL_documentAttributeSticker")
+TL_documentAttributeFilename = jclass("org.telegram.tgnet.TLRPC$TL_documentAttributeFilename")
+FileLoader = jclass("org.telegram.messenger.FileLoader")
+SendMessagesHelper = jclass("org.telegram.messenger.SendMessagesHelper")
+DialogObject = jclass("org.telegram.messenger.DialogObject")
+
+_PRIORITY_HIGH = 3
+_AUTORESEND_TIMEOUT_SEC = 45.0
+_POLL_INTERVAL = 0.3
+
+_autoresend_lock = threading.Lock()
+_autoresend_active = set()
+
+
+def _file_stable_size(path, sample=0.5):
+    try:
+        s1 = os.path.getsize(path)
+    except Exception:
+        s1 = 0
+    time.sleep(sample)
+    try:
+        s2 = os.path.getsize(path)
+    except Exception:
+        s2 = 0
+    if s1 > 0 and s2 > 0 and s1 == s2:
+        return s1
+    time.sleep(sample)
+    try:
+        s3 = os.path.getsize(path)
+    except Exception:
+        s3 = 0
+    if s2 > 0 and s3 > 0 and s2 == s3:
+        return s2
+    return 0
+
+
+def _file_name_for_mime(mime):
+    if mime.endswith("webp"):
+        return "sticker.webp"
+    if mime.endswith("webm"):
+        return "sticker.webm"
+    if mime.endswith("tgsticker"):
+        return "sticker.tgs"
+    return "sticker"
+
+
+def _thumb_path(account, thumb):
+    try:
+        fl = FileLoader.getInstance(account)
+        return fl.getPathToAttach(thumb, True).getAbsolutePath()
+    except Exception:
+        return None
+
+
+def _compress_tgs(path, log):
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if raw[:2] == b"\x1f\x8b":
+            log("COMPRESS: file already gzip, cannot shrink")
+            return None
+        import gzip
+        comp = gzip.compress(raw, compresslevel=9)
+        if len(comp) >= len(raw):
+            log("COMPRESS: gzip did not shrink (" + str(len(comp)) + "), skipped")
+            return None
+        if len(comp) > 65536:
+            log("COMPRESS: still too big after gzip (" + str(len(comp)) +
+                " > 65536), skipping")
+            return None
+        with open(path, "wb") as fh:
+            fh.write(comp)
+        return len(comp)
+    except Exception as e:
+        log("COMPRESS FAILED: " + repr(e))
+        return None
+
+
+def _ensure_uploadable_thumb(account, doc):
+    from java.util import ArrayList
+    th = doc.thumbs
+    if th is None or th.size() == 0:
+        return
+    first = th.get(0)
+    p0 = _thumb_path(account, first)
+    if p0 is not None and os.path.exists(p0):
+        return
+    best = None
+    for i in range(th.size()):
+        p = _thumb_path(account, th.get(i))
+        if p is not None and os.path.exists(p):
+            best = th.get(i)
+            break
+    if best is not None:
+        fresh = ArrayList()
+        fresh.add(best)
+        for i in range(th.size()):
+            t = th.get(i)
+            if t is not best:
+                fresh.add(t)
+        doc.thumbs = fresh
+        return
+    doc.thumbs = ArrayList()
+
+
+def _sanitized_attributes(attrs_java):
+    count = attrs_java.size()
+    out = []
+    for i in range(count):
+        attr = attrs_java.get(i)
+        try:
+            if isinstance(attr, TL_documentAttributeFilename):
+                out.append(None)
+                continue
+        except Exception:
+            pass
+        out.append(attr)
+    return out
+
+
+def _own_dst(docid, ext):
+    dst_dir = os.path.join(
+        jclass("org.telegram.messenger.ApplicationLoader")
+        .applicationContext.getFilesDir().getAbsolutePath(),
+        "own_stickers")
+    os.makedirs(dst_dir, exist_ok=True)
+    return os.path.join(dst_dir, "sticker_" + str(docid) + "." + ext)
+
+
+class SendStickerAsOwn(BasePlugin):
+
+    def on_plugin_load(self):
+        self._register_send_message_hook()
+
+    def _register_send_message_hook(self):
+        try:
+            pid = getattr(self, "id", None)
+            if pid is None:
+                pid = "unlinked_stickers"
+            pc = jclass("com.exteragram.messenger.plugins.PluginsController").getInstance()
+            pc.addEventHook(str(pid), "send_message_hook", False, 0)
+        except Exception as e:
+            self.log("send_message_hook registration FAILED: " + repr(e))
+
+    def on_send_message_hook(self, account, params):
+        try:
+            self._hook(account, params)
+        except Exception as e:
+            self.log("SEND_HOOK EXCEPTION: " + repr(e))
+        return None
+
+    def _hook(self, account, params):
+        doc = params.document
+        if doc is None:
+            return
+        try:
+            if not isinstance(doc, TL_document):
+                return
+        except Exception as e:
+            self.log("SEND_HOOK isinstance FAILED: " + repr(e))
+            return
+        if doc.id == 0 or doc.access_hash == 0:
+            return
+        try:
+            if DialogObject.isEncryptedDialog(params.peer):
+                return
+        except Exception as e:
+            self.log("SEND_HOOK isEncryptedDialog FAILED: " + repr(e))
+            return
+        try:
+            if params.retryMessageObject is not None:
+                return
+        except Exception as e:
+            self.log("SEND_HOOK retry check FAILED: " + repr(e))
+            return
+        try:
+            p = params.path
+            if p is not None and len(p) > 0:
+                return
+        except Exception as e:
+            self.log("SEND_HOOK path check FAILED: " + repr(e))
+            return
+        try:
+            attrs_java = doc.attributes
+            n = attrs_java.size()
+            attrs = [attrs_java.get(i) for i in range(n)]
+        except Exception as e:
+            self.log("SEND_HOOK attrs read FAILED: " + repr(e))
+            return
+        is_sticker = False
+        for attr in attrs:
+            try:
+                if isinstance(attr, TL_documentAttributeSticker):
+                    is_sticker = True
+                    break
+            except Exception as e:
+                self.log("SEND_HOOK attr isinstance FAILED: " + repr(e))
+        if not is_sticker:
+            return
+
+        try:
+            loader = FileLoader.getInstance(account)
+            cache = loader.getPathToAttach(doc, False)
+            if cache is None:
+                return
+            cache_path = cache.getAbsolutePath()
+            exists = cache.exists()
+        except Exception as e:
+            self.log("SEND_HOOK cache check FAILED: " + repr(e))
+            return
+
+        clean_name = _file_name_for_mime(str(doc.mime_type or ""))
+        send_path = cache_path
+        final_size = None
+
+        if exists:
+            try:
+                dst = _own_dst(doc.id, clean_name.rsplit(".", 1)[1])
+                _copy_verified(cache_path, dst)
+                send_path = dst
+                if str(doc.mime_type or "").endswith("tgsticker") and \
+                        os.path.getsize(dst) > 65536:
+                    final_size = _compress_tgs(dst, self.log)
+            except Exception as e:
+                self.log("SEND_HOOK copy FAILED, using cache path: " + repr(e))
+                send_path = cache_path
+
+        new_doc = self._build_new_doc(doc, attrs_java, clean_name, final_size)
+        if new_doc is None:
+            return
+        try:
+            _ensure_uploadable_thumb(account, new_doc)
+        except Exception as e:
+            self.log("SEND_HOOK thumb ensure FAILED: " + repr(e))
+        try:
+            params.document = new_doc
+            params.path = send_path
+        except Exception as e:
+            self.log("SEND_HOOK params set FAILED: " + repr(e))
+            return
+
+        if not exists:
+            try:
+                loader.loadFile(doc, None, _PRIORITY_HIGH, 0)
+            except Exception as e:
+                self.log("SEND_HOOK download start FAILED: " + repr(e))
+            key = (str(params.peer), str(doc.id))
+            need_thread = False
+            with _autoresend_lock:
+                if key not in _autoresend_active:
+                    _autoresend_active.add(key)
+                    need_thread = True
+            if need_thread:
+                t = threading.Thread(
+                    target=self._auto_resend_worker,
+                    args=(account, params, cache_path, key),
+                    name="own_sticker_resend",
+                    daemon=True)
+                t.start()
+
+    def _build_new_doc(self, doc, attrs_java, clean_name, final_size):
+        try:
+            new_doc = TL_document()
+            new_doc.id = 0
+            new_doc.access_hash = 0
+            new_doc.dc_id = 0
+            for f in ["date", "mime_type", "size", "file_name", "file_reference",
+                      "key", "thumb", "has_thumb", "thumbs", "stickerSet"]:
+                try:
+                    v = getattr(doc, f)
+                    if v is not None:
+                        setattr(new_doc, f, v)
+                except Exception:
+                    pass
+            new_doc.file_name = clean_name
+            if final_size is not None:
+                new_doc.size = final_size
+            kept_attrs = [a for a in _sanitized_attributes(attrs_java) if a is not None]
+            from java.util import ArrayList
+            new_attrs = ArrayList()
+            for a in kept_attrs:
+                new_attrs.add(a)
+            new_doc.attributes = new_attrs
+            return new_doc
+        except Exception as e:
+            self.log("SEND_HOOK new_doc build FAILED: " + repr(e))
+            return None
+
+    def _auto_resend_worker(self, account, params, cache_path, key):
+        try:
+            deadline = time.time() + _AUTORESEND_TIMEOUT_SEC
+            while time.time() < deadline:
+                time.sleep(_POLL_INTERVAL * 3)
+                try:
+                    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+                        break
+                except Exception:
+                    pass
+            else:
+                self.log("AUTORESEND: timeout, file never appeared")
+                return
+            try:
+                stable = _file_stable_size(cache_path)
+                if stable > 0:
+                    doc = params.document
+                    mime = str(getattr(doc, "mime_type", "") or "")
+                    docid = str(getattr(doc, "id", "0"))
+                    dst = _own_dst(docid, _file_name_for_mime(mime).rsplit(".", 1)[1])
+                    _copy_verified(cache_path, dst)
+                    if mime.endswith("tgsticker") and os.path.getsize(dst) > 65536:
+                        final = _compress_tgs(dst, self.log)
+                        if final is not None:
+                            doc.size = final
+                    _ensure_uploadable_thumb(account, doc)
+                    params.path = dst
+                    SendMessagesHelper.getInstance(account).sendMessage(params)
+                else:
+                    self.log("AUTORESEND: file size unstable, skipped")
+            except Exception as e:
+                self.log("AUTORESEND FAILED: " + repr(e))
+        finally:
+            with _autoresend_lock:
+                _autoresend_active.discard(key)
+
+
+def _copy_verified(src, dst):
+    shutil.copyfile(src, dst)
+    if os.path.getsize(dst) != os.path.getsize(src):
+        raise IOError("size mismatch after copy")
+    return dst
+
+# __DEX_BEGIN__
+# eNpVk89rE0EUx9/sbtKmaht7EQLisujJJJsfuzFJRSxUpBDpIaV4EONkd5Jsu9lds5t0QSx6Vrzo
+# QfAq9CL05smjF/+AHoQKIl68ePAu+CY7gTXhk5l57/vem2S/sVm8UqmbcPJm92Xx4+1mZfzbDE5/
+# nBzmj5XLf749fCsDBAAQ7xnrIF7fJYA1SOJZ5AOCIfiMEOQMUZCf4qzgR4SCq7gGSIy8QF4hr5Fj
+# 5BT5hfxFllFbQK4gGnINuS4lM3jfjJi7hJxDZHGvEUnOGXGWUL0i7nB+fiYiTuDCvG5xTjSLPsti
+# /YKJrxLPkXn+AUnmB3muXJ3XcR6RpKYAOSgQAo9VgDzmM0gOVuPFDAXf2ZuO50S34OLWnfvq2Len
+# LlNdn9rMBrIN8nanA+sd6tkT37H1aeS4escfbkCxY/ljncURm9DAnQ4dL9RD5tm9MHKsAzbp0bDn
+# H3r6Pep4G9hhn86o7lJvqO/095kV/R/rRhPHw645Li/zOOS72K2bNNsMdw49kHc37wLZA2KDwm8I
+# 78jR0VbzidanKPJsra3ZLNaKGt4scFwaOb5Xwm/E5on+dIipEQ1L1ohZB+F0HGrtAXVDVtTGjlei
+# gaO1q0UtHNFSFSsqTYM2W9Vag7KK2WpYZqtVNer2wLxBG6bRMBp0UGvWq3VsOmOTEGdhUatcKxsl
+# m820p/iAuGvI82fKe4nkPknkUo7/7mviWZLUuvCulPKvnPKwkvJxJuXlbMrPRE303NOy2HN/kHyi
+# 4V6UVDGLB9Qkzj2VEXvuLVnoz3gDsef/r3/qWpi1
+# __DEX_END__
