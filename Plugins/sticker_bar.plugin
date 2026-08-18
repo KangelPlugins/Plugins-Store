@@ -1,0 +1,1390 @@
+# -*- coding: utf-8 -*-
+# TikTok Stickers — плагин для exteraGram / AyuGram
+#
+# ВАЖНО ПРО ГРАНИЦЫ ЭТОГО ПЛАГИНА (прочитай перед установкой):
+#
+# 1) Настоящие стикеры TikTok — это чужая графика (copyright), их нельзя "зашить"
+#    в файл плагина. Поэтому по умолчанию все 5 слотов пустые.
+#    Ты сам выбираешь любые 5 стикеров из СВОИХ паков в Telegram через настройки.
+#
+# 2) Панель над строкой ввода "врезается" во внутренний код Telegram хуками.
+#    Может ломаться при обновлениях клиента.
+
+from typing import Any, Dict, List
+
+from android.graphics import Color
+from android.graphics.drawable import GradientDrawable
+from android.os import SystemClock
+from android.view import Gravity, View, ViewTreeObserver
+from android.widget import FrameLayout, LinearLayout, TextView, HorizontalScrollView, ScrollView
+
+from org.telegram.messenger import AndroidUtilities, MediaDataController
+from org.telegram.ui.Components import BackupImageView, LayoutHelper
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook, MenuItemData, MenuItemType
+from client_utils import (
+    get_last_fragment,
+    get_media_data_controller,
+    send_message,
+)
+from hook_utils import find_class
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Custom, Divider, Header, SimpleSettingFactory, Text
+
+__id__ = "sticker_bar"
+__name__ = "Sticker_bar"
+__description__ = "Панель с 5 быстрыми стикерами над строкой ввода. Выбор из твоих паков Telegram. Вкл/выкл: ⋮ → Плагины."
+__author__ = "@demitrovsky"
+__version__ = "0.3.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+SLOT_COUNT = 5
+PREVIEW_SIZE_DP = 34
+CELL_SIZE_DP = 42
+PANEL_HEIGHT_DP = 50
+# Полностью скруглённая "пилюля" — радиус в половину высоты панели/ячейки
+PANEL_CORNER_RADIUS_DP = PANEL_HEIGHT_DP / 2
+CELL_CORNER_RADIUS_DP = CELL_SIZE_DP / 2
+PANEL_H_MARGIN_DP = 10
+PANEL_V_PADDING_DP = 4
+BASE_GAP_DP = 6
+KEYBOARD_THRESHOLD_DP = 150
+# Насколько высота строки ввода может отличаться от "состояния покоя"
+# прежде чем считать, что открыт реплай/edit/attach-режим
+REST_HEIGHT_SLACK_DP = 6
+Y_OFFSET_STEP_DP = 1
+DEFAULT_Y_OFFSET_DP = 80
+
+# Тёмная, спокойная, "нативная" палитра — без ярких/градиентных акцентов
+PANEL_BG_COLOR = "#E61C1C1E"
+PANEL_BORDER_COLOR = "#26FFFFFF"
+CELL_BG_COLOR = "#2C2C2E"
+CELL_PRESSED_COLOR = "#3A3A3C"
+
+# Не чаще раза в N мс пересчитываем позицию / состояние покоя
+REPOSITION_MIN_INTERVAL_MS = 48
+
+# --- Виртуализация пикера стикеров ---
+# Пикер: ВСЕ паки и ВСЕ стикеры без ограничений, но и паки, и картинки
+# создаются лениво — только когда попадают (с запасом) в видимую область.
+PICKER_BIND_BATCH = 8
+PICKER_BIND_DELAY_MS = 20
+# Сколько превью в паке биндим сразу при открытии секции; остальное —
+# по горизонтальному скроллу. Это главный источник лагов на больших паках.
+PICKER_INITIAL_BIND = 16
+# Оценочная высота ещё не построенной секции (плейсхолдер), пока не создана
+SECTION_ESTIMATED_HEIGHT_DP = 104
+# Во сколько высот экрана строим секции заранее (буфер сверху/снизу)
+SECTION_BUILD_BUFFER_SCREENS = 0.8
+# За пределами этого буфера — сложенные секции возвращаем в плейсхолдер,
+# чтобы дерево View оставалось маленьким даже для огромных коллекций
+SECTION_UNBUILD_BUFFER_SCREENS = 2.0
+# Секции достраиваются только после того как скролл ОСТАНОВИЛСЯ хотя бы
+# на этот срок — без этого каждый тик скролла триггерил relayout всего
+# контейнера и лагало сильнее, чем без виртуализации вообще.
+SCROLL_SETTLE_DELAY_MS = 140
+# За один проход строим не больше стольки секций — большой рывок скролла
+# не должен разом инициализировать десятки паков одним кадром.
+MAX_BUILDS_PER_PASS = 4
+
+# Кэш метаданных паков: собираем один раз, обновляем по TTL или при
+# stickersDidLoad. Не держим Java-объекты full_set — только short_name /
+# title / doc_count, чтобы не раздувать память и не ловить stale refs.
+SECTIONS_CACHE_TTL_MS = 10 * 60 * 1000  # 10 минут
+SECTIONS_CACHE_WARM_DELAY_MS = 600      # прогрев после force-load при старте
+
+
+def _slot_key(i: int) -> str:
+    return f"slot_{i}"
+
+
+def _split_value(value: str):
+    if not value or "|" not in value:
+        return None, None
+    short_name, idx = value.rsplit("|", 1)
+    try:
+        return short_name, int(idx)
+    except ValueError:
+        return None, None
+
+
+def _make_int_array(size: int = 2):
+    try:
+        from jarray import zeros
+        return zeros(size, "i")
+    except Exception:
+        try:
+            from java.lang import Integer
+            from java.lang.reflect import Array
+            return Array.newInstance(Integer.TYPE, size)
+        except Exception:
+            return None
+
+
+try:
+    from java import dynamic_proxy
+
+    class OnClickListenerProxy(dynamic_proxy(View.OnClickListener)):
+        def __init__(self, callback):
+            super().__init__()
+            self._callback = callback
+
+        def onClick(self, view):
+            try:
+                self._callback(view)
+            except Exception:
+                pass
+
+    def bind_click(view, callback):
+        view.setOnClickListener(OnClickListenerProxy(callback))
+
+    class OnLayoutChangeListenerProxy(dynamic_proxy(View.OnLayoutChangeListener)):
+        def __init__(self, callback):
+            super().__init__()
+            self._callback = callback
+
+        def onLayoutChange(self, v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom):
+            # Только если реально сдвинулась вертикаль — не трогаем скролл списка
+            if top != oldTop or bottom != oldBottom:
+                try:
+                    self._callback()
+                except Exception:
+                    pass
+
+except Exception:
+    def bind_click(view, callback):
+        view.setOnClickListener(callback)
+
+    class OnLayoutChangeListenerProxy:
+        def __init__(self, callback):
+            self._callback = callback
+
+
+class TikTokStickersPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._panels = {}
+        self._create_view_unhook = None
+        self._menu_item_id = None
+        self._stickers_observer = None
+        self._stickers_load_attempts = 0
+        # Кэш секций пикера: list[dict] или None, timestamp в ms
+        self._sections_cache = None
+        self._sections_cache_ts = 0
+
+    # ------------------------------------------------------------------
+    # Жизненный цикл
+    # ------------------------------------------------------------------
+
+    def on_plugin_load(self):
+        self.log("TikTok Stickers: loading")
+        self._install_chat_hook()
+        self._register_chat_menu()
+        # Пакеты стикеров запрашиваем сразу при загрузке плагина, а не
+        # только когда пользователь впервые откроет панель/пикер —
+        # на части устройств локальный кэш MediaDataController в этот
+        # момент ещё не готов, и без принудительного force-запроса
+        # какие-то паки не находятся вообще.
+        run_on_ui_thread(lambda: self._ensure_stickers_loaded(force=True))
+        self._register_stickers_observer()
+        # Прогрев кэша секций чуть позже force-load — к моменту открытия
+        # пикера метаданные уже готовы, без лагов на первом показе.
+        try:
+            from android.os import Handler, Looper
+            Handler(Looper.getMainLooper()).postDelayed(
+                lambda: run_on_ui_thread(self._warm_sections_cache),
+                SECTIONS_CACHE_WARM_DELAY_MS,
+            )
+        except Exception:
+            run_on_ui_thread(self._warm_sections_cache)
+
+    def on_plugin_unload(self):
+        if self._create_view_unhook:
+            try:
+                self.unhook_method(self._create_view_unhook)
+            except Exception as e:
+                self.log(f"TikTok Stickers: unhook failed: {e}")
+            self._create_view_unhook = None
+        if self._menu_item_id:
+            try:
+                self.remove_menu_item(self._menu_item_id)
+            except Exception:
+                pass
+            self._menu_item_id = None
+        self._unregister_stickers_observer()
+        self._panels.clear()
+        self._sections_cache = None
+        self._sections_cache_ts = 0
+
+    # ------------------------------------------------------------------
+    # Принудительная загрузка стикерпаков
+    # ------------------------------------------------------------------
+
+    def _ensure_stickers_loaded(self, force: bool = False):
+        """Просит Telegram (пере)загрузить список стикерпаков.
+
+        force=True обходит локальный кэш и гарантированно подтягивает
+        актуальный список с сервера — именно это чинит случаи, когда
+        часть паков просто не видна на некоторых устройствах.
+        """
+        try:
+            mdc = get_media_data_controller()
+            try:
+                type_image = MediaDataController.TYPE_IMAGE
+            except Exception:
+                type_image = 0
+            mdc.loadStickers(type_image, True, force)
+        except Exception as e:
+            self.log(f"Sticker_bar: loadStickers failed: {e}")
+
+    def _register_stickers_observer(self):
+        """Слушаем событие 'паки стикеров загружены', чтобы обновить
+        превью в панели/настройках сразу, как только данные реально
+        стали доступны (может случиться чуть позже force-запроса)."""
+        try:
+            from org.telegram.messenger import NotificationCenter, UserConfig
+
+            plugin = self
+
+            class StickersObserver(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+                def __init__(self):
+                    super().__init__()
+
+                def didReceivedNotification(self, notification_id, account, args):
+                    try:
+                        if notification_id == NotificationCenter.stickersDidLoad:
+                            def on_stickers_ready():
+                                plugin._invalidate_sections_cache()
+                                plugin._warm_sections_cache()
+                                plugin._refresh_all_previews()
+                            run_on_ui_thread(on_stickers_ready)
+                    except Exception:
+                        pass
+
+            observer = StickersObserver()
+            account = UserConfig.selectedAccount
+            nc = NotificationCenter.getInstance(account)
+            nc.addObserver(observer, NotificationCenter.stickersDidLoad)
+            self._stickers_observer = (nc, observer)
+        except Exception as e:
+            self.log(f"Sticker_bar: stickers observer not registered: {e}")
+            self._stickers_observer = None
+
+    def _unregister_stickers_observer(self):
+        if not self._stickers_observer:
+            return
+        try:
+            nc, observer = self._stickers_observer
+            from org.telegram.messenger import NotificationCenter
+            nc.removeObserver(observer, NotificationCenter.stickersDidLoad)
+        except Exception:
+            pass
+        self._stickers_observer = None
+
+    def _refresh_all_previews(self):
+        """Перепривязывает превью в quick-панели (актуально, если при
+        первом рендере паков ещё не было доступных данных)."""
+        for data in list(self._panels.values()):
+            cells = data.get("cells")
+            if not cells:
+                continue
+            for index, cell in cells:
+                try:
+                    self._bind_preview(cell, self.get_slot_value(index))
+                except Exception:
+                    pass
+
+    def _register_chat_menu(self):
+        """Пункт в ⋮ чата → Плагины: вкл/выкл панели."""
+        try:
+            self._menu_item_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Панель стикеров (вкл/выкл)",
+                    subtext="Sticker_bar",
+                    icon="msg_sticker",
+                    on_click=self._on_menu_toggle,
+                    priority=50,
+                )
+            )
+        except Exception as e:
+            self.log(f"TikTok Stickers: menu register failed: {e}")
+            self.set_setting("last_error", f"[menu] {type(e).__name__}: {e}")
+
+    def _on_menu_toggle(self, context: Dict[str, Any]):
+        new_state = not self.is_panel_enabled()
+        self.set_panel_enabled(new_state)
+        BulletinHelper.show_info(
+            "Панель стикеров включена" if new_state else "Панель стикеров выключена"
+        )
+
+    # ------------------------------------------------------------------
+    # Настройки: вкл/смещение
+    # ------------------------------------------------------------------
+
+    def get_y_offset_dp(self) -> int:
+        try:
+            return int(self.get_setting("y_offset_dp", str(DEFAULT_Y_OFFSET_DP)))
+        except Exception:
+            return DEFAULT_Y_OFFSET_DP
+
+    def set_y_offset_dp(self, value: int):
+        value = max(-80, min(280, int(value)))
+        self.set_setting("y_offset_dp", str(value), reload_settings=True)
+        self._reposition_all_panels()
+
+    def is_panel_enabled(self) -> bool:
+        return self.get_setting("panel_enabled", "1") == "1"
+
+    def set_panel_enabled(self, enabled: bool):
+        self.set_setting("panel_enabled", "1" if enabled else "0", reload_settings=False)
+        self._reposition_all_panels()
+
+    def _reposition_all_panels(self):
+        for data in list(self._panels.values()):
+            fn = data.get("reposition")
+            if fn:
+                try:
+                    run_on_ui_thread(fn)
+                except Exception as e:
+                    self.log(f"TikTok Stickers: reposition_all failed: {e}")
+
+    @staticmethod
+    def _enter_view_usable(enter_view) -> bool:
+        if enter_view is None:
+            return False
+        try:
+            if enter_view.getVisibility() != View.VISIBLE:
+                return False
+        except Exception:
+            return False
+        try:
+            h = enter_view.getHeight()
+            if h == 0:
+                h = enter_view.getMeasuredHeight()
+            if h == 0:
+                return True
+            return h > AndroidUtilities.dp(20)
+        except Exception:
+            return True
+
+    # ------------------------------------------------------------------
+    # Слоты / отправка
+    # ------------------------------------------------------------------
+
+    def get_slot_value(self, i: int) -> str:
+        return self.get_setting(_slot_key(i), "")
+
+    def set_slot_value(self, i: int, value: str):
+        self.set_setting(_slot_key(i), value, reload_settings=True)
+
+    def resolve_document(self, value: str):
+        short_name, idx = _split_value(value)
+        if short_name is None:
+            return None
+        try:
+            mdc = get_media_data_controller()
+            tset = mdc.getStickerSetByName(short_name)
+            if tset is None:
+                tset = mdc.getStickerSetByEmojiOrName(short_name)
+            if tset is None or tset.documents is None:
+                return None
+            docs = tset.documents
+            if idx < 0 or idx >= docs.size():
+                return None
+            return docs.get(idx)
+        except Exception as e:
+            self.log(f"TikTok Stickers: resolve_document failed for '{value}': {e}")
+            return None
+
+    def send_slot(self, i: int, peer_id: int, enter_view=None):
+        if not self.is_panel_enabled():
+            return
+        if enter_view is not None and not self._enter_view_usable(enter_view):
+            BulletinHelper.show_info("Здесь нельзя писать — панель стикеров недоступна.")
+            return
+        value = self.get_slot_value(i)
+        if not value:
+            BulletinHelper.show_info("Этот слот ещё не настроен: зайди в настройки плагина.")
+            return
+        doc = self.resolve_document(value)
+        if doc is None:
+            BulletinHelper.show_info("Не удалось найти этот стикер (пак мог измениться). Перевыбери его в настройках.")
+            return
+        try:
+            send_message({"peer": peer_id, "document": doc})
+        except Exception as e:
+            self.log(f"TikTok Stickers: send failed: {e}")
+            BulletinHelper.show_info("Не получилось отправить стикер.")
+
+    def _make_preview_view(self, context, size_dp: int) -> BackupImageView:
+        iv = BackupImageView(context)
+        iv.setRoundRadius(AndroidUtilities.dp(10))
+        return iv
+
+    def _bind_preview(self, image_view: BackupImageView, value: str):
+        short_name, idx = _split_value(value)
+        if short_name is None:
+            image_view.setImageDrawable(None)
+            return
+        try:
+            mdc = get_media_data_controller()
+            mdc.setPlaceholderImageByIndex(image_view, short_name, idx, "100_100")
+        except Exception as e:
+            self.log(f"TikTok Stickers: preview bind failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Настройки плагина (без вкл/выкл — оно в меню чата)
+    # ------------------------------------------------------------------
+
+    def _slot_subtext(self, i: int) -> str:
+        value = self.get_slot_value(i)
+        short_name, idx = _split_value(value)
+        if short_name is None:
+            return "Не настроено — нажми, чтобы выбрать стикер"
+        return f"Пак: {short_name}, стикер №{idx + 1}"
+
+    def create_settings(self) -> List[Any]:
+        plugin = self
+
+        slot_rows = []
+        for i in range(SLOT_COUNT):
+            def on_slot_click(view, index=i):
+                try:
+                    plugin._open_sticker_picker(index)
+                except Exception as e:
+                    error_text = f"{type(e).__name__}: {e}"
+                    plugin.log(f"TikTok Stickers: on_slot_click failed: {error_text}")
+                    plugin.set_setting("last_error", error_text)
+                    BulletinHelper.show_info("Сбой — см. 'Показать последнюю ошибку'")
+
+            slot_rows.append(
+                Text(
+                    text=f"Слот {i + 1}",
+                    subtext=plugin._slot_subtext(i),
+                    icon="msg_sticker",
+                    on_click=on_slot_click,
+                )
+            )
+
+        def on_test_send(view):
+            fragment = get_last_fragment()
+            peer_id = None
+            try:
+                peer_id = fragment.getDialogId()
+            except Exception:
+                pass
+            if peer_id is None:
+                try:
+                    from client_utils import get_user_config
+                    peer_id = get_user_config().getClientUserId()
+                except Exception:
+                    pass
+            if peer_id is None:
+                BulletinHelper.show_info("Открой любой чат и попробуй ещё раз.")
+                return
+            plugin.send_slot(0, peer_id)
+
+        def on_show_error(view):
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                return
+            error_text = plugin.get_setting("last_error", "(пока нет сохранённых ошибок)")
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Последняя ошибка")
+            builder.set_message(error_text)
+            builder.set_message_text_view_clickable(True)
+            builder.set_positive_button("OK", lambda b, w: b.dismiss())
+            builder.show()
+
+        y_offset = plugin.get_y_offset_dp()
+
+        def on_raise(view):
+            plugin.set_y_offset_dp(plugin.get_y_offset_dp() + Y_OFFSET_STEP_DP)
+            BulletinHelper.show_info(f"Смещение: +{plugin.get_y_offset_dp()} dp (выше)")
+
+        def on_lower(view):
+            plugin.set_y_offset_dp(plugin.get_y_offset_dp() - Y_OFFSET_STEP_DP)
+            BulletinHelper.show_info(f"Смещение: {plugin.get_y_offset_dp()} dp")
+
+        def on_reset_offset(view):
+            plugin.set_y_offset_dp(DEFAULT_Y_OFFSET_DP)
+            BulletinHelper.show_info(f"Смещение сброшено ({DEFAULT_Y_OFFSET_DP} dp)")
+
+        return [
+            Header(text="Стикеры панели (5 штук, как в TikTok)"),
+            *slot_rows,
+            Divider(),
+            Header(text="Позиция панели по оси Y"),
+            Text(
+                text=f"Текущее смещение: {y_offset} dp",
+                subtext=f"Плюс = выше. Шаг {Y_OFFSET_STEP_DP} dp. По умолчанию {DEFAULT_Y_OFFSET_DP} dp.",
+                icon="msg_info",
+            ),
+            Text(
+                text=f"Поднять выше (+{Y_OFFSET_STEP_DP} dp)",
+                icon="msg_arrow_up",
+                on_click=on_raise,
+            ),
+            Text(
+                text=f"Опустить ниже (−{Y_OFFSET_STEP_DP} dp)",
+                icon="msg_arrow_down",
+                on_click=on_lower,
+            ),
+            Text(
+                text=f"Сбросить смещение ({DEFAULT_Y_OFFSET_DP} dp)",
+                icon="msg_reset",
+                on_click=on_reset_offset,
+            ),
+            Divider(),
+            Text(
+                text="Тест: отправить стикер из 1-го слота",
+                icon="msg_send",
+                on_click=on_test_send,
+            ),
+            Text(
+                text="Показать последнюю ошибку",
+                icon="msg_info",
+                on_click=on_show_error,
+            ),
+            Divider(
+                text="Вкл/выкл панели: ⋮ в чате → Плагины → «Панель стикеров (вкл/выкл)»."
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Диалог выбора стикера: весь пак, картинки пачками (без лагов)
+    # ------------------------------------------------------------------
+
+    def _invalidate_sections_cache(self):
+        self._sections_cache = None
+        self._sections_cache_ts = 0
+
+    def _warm_sections_cache(self):
+        """Строит/обновляет кэш секций в фоне UI-потока. Безопасно вызывать
+        многократно — если TTL ещё жив, ничего не делает."""
+        try:
+            self._collect_picker_sections(force_refresh=False)
+        except Exception as e:
+            self.log(f"Sticker_bar: warm cache failed: {e}")
+
+    def _bind_picker_images_batched(
+        self, pending, start_index=0, bound_flags=None, max_index=None
+    ):
+        """Подгружает превью порциями, чтобы UI не замирал на больших паках.
+        bound_flags — optional list[bool] той же длины: помечаем уже
+        забинженные ячейки, чтобы горизонтальный скролл не дублировал работу.
+        max_index — если задан, не идём дальше этого индекса (для initial bind)."""
+        if not pending:
+            return
+        limit = len(pending) if max_index is None else min(max_index, len(pending))
+        if start_index >= limit:
+            return
+        end = min(start_index + PICKER_BIND_BATCH, limit)
+        mdc = get_media_data_controller()
+        for i in range(start_index, end):
+            if bound_flags is not None and bound_flags[i]:
+                continue
+            cell, short_name, doc_index = pending[i]
+            try:
+                mdc.setPlaceholderImageByIndex(cell, short_name, doc_index, "80_80")
+                if bound_flags is not None:
+                    bound_flags[i] = True
+            except Exception:
+                pass
+        if end < limit:
+            delay = PICKER_BIND_DELAY_MS
+            try:
+                from android.os import Handler, Looper
+                handler = Handler(Looper.getMainLooper())
+
+                def next_batch():
+                    self._bind_picker_images_batched(
+                        pending, end, bound_flags, max_index
+                    )
+
+                handler.postDelayed(next_batch, delay)
+            except Exception:
+                try:
+                    run_on_ui_thread(
+                        lambda: self._bind_picker_images_batched(
+                            pending, end, bound_flags, max_index
+                        )
+                    )
+                except Exception:
+                    self._bind_picker_images_batched(
+                        pending, end, bound_flags, max_index
+                    )
+
+    def _collect_picker_sections(self, force_refresh: bool = False):
+        """Собирает лёгкие метаданные паков (без создания View и без
+        подгрузки картинок). Результат кэшируется на SECTIONS_CACHE_TTL_MS
+        и сбрасывается при stickersDidLoad / force_refresh."""
+        now = SystemClock.uptimeMillis()
+        if (
+            not force_refresh
+            and self._sections_cache is not None
+            and (now - self._sections_cache_ts) < SECTIONS_CACHE_TTL_MS
+        ):
+            return self._sections_cache
+
+        try:
+            mdc = get_media_data_controller()
+            try:
+                type_image = MediaDataController.TYPE_IMAGE
+            except Exception:
+                type_image = 0
+            sticker_sets = mdc.getStickerSets(type_image)
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {e}"
+            self.log(f"Sticker_bar: getStickerSets failed: {error_text}")
+            self.set_setting("last_error", error_text)
+            return None
+
+        sections = []
+        if not sticker_sets or sticker_sets.size() == 0:
+            self._sections_cache = sections
+            self._sections_cache_ts = now
+            return sections
+
+        for set_index in range(sticker_sets.size()):
+            try:
+                tset = sticker_sets.get(set_index)
+                short_name = tset.set.short_name if tset.set is not None else None
+                if not short_name:
+                    continue
+
+                full_set = tset
+                has_docs = tset.documents is not None and tset.documents.size() > 0
+                if not has_docs:
+                    try:
+                        loaded = mdc.getStickerSetByName(short_name)
+                        if (
+                            loaded is not None
+                            and loaded.documents is not None
+                            and loaded.documents.size() > 0
+                        ):
+                            full_set = loaded
+                    except Exception:
+                        pass
+
+                if full_set.documents is None or full_set.documents.size() == 0:
+                    continue
+
+                # Только лёгкие данные — без хранения Java full_set
+                sections.append({
+                    "short_name": short_name,
+                    "title": tset.set.title if tset.set is not None else short_name,
+                    "doc_count": full_set.documents.size(),
+                })
+            except Exception as e:
+                self.log(f"Sticker_bar: pack meta failed: {e}")
+                continue
+
+        self._sections_cache = sections
+        self._sections_cache_ts = now
+        return sections
+
+    def _make_section_placeholder(self, activity, height_dp: float):
+        placeholder = View(activity)
+        placeholder.setLayoutParams(LayoutHelper.createLinear(-1, height_dp))
+        return placeholder
+
+    def _build_section_content(self, activity, slot_index, meta, dialog_holder):
+        """Строит title + горизонтальный ряд стикеров ОДНОГО пака.
+        Ячейки создаём сразу (дешёво), превью биндим только для первых
+        PICKER_INITIAL_BIND; остальное — по горизонтальному скроллу."""
+        wrapper = LinearLayout(activity)
+        wrapper.setOrientation(LinearLayout.VERTICAL)
+
+        title = TextView(activity)
+        title.setText(meta["title"])
+        title.setPadding(
+            AndroidUtilities.dp(16), AndroidUtilities.dp(12),
+            AndroidUtilities.dp(16), AndroidUtilities.dp(6),
+        )
+        wrapper.addView(title)
+
+        pack_row = LinearLayout(activity)
+        pack_row.setOrientation(LinearLayout.HORIZONTAL)
+
+        short_name = meta["short_name"]
+        pending = []
+        for doc_index in range(meta["doc_count"]):
+            cell = self._make_preview_view(activity, 56)
+
+            def on_pick(view, sn=short_name, di=doc_index):
+                self.set_slot_value(slot_index, f"{sn}|{di}")
+                holder_dialog = dialog_holder.get("dialog")
+                if holder_dialog is not None:
+                    holder_dialog.dismiss()
+
+            bind_click(cell, on_pick)
+            pack_row.addView(cell, LayoutHelper.createLinear(56, 56, 0, 4, 0, 4, 0))
+            pending.append((cell, short_name, doc_index))
+
+        pack_row.setPadding(
+            AndroidUtilities.dp(12), 0,
+            AndroidUtilities.dp(12), AndroidUtilities.dp(8),
+        )
+        h_scroller = HorizontalScrollView(activity)
+        try:
+            h_scroller.setHorizontalScrollBarEnabled(False)
+            h_scroller.setOverScrollMode(View.OVER_SCROLL_NEVER)
+        except Exception:
+            pass
+        h_scroller.addView(pack_row)
+
+        # Флаги «уже забинжено» + догрузка по горизонтальному скроллу
+        bound_flags = [False] * len(pending)
+        initial_end = min(PICKER_INITIAL_BIND, len(pending))
+        if initial_end > 0:
+            # Только первые N — не тянем весь пак сразу
+            self._bind_picker_images_batched(
+                pending, 0, bound_flags, max_index=initial_end
+            )
+
+        # Если пак длиннее initial — слушаем скролл и биндим видимый хвост
+        if len(pending) > initial_end:
+            cell_w = AndroidUtilities.dp(56 + 8)  # 56 + горизонтальные margin 4+4
+            bind_state = {"next": initial_end, "scheduled": False}
+
+            def bind_visible_tail():
+                bind_state["scheduled"] = False
+                try:
+                    scroll_x = h_scroller.getScrollX()
+                    width = h_scroller.getWidth()
+                    if width <= 0:
+                        width = AndroidUtilities.dp(320)
+                    # небольшой буфер справа
+                    right_edge = scroll_x + width + AndroidUtilities.dp(120)
+                    target = min(len(pending), int(right_edge / max(cell_w, 1)) + 2)
+                    # ищем первый ещё не забинженный в [0, target)
+                    start = 0
+                    while start < target and bound_flags[start]:
+                        start += 1
+                    if start >= target:
+                        bind_state["next"] = max(bind_state["next"], target)
+                        return
+                    self._bind_picker_images_batched(
+                        pending, start, bound_flags, max_index=target
+                    )
+                    bind_state["next"] = max(bind_state["next"], target)
+                except Exception as e:
+                    self.log(f"Sticker_bar: bind_visible_tail failed: {e}")
+
+            def request_tail_bind():
+                if bind_state["scheduled"]:
+                    return
+                bind_state["scheduled"] = True
+                try:
+                    from android.os import Handler, Looper
+                    Handler(Looper.getMainLooper()).postDelayed(bind_visible_tail, 48)
+                except Exception:
+                    bind_visible_tail()
+
+            try:
+                from java import dynamic_proxy
+
+                class HScrollListener(dynamic_proxy(View.OnScrollChangeListener)):
+                    def __init__(self, cb):
+                        super().__init__()
+                        self._cb = cb
+
+                    def onScrollChange(self, v, sx, sy, osx, osy):
+                        try:
+                            self._cb()
+                        except Exception:
+                            pass
+
+                h_scroller.setOnScrollChangeListener(HScrollListener(request_tail_bind))
+            except Exception:
+                # Старый рантайм без OnScrollChangeListener — добиндим всё пачками
+                if initial_end < len(pending):
+                    self._bind_picker_images_batched(
+                        pending, initial_end, bound_flags, max_index=None
+                    )
+
+        wrapper.addView(h_scroller)
+        wrapper.setLayoutParams(LayoutHelper.createLinear(-1, -2))
+        # pending больше не нужен снаружи — биндинг управляется внутри
+        return wrapper, None
+
+    def _open_sticker_picker(self, slot_index: int, retry: bool = True):
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+        activity = fragment.getParentActivity()
+        if activity is None:
+            return
+
+        # При retry=False (второй заход после force-load) принудительно
+        # пересобираем кэш — иначе можем снова увидеть пустой список.
+        sections_meta = self._collect_picker_sections(force_refresh=not retry)
+
+        if sections_meta is None:
+            BulletinHelper.show_info("Ошибка — см. 'Показать последнюю ошибку' в настройках")
+            return
+
+        if not sections_meta and retry:
+            # Иногда локальный кэш паков ещё не готов — форсируем
+            # загрузку, сбрасываем наш кэш и пробуем ещё раз один раз.
+            self._invalidate_sections_cache()
+            self._ensure_stickers_loaded(force=True)
+            try:
+                from android.os import Handler, Looper
+                Handler(Looper.getMainLooper()).postDelayed(
+                    lambda: self._open_sticker_picker(slot_index, retry=False), 450
+                )
+                return
+            except Exception:
+                pass  # если не вышло — просто покажем "паков нет" ниже
+
+        container = LinearLayout(activity)
+        container.setOrientation(LinearLayout.VERTICAL)
+        dialog_holder = {}
+
+        if not sections_meta:
+            empty_label = TextView(activity)
+            empty_label.setText("У тебя пока нет добавленных стикерпаков в Telegram.")
+            empty_label.setPadding(
+                AndroidUtilities.dp(24), AndroidUtilities.dp(24),
+                AndroidUtilities.dp(24), AndroidUtilities.dp(24),
+            )
+            container.addView(empty_label)
+
+            scroll = ScrollView(activity)
+            scroll.addView(container)
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Выбери стикер для слота")
+            builder.set_view(scroll, 480)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            dialog_holder["dialog"] = builder
+            builder.show()
+            return
+
+        # --- Виртуализация: сначала только плейсхолдеры фиксированной
+        # высоты для КАЖДОГО пака (дёшево — обычная View без детей),
+        # реальные ряды стикеров достраиваются лениво по скроллу.
+        for _ in sections_meta:
+            container.addView(self._make_section_placeholder(activity, SECTION_ESTIMATED_HEIGHT_DP))
+
+        built = {}
+
+        def ensure_built(index):
+            if built.get(index):
+                return
+            try:
+                meta = sections_meta[index]
+                wrapper, _pending = self._build_section_content(
+                    activity, slot_index, meta, dialog_holder
+                )
+                container.removeViewAt(index)
+                container.addView(wrapper, index)
+                built[index] = True
+                # Биндинг превью теперь внутри _build_section_content
+                # (initial + по горизонтальному скроллу)
+            except Exception as e:
+                self.log(f"Sticker_bar: ensure_built({index}) failed: {e}")
+
+        def unbuild(index):
+            if not built.get(index):
+                return
+            try:
+                container.removeViewAt(index)
+                container.addView(
+                    self._make_section_placeholder(activity, SECTION_ESTIMATED_HEIGHT_DP), index
+                )
+                built[index] = False
+            except Exception as e:
+                self.log(f"Sticker_bar: unbuild({index}) failed: {e}")
+
+        picker_handler = {"h": None, "pending_runnable": None}
+
+        def _get_handler():
+            if picker_handler["h"] is None:
+                from android.os import Handler, Looper
+                picker_handler["h"] = Handler(Looper.getMainLooper())
+            return picker_handler["h"]
+
+        def run_visible_range_pass():
+            """Один проход: строит/разбирает секции, но не больше
+            MAX_BUILDS_PER_PASS штук за раз — крупный рывок скролла не
+            должен разом инициализировать десятки паков в один кадр."""
+            try:
+                viewport_h = scroll.getHeight()
+                if viewport_h <= 0:
+                    return
+                scroll_y = scroll.getScrollY()
+                build_buf = int(SECTION_BUILD_BUFFER_SCREENS * viewport_h)
+                unbuild_buf = int(SECTION_UNBUILD_BUFFER_SCREENS * viewport_h)
+                build_lo, build_hi = scroll_y - build_buf, scroll_y + viewport_h + build_buf
+                keep_lo, keep_hi = scroll_y - unbuild_buf, scroll_y + viewport_h + unbuild_buf
+
+                count = container.getChildCount()
+                built_this_pass = 0
+                more_pending = False
+                for i in range(count):
+                    child = container.getChildAt(i)
+                    if child is None:
+                        continue
+                    top, bottom = child.getTop(), child.getBottom()
+                    is_built = built.get(i, False)
+                    if bottom >= build_lo and top <= build_hi:
+                        if not is_built:
+                            if built_this_pass >= MAX_BUILDS_PER_PASS:
+                                more_pending = True
+                                continue
+                            ensure_built(i)
+                            built_this_pass += 1
+                    elif is_built and not (bottom >= keep_lo and top <= keep_hi):
+                        unbuild(i)
+
+                if more_pending:
+                    # Догоняем остальное на следующем кадре, не блокируя текущий
+                    try:
+                        _get_handler().postDelayed(run_visible_range_pass, 16)
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.log(f"Sticker_bar: run_visible_range_pass failed: {e}")
+
+        def request_visible_range_update(immediate=False):
+            """Скролл дёргает ЭТО. Реальная сборка секций откладывается,
+            пока скролл не остановится — иначе каждый тик скролла вызывал
+            relayout всего контейнера и лагало сильнее, чем без
+            виртуализации вообще."""
+            try:
+                handler = _get_handler()
+                prev = picker_handler["pending_runnable"]
+                if prev is not None:
+                    try:
+                        handler.removeCallbacks(prev)
+                    except Exception:
+                        pass
+                if immediate:
+                    run_visible_range_pass()
+                    return
+                picker_handler["pending_runnable"] = run_visible_range_pass
+                handler.postDelayed(run_visible_range_pass, SCROLL_SETTLE_DELAY_MS)
+            except Exception as e:
+                self.log(f"Sticker_bar: request_visible_range_update failed: {e}")
+                try:
+                    run_visible_range_pass()
+                except Exception:
+                    pass
+
+        scroll = ScrollView(activity)
+        try:
+            scroll.setFillViewport(True)
+            scroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS)
+        except Exception:
+            pass
+        scroll.addView(container)
+
+        scroll_listener_attached = False
+        try:
+            from java import dynamic_proxy
+
+            class OnScrollChangeListenerProxy(dynamic_proxy(View.OnScrollChangeListener)):
+                def __init__(self, callback):
+                    super().__init__()
+                    self._callback = callback
+
+                def onScrollChange(self, v, scrollX, scrollY, oldScrollX, oldScrollY):
+                    try:
+                        self._callback()
+                    except Exception:
+                        pass
+
+            scroll.setOnScrollChangeListener(
+                OnScrollChangeListenerProxy(lambda: request_visible_range_update())
+            )
+            scroll_listener_attached = True
+        except Exception as e:
+            self.log(f"Sticker_bar: scroll virtualization unavailable, building all sections: {e}")
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Выбери стикер для слота")
+        builder.set_view(scroll, 480)
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        dialog_holder["dialog"] = builder
+        builder.show()
+
+        if scroll_listener_attached:
+            # Первый проход — после того как диалог реально измерен и
+            # получил высоту (иначе scroll.getHeight() ещё 0).
+            try:
+                scroll.post(lambda: request_visible_range_update(immediate=True))
+            except Exception:
+                run_on_ui_thread(lambda: request_visible_range_update(immediate=True))
+        else:
+            # Нет виртуализации (совсем старый рантайм) — строим всё,
+            # как раньше, но по-прежнему с пакетной подгрузкой картинок.
+            for i in range(len(sections_meta)):
+                ensure_built(i)
+
+    # ------------------------------------------------------------------
+    # Хук createView + лёгкая панель
+    # ------------------------------------------------------------------
+
+    def _install_chat_hook(self):
+        try:
+            ChatActivityClass = find_class("org.telegram.ui.ChatActivity")
+            ContextClass = find_class("android.content.Context")
+            if not ChatActivityClass or not ContextClass:
+                msg = "ChatActivity/Context class not found"
+                self.log(f"TikTok Stickers: {msg}")
+                self.set_setting("last_error", msg)
+                return
+
+            try:
+                create_view_method = ChatActivityClass.getDeclaredMethod(
+                    "createView", ContextClass
+                )
+            except AttributeError:
+                create_view_method = ChatActivityClass.getClass().getDeclaredMethod(
+                    "createView", ContextClass
+                )
+            create_view_method.setAccessible(True)
+
+            plugin = self
+
+            class ChatCreateViewHook(MethodHook):
+                def after_hooked_method(self, param):
+                    try:
+                        chat_activity = param.thisObject
+                        run_on_ui_thread(lambda: plugin._attach_panel(chat_activity))
+                    except Exception as e:
+                        error_text = f"{type(e).__name__}: {e}"
+                        plugin.log(f"TikTok Stickers: after createView failed: {error_text}")
+                        plugin.set_setting("last_error", f"[hook] {error_text}")
+
+            self._create_view_unhook = self.hook_method(
+                create_view_method, ChatCreateViewHook()
+            )
+            if self._create_view_unhook:
+                self.log("TikTok Stickers: hooked ChatActivity.createView")
+            else:
+                self.set_setting("last_error", "[install] hook_method returned falsy")
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {e}"
+            self.log(f"TikTok Stickers: _install_chat_hook failed: {error_text}")
+            self.set_setting("last_error", f"[install] {error_text}")
+
+    def _attach_panel(self, chat_activity):
+        try:
+            key = id(chat_activity)
+            if key in self._panels:
+                return
+
+            enter_view = self._get_field(chat_activity, "chatActivityEnterView")
+            content_view = self._get_field(chat_activity, "contentView")
+            if enter_view is None or content_view is None:
+                msg = (
+                    "chatActivityEnterView/contentView field not found — "
+                    "нужно уточнить имена полей под конкретную сборку"
+                )
+                self.log(f"TikTok Stickers: {msg}")
+                self.set_setting("last_error", f"[panel] {msg}")
+                return
+
+            context = enter_view.getContext()
+            panel, cells = self._build_panel_view(context, chat_activity, enter_view)
+
+            try:
+                content_view.addView(
+                    panel,
+                    LayoutHelper.createFrame(
+                        -1, PANEL_HEIGHT_DP,
+                        Gravity.LEFT | Gravity.TOP,
+                    ),
+                )
+            except Exception as e:
+                error_text = f"{type(e).__name__}: {e}"
+                self.log(f"TikTok Stickers: addView failed: {error_text}")
+                self.set_setting("last_error", f"[panel addView] {error_text}")
+                return
+
+            # Кэш, чтобы не дёргать setLayoutParams и getLocationOnScreen зря
+            state = {
+                "last_top_margin": -1,
+                "last_visible": None,
+                "last_reposition_ms": 0,
+                # Высота строки ввода в состоянии покоя (без реплая/edit/
+                # attach-превью). Обновляется вниз — берём минимум из
+                # увиденного, это и есть "обычное состояние".
+                "base_enter_height": None,
+            }
+
+            def apply_visibility(visible: bool):
+                if state["last_visible"] is visible:
+                    return
+                state["last_visible"] = visible
+                panel.setVisibility(View.VISIBLE if visible else View.GONE)
+
+            def is_at_rest() -> bool:
+                """Панель видна, когда строка ввода в обычном нижнем
+                состоянии: клавиатура не открыта и нет реплая/edit/
+                attach-режима (не увеличена высота строки)."""
+                from android.graphics import Rect
+
+                # 1) Системная клавиатура (IME)
+                root = content_view.getRootView()
+                rect = Rect()
+                root.getWindowVisibleDisplayFrame(rect)
+                screen_height = root.getHeight()
+                keypad_height = screen_height - rect.bottom
+                if keypad_height > AndroidUtilities.dp(KEYBOARD_THRESHOLD_DP):
+                    return False
+
+                # 2) Реплай / edit / attach-превью увеличивают высоту
+                # строки ввода относительно "состояния покоя"
+                h = enter_view.getHeight()
+                if h <= 0:
+                    h = enter_view.getMeasuredHeight()
+                if h > 0:
+                    base = state["base_enter_height"]
+                    if base is None or h < base:
+                        state["base_enter_height"] = h
+                        base = h
+                    if h > base + AndroidUtilities.dp(REST_HEIGHT_SLACK_DP):
+                        return False
+
+                return True
+
+            def reposition(force=False):
+                try:
+                    now = SystemClock.uptimeMillis()
+                    if (
+                        not force
+                        and now - state["last_reposition_ms"] < REPOSITION_MIN_INTERVAL_MS
+                    ):
+                        return
+                    state["last_reposition_ms"] = now
+
+                    if not self.is_panel_enabled() or not self._enter_view_usable(enter_view):
+                        apply_visibility(False)
+                        return
+
+                    if not is_at_rest():
+                        apply_visibility(False)
+                        return
+
+                    margin_h = AndroidUtilities.dp(PANEL_H_MARGIN_DP)
+                    panel_h = AndroidUtilities.dp(PANEL_HEIGHT_DP)
+                    gap = AndroidUtilities.dp(BASE_GAP_DP)
+                    y_off = AndroidUtilities.dp(self.get_y_offset_dp())
+
+                    new_top = None
+                    enter_loc = _make_int_array(2)
+                    content_loc = _make_int_array(2)
+                    if enter_loc is not None and content_loc is not None:
+                        enter_view.getLocationOnScreen(enter_loc)
+                        content_view.getLocationOnScreen(content_loc)
+                        relative_top = enter_loc[1] - content_loc[1]
+                        new_top = max(0, relative_top - panel_h - gap - y_off)
+                    else:
+                        new_top = max(
+                            0, enter_view.getTop() - panel_h - gap - y_off
+                        )
+
+                    if new_top is None:
+                        return
+
+                    # Не трогаем layout, если ничего не изменилось
+                    if new_top == state["last_top_margin"]:
+                        apply_visibility(True)
+                        return
+
+                    lp = panel.getLayoutParams()
+                    lp.topMargin = new_top
+                    try:
+                        lp.leftMargin = margin_h
+                        lp.rightMargin = margin_h
+                    except Exception:
+                        pass
+                    panel.setLayoutParams(lp)
+                    state["last_top_margin"] = new_top
+                    apply_visibility(True)
+                except Exception as e:
+                    error_text = f"{type(e).__name__}: {e}"
+                    self.log(f"TikTok Stickers: reposition failed: {error_text}")
+                    self.set_setting("last_error", f"[reposition] {error_text}")
+
+            # Главный триггер: строка ввода сдвинулась/изменила размер —
+            # реплай, edit, attach, клавиатура и т.п.
+            layout_listener = OnLayoutChangeListenerProxy(
+                lambda: reposition(force=True)
+            )
+            try:
+                enter_view.addOnLayoutChangeListener(layout_listener)
+            except Exception as e:
+                self.log(f"TikTok Stickers: addOnLayoutChangeListener failed: {e}")
+
+            # Fallback на global layout — ловит случаи, когда сама строка
+            # ввода не двигалась, но снизу появилась/исчезла встроенная
+            # эмодзи/стикер-панель Telegram или клавиатура открылась без
+            # изменения layout enter_view.
+            global_listener = ViewTreeObserverListenerProxy(
+                lambda: reposition()
+            )
+            try:
+                content_view.getViewTreeObserver().addOnGlobalLayoutListener(
+                    global_listener
+                )
+            except Exception as e:
+                self.log(f"TikTok Stickers: addOnGlobalLayoutListener failed: {e}")
+
+            self._panels[key] = {
+                "panel": panel,
+                "cells": cells,
+                "enter_view": enter_view,
+                "content_view": content_view,
+                "layout_listener": layout_listener,
+                "global_listener": global_listener,
+                "reposition": lambda: reposition(force=True),
+            }
+            reposition(force=True)
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {e}"
+            self.log(f"TikTok Stickers: _attach_panel failed: {error_text}")
+            self.set_setting("last_error", f"[attach_panel] {error_text}")
+
+    @staticmethod
+    def _make_ripple_bg(normal_hex: str, pressed_hex: str, radius_dp: float):
+        """Плоская тёмная заливка с мягким ripple на нажатие — без
+        градиентов/подсветок, чтобы панель выглядела как часть системы,
+        а не как отдельный "накладной" слой."""
+        try:
+            base = GradientDrawable()
+            base.setColor(Color.parseColor(normal_hex))
+            base.setCornerRadius(AndroidUtilities.dp(radius_dp))
+
+            from android.graphics.drawable import RippleDrawable
+            from android.content.res import ColorStateList
+
+            mask = GradientDrawable()
+            mask.setColor(Color.WHITE)
+            mask.setCornerRadius(AndroidUtilities.dp(radius_dp))
+
+            ripple_color = ColorStateList.valueOf(Color.parseColor(pressed_hex))
+            return RippleDrawable(ripple_color, base, mask)
+        except Exception:
+            try:
+                gd = GradientDrawable()
+                gd.setColor(Color.parseColor(normal_hex))
+                gd.setCornerRadius(AndroidUtilities.dp(radius_dp))
+                return gd
+            except Exception:
+                return None
+
+    def _build_panel_view(self, context, chat_activity, enter_view):
+        """Возвращает (panel, cells) — cells нужны, чтобы позже точечно
+        обновлять превью (см. _refresh_all_previews) без прохода по
+        Java-дереву View."""
+        plugin = self
+        panel = LinearLayout(context)
+        panel.setOrientation(LinearLayout.HORIZONTAL)
+        panel.setGravity(Gravity.CENTER_VERTICAL)
+        panel.setPadding(
+            AndroidUtilities.dp(4),
+            AndroidUtilities.dp(PANEL_V_PADDING_DP),
+            AndroidUtilities.dp(4),
+            AndroidUtilities.dp(PANEL_V_PADDING_DP),
+        )
+
+        try:
+            gd = GradientDrawable()
+            gd.setColor(Color.parseColor(PANEL_BG_COLOR))
+            gd.setCornerRadius(AndroidUtilities.dp(PANEL_CORNER_RADIUS_DP))
+            gd.setStroke(AndroidUtilities.dp(1), Color.parseColor(PANEL_BORDER_COLOR))
+            panel.setBackground(gd)
+        except Exception:
+            try:
+                panel.setBackgroundColor(Color.parseColor(PANEL_BG_COLOR))
+            except Exception:
+                pass
+
+        cells = []
+
+        for i in range(SLOT_COUNT):
+            # Никаких линий-разделителей между ячейками — на плотном тёмном
+            # фоне они и создавали ощущение "накиданной" AI-панели.
+            slot = FrameLayout(context)
+            bg = self._make_ripple_bg(CELL_BG_COLOR, CELL_PRESSED_COLOR, CELL_CORNER_RADIUS_DP)
+            if bg is not None:
+                slot.setBackground(bg)
+            else:
+                try:
+                    slot.setBackgroundColor(Color.parseColor(CELL_BG_COLOR))
+                except Exception:
+                    pass
+
+            cell = self._make_preview_view(context, PREVIEW_SIZE_DP)
+            self._bind_preview(cell, self.get_slot_value(i))
+            cells.append((i, cell))
+
+            def on_click(view, index=i):
+                if not plugin.is_panel_enabled():
+                    return
+                peer_id = None
+                try:
+                    peer_id = chat_activity.getDialogId()
+                except Exception as e:
+                    plugin.log(f"TikTok Stickers: getDialogId failed: {e}")
+                if peer_id is not None:
+                    plugin.send_slot(index, peer_id, enter_view=enter_view)
+
+            bind_click(cell, on_click)
+            bind_click(slot, on_click)
+
+            slot.addView(
+                cell,
+                LayoutHelper.createFrame(
+                    PREVIEW_SIZE_DP, PREVIEW_SIZE_DP,
+                    Gravity.CENTER,
+                ),
+            )
+            panel.addView(
+                slot,
+                LayoutHelper.createLinear(0, CELL_SIZE_DP, 1.0, 2, 0, 2, 0),
+            )
+
+        return panel, cells
+
+    @staticmethod
+    def _get_field(obj, name):
+        try:
+            f = obj.getClass().getDeclaredField(name)
+            f.setAccessible(True)
+            return f.get(obj)
+        except Exception:
+            return None
+
+
+try:
+    from java import dynamic_proxy
+
+    class ViewTreeObserverListenerProxy(
+        dynamic_proxy(ViewTreeObserver.OnGlobalLayoutListener)
+    ):
+        def __init__(self, callback):
+            super().__init__()
+            self._callback = callback
+
+        def onGlobalLayout(self):
+            try:
+                self._callback()
+            except Exception:
+                pass
+except Exception:
+    class ViewTreeObserverListenerProxy:
+        def __init__(self, callback):
+            self._callback = callback
