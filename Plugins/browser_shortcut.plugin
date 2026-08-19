@@ -1,0 +1,439 @@
+__id__ = "browser_shortcut"
+__name__ = "Browser Shortcut"
+__description__ = "Создайте ярлык на главном экране с пользовательским именем и значком, который будет открывать URL-адрес во встроенном браузере приложения.\n\nCreate a home screen shortcut with a custom name and icon that opens a URL in the client's in-app browser"
+__author__ = "Е-бать"
+__version__ = "1.2"
+__icon__ = "NE_SMOTRI_SYUDA81/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+
+import os
+import re
+import traceback
+
+from java import jclass
+
+from android.app import Activity
+from android.content import Intent
+from android.graphics import BitmapFactory, Bitmap
+
+from org.telegram.messenger import ApplicationLoader
+from org.telegram.messenger.browser import Browser
+from org.telegram.ui import LaunchActivity
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread, log
+from hook_utils import find_class
+from file_utils import ensure_dir_exists, delete_file
+from ui.settings import Header, Input, Text, Divider, Selector
+from ui.bulletin import BulletinHelper
+
+from typing import Any, List
+
+
+def _get_plugin_dir():
+    ctx = ApplicationLoader.applicationContext
+    base = ctx.getFilesDir().getAbsolutePath()
+    return os.path.join(base, "plugins", "browser_shortcut")
+
+
+def _log(msg):
+    log(f"[browser_shortcut] {msg}")
+
+
+ICON_FILENAME = "client_icon.png"
+REQUEST_PICK_IMAGE = 30172
+EXTRA_TARGET_URL = "browser_shortcut_plugin_target_url"
+# Private action + explicit component, deliberately NOT ACTION_MAIN/CATEGORY_LAUNCHER,
+# so the pinned shortcut's intent isn't treated as a duplicate of the plain app icon
+# by task-reset/dedup logic (which was silently dropping the extra).
+SHORTCUT_ACTION = "com.exteragram.plugins.browser_shortcut.OPEN"
+
+COLD_START_DELAY_MS = 600
+WARM_START_DELAY_MS = 100
+RETRY_DELAY_MS = 500
+MAX_ATTEMPTS = 3
+
+# Index into LANGUAGE_ITEMS <-> STRINGS language code. Item labels stay in
+# their own language regardless of the current setting, so the user can
+# always find their language in the picker.
+LANGUAGES = ["en", "ru"]
+LANGUAGE_ITEMS = ["English", "Русский"]
+
+STRINGS = {
+    "en": {
+        "header_shortcut": "Shortcut Settings",
+        "language_label": "Interface language",
+        "name_label": "Shortcut name",
+        "name_default": "Browser",
+        "url_label": "URL to open",
+        "icon_label": "App icon",
+        "icon_remove": "Remove Icon",
+        "header_create": "Create Shortcut",
+        "create_button": "Create shortcut",
+        "hint": "A new shortcut with your name and icon will be pinned to "
+                "the home screen. Tapping it opens the URL above directly "
+                "in the client's in-app browser.",
+        "err_decode_image": "Failed to decode the image",
+        "icon_saved": "Icon saved! Now press \"Create Shortcut\".",
+        "no_activity": "Cannot open gallery — no activity",
+        "icon_removed": "Icon removed.",
+        "err_no_name": "Enter a name first!",
+        "err_no_url": "Enter a URL first!",
+        "err_no_pin_support": "Your launcher does not support pinned shortcuts",
+        "shortcut_created": "Shortcut \"{name}\" added to home screen!",
+        "error_prefix": "Error: {error}",
+    },
+    "ru": {
+        "header_shortcut": "Настройки ярлыка",
+        "language_label": "Язык интерфейса",
+        "name_label": "Название ярлыка",
+        "name_default": "Браузер",
+        "url_label": "URL для открытия",
+        "icon_label": "Иконка приложения",
+        "icon_remove": "Удалить иконку",
+        "header_create": "Создание ярлыка",
+        "create_button": "Создать ярлык",
+        "hint": "Новый ярлык с вашим именем и иконкой будет закреплён на "
+                "главном экране. Нажатие на него сразу открывает указанный "
+                "URL во встроенном браузере клиента.",
+        "err_decode_image": "Не удалось декодировать изображение",
+        "icon_saved": "Иконка сохранена! Теперь нажмите «Создать ярлык».",
+        "no_activity": "Не удалось открыть галерею — activity недоступна",
+        "icon_removed": "Иконка удалена.",
+        "err_no_name": "Сначала введите название!",
+        "err_no_url": "Сначала введите URL!",
+        "err_no_pin_support": "Ваш лаунчер не поддерживает закреплённые ярлыки",
+        "shortcut_created": "Ярлык «{name}» добавлен на главный экран!",
+        "error_prefix": "Ошибка: {error}",
+    },
+}
+
+
+class ActivityResultHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            request_code = param.args[0]
+            result_code = param.args[1]
+            data = param.args[2]
+
+            if request_code != REQUEST_PICK_IMAGE:
+                return
+            if result_code != Activity.RESULT_OK or data is None:
+                return
+
+            uri = data.getData()
+            if uri is None:
+                return
+
+            self.plugin._handle_image_picked(uri)
+        except Exception as e:
+            _log(f"ActivityResultHook error: {e}")
+
+
+class LaunchCreateHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            activity = param.thisObject
+            self.plugin._consume_intent(activity.getIntent(), COLD_START_DELAY_MS, "onCreate")
+        except Exception as e:
+            _log(f"LaunchCreateHook error: {e}")
+
+
+class LaunchNewIntentHook(MethodHook):
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin._consume_intent(param.args[0], WARM_START_DELAY_MS, "onNewIntent")
+        except Exception as e:
+            _log(f"LaunchNewIntentHook error: {e}")
+
+
+class BrowserShortcutPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        ensure_dir_exists(_get_plugin_dir())
+
+        try:
+            LaunchActivityClass = find_class("org.telegram.ui.LaunchActivity")
+        except Exception as e:
+            _log(f"find_class(LaunchActivity) failed: {e}")
+            return
+
+        if LaunchActivityClass is None:
+            _log("find_class(LaunchActivity) returned None")
+            return
+
+        # Each hook is registered independently so a failure on one (e.g. a
+        # missing overload) can't silently prevent the others from attaching.
+        for method_name, hook in (
+            ("onActivityResult", ActivityResultHook(self)),
+            ("onCreate", LaunchCreateHook(self)),
+            ("onNewIntent", LaunchNewIntentHook(self)),
+        ):
+            try:
+                result = self.hook_all_methods(LaunchActivityClass, method_name, hook)
+                _log(f"hooked {method_name}: {result}")
+            except Exception as e:
+                _log(f"hook {method_name} failed: {e}")
+
+    def on_plugin_unload(self):
+        pass
+
+    def _lang(self) -> str:
+        idx = self.get_setting("language", 0)
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = 0
+        if idx < 0 or idx >= len(LANGUAGES):
+            idx = 0
+        return LANGUAGES[idx]
+
+    def _t(self, key: str, **kwargs) -> str:
+        table = STRINGS.get(self._lang(), STRINGS["en"])
+        template = table.get(key, STRINGS["en"].get(key, key))
+        if kwargs:
+            try:
+                return template.format(**kwargs)
+            except Exception:
+                return template
+        return template
+
+    def _consume_intent(self, intent, initial_delay, source):
+        try:
+            if intent is None:
+                _log(f"_consume_intent[{source}]: intent is None")
+                return
+            url = intent.getStringExtra(EXTRA_TARGET_URL)
+            _log(f"_consume_intent[{source}]: extra={url!r}")
+            if not url:
+                return
+            # Cleared immediately so a later recreation (e.g. rotation) of the
+            # same Activity/Intent pair doesn't reopen the browser again.
+            intent.removeExtra(EXTRA_TARGET_URL)
+            run_on_ui_thread(lambda: self._open_client_browser(url), initial_delay)
+        except Exception as e:
+            _log(f"_consume_intent[{source}] error: {e}")
+
+    def _open_client_browser(self, url, attempt=1):
+        try:
+            context = ApplicationLoader.applicationContext
+            opened = Browser.openInTelegramBrowser(context, url, None)
+            _log(f"openInTelegramBrowser attempt {attempt} -> {opened}")
+
+            if opened:
+                return
+
+            if attempt < MAX_ATTEMPTS:
+                # getSafeLastFragment() returns None until LaunchActivity has
+                # attached its first fragment; retry instead of giving up.
+                run_on_ui_thread(
+                    lambda: self._open_client_browser(url, attempt + 1), RETRY_DELAY_MS
+                )
+                return
+
+            Browser.openUrl(context, url)
+            _log("all attempts failed, fell back to Browser.openUrl")
+        except Exception as e:
+            _log(f"_open_client_browser error (attempt {attempt}): {e}")
+            _log(traceback.format_exc())
+            if attempt < MAX_ATTEMPTS:
+                run_on_ui_thread(
+                    lambda: self._open_client_browser(url, attempt + 1), RETRY_DELAY_MS
+                )
+            else:
+                BulletinHelper.show_error(self._t("error_prefix", error=e))
+
+    def _handle_image_picked(self, uri):
+        try:
+            context = ApplicationLoader.applicationContext
+            input_stream = context.getContentResolver().openInputStream(uri)
+            bitmap = BitmapFactory.decodeStream(input_stream)
+            input_stream.close()
+
+            if bitmap is None:
+                BulletinHelper.show_error(self._t("err_decode_image"))
+                return
+
+            scaled = Bitmap.createScaledBitmap(bitmap, 192, 192, True)
+
+            icon_dir = _get_plugin_dir()
+            ensure_dir_exists(icon_dir)
+            icon_path = os.path.join(icon_dir, ICON_FILENAME)
+
+            FileOutputStream = jclass("java.io.FileOutputStream")
+            fos = FileOutputStream(icon_path)
+            scaled.compress(Bitmap.CompressFormat.PNG, 100, fos)
+            fos.flush()
+            fos.close()
+
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(self._t("icon_saved"))
+            )
+        except Exception as e:
+            BulletinHelper.show_error(self._t("error_prefix", error=e))
+
+    def _pick_image(self, view):
+        try:
+            activity = None
+            try:
+                from client_utils import get_last_fragment
+                fragment = get_last_fragment()
+                if fragment is not None:
+                    activity = fragment.getParentActivity()
+            except Exception:
+                pass
+
+            if activity is None:
+                BulletinHelper.show_error(self._t("no_activity"))
+                return
+
+            intent = Intent(Intent.ACTION_PICK)
+            intent.setType("image/*")
+            activity.startActivityForResult(intent, REQUEST_PICK_IMAGE)
+        except Exception as e:
+            BulletinHelper.show_error(self._t("error_prefix", error=e))
+
+    def _remove_icon(self, view):
+        try:
+            icon_path = os.path.join(_get_plugin_dir(), ICON_FILENAME)
+            if os.path.exists(icon_path):
+                delete_file(icon_path)
+            BulletinHelper.show_success(self._t("icon_removed"))
+        except Exception as e:
+            pass
+
+    def _normalize_url(self, url: str) -> str:
+        url = url.strip()
+        if "://" not in url:
+            url = "https://" + url
+        return url
+
+    def _create_shortcut(self, view):
+        try:
+            context = ApplicationLoader.applicationContext
+            custom_name = self.get_setting("client_name", "")
+            target_url = self.get_setting("target_url", "")
+            icon_path = os.path.join(_get_plugin_dir(), ICON_FILENAME)
+
+            if not custom_name:
+                BulletinHelper.show_error(self._t("err_no_name"))
+                return
+            if not target_url:
+                BulletinHelper.show_error(self._t("err_no_url"))
+                return
+
+            target_url = self._normalize_url(target_url)
+
+            ComponentName = jclass("android.content.ComponentName")
+
+            launch_intent = Intent(SHORTCUT_ACTION)
+            launch_intent.setComponent(
+                ComponentName(context.getPackageName(), "org.telegram.ui.LaunchActivity")
+            )
+            launch_intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            launch_intent.putExtra(EXTRA_TARGET_URL, target_url)
+
+            _log(f"shortcut intent built: action={SHORTCUT_ACTION}, url={target_url!r}")
+
+            safe_name = re.sub(r"[^a-z0-9_]+", "_", custom_name.strip().lower()).strip("_")
+            shortcut_id = "browser_shortcut_" + (safe_name or "link")
+
+            ShortcutInfoBuilder = jclass("android.content.pm.ShortcutInfo$Builder")
+            IconClass = jclass("android.graphics.drawable.Icon")
+
+            builder = ShortcutInfoBuilder(context, shortcut_id)
+            builder.setShortLabel(custom_name)
+            builder.setLongLabel(custom_name)
+            builder.setIntent(launch_intent)
+
+            if os.path.exists(icon_path):
+                bitmap = BitmapFactory.decodeFile(icon_path)
+                if bitmap is not None:
+                    scaled = Bitmap.createScaledBitmap(bitmap, 192, 192, True)
+                    icon = IconClass.createWithBitmap(scaled)
+                    builder.setIcon(icon)
+
+            shortcut_info = builder.build()
+
+            ShortcutManagerClass = jclass("android.content.pm.ShortcutManager")
+            shortcut_manager = context.getSystemService(ShortcutManagerClass)
+
+            if shortcut_manager.isRequestPinShortcutSupported():
+                shortcut_manager.requestPinShortcut(shortcut_info, None)
+                BulletinHelper.show_success(self._t("shortcut_created", name=custom_name))
+            else:
+                BulletinHelper.show_error(self._t("err_no_pin_support"))
+        except Exception as e:
+            _log(f"_create_shortcut error: {e}")
+            _log(traceback.format_exc())
+            BulletinHelper.show_error(self._t("error_prefix", error=e))
+
+    def _on_name_change(self, new_value: str):
+        pass
+
+    def _on_url_change(self, new_value: str):
+        pass
+
+    def _on_language_change(self, new_index: int):
+        self.set_setting("language", new_index, reload_settings=True)
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text=self._t("header_shortcut")),
+            Selector(
+                key="language",
+                text=self._t("language_label"),
+                default=0,
+                items=LANGUAGE_ITEMS,
+                icon="msg_language",
+                on_change=self._on_language_change,
+            ),
+            Input(
+                key="client_name",
+                text=self._t("name_label"),
+                default=self._t("name_default"),
+                icon="msg_edit",
+                on_change=self._on_name_change,
+            ),
+            Input(
+                key="target_url",
+                text=self._t("url_label"),
+                default="https://www.google.com",
+                icon="msg_link2",
+                on_change=self._on_url_change,
+            ),
+            Text(
+                text=self._t("icon_label"),
+                icon="msg_gallery",
+                on_click=self._pick_image,
+            ),
+            Text(
+                text=self._t("icon_remove"),
+                icon="msg_delete",
+                red=True,
+                on_click=self._remove_icon,
+            ),
+            Divider(),
+            Header(text=self._t("header_create")),
+            Text(
+                text=self._t("create_button"),
+                icon="msg_link2",
+                on_click=self._create_shortcut,
+                accent=True,
+            ),
+            Divider(text=self._t("hint")),
+        ]
