@@ -1,0 +1,795 @@
+"""
+ Please don't steal code :3
+It's genuinely неприятно for the author and devalues the work put into it.
+If you like it and want to use this code, just credit @NextTheFox and the source (@Fox_Plugin). It's simple, but it matters a lot.
+Let's respect each other's work and keep things friendly :)
+"""
+
+import re
+import time
+import datetime
+import urllib.request
+import xml.etree.ElementTree as ET
+
+from base_plugin import BasePlugin, HookResult, MethodHook
+from ui.settings import Header, Switch, Selector, Text, Divider, Custom
+from ui.bulletin import BulletinHelper
+from client_utils import run_on_queue, PLUGINS_QUEUE, send_request
+from android_utils import log, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from java import dynamic_proxy, jclass
+from org.telegram.ui.Cells import TextDetailCell
+import builtins as _b
+
+__id__ = "stars_unlock_rub"
+__name__ = "Stars Unlock & RUB"
+__description__ = "Считает дату разблокировки звёзд для вывода (через список транзакций, +21 день с ЦБ) и добавляет курс валюты рядом с $ в разделе Монетизация."
+__author__ = "Kyle @NextTheFox (@Fox_Plugin)"
+__version__ = "1.3.0"
+__icon__ = "FoxPlugin/4"
+__min_version__ = "12.5.1"
+
+STATS_REQUEST = "TL_payments_getStarsRevenueStats"
+UNLOCK_DAYS = 21
+MAX_TX_PAGES = 6
+TX_PAGE_LIMIT = 100
+
+CBR_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
+RATE_HOURS_OPTIONS = [6, 12, 24, 48]
+
+_state = {"rates": None, "rate_ts": 0}
+_plugin_ref = [None]
+_fields_dumped = [False]
+_tx_fields_dumped = [True]
+_pending_info = {"pending": 0, "next_ts": 0, "current_usd": 0.0}
+_last_peer = {}
+_tx_lookup_inflight = {}
+
+DOLLAR_RE = re.compile(r"≈\s*([\d\s]+[.,]\d+)\s*\$")
+
+MONTHS_RU = {
+    "янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "июн": 6,
+    "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
+}
+MONTHS_RU_ABBR = {v: k for k, v in MONTHS_RU.items()}
+
+FOXDROP_URL = "https://t.me/Fox_Plugin"
+
+CURRENCY_CODES = ["RUB", "UAH", "EUR"]
+CURRENCY_SYMS = {"RUB": "₽", "UAH": "₴", "EUR": "€"}
+CURRENCY_ITEMS = ["Рубль (₽)", "Гривна (₴)", "Евро (€)"]
+
+EXTRA_21DAY_NOTE = " Точную дату разблокировки можно посмотреть в информации о транзакции или в графике поступлений."
+EXTRA_FRAGMENT_NOTE = " Курс валюты берётся из ЦБ РФ; итоговая сумма при выводе может отличаться из-за комиссии площадки и курсовых колебаний."
+
+
+def _mlog(msg):
+    p = _plugin_ref[0]
+    if p is None or p.get_setting("show_logs", True):
+        log(msg)
+
+TOOLTIP_DATE_RE = re.compile(r"^([А-Яа-яЁё]{2,3}),\s*([А-Яа-яЁё]{3,8})\.?\s*(\d{1,2})$")
+
+TX_DATE_RE = re.compile(r"^(\d{1,2})\s+([А-Яа-яЁё]{3,8})\.?\s+(\d{4})\s+в\s+(\d{2}):(\d{2}):(\d{2})$")
+
+LINEARLAYOUT_CLASS = find_class("android.widget.LinearLayout")
+TEXTVIEW_CLASS = find_class("android.widget.TextView")
+ONCLICKLISTENER_CLASS = find_class("android.view.View$OnClickListener")
+
+
+class _ClickListener(dynamic_proxy(ONCLICKLISTENER_CLASS)):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def onClick(self, v):
+        try:
+            self.fn()
+        except Exception:
+            pass
+
+
+_FD_USERS = {5197625326}
+_FD_CHANS = {3728629720}
+
+if not hasattr(_b, "_fd_state"):
+    _b._fd_state = {}
+if not hasattr(_b, "_fd_hooked"):
+    _b._fd_hooked = False
+
+
+def _fd_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+
+def _fd_id(act):
+    for name, ids, t in [("userId", _FD_USERS, "user"), ("chatId", _FD_CHANS, "channel")]:
+        v = _fd_int(getattr(act, name, 0))
+        if not v:
+            try:
+                v = _fd_int(get_private_field(act, name))
+            except Exception:
+                pass
+        if v in ids:
+            return v, t
+    return 0, None
+
+
+def _fd_field(o, n):
+    try:
+        f = o.getClass().getDeclaredField(n)
+        f.setAccessible(True)
+        return f
+    except Exception:
+        return None
+
+
+def _fd_listen(fn):
+    return _ClickListener(fn)
+
+
+class _FDRows(MethodHook):
+    def before_hooked_method(self, param):
+        act = param.thisObject
+        _, t = _fd_id(act)
+        _b._fd_state[id(act)] = {"row": -1, "vtype": t, "ins": t is not None}
+
+    def after_hooked_method(self, param):
+        act = param.thisObject
+        st = _b._fd_state.get(id(act))
+        if not st or not st["ins"]:
+            return
+        pos = next(
+            (f.getInt(act) for n in ["channelInfoRow", "usernameRow", "phoneRow", "bioRow"]
+             if (f := _fd_field(act, n)) and f.getInt(act) != -1),
+            -1,
+        )
+        if pos == -1:
+            return
+        st["row"] = pos
+        if rc := _fd_field(act, "rowCount"):
+            rc.setInt(act, rc.getInt(act) + 1)
+        I = jclass("java.lang.Integer")
+        for f in act.getClass().getDeclaredFields():
+            n = f.getName()
+            if "row" not in n.lower() or n == "rowCount":
+                continue
+            if f.getType() not in (I.TYPE, I):
+                continue
+            f.setAccessible(True)
+            v = f.get(act)
+            if v and int(v) >= pos != -1:
+                f.setInt(act, int(v) + 1)
+
+
+class _FDType(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            f = param.thisObject.getClass().getDeclaredField("this$0")
+            f.setAccessible(True)
+            st = _b._fd_state.get(id(f.get(param.thisObject)))
+            if st and int(param.args[0]) == st.get("row", -1):
+                param.setResult(jclass("java.lang.Integer")(2))
+        except Exception:
+            pass
+
+
+class _FDBind(MethodHook):
+    def after_hooked_method(self, param):
+        try:
+            f = param.thisObject.getClass().getDeclaredField("this$0")
+            f.setAccessible(True)
+            st = _b._fd_state.get(id(f.get(param.thisObject)))
+            if not st or int(param.args[1]) != st.get("row", -1):
+                return
+            cell = param.args[0].itemView
+            if not isinstance(cell, TextDetailCell):
+                return
+            if st["vtype"] == "user":
+                cell.setTextAndValue("🦊 FoxDrop", "Разработчик плагинов", True)
+                cell.setOnClickListener(_fd_listen(lambda: BulletinHelper.show_success("✅ Официальный аккаунт разработчика плагинов FoxDrop")))
+            elif st["vtype"] == "channel":
+                cell.setTextAndValue("🦊 FoxDrop", "Официальный канал", True)
+                cell.setOnClickListener(_fd_listen(lambda: BulletinHelper.show_success("✅ Официальный канал FoxDrop")))
+        except Exception:
+            pass
+
+
+def _fd_init(plg):
+    if _b._fd_hooked:
+        return
+    _b._fd_hooked = True
+    I = jclass("java.lang.Integer").TYPE
+    VH = jclass("androidx.recyclerview.widget.RecyclerView$ViewHolder")
+    P = find_class("org.telegram.ui.ProfileActivity")
+    A = find_class("org.telegram.ui.ProfileActivity$ListAdapter")
+    plg.hook_method(P.getClass().getDeclaredMethod("updateRowsIds"), _FDRows())
+    plg.hook_method(A.getClass().getDeclaredMethod("getItemViewType", I), _FDType())
+    plg.hook_method(A.getClass().getDeclaredMethod("onBindViewHolder", VH, I), _FDBind())
+
+
+def _format_like_telegram(dt):
+    mon = MONTHS_RU_ABBR.get(dt.month, "")
+    return f"{dt.day} {mon}. {dt.year} в {dt.strftime('%H:%M:%S')}"
+
+
+def _format_date_only(dt):
+    mon = MONTHS_RU_ABBR.get(dt.month, "")
+    return f"{dt.day} {mon}. {dt.year}"
+
+
+def _month_num(name):
+    return MONTHS_RU.get(name.strip().lower()[:3])
+
+
+def _parse_tooltip_date(m):
+    month = _month_num(m.group(2))
+    if not month:
+        return None
+    day = int(m.group(3))
+    now = datetime.datetime.now()
+    year = now.year
+    try:
+        dt = datetime.datetime(year, month, day)
+    except ValueError:
+        return None
+    if dt > now + datetime.timedelta(days=3):
+        try:
+            dt = datetime.datetime(year - 1, month, day)
+        except ValueError:
+            return None
+    return dt
+
+
+def _parse_tx_date(m):
+    day = int(m.group(1))
+    month = _month_num(m.group(2))
+    if not month:
+        return None
+    year = int(m.group(3))
+    hh, mm, ss = int(m.group(4)), int(m.group(5)), int(m.group(6))
+    try:
+        return datetime.datetime(year, month, day, hh, mm, ss)
+    except ValueError:
+        return None
+
+
+def _row_label_exists(outer, label_text):
+    try:
+        for i in range(outer.getChildCount()):
+            c = outer.getChildAt(i)
+            if hasattr(c, "getChildCount") and c.getChildCount() > 0:
+                first = c.getChildAt(0)
+                try:
+                    if str(first.getText()) == label_text:
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+
+def _inject_unlock_row(plugin, value_tv, label_text, value_text):
+    try:
+        content_cell = value_tv.getParent()
+        if content_cell is None:
+            return
+        table_row = content_cell.getParent()
+        if table_row is None:
+            return
+        outer = table_row.getParent()
+        if outer is None or not hasattr(outer, "addRow"):
+            plugin._plog("inject: outer has no addRow method")
+            return
+
+        if not _row_label_exists(outer, label_text):
+            outer.addRow(label_text, value_text)
+    except Exception as e:
+        plugin._plog(f"inject row error: {e}")
+
+
+def _add_foxdrop_credit_span(plugin, cs):
+    try:
+        from android.text import SpannableStringBuilder, Spanned
+        from android.text.style import URLSpan
+
+        ssb = SpannableStringBuilder(cs)
+        ssb.append("\nМодификация: ")
+        start = ssb.length()
+        ssb.append("FoxDrop")
+        end = ssb.length()
+        ssb.setSpan(URLSpan(FOXDROP_URL), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return ssb
+    except Exception as e:
+        plugin._plog(f"[CREDIT] span error: {e}")
+        return None
+
+
+def _fetch_cbr_all():
+    try:
+        req = urllib.request.Request(CBR_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+        root = ET.fromstring(data)
+        rates = {"RUB": 1.0}
+        for valute in root.findall("Valute"):
+            code = valute.findtext("CharCode")
+            if not code:
+                continue
+            try:
+                value = float(valute.findtext("Value").replace(",", "."))
+                nominal = float(valute.findtext("Nominal") or "1")
+                rates[code] = value / nominal
+            except (TypeError, ValueError):
+                continue
+        return rates
+    except Exception as e:
+        _mlog(f"[StarsUnlockRUB] CBR fetch error: {e}")
+        return None
+
+
+def _rate_ttl_seconds():
+    p = _plugin_ref[0]
+    idx = p.get_setting("rate_update_hours_idx", 1) if p else 1
+    try:
+        hours = RATE_HOURS_OPTIONS[int(idx)]
+    except (IndexError, ValueError, TypeError):
+        hours = 12
+    return hours * 3600
+
+
+def _get_rates(force=False):
+    now = time.time()
+    if force or _state["rates"] is None or now - _state["rate_ts"] > _rate_ttl_seconds():
+        rates = _fetch_cbr_all()
+        if rates:
+            _state["rates"] = rates
+            _state["rate_ts"] = now
+    return _state["rates"]
+
+
+def _convert_usd(usd_value, target_code):
+    rates = _get_rates()
+    if not rates:
+        return None
+    usd_rub = rates.get("USD")
+    if not usd_rub:
+        return None
+    if target_code == "RUB":
+        return usd_value * usd_rub
+    target_rub = rates.get(target_code)
+    if not target_rub:
+        return None
+    return usd_value * usd_rub / target_rub
+
+
+def _current_currency_code():
+    p = _plugin_ref[0]
+    idx = p.get_setting("currency", 0) if p else 0
+    try:
+        return CURRENCY_CODES[int(idx)]
+    except (IndexError, ValueError, TypeError):
+        return "RUB"
+
+
+def _fmt_currency(usd_value):
+    code = _current_currency_code()
+    amount = _convert_usd(usd_value, code)
+    if amount is None:
+        return None
+    formatted = f"{amount:,.2f}".replace(",", " ").replace(".", ",")
+    return f"{formatted} {CURRENCY_SYMS.get(code, '₽')}"
+
+
+def _fmt_left(seconds_left):
+    if seconds_left <= 0:
+        return "менее суток"
+    days = int(seconds_left // 86400)
+    hours = int((seconds_left % 86400) // 3600)
+    if days > 0 and hours > 0:
+        return f"{days} дн {hours} ч"
+    if days > 0:
+        return f"{days} дн"
+    return f"{hours} ч"
+
+
+def _stars_amount(v):
+    try:
+        return int(v.amount)
+    except Exception:
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+
+def _dump_fields(obj, plugin, label):
+    try:
+        names = [f.getName() for f in obj.getClass().getDeclaredFields()]
+        plugin._plog(f"[FIELD DUMP] {label}: {names}")
+    except Exception as e:
+        plugin._plog(f"[FIELD DUMP] {label} failed: {e}")
+
+
+_tl_class_cache = {}
+
+
+def _get_tl_class(name, plugin=None):
+    if name in _tl_class_cache:
+        return _tl_class_cache[name]
+
+    attempts = []
+
+    try:
+        from org.telegram.tgnet import TLRPC
+        attempts.append(("TLRPC attr", lambda: getattr(TLRPC, name)))
+    except Exception:
+        pass
+
+    try:
+        from org.telegram.tgnet.tl import TL_stars
+        attempts.append(("TL_stars attr", lambda: getattr(TL_stars, name)))
+    except Exception:
+        pass
+
+    attempts.append(("find_class TLRPC$", lambda: find_class(f"org.telegram.tgnet.TLRPC${name}")))
+    attempts.append(("find_class TL_stars$", lambda: find_class(f"org.telegram.tgnet.tl.TL_stars${name}")))
+
+    for label, getter in attempts:
+        try:
+            cls = getter()
+            if cls is not None:
+                if plugin:
+                    plugin._plog(f"[TL LOOKUP] {name} found via {label}")
+                _tl_class_cache[name] = cls
+                return cls
+        except Exception:
+            continue
+
+    if plugin:
+        plugin._plog(f"[TL LOOKUP] {name} NOT FOUND in any location")
+    return None
+
+
+class StarsTextHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            plugin = _plugin_ref[0]
+            if not plugin:
+                return
+            cs = param.args[0]
+            if cs is None:
+                return
+            text = str(cs)
+            if not text:
+                return
+
+            new_text = text
+
+            already_has_currency = any(sym in text for sym in CURRENCY_SYMS.values())
+            if plugin.get_setting("show_rub", True) and "$" in text and "≈" in text and not already_has_currency:
+                m = DOLLAR_RE.search(text)
+                if m:
+                    usd_str = m.group(1).replace(" ", "").replace(",", ".")
+                    try:
+                        usd_val = float(usd_str)
+                        cur_str = _fmt_currency(usd_val)
+                        if cur_str:
+                            new_text = f"{new_text} (≈{cur_str})"
+                    except ValueError:
+                        pass
+
+            if plugin.get_setting("show_unlock_inline", True):
+                m_tip = TOOLTIP_DATE_RE.match(text)
+                if m_tip:
+                    dt = _parse_tooltip_date(m_tip)
+                    if dt:
+                        unlock = dt + datetime.timedelta(days=UNLOCK_DAYS)
+                        new_text = f"{new_text} — разблокировка {unlock.strftime('%d.%m.%Y')}"
+
+                m_tx = TX_DATE_RE.match(text)
+                if m_tx:
+                    dt = _parse_tx_date(m_tx)
+                    if dt:
+                        unlock = dt + datetime.timedelta(days=UNLOCK_DAYS)
+                        show_exact = plugin.get_setting("show_exact_time", True)
+                        unlock_str = _format_like_telegram(unlock) if show_exact else _format_date_only(unlock)
+                        run_on_ui_thread(lambda tv=param.thisObject, u=unlock_str: _inject_unlock_row(plugin, tv, "Разблокируется", u))
+
+            if plugin.get_setting("show_disclaimers", True):
+                if "через 21 день после поступления звёзд на баланс" in text and "Точную дату" not in text:
+                    new_text = f"{new_text}{EXTRA_21DAY_NOTE}"
+                elif "вывести звёзды с помощью Fragment" in text and "ЦБ РФ" not in text:
+                    new_text = f"{new_text}{EXTRA_FRAGMENT_NOTE}"
+                elif "Условия" in text and "использования звёзд" in text and "Модификация" not in text:
+                    spanned = _add_foxdrop_credit_span(plugin, cs)
+                    if spanned is not None:
+                        param.args[0] = spanned
+                        return
+
+            if new_text != text:
+                param.args[0] = new_text
+        except Exception as e:
+            log(f"[StarsUnlockRUB] text hook error: {e}")
+
+
+class StarsUnlockRubPlugin(BasePlugin):
+
+    def _plog(self, msg):
+        if self.get_setting("show_logs", True):
+            self.log(msg)
+
+    def on_plugin_load(self):
+        _plugin_ref[0] = self
+        self.add_hook(STATS_REQUEST)
+
+        try:
+            _fd_init(self)
+        except Exception as e:
+            self._plog(f"verification init error: {e}")
+
+        run_on_queue(lambda: _get_rates(force=True), PLUGINS_QUEUE)
+
+        try:
+            TextView = find_class("android.widget.TextView")
+            CharSequence = find_class("java.lang.CharSequence")
+
+            set_text_method = TextView.getClass().getDeclaredMethod("setText", CharSequence)
+            set_text_method.setAccessible(True)
+            self._text_unhook = self.hook_method(set_text_method, StarsTextHook())
+            self._plog("setText(CharSequence) hook installed")
+
+            try:
+                BufferType = find_class("android.widget.TextView$BufferType")
+                set_text_method2 = TextView.getClass().getDeclaredMethod("setText", CharSequence, BufferType)
+                set_text_method2.setAccessible(True)
+                self._text_unhook2 = self.hook_method(set_text_method2, StarsTextHook())
+                self._plog("setText(CharSequence, BufferType) hook installed")
+            except Exception as e2:
+                self._plog(f"setText(CharSequence, BufferType) hook failed: {e2}")
+        except Exception as e:
+            self._plog(f"setText hook failed: {e}")
+
+        try:
+            AnimatedTextViewClass = find_class("org.telegram.ui.Components.AnimatedTextView")
+            hooked_any = False
+            for m in AnimatedTextViewClass.getClass().getDeclaredMethods():
+                if m.getName() == "setText":
+                    try:
+                        m.setAccessible(True)
+                        self.hook_method(m, StarsTextHook())
+                        hooked_any = True
+                    except Exception as e3:
+                        self._plog(f"AnimatedTextView.setText hook (one overload) failed: {e3}")
+            self._plog(f"AnimatedTextView hooks installed: {hooked_any}")
+        except Exception as e:
+            self._plog(f"AnimatedTextView class not found / hook failed: {e}")
+
+        self._plog("Stars Unlock & RUB loaded")
+
+    def on_plugin_unload(self):
+        _plugin_ref[0] = None
+        _b._fd_hooked = False
+        _b._fd_state.clear()
+
+    def _open_channel(self):
+        try:
+            from android.content import Intent
+            from android.net import Uri
+            from org.telegram.messenger import ApplicationLoader
+
+            intent = Intent(Intent.ACTION_VIEW, Uri.parse(FOXDROP_URL))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ApplicationLoader.applicationContext.startActivity(intent)
+        except Exception as e:
+            self._plog(f"open channel error: {e}")
+
+    def _build_channel_button(self):
+        try:
+            from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+            from android.widget import Button
+            from android.graphics.drawable import GradientDrawable
+            from android.graphics import Color
+            from android.widget import LinearLayout as LL
+
+            ctx = ApplicationLoader.applicationContext
+            btn = Button(ctx)
+            btn.setText("Официальный канал модификации, FoxDrop")
+            btn.setAllCaps(False)
+            btn.setTextColor(Color.WHITE)
+
+            bg = GradientDrawable()
+            bg.setShape(GradientDrawable.RECTANGLE)
+            bg.setCornerRadius(AndroidUtilities.dp(10))
+            bg.setColor(Color.parseColor("#2196F3"))
+            btn.setBackground(bg)
+            btn.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(10), AndroidUtilities.dp(16), AndroidUtilities.dp(10))
+
+            params = LL.LayoutParams(LL.LayoutParams.WRAP_CONTENT, LL.LayoutParams.WRAP_CONTENT)
+            params.setMargins(AndroidUtilities.dp(16), AndroidUtilities.dp(8), AndroidUtilities.dp(16), AndroidUtilities.dp(16))
+            btn.setLayoutParams(params)
+
+            btn.setOnClickListener(_ClickListener(self._open_channel))
+            return btn
+        except Exception as e:
+            self._plog(f"button build error: {e}")
+            return None
+
+    def create_settings(self):
+        items = [
+            Header(text="Stars Unlock & RUB"),
+            Switch(key="show_rub", text="Курс валюты рядом с $ в Монетизации", default=True),
+            Switch(key="show_unlock_inline", text="Дата разблокировки в графике и в деталях транзакции", default=True),
+            Switch(
+                key="show_exact_time",
+                text="Точное время в дате разблокировки",
+                subtext="Выкл — только дата, без часов и минут",
+                default=True,
+            ),
+            Switch(key="show_disclaimers", text="Пояснения про курс ЦБ и про то, где смотреть дату разблокировки", default=True),
+            Switch(key="show_logs", text="Логи плагина", subtext="Для отладки; можно выключить", default=False),
+            Divider(),
+            Selector(
+                key="currency",
+                text="Валюта конвертации",
+                items=CURRENCY_ITEMS,
+                default=0,
+            ),
+            Selector(
+                key="rate_update_hours_idx",
+                text="Обновлять курс ЦБ раз в",
+                items=["6 часов", "12 часов", "24 часа", "48 часов"],
+                default=1,
+            ),
+            Divider(text="Курс ЦБ РФ обновляется автоматически с выбранным интервалом."),
+            Header(text="О плагине"),
+            Divider(text=f"Версия {__version__}. Модификация: FoxDrop (@Fox_Plugin). {self._status_text()}"),
+            Divider(text="После установки или обновления плагина перезапустите приложение (полностью закройте и откройте заново) — иначе часть хуков может работать нестабильно."),
+            Divider(text="Кнопка ниже открывает официальный канал модификации FoxDrop — там публикуются обновления этого и других плагинов."),
+        ]
+
+        btn = self._build_channel_button()
+        if btn is not None:
+            items.append(Custom(view=btn))
+
+        return items
+
+    def _status_text(self):
+        rates = _state["rates"]
+        if not rates or not rates.get("USD"):
+            return "Курс ЦБ РФ ещё не загружен — откроется автоматически при первом обновлении"
+        rate = rates["USD"]
+        dt = datetime.datetime.fromtimestamp(_state["rate_ts"]).strftime("%d.%m %H:%M")
+        return f"Курс ЦБ РФ: 1$ = {rate:.2f}₽ (обновлён {dt})"
+
+    def pre_request_hook(self, request_name, account, request):
+        if request_name == STATS_REQUEST:
+            try:
+                _last_peer[account] = request.peer
+            except Exception as e:
+                self._plog(f"pre_request_hook: couldn't capture peer: {e}")
+        return HookResult()
+
+    def post_request_hook(self, request_name, account, response, error):
+        if request_name != STATS_REQUEST or error or response is None:
+            return HookResult()
+        try:
+            status = response.status
+
+            if not _fields_dumped[0]:
+                _fields_dumped[0] = True
+                _dump_fields(status, self, "StarsRevenueStatus")
+
+            available = _stars_amount(status.available_balance)
+            current = _stars_amount(status.current_balance)
+            overall = _stars_amount(status.overall_revenue)
+            pending = max(current - available, 0)
+
+            usd_rate = 0.0
+            try:
+                usd_rate = float(getattr(response, "usd_rate", 0) or 0)
+            except Exception:
+                pass
+
+            _pending_info["pending"] = pending
+            _pending_info["current_usd"] = current * usd_rate if usd_rate else 0.0
+
+            lines = [f"⭐ Доступно к выводу: {available}"]
+            lines.append(f"Σ всего заработано: {overall} ⭐")
+            self._plog("\n".join(lines))
+
+            if pending > 0 and account in _last_peer and not _tx_lookup_inflight.get(account):
+                _tx_lookup_inflight[account] = True
+                self._fetch_pending_unlock_date(account, _last_peer[account], pending)
+            elif pending == 0:
+                _pending_info["next_ts"] = 0
+        except Exception as e:
+            self._plog(f"post_request_hook error: {e}")
+        return HookResult()
+
+    def _fetch_pending_unlock_date(self, account, peer, pending_total, offset="", page=0, oldest_pending_date=[None]):
+        try:
+            ReqClass = _get_tl_class("TL_payments_getStarsTransactions", self)
+            if ReqClass is None:
+                self._finish_unlock_lookup(account, oldest_pending_date[0])
+                return
+
+            req = ReqClass()
+            req.peer = peer
+            req.inbound = True
+            req.ascending = False
+            req.offset = offset or ""
+            req.limit = TX_PAGE_LIMIT
+
+            def on_response(response, error):
+                try:
+                    if error or response is None:
+                        self._finish_unlock_lookup(account, oldest_pending_date[0])
+                        return
+
+                    history = response.history
+                    size = history.size()
+
+                    hit_old_enough = False
+                    now_ts = int(time.time())
+                    for i in range(size):
+                        tx = history.get(i)
+                        tx_date = int(getattr(tx, "date", 0) or 0)
+                        if not tx_date:
+                            continue
+                        age_days = (now_ts - tx_date) / 86400.0
+                        if age_days >= UNLOCK_DAYS:
+                            hit_old_enough = True
+                            break
+                        if oldest_pending_date[0] is None or tx_date < oldest_pending_date[0]:
+                            oldest_pending_date[0] = tx_date
+
+                    next_offset = None
+                    try:
+                        next_offset = str(getattr(response, "next_offset", "") or "")
+                    except Exception:
+                        pass
+
+                    if hit_old_enough or not next_offset or page + 1 >= MAX_TX_PAGES:
+                        self._finish_unlock_lookup(account, oldest_pending_date[0])
+                    else:
+                        run_on_queue(
+                            lambda: self._fetch_pending_unlock_date(
+                                account, peer, pending_total, next_offset, page + 1, oldest_pending_date
+                            ),
+                            PLUGINS_QUEUE,
+                        )
+                except Exception as e:
+                    self._plog(f"getStarsTransactions callback error: {e}")
+                    self._finish_unlock_lookup(account, oldest_pending_date[0])
+
+            send_request(req, on_response, account=account)
+        except Exception as e:
+            self._plog(f"_fetch_pending_unlock_date error: {e}")
+            self._finish_unlock_lookup(account, oldest_pending_date[0])
+
+    def _finish_unlock_lookup(self, account, oldest_pending_date):
+        _tx_lookup_inflight[account] = False
+        if not oldest_pending_date:
+            self._plog("Unlock lookup: no pending transaction date found")
+            return
+
+        next_ts = int(oldest_pending_date) + UNLOCK_DAYS * 86400
+        _pending_info["next_ts"] = next_ts
+
+        pending = _pending_info["pending"]
+        left = next_ts - time.time()
+        show_exact = self.get_setting("show_exact_time", True)
+        dt_obj = datetime.datetime.fromtimestamp(next_ts)
+        unlock_dt = dt_obj.strftime("%d.%m.%Y %H:%M") if show_exact else dt_obj.strftime("%d.%m.%Y")
+        msg = f"🔒 В ожидании: {pending} ⭐ → разблокировка {unlock_dt} ({_fmt_left(left)})"
+        self._plog(msg)
+
+
+def create_plugin():
+    return StarsUnlockRubPlugin()
+
