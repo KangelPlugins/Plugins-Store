@@ -1,0 +1,1031 @@
+import os
+import ast
+import re
+import json
+import time
+import hashlib
+import sqlite3
+import threading
+import gc
+import base64
+import zlib
+from typing import List, Dict, Any, Tuple, Optional
+
+_ACTIVE_CHECKER_INSTANCE = None
+
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from client_utils import run_on_queue, get_last_fragment
+from android_utils import run_on_ui_thread, log
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Text, Switch
+from ui.alert import AlertDialogBuilder
+from hook_utils import find_class
+from java import dynamic_proxy
+
+from android.view import View
+
+__id__ = "PluginChecker"
+__name__ = "Plugin Checker"
+__description__ = "Сканер безопасности плагинов. Находит скрытый и вредоносный код с помощью статического анализа."
+__author__ = "@HysteriaPlugins"
+__version__ = "0.1.0"
+__icon__ = "pluginchecker/0"
+__min_version__ = "12.5.1"
+
+def as_java_color(color: int) -> int:
+    value = int(color)
+    if value > 0x7FFFFFFF:
+        value -= 0x100000000
+    return value
+
+class PluginChecker(BasePlugin):
+    DANGEROUS_IMPORTS = {
+        'ctypes': 'WARNING',
+        'subprocess': 'WARNING',
+        'socket': 'HIGH',
+        'urllib.request': 'HIGH',
+        'requests': 'HIGH',
+        'aiohttp': 'HIGH',
+        'httpx': 'HIGH',
+    }
+
+    DANGEROUS_FUNCTIONS = {
+        'exec': 'CRITICAL',
+        'eval': 'CRITICAL',
+        '__import__': 'HIGH',
+        'compile': 'HIGH',
+        'os.system': 'CRITICAL',
+        'os.popen': 'CRITICAL',
+        'subprocess.Popen': 'CRITICAL',
+        'subprocess.call': 'CRITICAL',
+        'socket.socket': 'HIGH',
+        'requests.get': 'HIGH',
+        'requests.post': 'HIGH',
+        'urllib.request.urlopen': 'HIGH',
+    }
+
+    SENSITIVE_TELEGRAM_ATTRS = {
+        'UserConfig', 'MessagesStorage', 'AccountInstance',
+        'auth_key', 'session', 'phone', 'currentUser'
+    }
+
+    MALICIOUS_STRINGS = [
+        "steal_session", "dump_database", "extract_contacts",
+        "send_logs", "collect_info", "upload_to_server", "exfiltrate",
+        "keylogger", "screenshot", "clipboard", "spy"
+    ]
+
+    BUTTON_COLORS = {
+        "safe": (0xFF43A047, 0xFF2E7D32),
+        "risks": (0xFFFFC107, 0xFFF9A825),
+        "suspicious": (0xFFFF5722, 0xFFE64A19),
+        "malware": (0xFFD32F2F, 0xFFC62828),
+        "default": (0xFF757575, 0xFF616161)
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._installed_hooks = []
+        self._current_analyze_btn = None
+        self._current_sheet = None
+        self._current_chk_box = None
+        self._current_install_btn = None
+        self._current_parent_layout = None
+        self._current_orig_listener = None
+        self._hash_cache = {}
+        self._last_scan_stats = {}
+        self._cached_ui_classes = None
+        self._current_score = None
+        self._current_badge = None
+        self._current_reports = None
+        self._is_scanning = False
+
+    def on_plugin_load(self):
+        global _ACTIVE_CHECKER_INSTANCE
+        if _ACTIVE_CHECKER_INSTANCE is not None and _ACTIVE_CHECKER_INSTANCE is not self:
+            try:
+                _ACTIVE_CHECKER_INSTANCE.on_plugin_unload()
+            except Exception:
+                pass
+        _ACTIVE_CHECKER_INSTANCE = self
+
+        threading.Thread(target=self._init_cache_db, daemon=True).start()
+        self._hook_install_ui()
+
+    def _init_cache_db(self):
+        try:
+            db_path = self._get_db_path()
+            with sqlite3.connect(db_path, timeout=10.0) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS scan_cache (
+                        sha256 TEXT PRIMARY KEY,
+                        file_name TEXT,
+                        timestamp REAL,
+                        reports_json TEXT,
+                        stats_json TEXT,
+                        score INTEGER,
+                        badge TEXT
+                    )
+                """)
+                conn.commit()
+        except Exception:
+            pass
+
+    def _get_db_path(self) -> str:
+        cache_dir = self._get_cache_dir()
+        db_dir = os.path.join(cache_dir, "scan_cache")
+        os.makedirs(db_dir, exist_ok=True)
+        return os.path.join(db_dir, "plugins_hash_cache.db")
+
+    def _get_cache_dir(self) -> str:
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            d = os.path.join(ctx.getFilesDir().getAbsolutePath(), "plugin_checker")
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            d = os.path.join(os.getcwd(), "plugin_checker")
+            os.makedirs(d, exist_ok=True)
+            return d
+
+    def _get_ui_classes(self):
+        if not self._cached_ui_classes or not self._cached_ui_classes[0]:
+            b_cls = find_class("org.telegram.ui.Stories.recorder.ButtonWithCounterView")
+            l_cls = find_class("android.widget.LinearLayout")
+            t_cls = find_class("org.telegram.ui.ActionBar.Theme")
+            u_cls = find_class("org.telegram.messenger.AndroidUtilities")
+            cb_cls = find_class("android.widget.CheckBox")
+            comp_cls = find_class("android.widget.CompoundButton")
+            self._cached_ui_classes = (b_cls, l_cls, t_cls, u_cls, cb_cls, comp_cls)
+        return self._cached_ui_classes
+
+    def _safe_set_text(self, view, text_str: str, animate: bool = False):
+        if not view:
+            return
+        try:
+            view.setText(text_str, animate)
+        except Exception:
+            try:
+                view.setText(text_str)
+            except Exception:
+                pass
+
+    def _get_button_colors(self, score: int) -> Tuple[int, int]:
+        if score >= 80:
+            return self.BUTTON_COLORS["safe"]
+        elif score >= 60:
+            return self.BUTTON_COLORS["risks"]
+        elif score >= 40:
+            return self.BUTTON_COLORS["suspicious"]
+        else:
+            return self.BUTTON_COLORS["malware"]
+
+    def _get_score_emoji(self, score: int) -> str:
+        if score >= 80:
+            return "🟢"
+        elif score >= 60:
+            return "🟡"
+        elif score >= 40:
+            return "🟠"
+        else:
+            return "🔴"
+
+    def create_settings(self):
+        db_entries_count = 0
+        try:
+            db_path = self._get_db_path()
+            if os.path.exists(db_path):
+                with sqlite3.connect(db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM scan_cache")
+                    row = cursor.fetchone()
+                    if row:
+                        db_entries_count = row[0]
+        except Exception:
+            pass
+
+        last_stats = self._get_last_scan_stats()
+        engine_status = last_stats.get("status", "Готов к работе")
+        scan_time_ms = last_stats.get("scan_time_ms", 0.0)
+        scanned_chunks = last_stats.get("scanned_chunks", 0)
+        
+        speed_sub = f"{scan_time_ms} мс ({scanned_chunks} чанков)" if scan_time_ms > 0 else "Замеры отсутствуют"
+        cache_sub = f"Сохранено отчетов: {db_entries_count}" if db_entries_count > 0 else "Кэш пуст"
+
+        return [
+            Header(text="Безопасный сканер"),
+            Header(text="Диагностика"),
+            Text(text="Движок вычислений", subtext=engine_status, icon="msg_permissions"),
+            Text(text="Время последней проверки", subtext=speed_sub, icon="msg_radar"),
+            Header(text="Управление кэшем"),
+            Text(text="Очистить кэш проверок", subtext=cache_sub, icon="msg_delete", red=True, on_click=lambda v: self._clear_sql_cache()),
+            Header(text="Настройки"),
+            Switch(key="auto_block", text="Блокировать опасные плагины", default=True, subtext="Автоматически отменять установку вредоносных плагинов"),
+            Switch(key="save_results", text="Сохранять результаты проверок", default=True, subtext="Сохранять результаты для быстрого доступа"),
+        ]
+
+    def _clear_sql_cache(self):
+        try:
+            if hasattr(self, "_hash_cache"):
+                self._hash_cache.clear()
+            if hasattr(self, "_last_scan_stats"):
+                self._last_scan_stats.clear()
+            db_path = self._get_db_path()
+            if os.path.exists(db_path):
+                with sqlite3.connect(db_path, timeout=10.0) as conn:
+                    conn.execute("DELETE FROM scan_cache")
+                    conn.commit()
+            self._current_score = None
+            self._current_badge = None
+            self._current_reports = None
+            fragment = get_last_fragment()
+            if fragment:
+                BulletinHelper.show_success("Кэш успешно очищен!", fragment)
+        except Exception as e:
+            fragment = get_last_fragment()
+            if fragment:
+                BulletinHelper.show_error(f"Ошибка очистки кэша: {e}", fragment)
+
+    def _get_cached_scan_result(self, file_hash: str) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any], int, str]]:
+        if not file_hash:
+            return None
+        if hasattr(self, "_hash_cache") and file_hash in self._hash_cache:
+            reports, stats = self._hash_cache[file_hash]
+            return reports, stats, None, None
+
+        try:
+            db_path = self._get_db_path()
+            if os.path.exists(db_path):
+                with sqlite3.connect(db_path, timeout=10.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT reports_json, stats_json, score, badge 
+                        FROM scan_cache 
+                        WHERE sha256 = ?
+                    """, (file_hash,))
+                    row = cursor.fetchone()
+                    if row:
+                        reports = json.loads(row[0])
+                        stats = json.loads(row[1])
+                        score = row[2]
+                        badge = row[3]
+                        if not hasattr(self, "_hash_cache"):
+                            self._hash_cache = {}
+                        self._hash_cache[file_hash] = (reports, stats)
+                        return reports, stats, score, badge
+        except Exception:
+            pass
+        return None
+
+    def _save_cached_scan_result(self, file_hash: str, file_name: str, reports: List[Dict[str, Any]], 
+                                 stats: Dict[str, Any], score: int, badge: str):
+        if not file_hash:
+            return
+        if not hasattr(self, "_hash_cache"):
+            self._hash_cache = {}
+        self._hash_cache[file_hash] = (reports, stats)
+
+        if not self.get_setting("save_results", True):
+            return
+
+        try:
+            db_path = self._get_db_path()
+            with sqlite3.connect(db_path, timeout=10.0) as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO scan_cache 
+                       (sha256, file_name, timestamp, reports_json, stats_json, score, badge) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (file_hash, file_name, time.time(), 
+                     json.dumps(reports, ensure_ascii=False), 
+                     json.dumps(stats, ensure_ascii=False),
+                     score, badge)
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+    def _save_last_scan_stats(self, stats: Dict[str, Any]):
+        self._last_scan_stats = stats
+        try:
+            cache_dir = self._get_cache_dir()
+            scan_meta_path = os.path.join(cache_dir, "last_scan.json")
+            with open(scan_meta_path, "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _get_last_scan_stats(self) -> Dict[str, Any]:
+        if hasattr(self, "_last_scan_stats") and self._last_scan_stats:
+            return self._last_scan_stats
+        try:
+            cache_dir = self._get_cache_dir()
+            scan_meta_path = os.path.join(cache_dir, "last_scan.json")
+            if os.path.exists(scan_meta_path):
+                with open(scan_meta_path, "r", encoding="utf-8") as f:
+                    self._last_scan_stats = json.load(f)
+                    return self._last_scan_stats
+        except Exception:
+            pass
+        return {}
+
+    def scan_plugin_code(self, code_str: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        t_start = time.perf_counter()
+        reports = []
+        stats = {
+            "scanned_chunks": 0,
+            "status": "OK",
+            "critical_count": 0,
+            "high_count": 0,
+            "warning_count": 0,
+            "scan_time_ms": 0.0,
+            "total_threats": 0,
+        }
+
+        try:
+            tree = ast.parse(code_str)
+        except SyntaxError as e:
+            reports.append({
+                "level": "CRITICAL",
+                "line": getattr(e, "lineno", 0),
+                "rule": "SYNTAX_ERROR",
+                "detail": f"Ошибка синтаксиса Python: {e}"
+            })
+            stats["scan_time_ms"] = round((time.perf_counter() - t_start) * 1000, 2)
+            return reports, stats
+
+        class CombinedASTVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.chunks = []
+                self.reports = []
+                self.sensitive_vars = set()
+
+            def visit_Import(self, node):
+                for alias in node.names:
+                    mod = alias.name.split('.')[0]
+                    if mod in PluginChecker.DANGEROUS_IMPORTS:
+                        level = PluginChecker.DANGEROUS_IMPORTS[mod]
+                        self.reports.append({
+                            "level": level,
+                            "line": getattr(node, "lineno", 0),
+                            "rule": f"DANGEROUS_IMPORT_{mod.upper()}",
+                            "detail": f"Импорт опасного модуля: {mod}"
+                        })
+                self.generic_visit(node)
+
+            def visit_ImportFrom(self, node):
+                if node.module:
+                    mod = node.module.split('.')[0]
+                    if mod in PluginChecker.DANGEROUS_IMPORTS:
+                        level = PluginChecker.DANGEROUS_IMPORTS[mod]
+                        self.reports.append({
+                            "level": level,
+                            "line": getattr(node, "lineno", 0),
+                            "rule": f"DANGEROUS_IMPORT_{mod.upper()}",
+                            "detail": f"Импорт опасного модуля: {mod}"
+                        })
+                self.generic_visit(node)
+
+            def visit_FunctionDef(self, node):
+                self._extract_chunk(node)
+                self.generic_visit(node)
+
+            def visit_AsyncFunctionDef(self, node):
+                self._extract_chunk(node)
+                self.generic_visit(node)
+
+            def visit_ClassDef(self, node):
+                self._extract_chunk(node)
+                self.generic_visit(node)
+
+            def visit_Call(self, node):
+                func_name = ""
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    func_name = node.func.attr
+
+                if func_name in PluginChecker.DANGEROUS_FUNCTIONS:
+                    level = PluginChecker.DANGEROUS_FUNCTIONS[func_name]
+                    self.reports.append({
+                        "level": level,
+                        "line": getattr(node, 'lineno', 0),
+                        "rule": f"DANGEROUS_FUNCTION_{func_name.upper()}",
+                        "detail": f"Вызов опасной функции: {func_name}"
+                    })
+
+                self.generic_visit(node)
+
+            def visit_Assign(self, node):
+                is_sensitive = False
+                for child in ast.walk(node.value):
+                    if isinstance(child, ast.Attribute):
+                        if any(attr in child.attr for attr in PluginChecker.SENSITIVE_TELEGRAM_ATTRS):
+                            is_sensitive = True
+                    elif isinstance(child, ast.Name):
+                        if child.id in self.sensitive_vars:
+                            is_sensitive = True
+
+                if is_sensitive:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            self.sensitive_vars.add(target.id)
+
+                self.generic_visit(node)
+
+            def _extract_chunk(self, node):
+                try:
+                    raw_code = ast.unparse(node)
+                    canonical = " ".join(line.strip() for line in raw_code.splitlines() if line.strip())
+                    if len(canonical) > 20:
+                        self.chunks.append((node.name, getattr(node, 'lineno', 0), canonical))
+                except Exception:
+                    pass
+
+        visitor = CombinedASTVisitor()
+        visitor.visit(tree)
+        reports.extend(visitor.reports)
+
+        # Проверка на вредоносные строки
+        code_lower = code_str.lower()
+        for pattern in self.MALICIOUS_STRINGS:
+            if pattern in code_lower:
+                reports.append({
+                    "level": "WARNING",
+                    "line": 0,
+                    "rule": f"MALICIOUS_STRING_{pattern.upper()}",
+                    "detail": f"Обнаружена подозрительная строка: {pattern}"
+                })
+
+        for r in reports:
+            level = r.get("level", "")
+            if level == "CRITICAL":
+                stats["critical_count"] += 1
+            elif level == "HIGH":
+                stats["high_count"] += 1
+            elif level == "WARNING":
+                stats["warning_count"] += 1
+
+        stats["scanned_chunks"] = len(visitor.chunks)
+        stats["total_threats"] = len(reports)
+        stats["scan_time_ms"] = round((time.perf_counter() - t_start) * 1000, 2)
+        return reports, stats
+
+    def _calculate_security_score(self, reports: List[Dict[str, Any]]) -> Tuple[int, str]:
+        crit_count = sum(1 for r in reports if r.get("level") == "CRITICAL")
+        if crit_count > 0:
+            return 0, "🔴 F (Вредоносный плагин)"
+
+        high_count = sum(1 for r in reports if r.get("level") == "HIGH")
+        warn_count = sum(1 for r in reports if r.get("level") == "WARNING")
+
+        score = 100
+        score -= high_count * 15
+        score -= min(warn_count * 5, 20)
+        score = max(0, min(100, score))
+
+        if score >= 80:
+            badge = "🟢 A (Безопасно)"
+        elif score >= 60:
+            badge = "🟡 B (Есть риски)"
+        elif score >= 40:
+            badge = "🟠 C (Подозрительно)"
+        else:
+            badge = "🔴 F (Вредоносный плагин)"
+
+        return score, badge
+
+    def _perform_file_scan(self, file_path: str) -> Tuple[int, str, List[Dict[str, Any]], Dict[str, Any], bool]:
+        if not file_path or not os.path.exists(file_path):
+            return 0, "❌ Ошибка", [], {}, True
+
+        file_hash = ""
+        file_name = os.path.basename(file_path)
+        code = ""
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                code = f.read()
+            file_hash = hashlib.sha256(code.encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            try:
+                with open(file_path, "rb") as f:
+                    raw = f.read()
+                    file_hash = hashlib.sha256(raw).hexdigest()
+                    code = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+
+        if not file_hash:
+            return 0, "❌ Не удалось прочитать файл", [], {}, True
+
+        cached_res = self._get_cached_scan_result(file_hash)
+        if cached_res:
+            reports, ai_stats, cached_score, cached_badge = cached_res
+            if cached_score is not None:
+                score = cached_score
+                badge = cached_badge
+            else:
+                score, badge = self._calculate_security_score(reports)
+        else:
+            reports, ai_stats = self.scan_plugin_code(code)
+            score, badge = self._calculate_security_score(reports)
+            if file_hash:
+                self._save_cached_scan_result(file_hash, file_name, reports, ai_stats, score, badge)
+        
+        has_critical = any(r.get("level") == "CRITICAL" for r in reports) or score < 40
+        self._save_last_scan_stats(ai_stats)
+        return score, badge, reports, ai_stats, has_critical
+
+    def _update_button_ui(self, score: int, badge: str, reports: List[Dict]):
+        try:
+            colors = self._get_button_colors(score)
+            emoji = self._get_score_emoji(score)
+            
+            if self._current_analyze_btn:
+                btn_cls, lin_cls, theme_cls, util_cls, cb_cls, compound_cls = self._get_ui_classes()
+                resources_provider = self._get_theme_provider(self._current_sheet)
+                self._current_analyze_btn.setBackground(
+                    self._make_button_bg(theme_cls, util_cls, colors[0], colors[1], resources_provider)
+                )
+                self._safe_set_text(self._current_analyze_btn, f"{emoji} {score}/100")
+
+            install_btn = getattr(self, "_current_install_btn", None)
+            orig_listener = getattr(self, "_current_orig_listener", None)
+            
+            if install_btn:
+                if self.get_setting("auto_block", True) and score < 40:
+                    install_btn.setEnabled(False)
+                    install_btn.setClickable(False)
+                    install_btn.setAlpha(0.4)
+                    self._safe_set_text(install_btn, "❌ Установка заблокирована")
+                    
+                    class BlockedClickListener(dynamic_proxy(View.OnClickListener)):
+                        def onClick(self_inner, v):
+                            try:
+                                frag = get_last_fragment()
+                                if frag:
+                                    BulletinHelper.show_error("❌ Плагин содержит вредоносный код", frag)
+                            except Exception:
+                                pass
+                    install_btn.setOnClickListener(BlockedClickListener())
+                else:
+                    install_btn.setEnabled(True)
+                    install_btn.setClickable(True)
+                    install_btn.setAlpha(1.0)
+                    self._safe_set_text(install_btn, "Установить")
+                    if orig_listener:
+                        install_btn.setOnClickListener(orig_listener)
+
+            self._current_score = score
+            self._current_badge = badge
+            self._current_reports = reports
+        except Exception as e:
+            log(f"[PluginChecker] update_button_ui error: {e}")
+
+    def _scan_file_and_show_alert(self, file_path: str):
+        if self._is_scanning:
+            return
+        self._is_scanning = True
+
+        def _start_loading_ui():
+            if self._current_analyze_btn:
+                try:
+                    self._safe_set_text(self._current_analyze_btn, "⏳ Сканирование...")
+                except Exception:
+                    pass
+
+        run_on_ui_thread(_start_loading_ui)
+
+        def _do_scan():
+            try:
+                score, badge, reports, ai_stats, has_critical = self._perform_file_scan(file_path)
+            except Exception as e:
+                log(f"[PluginChecker] scan error: {e}")
+                score, badge, reports, ai_stats, has_critical = 0, "❌ Ошибка", [], {}, True
+
+            def _show_ui():
+                try:
+                    self._is_scanning = False
+                    
+                    if self._current_analyze_btn:
+                        colors = self._get_button_colors(score)
+                        emoji = self._get_score_emoji(score)
+                        btn_cls, lin_cls, theme_cls, util_cls, cb_cls, compound_cls = self._get_ui_classes()
+                        resources_provider = self._get_theme_provider(self._current_sheet)
+                        self._current_analyze_btn.setBackground(
+                            self._make_button_bg(theme_cls, util_cls, colors[0], colors[1], resources_provider)
+                        )
+                        self._safe_set_text(self._current_analyze_btn, f"{emoji} {score}/100")
+
+                    self._update_button_ui(score, badge, reports)
+
+                    last_fragment = get_last_fragment()
+                    if not last_fragment or not last_fragment.getParentActivity():
+                        return
+
+                    context = last_fragment.getParentActivity()
+                    builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+
+                    critical_count = sum(1 for r in reports if r.get("level") == "CRITICAL")
+                    high_count = sum(1 for r in reports if r.get("level") == "HIGH")
+                    warning_count = sum(1 for r in reports if r.get("level") == "WARNING")
+                    total_threats = len(reports)
+
+                    if score < 40 or has_critical:
+                        critical_reports = [r for r in reports if r.get("level") == "CRITICAL"]
+                        high_reports = [r for r in reports if r.get("level") == "HIGH"]
+                        
+                        threat_parts = []
+                        if critical_reports:
+                            threat_parts.append("🔴 КРИТИЧЕСКИЕ УГРОЗЫ:")
+                            for r in critical_reports[:4]:
+                                line_info = f" (строка {r.get('line')})" if r.get('line') else ""
+                                threat_parts.append(f"  • {r.get('rule')}{line_info}: {r.get('detail')}")
+                        
+                        if high_reports and len(threat_parts) < 4:
+                            if threat_parts:
+                                threat_parts.append("")
+                            threat_parts.append("🟡 ВЫСОКИЕ РИСКИ:")
+                            for r in high_reports[:3]:
+                                line_info = f" (строка {r.get('line')})" if r.get('line') else ""
+                                threat_parts.append(f"  • {r.get('rule')}{line_info}: {r.get('detail')}")
+                        
+                        if total_threats > 7:
+                            threat_parts.append(f"\n... и еще {total_threats - 7} угроз")
+                        
+                        crit_msg = "\n".join(threat_parts) if threat_parts else "Обнаружены критические угрозы"
+                        
+                        builder.set_title(f"❌ Опасность!\nРейтинг: {score}/100")
+                        builder.set_message(f"Категория: {badge}\n\n📊 Статистика: Критических: {critical_count}, Высоких: {high_count}, Предупреждений: {warning_count}\n\n{crit_msg}")
+                    else:
+                        warning_reports = [r for r in reports if r.get("level") in ("HIGH", "WARNING")]
+                        if warning_reports:
+                            warn_parts = ["⚠️ ПРЕДУПРЕЖДЕНИЯ:"]
+                            for r in warning_reports[:4]:
+                                line_info = f" (строка {r.get('line')})" if r.get('line') else ""
+                                warn_parts.append(f"  • {r.get('rule')}{line_info}: {r.get('detail')}")
+                            if len(warning_reports) > 4:
+                                warn_parts.append(f"\n... и еще {len(warning_reports) - 4} предупреждений")
+                            warn_msg = "\n".join(warn_parts)
+                        else:
+                            warn_msg = "✅ Вредоносный код не обнаружен."
+                        
+                        builder.set_title(f"🛡️ Plugin Checker\nРейтинг: {score}/100")
+                        builder.set_message(f"Категория: {badge}\n\n📊 Статистика: Критических: 0, Высоких: {high_count}, Предупреждений: {warning_count}\n\n{warn_msg}")
+
+                    builder.set_positive_button("Закрыть", lambda d, w: d.dismiss() if hasattr(d, "dismiss") else None)
+                    builder.set_cancelable(True)
+                    builder.set_canceled_on_touch_outside(True)
+                    builder.show()
+
+                except Exception as ui_err:
+                    log(f"[PluginChecker] _show_ui exception: {ui_err}")
+                    self._is_scanning = False
+
+            run_on_ui_thread(_show_ui)
+
+        threading.Thread(target=_do_scan, daemon=True).start()
+
+    def _make_button_bg(self, theme_cls, util_cls, color_bg, color_selector, resources_provider):
+        try:
+            return theme_cls.createSimpleSelectorRoundRectDrawable(
+                util_cls.dp(8),
+                as_java_color(color_bg),
+                as_java_color(color_selector),
+            )
+        except Exception:
+            try:
+                return theme_cls.createSimpleSelectorRoundRectDrawable(
+                    util_cls.dp(8),
+                    as_java_color(color_bg),
+                    as_java_color(color_selector),
+                    resources_provider,
+                )
+            except Exception:
+                return None
+
+    def _get_theme_provider(self, sheet):
+        provider = self._get_field_deep(sheet, "resourcesProvider")
+        if provider:
+            return provider
+        activity = self._get_field_deep(sheet, "parentActivity")
+        if activity:
+            current_frag = self._get_field_deep(activity, "currentFragment")
+            if current_frag:
+                frag_provider = self._get_field_deep(current_frag, "resourcesProvider")
+                if frag_provider:
+                    return frag_provider
+        return None
+
+    def _find_install_button_pair(self, root_view, btn_cls):
+        if not root_view or not hasattr(root_view, "getChildCount"):
+            return None, None
+        try:
+            if btn_cls:
+                res_b, res_p = self._find_view_pair(root_view, btn_cls)
+                if res_b and res_p:
+                    return res_b, res_p
+            for i in range(root_view.getChildCount()):
+                child = root_view.getChildAt(i)
+                text_val = ""
+                if hasattr(child, "getText"):
+                    try:
+                        text_val = str(child.getText() or "").lower()
+                    except Exception:
+                        pass
+                if any(w in text_val for w in ["установ", "обнов", "install", "update", "reinstall"]):
+                    return child, root_view
+                res, parent = self._find_install_button_pair(child, btn_cls)
+                if res and parent:
+                    return res, parent
+        except Exception:
+            pass
+        return None, None
+
+    def _find_view_pair(self, root_view, target_cls):
+        if not root_view or not hasattr(root_view, "getChildCount"):
+            return None, None
+        try:
+            for i in range(root_view.getChildCount()):
+                child = root_view.getChildAt(i)
+                if isinstance(child, target_cls):
+                    return child, root_view
+                res, parent = self._find_view_pair(child, target_cls)
+                if res and parent:
+                    return res, parent
+        except Exception:
+            pass
+        return None, None
+
+    def _get_field_deep(self, obj, field_name):
+        if obj is None:
+            return None
+        if hasattr(obj, field_name):
+            try:
+                return getattr(obj, field_name)
+            except Exception:
+                pass
+        curr_cls = obj.getClass() if hasattr(obj, "getClass") else None
+        while curr_cls is not None:
+            try:
+                f = curr_cls.getDeclaredField(field_name)
+                f.setAccessible(True)
+                return f.get(obj)
+            except Exception:
+                curr_cls = curr_cls.getSuperclass()
+        return None
+
+    def _extract_file_path_from_any(self, sheet, args):
+        candidates = []
+        if args:
+            for arg in args:
+                if arg is not None:
+                    candidates.append(arg)
+                    for fld in ['plugin', 'validationResult', 'params', 'installParams']:
+                        val = self._get_field_deep(arg, fld)
+                        if val is not None:
+                            candidates.append(val)
+        if sheet is not None:
+            candidates.append(sheet)
+            for fld in ['plugin', 'validationResult', 'params', 'installParams', 'validation']:
+                val = self._get_field_deep(sheet, fld)
+                if val is not None:
+                    candidates.append(val)
+
+        for c in candidates:
+            if hasattr(c, 'getAbsolutePath'):
+                try:
+                    s = str(c.getAbsolutePath())
+                    if s: return s
+                except Exception:
+                    pass
+            if hasattr(c, 'getPath'):
+                try:
+                    s = str(c.getPath())
+                    if s: return s
+                except Exception:
+                    pass
+            for attr in ['filePath', 'path', 'file', 'sourcePath', 'localPath']:
+                val = self._get_field_deep(c, attr)
+                if val:
+                    if hasattr(val, 'getAbsolutePath'):
+                        try:
+                            return str(val.getAbsolutePath())
+                        except Exception:
+                            pass
+                    if hasattr(val, 'getPath'):
+                        try:
+                            return str(val.getPath())
+                        except Exception:
+                            pass
+                    s = str(val)
+                    if s.endswith('.plugin') or s.endswith('.py') or (os.path.exists(s) and os.path.isfile(s)):
+                        return s
+            s = str(c)
+            if s.endswith('.plugin') or s.endswith('.py'):
+                return s
+        return None
+
+    def _hook_install_ui(self):
+        target_classes = [
+            "com.exteragram.messenger.plugins.ui.components.InstallPluginBottomSheet",
+            "com.exteragram.messenger.plugins.ui.InstallPluginBottomSheet",
+            "com.exteragram.messenger.plugins.ui.PluginInstallBottomSheet"
+        ]
+
+        class _InstallSheetHook(MethodHook):
+            def __init__(self, plugin_instance):
+                super().__init__()
+                self.plugin = plugin_instance
+
+            def after_hooked_method(self, param):
+                try:
+                    plugin = self.plugin
+                    sheet = param.thisObject
+                    if not sheet:
+                        return
+
+                    saved_path = plugin._extract_file_path_from_any(sheet, param.args)
+
+                    def modify_ui():
+                        try:
+                            custom_view = plugin._get_field_deep(sheet, "customView")
+                            if not custom_view:
+                                custom_view = plugin._get_field_deep(sheet, "containerView")
+                            if not custom_view:
+                                custom_view = plugin._get_field_deep(sheet, "sheetView")
+                            if not custom_view:
+                                return
+
+                            btn_cls, lin_cls, theme_cls, util_cls, cb_cls, compound_cls = plugin._get_ui_classes()
+                            install_btn, parent_layout = plugin._find_install_button_pair(custom_view, btn_cls)
+                            if not install_btn or not parent_layout:
+                                return
+
+                            if getattr(plugin, "_current_sheet", None) == sheet and getattr(plugin, "_current_analyze_btn", None):
+                                return
+
+                            context = sheet.getContext()
+                            resources_provider = plugin._get_theme_provider(sheet)
+
+                            analyze_btn = btn_cls(context, True, resources_provider) if btn_cls else None
+                            if not analyze_btn:
+                                return
+
+                            cached_score = None
+                            cached_badge = None
+                            cached_reports = None
+                            resolved_path = saved_path or plugin._extract_file_path_from_any(sheet, None)
+                            
+                            if resolved_path:
+                                try:
+                                    f_hash = ""
+                                    with open(resolved_path, "r", encoding="utf-8", errors="ignore") as f:
+                                        f_code = f.read()
+                                    f_hash = hashlib.sha256(f_code.encode("utf-8", errors="ignore")).hexdigest()
+                                    if f_hash:
+                                        cached_res = plugin._get_cached_scan_result(f_hash)
+                                        if cached_res:
+                                            cached_reports, _, cached_score, cached_badge = cached_res
+                                except Exception:
+                                    pass
+
+                            if cached_score is not None and cached_reports is not None:
+                                colors = plugin._get_button_colors(cached_score)
+                                emoji = plugin._get_score_emoji(cached_score)
+                                analyze_btn.setBackground(
+                                    plugin._make_button_bg(theme_cls, util_cls, colors[0], colors[1], resources_provider)
+                                )
+                                plugin._safe_set_text(analyze_btn, f"{emoji} {cached_score}/100")
+                                plugin._current_score = cached_score
+                                plugin._current_badge = cached_badge
+                                plugin._current_reports = cached_reports
+                            else:
+                                default_colors = PluginChecker.BUTTON_COLORS["default"]
+                                analyze_btn.setBackground(
+                                    plugin._make_button_bg(theme_cls, util_cls, default_colors[0], default_colors[1], resources_provider)
+                                )
+                                plugin._safe_set_text(analyze_btn, "🔍 Проверить")
+
+                            plugin._current_analyze_btn = analyze_btn
+                            plugin._current_sheet = sheet
+                            plugin._current_install_btn = install_btn
+                            plugin._current_parent_layout = parent_layout
+                            plugin._current_chk_box = None
+
+                            class AnalyzeClickListener(dynamic_proxy(View.OnClickListener)):
+                                def onClick(self_inner, v):
+                                    try:
+                                        path_to_scan = saved_path or plugin._extract_file_path_from_any(sheet, None)
+                                        if path_to_scan:
+                                            plugin._scan_file_and_show_alert(path_to_scan)
+                                        else:
+                                            frag = get_last_fragment()
+                                            if frag:
+                                                BulletinHelper.show_error("Путь к файлу не найден", frag)
+                                    except Exception as cl_err:
+                                        log(f"[PluginChecker] Click error: {cl_err}")
+
+                            analyze_btn.setOnClickListener(AnalyzeClickListener())
+
+                            m_info = plugin._get_field_deep(install_btn, "mListenerInfo")
+                            orig_listener = plugin._get_field_deep(m_info, "mOnClickListener") if m_info else plugin._get_field_deep(install_btn, "mOnClickListener")
+                            plugin._current_orig_listener = orig_listener
+
+                            idx = -1
+                            for i in range(parent_layout.getChildCount()):
+                                if parent_layout.getChildAt(i) == install_btn:
+                                    idx = i + 1
+                                    break
+
+                            if idx != -1 and idx <= parent_layout.getChildCount():
+                                lp = lin_cls.LayoutParams(install_btn.getLayoutParams()) if lin_cls else None
+                                if lp and util_cls:
+                                    lp.topMargin = util_cls.dp(8)
+                                    lp.bottomMargin = 0
+                                    try:
+                                        install_lp = install_btn.getLayoutParams()
+                                        if isinstance(install_lp, lin_cls.LayoutParams):
+                                            install_lp.bottomMargin = 0
+                                            install_btn.setLayoutParams(install_lp)
+                                    except Exception:
+                                        pass
+                                    parent_layout.addView(analyze_btn, idx, lp)
+
+                            if cached_score is not None and cached_reports is not None:
+                                plugin._update_button_ui(cached_score, cached_badge or "", cached_reports)
+                            else:
+                                if plugin.get_setting("auto_block", True):
+                                    install_btn.setEnabled(False)
+                                    install_btn.setClickable(False)
+                                    try:
+                                        install_btn.setAlpha(0.5)
+                                    except Exception:
+                                        pass
+                                    plugin._safe_set_text(install_btn, "Проверьте плагин")
+
+                                    class NotScannedClickListener(dynamic_proxy(View.OnClickListener)):
+                                        def onClick(self_inner, v):
+                                            try:
+                                                frag = get_last_fragment()
+                                                if frag:
+                                                    BulletinHelper.show_error("⚠️ Нажмите «Проверить»", frag)
+                                            except Exception:
+                                                pass
+
+                                    install_btn.setOnClickListener(NotScannedClickListener())
+
+                        except Exception as me:
+                            log(f"[PluginChecker] modify_ui error: {me}")
+
+                    run_on_ui_thread(modify_ui)
+                finally:
+                    del param
+
+        for class_name in target_classes:
+            try:
+                cls = find_class(class_name)
+                if not cls:
+                    continue
+                constructors = cls.getClass().getDeclaredConstructors() if hasattr(cls, "getClass") else cls.getDeclaredConstructors()
+                for ctor in constructors:
+                    try:
+                        ctor.setAccessible(True)
+                        h = self.hook_method(ctor, _InstallSheetHook(self))
+                        if h:
+                            self._installed_hooks.append(h)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    def on_plugin_unload(self):
+        global _ACTIVE_CHECKER_INSTANCE
+        try:
+            if hasattr(self, "_installed_hooks") and self._installed_hooks:
+                for h in self._installed_hooks:
+                    try:
+                        self.unhook_method(h)
+                    except Exception:
+                        pass
+                self._installed_hooks.clear()
+        except Exception:
+            pass
+
+        self._current_analyze_btn = None
+        self._current_sheet = None
+        self._current_chk_box = None
+        self._current_install_btn = None
+        self._current_parent_layout = None
+        self._current_orig_listener = None
+        self._hash_cache.clear()
+        self._current_score = None
+        self._current_badge = None
+        self._current_reports = None
+        self._is_scanning = False
+        if _ACTIVE_CHECKER_INSTANCE is self:
+            _ACTIVE_CHECKER_INSTANCE = None
+        try:
+            gc.collect()
+        except Exception:
+            pass
