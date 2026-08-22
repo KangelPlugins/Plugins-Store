@@ -1,0 +1,1468 @@
+from typing import Any, Dict, List, Set, Tuple
+
+from android.view import View
+from android_utils import OnClickListener, run_on_ui_thread
+from base_plugin import BasePlugin
+from hook_utils import find_class, get_private_field, set_private_field
+from java import jclass
+from java.lang import Boolean
+from org.telegram.messenger import AndroidUtilities, LocaleController, UserObject
+from org.telegram.tgnet import TLRPC
+from org.telegram.ui.Components import UItem
+
+
+__id__ = "recent_actions_plus"
+__name__ = "Recent Actions+"
+__description__ = (
+    "Расширяет фильтры «Недавних действий» и добавляет поиск событий, "
+    "связанных с конкретным участником."
+)
+__author__ = "@anivplugins @mraniv"
+__version__ = "1.0.0"
+__icon__ = "NyaEmojiStickers/16"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+
+ADMIN_LOG_ACTIVITY = "org.telegram.ui.ChannelAdminLogActivity"
+ADMIN_LOG_FILTER = "org.telegram.ui.Components.AdminLogFilterAlert2"
+BASE_FRAGMENT = "org.telegram.ui.ActionBar.BaseFragment"
+CHAT_USERS_ACTIVITY = "org.telegram.ui.ChatUsersActivity"
+ADMIN_LOG_REQUEST_CLASS = "org.telegram.tgnet.TLRPC$TL_channels_getAdminLog"
+
+TARGET_ROW_ID = 931000
+CLEAR_TARGET_ROW_ID = 931001
+ACTION_ROW_BASE = 931100
+NATIVE_MEMBERS_SECTION_ROW_ID = 2
+NATIVE_SETTINGS_SECTION_ROW_ID = 8
+NATIVE_MESSAGES_SECTION_ROW_ID = 12
+NATIVE_ACTION_CHILD_IDS = (
+    frozenset(range(3, 8))
+    | frozenset(range(9, 12))
+    | frozenset(range(13, 16))
+)
+
+AUTOLOAD_TARGET_COUNT = 5
+AUTOLOAD_MAX_PAGES = 3
+AUTOLOAD_START_DELAY_MS = 360
+AUTOLOAD_NEXT_DELAY_MS = 90
+AUTOLOAD_REQUEST_LIMIT = 100
+
+ALL_FILTER_FIELDS = (
+    "join",
+    "leave",
+    "invite",
+    "ban",
+    "unban",
+    "kick",
+    "unkick",
+    "promote",
+    "demote",
+    "info",
+    "settings",
+    "pinned",
+    "edit",
+    "delete",
+    "group_call",
+    "invites",
+    "send",
+    "forums",
+    "sub_extend",
+    "edit_rank",
+)
+
+# The stock AdminLogFilterAlert2 omits forum events even though the Telegram
+# TL schema supports them. Message sends and subscription extensions stay
+# enabled, but are intentionally not exposed as separate plugin filters.
+EXTRA_FILTER_FIELDS = ("forums",)
+ALWAYS_ENABLED_FIELDS = ("send", "sub_extend")
+
+ACTION_SECTIONS: Tuple[Tuple[int, str, Tuple[Tuple[str, str], ...]], ...] = (
+    (
+        NATIVE_MEMBERS_SECTION_ROW_ID,
+        "sectionMembersExpanded",
+        (
+            ("promote", "Назначение администраторов"),
+            ("demote", "Снятие администраторов"),
+            ("ban", "Ограничение участников"),
+            ("unban", "Снятие ограничений"),
+            ("kick", "Исключение участников"),
+            ("unkick", "Возврат исключённых"),
+            ("invite", "Приглашение участников"),
+            ("join", "Вступление участников"),
+            ("leave", "Выход участников"),
+            ("edit_rank", "Изменение подписи администратора"),
+        ),
+    ),
+    (
+        NATIVE_SETTINGS_SECTION_ROW_ID,
+        "sectionSettingsExpanded",
+        (
+            ("info", "Название, описание и оформление"),
+            ("settings", "Основные настройки"),
+            ("invites", "Ссылки-приглашения"),
+            ("group_call", "Голосовые чаты"),
+        ),
+    ),
+    (
+        NATIVE_MESSAGES_SECTION_ROW_ID,
+        "sectionMessagesExpanded",
+        (
+            ("delete", "Удалённые сообщения"),
+            ("edit", "Изменённые сообщения"),
+            ("pinned", "Закреплённые сообщения"),
+            ("forums", "Темы форума"),
+        ),
+    ),
+)
+
+ACTION_FIELDS_BY_ID: Dict[int, str] = {}
+ACTION_ROWS_BY_SECTION: Dict[int, Tuple[Tuple[int, str, str], ...]] = {}
+ACTION_EXPANDED_FIELD_BY_SECTION: Dict[int, str] = {}
+_next_action_id = ACTION_ROW_BASE
+for _section_id, _expanded_field, _section_actions in ACTION_SECTIONS:
+    ACTION_EXPANDED_FIELD_BY_SECTION[_section_id] = _expanded_field
+    _section_rows = []
+    for _field_name, _label in _section_actions:
+        ACTION_FIELDS_BY_ID[_next_action_id] = _field_name
+        _section_rows.append((_next_action_id, _field_name, _label))
+        _next_action_id += 1
+    ACTION_ROWS_BY_SECTION[_section_id] = tuple(_section_rows)
+
+MEGAGROUP_ONLY_ACTION_FIELDS = frozenset(
+    ("ban", "unban", "kick", "unkick", "edit_rank")
+)
+
+SELF_PARTICIPANT_ACTIONS = {
+    "TL_channelAdminLogEventActionParticipantJoin",
+    "TL_channelAdminLogEventActionParticipantLeave",
+    "TL_channelAdminLogEventActionParticipantJoinByInvite",
+    "TL_channelAdminLogEventActionParticipantJoinByRequest",
+}
+
+MESSAGE_ACTION_FIELDS = ("message", "new_message", "prev_message")
+PARTICIPANT_ACTION_FIELDS = ("participant", "new_participant", "prev_participant")
+
+Bundle = jclass("android.os.Bundle")
+ArrayList = jclass("java.util.ArrayList")
+ChatUsersActivity = jclass(CHAT_USERS_ACTIVITY)
+
+
+class RecentActionsPlus(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._active = False
+        self._unhooks: List[Any] = []
+        self._sheet_states: Dict[int, Dict[str, Any]] = {}
+        self._targets: Dict[int, int] = {}
+        self._extra_filters: Dict[int, Dict[str, bool]] = {}
+        self._member_pickers: Dict[int, Dict[str, Any]] = {}
+        self._activity_cache: Dict[int, Dict[str, Any]] = {}
+        self._load_messages_method = None
+
+    def on_plugin_load(self):
+        self.on_plugin_unload()
+        self._active = True
+        try:
+            activity_class = find_class(ADMIN_LOG_ACTIVITY)
+            filter_class = find_class(ADMIN_LOG_FILTER)
+            base_fragment_class = find_class(BASE_FRAGMENT)
+            chat_users_class = find_class(CHAT_USERS_ACTIVITY)
+            admin_log_request_class = find_class(ADMIN_LOG_REQUEST_CLASS)
+            if activity_class is None:
+                raise RuntimeError(f"class not found: {ADMIN_LOG_ACTIVITY}")
+            if filter_class is None:
+                raise RuntimeError(f"class not found: {ADMIN_LOG_FILTER}")
+            if base_fragment_class is None:
+                raise RuntimeError(f"class not found: {BASE_FRAGMENT}")
+            if chat_users_class is None:
+                raise RuntimeError(f"class not found: {CHAT_USERS_ACTIVITY}")
+            if admin_log_request_class is None:
+                raise RuntimeError(f"class not found: {ADMIN_LOG_REQUEST_CLASS}")
+
+            self._install_all_methods(
+                activity_class,
+                "loadMessages",
+                before=self._before_load_messages,
+            )
+            self._install_all_methods(
+                activity_class,
+                "filterDeletedMessages",
+                after=self._after_filter_messages,
+            )
+            self._install_all_methods(
+                activity_class,
+                "onFragmentDestroy",
+                after=self._after_activity_destroy,
+            )
+            self._install_all_methods(
+                activity_class,
+                "onResume",
+                after=self._after_activity_resume,
+            )
+            self._install_constructors(filter_class, after=self._after_filter_constructor)
+            self._install_all_methods(
+                filter_class,
+                "fillItems",
+                after=self._after_fill_filter_items,
+            )
+            self._install_all_methods(
+                filter_class,
+                "onClick",
+                before=self._before_filter_click,
+            )
+            self._install_all_methods(
+                base_fragment_class,
+                "presentFragment",
+                before=self._before_present_fragment,
+            )
+            self._install_all_methods(
+                chat_users_class,
+                "onFragmentDestroy",
+                after=self._after_member_picker_destroy,
+            )
+            self._install_all_methods(
+                chat_users_class,
+                "updateRows",
+                before=self._before_member_picker_rows,
+                after=self._after_member_picker_rows,
+            )
+            self._install_all_methods(
+                admin_log_request_class,
+                "serializeToStream",
+                before=self._before_serialize_admin_log_request,
+            )
+        except Exception:
+            self.on_plugin_unload()
+
+    def on_plugin_unload(self):
+        self._active = False
+        activities: Dict[int, Any] = {}
+        for state in list(getattr(self, "_sheet_states", {}).values()):
+            activity = state.get("activity")
+            if activity is not None:
+                activities[self._object_key(activity)] = activity
+        for state in list(getattr(self, "_activity_cache", {}).values()):
+            activity = state.get("activity")
+            if activity is not None:
+                activities[self._object_key(activity)] = activity
+        for unhook in list(getattr(self, "_unhooks", [])):
+            try:
+                self.unhook_method(unhook)
+            except Exception:
+                pass
+        self._unhooks.clear()
+
+        for activity in activities.values():
+            run_on_ui_thread(
+                lambda activity=activity: self._restore_activity_ui(activity)
+            )
+
+        self._sheet_states.clear()
+        self._targets.clear()
+        self._extra_filters.clear()
+        self._member_pickers.clear()
+        self._activity_cache.clear()
+        self._load_messages_method = None
+
+    # Hook installation -------------------------------------------------
+
+    def _install_all_methods(self, clazz, method_name, *, before=None, after=None):
+        try:
+            unhooks = self.hook_all_methods(
+                clazz,
+                method_name,
+                priority=10000,
+                before=before,
+                after=after,
+            )
+            if unhooks:
+                self._unhooks.extend(unhooks)
+        except Exception:
+            pass
+
+    def _install_constructors(self, clazz, *, before=None, after=None):
+        try:
+            unhooks = self.hook_all_constructors(
+                clazz,
+                priority=10000,
+                before=before,
+                after=after,
+            )
+            if unhooks:
+                self._unhooks.extend(unhooks)
+        except Exception:
+            pass
+
+    # Native filter extension ------------------------------------------
+
+    def _after_filter_constructor(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) != 4:
+                return
+            sheet = param.thisObject
+            activity = args[0]
+            if not self._is_class(activity, "ChannelAdminLogActivity"):
+                return
+
+            chat_id = self._chat_id(activity)
+            if chat_id == 0:
+                return
+
+            incoming_filter = args[1]
+            extra_state = self._extra_filters.get(chat_id)
+            if extra_state is None:
+                extra_state = {}
+                for field in EXTRA_FILTER_FIELDS:
+                    extra_state[field] = (
+                        bool(getattr(incoming_filter, field))
+                        if incoming_filter is not None
+                        else True
+                    )
+                self._extra_filters[chat_id] = extra_state
+
+            current_filter = get_private_field(sheet, "currentFilter")
+            if current_filter is not None:
+                for field in EXTRA_FILTER_FIELDS:
+                    setattr(current_filter, field, bool(extra_state.get(field, True)))
+                for field in ALWAYS_ENABLED_FIELDS:
+                    setattr(current_filter, field, True)
+
+            self._sheet_states[self._object_key(sheet)] = {
+                "sheet": sheet,
+                "activity": activity,
+                "chat_id": chat_id,
+                "did_scroll_top": False,
+            }
+        except Exception:
+            pass
+
+    def _after_fill_filter_items(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) != 2:
+                return
+            sheet = param.thisObject
+            state = self._sheet_states.get(self._object_key(sheet))
+            if state is None:
+                return
+
+            items = args[0]
+            current_filter = get_private_field(sheet, "currentFilter")
+            if items is None or current_filter is None:
+                return
+
+            native_items = []
+            for index in range(int(items.size())):
+                native_items.append(items.get(index))
+
+            items.clear()
+            activity = state["activity"]
+            target_id = self._target_for_activity(activity)
+            target_value = (
+                self._target_label(activity, target_id)
+                if target_id != 0
+                else "Все участники"
+            )
+
+            items.add(UItem.asShadow(None))
+            items.add(UItem.asHeader("Участник"))
+            items.add(UItem.asButton(TARGET_ROW_ID, "Участник", target_value))
+            if target_id != 0:
+                items.add(
+                    UItem.asButton(
+                        CLEAR_TARGET_ROW_ID,
+                        "Сбросить настройку участника",
+                    ).red()
+                )
+
+            is_megagroup = bool(get_private_field(sheet, "isMegagroup"))
+            expanded_by_section = {
+                section_id: bool(get_private_field(sheet, expanded_field))
+                for section_id, expanded_field, _actions in ACTION_SECTIONS
+            }
+
+            # Keep Telegram's native headers, collapsible groups and admin rows.
+            # Only replace its combined action children with our detailed rows.
+            for native_item in native_items:
+                native_id = int(getattr(native_item, "id", 0) or 0)
+                if native_id in NATIVE_ACTION_CHILD_IDS:
+                    continue
+
+                action_rows = self._action_rows_for_section(
+                    native_id,
+                    is_megagroup,
+                )
+                if action_rows:
+                    enabled_count = sum(
+                        1
+                        for _row_id, field, _label in action_rows
+                        if bool(getattr(current_filter, field))
+                    )
+                    native_item.animatedText = f"{enabled_count}/{len(action_rows)}"
+                    native_item.checked = enabled_count > 0
+                    if native_item.clickCallback is not None:
+                        native_callback = native_item.clickCallback
+                        expanded_field = ACTION_EXPANDED_FIELD_BY_SECTION[native_id]
+                        native_item.clickCallback = OnClickListener(
+                            lambda clicked_view,
+                            sheet=sheet,
+                            section_id=native_id,
+                            expanded_field=expanded_field,
+                            native_callback=native_callback: self._toggle_filter_section_click(
+                                sheet,
+                                section_id,
+                                expanded_field,
+                                native_callback,
+                                clicked_view,
+                            )
+                        )
+
+                items.add(native_item)
+
+                if action_rows and expanded_by_section.get(native_id, False):
+                    for row_id, field, label in action_rows:
+                        items.add(
+                            UItem.asRoundCheckbox(row_id, label)
+                            .pad()
+                            .setChecked(bool(getattr(current_filter, field)))
+                        )
+
+            if not bool(state.get("did_scroll_top", False)):
+                state["did_scroll_top"] = True
+                self._set_initial_filter_position(sheet)
+        except Exception:
+            pass
+
+    def _before_filter_click(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) != 3:
+                return
+            sheet = param.thisObject
+            state = self._sheet_states.get(self._object_key(sheet))
+            if state is None:
+                return
+
+            item = args[0]
+            view = args[1]
+            if item is None:
+                return
+            item_id = int(item.id)
+
+            if item_id == TARGET_ROW_ID:
+                param.setResult(None)
+                self._show_target_picker(sheet, state["activity"])
+                return
+
+            if item_id == CLEAR_TARGET_ROW_ID:
+                param.setResult(None)
+                self._set_target(state["activity"], 0)
+                self._refresh_filter_sheet(sheet)
+                return
+
+            expanded_field = ACTION_EXPANDED_FIELD_BY_SECTION.get(item_id)
+            if expanded_field is not None:
+                current_filter = get_private_field(sheet, "currentFilter")
+                if current_filter is None or view is None:
+                    return
+
+                clicked_group_expand = self._is_group_expand_click(
+                    view,
+                    float(args[2]),
+                )
+                if (
+                    clicked_group_expand
+                    and self._toggle_filter_section(
+                        sheet,
+                        item_id,
+                        expanded_field,
+                    )
+                ):
+                    param.setResult(None)
+                    return
+
+                if (
+                    item_id == NATIVE_MESSAGES_SECTION_ROW_ID
+                    and not clicked_group_expand
+                ):
+                    new_value = not bool(view.isChecked())
+                    current_filter.forums = new_value
+                    self._store_extra_filter(state, "forums", new_value)
+                return
+
+            field = ACTION_FIELDS_BY_ID.get(item_id)
+            if field is None:
+                return
+
+            current_filter = get_private_field(sheet, "currentFilter")
+            if current_filter is None:
+                return
+
+            # The stock onClick toggles the CheckBoxCell after this before-hook.
+            # Store exactly the value which the cell is about to receive.
+            new_value = not bool(view.isChecked())
+            setattr(current_filter, field, new_value)
+
+            if field in EXTRA_FILTER_FIELDS:
+                self._store_extra_filter(state, field, new_value)
+        except Exception:
+            pass
+
+    def _action_rows_for_section(self, section_id, is_megagroup):
+        rows = ACTION_ROWS_BY_SECTION.get(int(section_id), ())
+        if is_megagroup or int(section_id) != NATIVE_MEMBERS_SECTION_ROW_ID:
+            return rows
+        return tuple(
+            row for row in rows if row[1] not in MEGAGROUP_ONLY_ACTION_FIELDS
+        )
+
+    def _is_group_expand_click(self, view, x):
+        edge = int(AndroidUtilities.dp(60))
+        width = int(view.getMeasuredWidth())
+        if bool(LocaleController.isRTL):
+            return x < width - edge
+        return x > edge
+
+    def _toggle_filter_section_click(
+        self,
+        sheet,
+        section_id,
+        expanded_field,
+        native_callback,
+        clicked_view,
+    ):
+        try:
+            if not self._active:
+                native_callback.onClick(clicked_view)
+                return
+            if not self._toggle_filter_section(
+                sheet,
+                section_id,
+                expanded_field,
+            ):
+                native_callback.onClick(clicked_view)
+        except Exception:
+            pass
+
+    def _toggle_filter_section(self, sheet, section_id, expanded_field):
+        state_changed = False
+        try:
+            recycler = get_private_field(sheet, "recyclerListView")
+            adapter = get_private_field(sheet, "adapter")
+            container = get_private_field(sheet, "containerView")
+            if recycler is None or adapter is None or container is None:
+                return False
+
+            position = self._find_filter_section_position(adapter, section_id)
+            if position < 0:
+                return False
+
+            holder = recycler.findViewHolderForAdapterPosition(position)
+            if holder is None or holder.itemView is None:
+                return False
+
+            anchor_screen_y = int(holder.itemView.getTop()) + int(
+                container.getTop()
+            )
+            recycler.stopScroll()
+            expanded = bool(get_private_field(sheet, expanded_field))
+            if not set_private_field(
+                sheet,
+                expanded_field,
+                not expanded,
+            ):
+                return False
+            state_changed = True
+
+            adapter.update(True)
+            self._restore_filter_section_anchor(
+                sheet,
+                section_id,
+                anchor_screen_y,
+            )
+            run_on_ui_thread(
+                lambda: self._restore_filter_section_anchor(
+                    sheet,
+                    section_id,
+                    anchor_screen_y,
+                ),
+                32,
+            )
+            return True
+        except Exception:
+            if state_changed:
+                run_on_ui_thread(lambda: self._refresh_filter_sheet(sheet))
+            return state_changed
+
+    def _find_filter_section_position(self, adapter, section_id):
+        try:
+            for position in range(int(adapter.getItemCount())):
+                item = adapter.getItem(position)
+                if item is not None and int(item.id) == int(section_id):
+                    return position
+        except Exception:
+            pass
+        return -1
+
+    def _restore_filter_section_anchor(self, sheet, section_id, anchor_screen_y):
+        try:
+            recycler = get_private_field(sheet, "recyclerListView")
+            adapter = get_private_field(sheet, "adapter")
+            container = get_private_field(sheet, "containerView")
+            if recycler is None or adapter is None or container is None:
+                return
+
+            position = self._find_filter_section_position(adapter, section_id)
+            layout_manager = recycler.getLayoutManager()
+            if position >= 0 and layout_manager is not None:
+                offset = (
+                    int(anchor_screen_y)
+                    - int(container.getTop())
+                    - int(recycler.getPaddingTop())
+                )
+                layout_manager.scrollToPositionWithOffset(
+                    position,
+                    offset,
+                )
+        except Exception:
+            pass
+
+    def _store_extra_filter(self, state, field, value):
+        chat_id = int(state["chat_id"])
+        extra_state = self._extra_filters.setdefault(
+            chat_id,
+            {name: True for name in EXTRA_FILTER_FIELDS},
+        )
+        extra_state[field] = bool(value)
+
+    # Activity filtering ------------------------------------------------
+
+    def _before_serialize_admin_log_request(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) != 1:
+                return
+            request = param.thisObject
+            channel = getattr(request, "channel", None)
+            chat_id = int(getattr(channel, "channel_id", 0) or 0)
+            if chat_id not in self._targets:
+                return
+            # max_id == 0 is the initial load or Telegram's lightweight
+            # reloadLastMessages() poll. Only enlarge older-page requests.
+            if int(getattr(request, "max_id", 0) or 0) == 0:
+                return
+            current_limit = int(getattr(request, "limit", 0) or 0)
+            if current_limit < AUTOLOAD_REQUEST_LIMIT:
+                request.limit = AUTOLOAD_REQUEST_LIMIT
+        except Exception:
+            pass
+
+    def _before_load_messages(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) != 1:
+                return
+            activity = param.thisObject
+            reset = bool(args[0])
+
+            if reset and not bool(get_private_field(activity, "loading")):
+                # Telegram 12.9.0 doesn't reset endReached on a fresh query.
+                set_private_field(activity, "endReached", False)
+                activity_state = self._ensure_activity_cache(activity)
+                activity_state["generation"] += 1
+                activity_state["event_matches"] = {}
+                activity_state["match_target_id"] = 0
+                activity_state["pages_loaded"] = 0
+                activity_state["loading_page"] = 0
+                activity_state["load_scheduled"] = False
+                activity_state["searching"] = self._target_for_activity(activity) != 0
+                activity_state["filter_applied"] = False
+
+            self._patch_missing_server_filters(activity)
+        except Exception:
+            pass
+
+    def _after_filter_messages(self, param):
+        try:
+            if param.args is not None and len(param.args) != 0:
+                return
+            activity = param.thisObject
+            activity_state = self._ensure_activity_cache(activity)
+            target_id = int(
+                self._targets.get(int(activity_state.get("chat_id", 0)), 0) or 0
+            )
+            if target_id == 0:
+                return
+
+            messages = activity_state.get("messages")
+            filtered = activity_state.get("filtered_messages")
+            if messages is None or filtered is None:
+                return
+
+            if int(activity_state.get("match_target_id", 0)) != target_id:
+                activity_state["match_target_id"] = target_id
+                activity_state["event_matches"] = {}
+            event_matches = activity_state["event_matches"]
+
+            matched_event_ids: Set[int] = set()
+            matched_date_keys: Set[str] = set()
+            # Snapshot the Java lists once. Calling size()/get() through the
+            # Python bridge for every item was a large part of the UI stalls.
+            for message in messages.toArray():
+                event = getattr(message, "currentEvent", None)
+                if event is None:
+                    continue
+                event_id = int(getattr(event, "id", 0))
+                is_match = event_matches.get(event_id) if event_id else None
+                if is_match is None:
+                    is_match = target_id in self._event_user_ids(event)
+                    if event_id:
+                        event_matches[event_id] = is_match
+                if is_match:
+                    if event_id:
+                        matched_event_ids.add(event_id)
+                    date_key = str(getattr(message, "dateKey", "") or "")
+                    if date_key:
+                        matched_date_keys.add(date_key)
+
+            # Rebuild once instead of removing hundreds of ArrayList entries
+            # one by one. Reverse removals became quadratic on long histories.
+            kept_messages = ArrayList()
+            kept_event_ids: Set[int] = set()
+            for message in filtered.toArray():
+                if bool(getattr(message, "isDateObject", False)):
+                    date_key = str(getattr(message, "dateKey", "") or "")
+                    if date_key in matched_date_keys:
+                        kept_messages.add(message)
+                    continue
+
+                event = getattr(message, "currentEvent", None)
+                event_id = int(getattr(event, "id", 0)) if event is not None else 0
+                if event_id == 0:
+                    event_id = int(
+                        getattr(message, "actionDeleteGroupEventId", 0) or 0
+                    )
+                if event_id != 0 and event_id in matched_event_ids:
+                    kept_messages.add(message)
+                    kept_event_ids.add(event_id)
+
+            filtered.clear()
+            filtered.addAll(kept_messages)
+
+            # A pending plugin page is complete only when Telegram has rebuilt
+            # filteredMessages from its response. Keep requested and completed
+            # page numbers separate so the progress UI never jumps ahead.
+            completed_page = int(activity_state.get("loading_page", 0))
+            if completed_page > 0:
+                activity_state["pages_loaded"] = max(
+                    int(activity_state.get("pages_loaded", 0)),
+                    completed_page,
+                )
+                activity_state["loading_page"] = 0
+
+            # Count what actually survived into Telegram's adapter, not raw
+            # events in the backing history. Grouped deletion events can make
+            # those numbers differ.
+            visible_count = len(kept_event_ids)
+            activity_state["visible_count"] = visible_count
+            activity_state["filter_applied"] = True
+            will_continue = self._schedule_next_page(
+                activity,
+                activity_state,
+                visible_count,
+            )
+            # Between consecutive pages, keep the current progress state until
+            # the next request starts. This avoids a completed/loading flicker
+            # during the short pagination delay.
+            if completed_page == 0 or not will_continue:
+                self._schedule_result_commit(activity, activity_state)
+        except Exception:
+            pass
+
+    def _after_activity_destroy(self, param):
+        try:
+            if param.args is not None and len(param.args) != 0:
+                return
+            activity = param.thisObject
+            activity_key = self._object_key(activity)
+            self._activity_cache.pop(activity_key, None)
+            for picker_key, picker_state in list(self._member_pickers.items()):
+                if picker_state.get("activity") is activity:
+                    self._member_pickers.pop(picker_key, None)
+            for sheet_key, state in list(self._sheet_states.items()):
+                if state.get("activity") is activity:
+                    self._sheet_states.pop(sheet_key, None)
+        except Exception:
+            pass
+
+    def _after_activity_resume(self, param):
+        try:
+            if param.args is not None and len(param.args) != 0:
+                return
+            activity = param.thisObject
+            if self._object_key(activity) not in self._activity_cache:
+                return
+            activity_state = self._ensure_activity_cache(activity)
+            if self._target_for_activity(activity) == 0:
+                return
+            self._schedule_result_commit(activity, activity_state)
+        except Exception:
+            pass
+
+    # Target picker -----------------------------------------------------
+
+    def _show_target_picker(self, sheet, activity):
+        try:
+            chat_id = self._chat_id(activity)
+            if chat_id == 0:
+                return
+
+            args = Bundle()
+            args.putLong("chat_id", chat_id)
+            args.putInt("type", 2)  # ChatUsersActivity.TYPE_USERS
+            args.putInt("selectType", 0)  # SELECT_TYPE_MEMBERS
+
+            picker = ChatUsersActivity(args)
+            picker_key = self._object_key(picker)
+            self._member_pickers[picker_key] = {
+                "picker": picker,
+                "activity": activity,
+            }
+
+            sheet.dismiss()
+            if not bool(activity.presentFragment(picker)):
+                self._member_pickers.pop(picker_key, None)
+        except Exception:
+            pass
+
+    def _before_present_fragment(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) != 1:
+                return
+
+            picker = param.thisObject
+            picker_key = self._object_key(picker)
+            picker_state = self._member_pickers.get(picker_key)
+            if picker_state is None:
+                return
+
+            fragment = args[0]
+            if not self._is_class(fragment, "ProfileActivity"):
+                return
+
+            fragment_args = fragment.getArguments()
+            if fragment_args is None:
+                return
+            user_id = int(fragment_args.getLong("user_id") or 0)
+            if user_id <= 0:
+                return
+
+            # This ProfileActivity is only Telegram's default reaction to a
+            # member click. Consume it and return the member to our filter.
+            param.setResult(Boolean(True))
+            self._member_pickers.pop(picker_key, None)
+            picker.finishFragment()
+            self._set_target(picker_state["activity"], user_id)
+        except Exception:
+            pass
+
+    def _after_member_picker_destroy(self, param):
+        try:
+            if param.args is not None and len(param.args) != 0:
+                return
+            self._member_pickers.pop(self._object_key(param.thisObject), None)
+        except Exception:
+            pass
+
+    def _before_member_picker_rows(self, param):
+        try:
+            if param.args is not None and len(param.args) != 0:
+                return
+            picker = param.thisObject
+            if self._object_key(picker) not in self._member_pickers:
+                return
+            # ChatUsersActivity only inserts Hide Members when
+            # needOpenSearch is false. Toggle it solely while rows are built;
+            # restoring it in the after-hook prevents auto-opening search.
+            set_private_field(picker, "needOpenSearch", True)
+        except Exception:
+            pass
+
+    def _after_member_picker_rows(self, param):
+        try:
+            if param.args is not None and len(param.args) != 0:
+                return
+            picker = param.thisObject
+            if self._object_key(picker) not in self._member_pickers:
+                return
+            set_private_field(picker, "needOpenSearch", False)
+        except Exception:
+            pass
+
+    def _set_target(self, activity, target_id: int):
+        chat_id = self._chat_id(activity)
+        if chat_id == 0:
+            return
+        activity_state = self._ensure_activity_cache(activity)
+        previous_target = int(self._targets.get(chat_id, 0) or 0)
+
+        # Rebuild Telegram's full native list before starting another session.
+        # This guarantees that the picker transition always reveals valid
+        # content instead of the previous participant's filtered snapshot.
+        if previous_target != 0 and target_id > 0:
+            self._targets.pop(chat_id, None)
+            self._invoke_native_filter(activity)
+
+        activity_state["generation"] += 1
+        generation = int(activity_state["generation"])
+        activity_state["event_matches"] = {}
+        activity_state["match_target_id"] = target_id
+        activity_state["visible_count"] = 0
+        activity_state["pages_loaded"] = 0
+        activity_state["loading_page"] = 0
+        activity_state["load_scheduled"] = False
+        activity_state["searching"] = target_id > 0
+        activity_state["filter_applied"] = False
+        activity_state["commit_revision"] += 1
+
+        if target_id > 0:
+            self._targets[chat_id] = target_id
+        else:
+            self._targets.pop(chat_id, None)
+
+        if target_id > 0:
+            avatar = get_private_field(activity, "avatarContainer")
+            if avatar is not None:
+                avatar.setSubtitle(
+                    f"Участник: {self._target_label(activity, target_id)} · поиск…"
+                )
+            # Wait until ChatUsersActivity has finished popping. Only then
+            # apply the local filter and decide whether older pages are needed.
+            run_on_ui_thread(
+                lambda: self._start_target_session(
+                    activity,
+                    generation,
+                    target_id,
+                ),
+                220,
+            )
+        else:
+            self._restore_native_view(activity)
+            run_on_ui_thread(
+                lambda: self._scroll_to_latest_after_reset(
+                    activity,
+                    generation,
+                ),
+                48,
+            )
+
+    def _start_target_session(self, activity, generation: int, target_id: int):
+        try:
+            if not self._active:
+                return
+            activity_state = self._activity_cache.get(self._object_key(activity))
+            if activity_state is None:
+                return
+            if int(activity_state.get("generation", 0)) != generation:
+                return
+            if self._target_for_activity(activity) != target_id:
+                return
+            self._invoke_native_filter(activity)
+        except Exception:
+            pass
+
+    def _refresh_filter_sheet(self, sheet):
+        try:
+            adapter = get_private_field(sheet, "adapter")
+            if adapter is not None:
+                adapter.update(True)
+        except Exception:
+            pass
+
+    def _set_initial_filter_position(self, sheet):
+        try:
+            recycler = get_private_field(sheet, "recyclerListView")
+            if recycler is not None:
+                layout_manager = recycler.getLayoutManager()
+                if layout_manager is not None:
+                    layout_manager.scrollToPositionWithOffset(0, 0)
+        except Exception:
+            pass
+
+    def _invoke_native_filter(self, activity):
+        try:
+            method = self._find_method_on_object(
+                activity,
+                "filterDeletedMessages",
+                0,
+            )
+            if method is not None:
+                method.invoke(activity)
+            adapter = get_private_field(activity, "chatAdapter")
+            if adapter is not None:
+                adapter.updateRows()
+                adapter.notifyDataSetChanged()
+        except Exception:
+            pass
+
+    def _scroll_to_latest_after_reset(self, activity, generation: int):
+        try:
+            activity_state = self._activity_cache.get(self._object_key(activity))
+            if activity_state is None:
+                return
+            if int(activity_state.get("generation", 0)) != generation:
+                return
+            if self._target_for_activity(activity) != 0:
+                return
+
+            method = self._find_method_on_object(
+                activity,
+                "moveScrollToLastMessage",
+                0,
+            )
+            if method is not None:
+                method.invoke(activity)
+        except Exception:
+            pass
+
+    # Event matching ----------------------------------------------------
+
+    def _event_user_ids(self, event) -> Set[int]:
+        result: Set[int] = set()
+        try:
+            actor_id = int(getattr(event, "user_id", 0) or 0)
+            if actor_id > 0:
+                result.add(actor_id)
+
+            action = getattr(event, "action", None)
+            if action is None:
+                return result
+            action_name = self._simple_name(action)
+
+            if action_name in SELF_PARTICIPANT_ACTIONS and actor_id > 0:
+                result.add(actor_id)
+
+            direct_user_id = int(getattr(action, "user_id", 0) or 0)
+            if direct_user_id > 0:
+                result.add(direct_user_id)
+
+            for field in PARTICIPANT_ACTION_FIELDS:
+                participant = getattr(action, field, None)
+                if participant is None:
+                    continue
+                participant_id = int(getattr(participant, "user_id", 0) or 0)
+                if participant_id > 0:
+                    result.add(participant_id)
+                peer_id = self._user_id_from_peer(getattr(participant, "peer", None))
+                if peer_id > 0:
+                    result.add(peer_id)
+
+            for field in MESSAGE_ACTION_FIELDS:
+                message = getattr(action, field, None)
+                if message is None:
+                    continue
+                author_id = self._user_id_from_peer(getattr(message, "from_id", None))
+                if author_id > 0:
+                    result.add(author_id)
+        except Exception:
+            pass
+        return result
+
+    @staticmethod
+    def _user_id_from_peer(peer) -> int:
+        if peer is None:
+            return 0
+        try:
+            return int(getattr(peer, "user_id", 0) or 0)
+        except Exception:
+            return 0
+
+    def _schedule_next_page(self, activity, activity_state, visible_count: int):
+        try:
+            can_load = (
+                visible_count < AUTOLOAD_TARGET_COUNT
+                and int(activity_state.get("pages_loaded", 0))
+                < AUTOLOAD_MAX_PAGES
+                and not bool(get_private_field(activity, "endReached"))
+            )
+            activity_state["searching"] = can_load
+            if not can_load:
+                return False
+            if bool(activity_state.get("load_scheduled", False)):
+                return True
+
+            activity_state["load_scheduled"] = True
+            generation = int(activity_state.get("generation", 0))
+            delay = (
+                AUTOLOAD_START_DELAY_MS
+                if int(activity_state.get("pages_loaded", 0)) == 0
+                else AUTOLOAD_NEXT_DELAY_MS
+            )
+            run_on_ui_thread(
+                lambda: self._run_next_page(activity, generation),
+                delay,
+            )
+            return True
+        except Exception:
+            activity_state["load_scheduled"] = False
+            activity_state["searching"] = False
+            return False
+
+    def _run_next_page(self, activity, generation: int):
+        activity_state = None
+        try:
+            activity_state = self._activity_cache.get(self._object_key(activity))
+            if activity_state is None:
+                return
+            if not self._active or int(activity_state.get("generation", 0)) != generation:
+                return
+            if self._target_for_activity(activity) == 0:
+                activity_state["load_scheduled"] = False
+                activity_state["searching"] = False
+                activity_state["loading_page"] = 0
+                return
+            if int(activity_state.get("visible_count", 0)) >= AUTOLOAD_TARGET_COUNT:
+                activity_state["load_scheduled"] = False
+                activity_state["searching"] = False
+                activity_state["loading_page"] = 0
+                self._schedule_result_commit(activity, activity_state)
+                return
+            if bool(get_private_field(activity, "loading")):
+                # Never drop the scheduled page merely because Telegram is
+                # still finishing the previous response callback.
+                run_on_ui_thread(
+                    lambda: self._run_next_page(activity, generation),
+                    AUTOLOAD_NEXT_DELAY_MS,
+                )
+                return
+            if (
+                bool(get_private_field(activity, "endReached"))
+                or int(activity_state.get("pages_loaded", 0))
+                >= AUTOLOAD_MAX_PAGES
+            ):
+                activity_state["load_scheduled"] = False
+                activity_state["searching"] = False
+                activity_state["loading_page"] = 0
+                self._schedule_result_commit(activity, activity_state)
+                return
+
+            method = self._load_messages_method
+            if method is None:
+                method = self._find_method_on_object(activity, "loadMessages", 1)
+                if method is None:
+                    activity_state["load_scheduled"] = False
+                    activity_state["searching"] = False
+                    activity_state["loading_page"] = 0
+                    self._schedule_result_commit(activity, activity_state)
+                    return
+                self._load_messages_method = method
+
+            next_page = int(activity_state.get("pages_loaded", 0)) + 1
+            activity_state["loading_page"] = next_page
+            activity_state["load_scheduled"] = False
+            self._schedule_result_commit(activity, activity_state)
+            method.invoke(activity, False)
+        except Exception:
+            if activity_state is not None:
+                activity_state["load_scheduled"] = False
+                activity_state["searching"] = False
+                activity_state["loading_page"] = 0
+                self._schedule_result_commit(activity, activity_state)
+
+    def _schedule_result_commit(self, activity, activity_state):
+        try:
+            activity_state["commit_revision"] = int(
+                activity_state.get("commit_revision", 0)
+            ) + 1
+            generation = int(activity_state.get("generation", 0))
+            revision = int(activity_state["commit_revision"])
+            run_on_ui_thread(
+                lambda: self._commit_result_view(
+                    activity,
+                    generation,
+                    revision,
+                    0,
+                ),
+                32,
+            )
+        except Exception:
+            pass
+
+    def _commit_result_view(
+        self,
+        activity,
+        generation: int,
+        revision: int,
+        retry: int,
+    ):
+        try:
+            activity_state = self._activity_cache.get(self._object_key(activity))
+            if activity_state is None:
+                return
+            if int(activity_state.get("generation", 0)) != generation:
+                return
+            if int(activity_state.get("commit_revision", 0)) != revision:
+                return
+            target_id = self._target_for_activity(activity)
+            if target_id == 0:
+                return
+
+            filtered = get_private_field(activity, "filteredMessages")
+            avatar = get_private_field(activity, "avatarContainer")
+            empty_view = get_private_field(activity, "emptyView")
+            empty_image = get_private_field(activity, "emptyImageView")
+            empty_container = get_private_field(activity, "emptyViewContainer")
+            chat_list = get_private_field(activity, "chatListView")
+            adapter = get_private_field(activity, "chatAdapter")
+            visible_count = int(activity_state.get("visible_count", 0))
+
+            if (
+                filtered is None
+                or chat_list is None
+                or adapter is None
+                or (
+                    visible_count == 0
+                    and (empty_container is None or empty_view is None)
+                )
+            ):
+                if retry < 12:
+                    run_on_ui_thread(
+                        lambda: self._commit_result_view(
+                            activity,
+                            generation,
+                            revision,
+                            retry + 1,
+                        ),
+                        80,
+                    )
+                return
+
+            searching = bool(activity_state.get("searching", False))
+            filter_applied = bool(activity_state.get("filter_applied", False))
+            pages_loaded = int(activity_state.get("pages_loaded", 0))
+            loading_page = int(activity_state.get("loading_page", 0))
+            name = self._target_label(activity, target_id)
+            if avatar is not None:
+                if loading_page > 0:
+                    suffix = (
+                        f" · загрузка {loading_page}/{AUTOLOAD_MAX_PAGES}…"
+                    )
+                elif searching:
+                    suffix = f" · поиск {pages_loaded}/{AUTOLOAD_MAX_PAGES}…"
+                else:
+                    suffix = ""
+                avatar.setSubtitle(
+                    f"Участник: {name} · найдено {visible_count}{suffix}"
+                )
+
+            chat_list.setAlpha(1.0)
+            chat_list.setVisibility(View.VISIBLE)
+            if empty_container is not None:
+                chat_list.setEmptyView(empty_container)
+
+            if filter_applied and visible_count == 0:
+                if empty_image is not None:
+                    empty_image.setVisibility(View.GONE)
+                if empty_view is not None:
+                    if loading_page > 0:
+                        empty_view.setText(
+                            f"Ищем действия, связанные с {name}…\n"
+                            f"Загружается страница {loading_page} из "
+                            f"{AUTOLOAD_MAX_PAGES}"
+                        )
+                    elif searching:
+                        empty_view.setText(
+                            f"Ищем действия, связанные с {name}…\n"
+                            f"Проверено страниц: "
+                            f"{pages_loaded} из "
+                            f"{AUTOLOAD_MAX_PAGES}"
+                        )
+                    else:
+                        empty_view.setText(
+                            f"Действий, связанных с {name}, не найдено.\n"
+                            "Выберите другого участника в фильтрах."
+                        )
+
+            # RecyclerListView owns the empty-view transition. Do not force
+            # visibility/alpha here: doing so fought its 150 ms animation and
+            # made every completed page visibly jerk.
+            chat_list.checkIfEmpty()
+        except Exception:
+            pass
+
+    def _restore_native_view(self, activity):
+        try:
+            self._invoke_native_filter(activity)
+            placeholder_method = self._find_method_on_object(
+                activity,
+                "updateEmptyPlaceholder",
+                0,
+            )
+            if placeholder_method is not None:
+                placeholder_method.invoke(activity)
+
+            avatar = get_private_field(activity, "avatarContainer")
+            empty_container = get_private_field(activity, "emptyViewContainer")
+            chat_list = get_private_field(activity, "chatListView")
+            if avatar is not None:
+                avatar.setSubtitle("Все действия")
+            if chat_list is not None:
+                chat_list.setAlpha(1.0)
+                chat_list.setVisibility(View.VISIBLE)
+                if empty_container is not None:
+                    chat_list.setEmptyView(empty_container)
+            if chat_list is not None:
+                chat_list.checkIfEmpty()
+        except Exception:
+            pass
+
+    def _restore_activity_ui(self, activity):
+        try:
+            activity_state = self._ensure_activity_cache(activity)
+            activity_state["generation"] += 1
+            activity_state["searching"] = False
+            activity_state["load_scheduled"] = False
+            activity_state["filter_applied"] = False
+            self._restore_native_view(activity)
+        except Exception:
+            pass
+
+    # Filter state helpers ---------------------------------------------
+
+    def _patch_missing_server_filters(self, activity):
+        chat_id = self._chat_id(activity)
+        if chat_id == 0:
+            return
+        extra_state = self._extra_filters.get(chat_id)
+        if extra_state is None:
+            return
+
+        current_filter = get_private_field(activity, "currentFilter")
+        if current_filter is None:
+            if all(bool(extra_state.get(field, True)) for field in EXTRA_FILTER_FIELDS):
+                return
+            current_filter = TLRPC.TL_channelAdminLogEventsFilter()
+            for field in ALL_FILTER_FIELDS:
+                setattr(current_filter, field, True)
+            if not set_private_field(activity, "currentFilter", current_filter):
+                return
+
+        for field in EXTRA_FILTER_FIELDS:
+            setattr(current_filter, field, bool(extra_state.get(field, True)))
+        for field in ALWAYS_ENABLED_FIELDS:
+            setattr(current_filter, field, True)
+
+    def _target_for_activity(self, activity) -> int:
+        return int(self._targets.get(self._chat_id(activity), 0) or 0)
+
+    def _target_label(self, activity, target_id: int) -> str:
+        if target_id <= 0:
+            return "Все участники"
+        try:
+            user = activity.getMessagesController().getUser(target_id)
+            if user is not None:
+                name = str(UserObject.getUserName(user) or "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+        return f"Пользователь {target_id}"
+
+    # Reflection and identity helpers ----------------------------------
+
+    @staticmethod
+    def _object_key(obj) -> int:
+        System = jclass("java.lang.System")
+        return int(System.identityHashCode(obj))
+
+    @staticmethod
+    def _simple_name(obj) -> str:
+        if obj is None:
+            return ""
+        try:
+            return str(obj.getClass().getSimpleName())
+        except Exception:
+            return ""
+
+    def _is_class(self, obj, simple_name: str) -> bool:
+        return self._simple_name(obj) == simple_name
+
+    def _ensure_activity_cache(self, activity) -> Dict[str, Any]:
+        activity_key = self._object_key(activity)
+        cached = self._activity_cache.get(activity_key)
+        if cached is not None:
+            return cached
+
+        chat = get_private_field(activity, "currentChat")
+        cached = {
+            "activity": activity,
+            "chat_id": int(getattr(chat, "id", 0) or 0) if chat is not None else 0,
+            "messages": get_private_field(activity, "messages"),
+            "filtered_messages": get_private_field(activity, "filteredMessages"),
+            "event_matches": {},
+            "match_target_id": 0,
+            "visible_count": 0,
+            "generation": 0,
+            "pages_loaded": 0,
+            "loading_page": 0,
+            "load_scheduled": False,
+            "searching": False,
+            "filter_applied": False,
+            "commit_revision": 0,
+        }
+        self._activity_cache[activity_key] = cached
+        return cached
+
+    def _chat_id(self, activity) -> int:
+        cached = self._activity_cache.get(self._object_key(activity))
+        if cached is not None:
+            return int(cached.get("chat_id", 0) or 0)
+        try:
+            chat = get_private_field(activity, "currentChat")
+            return int(getattr(chat, "id", 0) or 0) if chat is not None else 0
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _java_array_len(array) -> int:
+        try:
+            return len(array)
+        except Exception:
+            try:
+                return int(array.length)
+            except Exception:
+                return 0
+
+    def _find_method_on_object(self, obj, method_name: str, param_count: int):
+        if obj is None:
+            return None
+        try:
+            current = obj.getClass()
+        except Exception:
+            return None
+
+        while current is not None:
+            try:
+                methods = current.getDeclaredMethods()
+            except Exception:
+                methods = []
+            for method in methods:
+                try:
+                    if str(method.getName()) != method_name:
+                        continue
+                    if self._java_array_len(method.getParameterTypes()) != param_count:
+                        continue
+                    method.setAccessible(True)
+                    return method
+                except Exception:
+                    continue
+            try:
+                current = current.getSuperclass()
+            except Exception:
+                current = None
+        return None
+
+Plugin = RecentActionsPlus
